@@ -175,6 +175,8 @@ def _validate_task(
         raise SchemaError(f"{where}.resources.gpu: 必须是 0 (CPU-only) 或 1 (占 1 GPU)")
     resources = dict(resources)
     resources["gpu"] = gpu_req
+    if gpu_req == 0 and "cpus" not in resources:
+        resources["cpus"] = 1  # CPU-only 缺省 1 核 (配额制调度用)
 
     # retry_transform / probes 透传
     retry_transform = t.get("retry_transform")

@@ -26,7 +26,7 @@ POLL_SEC = 10
 HEARTBEAT_SEC = 30
 RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5)
 DEFAULT_MAX_RETRY = 1
-DEFAULT_MAX_CPU_JOBS = 2  # CPU-only 任务并发上限 (config max_cpu_jobs 可覆盖, §5b B4)
+DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
 
 
 class Dispatcher:
@@ -389,18 +389,20 @@ class Dispatcher:
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
                 " ORDER BY j.rowid"
             ).fetchall()
-            # CPU-only 并发上限: 当前 running 的 CPU-only 任务数 (gpu IS NULL)
-            max_cpu = int(self.cfg.get("max_cpu_jobs", DEFAULT_MAX_CPU_JOBS))
-            cpu_running = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL"
-            ).fetchone()[0]
+            # CPU 配额制 (§5b B4 升级): config.cpus_total = 节点总核数;
+            # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.
+            # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU)
+            cpus_total = int(self.cfg.get("cpus_total", 0) or 0)
+            used_cpu = self._cpu_in_use(conn)
             for j in ready:
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
                 resources = spec.get("resources") or {}
                 is_cpu_only = resources.get("gpu", 1) == 0
+                task_cpus = self._task_cpus(spec)
+                if cpus_total > 0 and used_cpu + task_cpus > cpus_total:
+                    # CPU 配额不足: 本任务等下轮 (CPU 超卖禁止, 与 GPU 同纪律)
+                    continue
                 if is_cpu_only:
-                    if cpu_running >= max_cpu:
-                        continue  # CPU 槽满: 本任务等下轮, 不阻塞 GPU 任务派发
                     gpu = None  # CPU-only: 不占 GPU 槽位
                 else:
                     # 用同一事务 assign (避免嵌套 connect 的 database is locked)
@@ -409,8 +411,7 @@ class Dispatcher:
                         break  # 无空卡, 本轮回合结束 (不抢占)
                 try:
                     self._launch_job(conn, j, gpu)
-                    if is_cpu_only:
-                        cpu_running += 1
+                    used_cpu += task_cpus
                 except Exception as e:
                     # 启动失败: 释放 GPU (如占) + 标 failed (走 retry 路径), 不中断整轮派发
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")
@@ -421,6 +422,30 @@ class Dispatcher:
                         finished_at=state.now(),
                     )
                     self._maybe_retry(conn, j)
+
+    def _task_cpus(self, spec: dict) -> int:
+        """任务 CPU 占用: resources.cpus 优先; GPU 任务未声明用 config.gpu_job_cpus."""
+        resources = spec.get("resources") or {}
+        cpus = resources.get("cpus")
+        if cpus:
+            return int(cpus)
+        if resources.get("gpu", 1) == 0:
+            return 1  # CPU-only 缺省 1 核 (schema 已补, 双保险)
+        return int(self.cfg.get("gpu_job_cpus", DEFAULT_GPU_JOB_CPUS))
+
+    def _cpu_in_use(self, conn) -> int:
+        """当前 running 任务 (GPU + CPU-only) 的 CPU 占用总和."""
+        used = 0
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status='running'"
+        ).fetchall()
+        for j in rows:
+            try:
+                spec = json.loads(self._get_task_spec(conn, j) or "{}")
+            except (json.JSONDecodeError, TypeError):
+                spec = {}
+            used += self._task_cpus(spec)
+        return used
 
     def _assign_in_tx(self, conn, job_id: str) -> int | None:
         """事务内 assign: 可用集 = 配置集 - quarantine, 只派 free 卡."""

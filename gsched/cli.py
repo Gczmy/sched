@@ -598,6 +598,16 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "quarantined": g["quarantined"],
                 }
             )
+        # CPU 配额: running 任务 CPU 占用 (GPU 任务按 resources.cpus 或 gpu_job_cpus)
+        cpus_total = cfg.get("cpus_total", 0)
+        cpu_used = 0
+        for j in conn.execute("SELECT * FROM jobs WHERE status='running'").fetchall():
+            res = res_by_task.get((j["batch_id"], j["task_id"]), {})
+            cpus = res.get("cpus")
+            if not cpus:
+                cpus = cfg.get("gpu_job_cpus", 8) if res.get("gpu", 1) != 0 else 1
+            cpu_used += int(cpus)
+        out["cpu"] = {"used": cpu_used, "total": cpus_total}
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -627,6 +637,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     for g in out["gpus"]:
         q = " QUARANTINED" if g["quarantined"] else ""
         print(f"  GPU{g['idx']} [{g['status']:<10}] job={g['job']}{q}")
+    c = out.get("cpu")
+    if c:
+        total_txt = str(c["total"]) if c["total"] else "未配置"
+        print(f"=== CPU ===\n  占用 {c['used']} / {total_txt} 核")
     return 0
 
 
