@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Any
 
 from . import state, __version__
@@ -434,24 +435,73 @@ def cmd_task(args: argparse.Namespace) -> int:
             print(f"  submitted: {j['submitted_at']}")
             print(f"  started:   {j['started_at'] or '-'}")
             print(f"  finished:  {j['finished_at'] or '-'}")
+            dur = "-"
+            if j["started_at"] and j["finished_at"]:
+                try:
+                    t0 = datetime.fromisoformat(j["started_at"])
+                    t1 = datetime.fromisoformat(j["finished_at"])
+                    dur = f"{(t1 - t0).total_seconds():.0f}s"
+                except (ValueError, TypeError):
+                    pass
+            print(f"  elapsed:   {dur}")
             print(f"  gpu: {j['gpu']}  pgid: {j['pgid']}  retries: {j['retries']}")
             print(f"  rc: {j['rc']}  failure: {j['failure'] or '-'}")
+            print(f"  kill_reason: {j['kill_reason'] or '-'}")
             print(f"  git_rev: {j['git_rev'] or '-'}")
             print(f"  log: {state.default_state_dir()}/{state.hostname()}/logs/{batch}/{task}.log")
     return 0
 
 
 def cmd_history(args: argparse.Namespace) -> int:
-    """sched history [batch]: 已完成任务的状态/耗时/结果."""
+    """sched history [batch] [--limit N] [--status s1,s2]: 终态任务历史.
+
+    展示批次名 (非截断 batch_id) + 耗时 + 失败原因; 支持按批次过滤.
+    """
+    limit = getattr(args, "limit", 50)
+    statuses = getattr(args, "status", None)
     with state.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE status IN ('done','skip','failed','blocked','cancelled','timed_out')"
-            " ORDER BY finished_at DESC LIMIT 50"
+        batches = conn.execute(
+            "SELECT id, name FROM batches ORDER BY created_at DESC"
         ).fetchall()
+        name_by_id = {b["id"]: b["name"] for b in batches}
+        where = "WHERE status IN ('done','skip','failed','blocked','cancelled','timed_out')"
+        params: list = []
+        if args.batch:
+            b = _batch_id_from_name(args.batch)
+            if not b:
+                print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+                return 1
+            where += " AND batch_id=?"
+            params.append(b)
+        if statuses:
+            sts = [s.strip() for s in statuses.split(",") if s.strip()]
+            if sts:
+                where += " AND status IN (%s)" % ",".join("?" * len(sts))
+                params.extend(sts)
+        rows = conn.execute(
+            f"SELECT * FROM jobs {where} ORDER BY finished_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        if not rows:
+            print("(无历史任务)")
+            return 0
+        print(f"{'批次':<20} {'任务':<16} {'状态':<10} {'rc':<4} {'耗时':<8} {'gpu':<4} {'失败原因'}")
         for j in rows:
+            bname = name_by_id.get(j["batch_id"], j["batch_id"])
+            dur = "-"
+            if j["started_at"] and j["finished_at"]:
+                try:
+                    t0 = datetime.fromisoformat(j["started_at"])
+                    t1 = datetime.fromisoformat(j["finished_at"])
+                    dur = f"{(t1 - t0).total_seconds():.0f}s"
+                except (ValueError, TypeError):
+                    pass
+            rc = "-" if j["rc"] is None else str(j["rc"])
+            gpu = "-" if j["gpu"] is None else str(j["gpu"])
+            fail = j["failure"] or (j["kill_reason"] or "-")
             print(
-                f"  {j['id'][-32:]:<34} [{j['status']:<8}] rc={j['rc']} "
-                f"gpu={j['gpu']} fin={j['finished_at']}"
+                f"  {bname:<18} {j['task_id']:<16} [{j['status']:<8}] {rc:<4} "
+                f"{dur:<8} {gpu:<4} {fail}"
             )
     return 0
 
@@ -575,8 +625,29 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tail_n(path: str, n: int) -> list[str]:
+    """读取文件最后 n 行 (纯 stdlib, 大文件不整体读入)."""
+    lines: list[str] = []
+    with open(path, "rb") as f:
+        try:
+            f.seek(0, 2)  # 到文件尾
+            size = f.tell()
+            block = 8192
+            buf = b""
+            while size > 0 and len(lines) < n:
+                read = min(block, size)
+                size -= read
+                f.seek(size)
+                buf = f.read(read) + buf
+                lines = buf.split(b"\n")
+            lines = buf.split(b"\n")
+        except OSError:
+            return []
+    return [l.decode("utf-8", errors="replace") for l in lines if l]
+
+
 def cmd_log(args: argparse.Namespace) -> int:
-    """sched log <batch>:<task> [-f]: tail 任务日志."""
+    """sched log <batch>:<task> [-f] [-n N]: tail 任务日志 (纯 stdlib, 无 subprocess)."""
     batch, task = _resolve_task_ref(args.task)
     log_path = os.path.join(
         state.default_state_dir(), state.hostname(), "logs", batch, f"{task}.log"
@@ -585,16 +656,26 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"日志不存在: {log_path}", file=sys.stderr)
         return 1
     if args.f:
-        import subprocess
-
+        # 原生 tail -f: 先输出尾部 N 行, 再轮询增量 (Q8: 无读线程竞态, CLI 侧纯读)
+        # 管道重定向时必须 flush (Python stdout 块缓冲会吞掉增量)
         try:
-            subprocess.run(["tail", "-f", log_path])
+            tail = "\n".join(_tail_n(log_path, args.n))
+            print(tail, flush=True)
+            pos = os.path.getsize(log_path)
+            while True:
+                time.sleep(1)
+                cur = os.path.getsize(log_path)
+                if cur > pos:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(pos)
+                        print(f.read(), end="", flush=True)
+                    pos = cur
+                elif cur < pos:
+                    pos = 0  # 文件被截断/轮转, 重新从头
         except KeyboardInterrupt:
-            pass
+            return 0
         return 0
-    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
-    print("".join(lines[-args.n:]))
+    print("\n".join(_tail_n(log_path, args.n)))
     return 0
 
 
@@ -702,6 +783,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("history", help="历史查询")
     p.add_argument("batch", nargs="?", default=None)
+    p.add_argument("--limit", type=int, default=50, help="最大行数 (默认 50)")
+    p.add_argument("--status", default=None, help="按状态过滤, 逗号分隔 (如 done,failed)")
     p.set_defaults(fn=cmd_history)
 
     p = sub.add_parser("cancel", help="取消 (组级 kill)")
