@@ -138,6 +138,40 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 print(f"错误: depends_on 引用的批次不存在: '{dep}' (O1)", file=sys.stderr)
                 return 1
 
+    # 依赖环检测 (§3.4e B3): 按 name 拓扑 DFS (当前批次 + 已存在批次全图)
+    def _dep_graph() -> dict[str, list[str]]:
+        """name -> depends_on name 列表 (含当前批次)."""
+        g: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
+        with state.connect() as conn:
+            rows = conn.execute("SELECT name, depends_on FROM batches").fetchall()
+            for r in rows:
+                g.setdefault(r["name"], json.loads(r["depends_on"] or "[]"))
+        return g
+
+    g = _dep_graph()
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def _has_cycle(name: str) -> bool:
+        if name in stack:
+            cycle = " -> ".join(stack[stack.index(name):] + [name])
+            raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
+        if name in visited:
+            return False
+        visited.add(name)
+        stack.append(name)
+        for d in g.get(name, []):
+            if _has_cycle(d):
+                return True
+        stack.pop()
+        return False
+
+    try:
+        _has_cycle(norm["name"])
+    except SchemaError as e:
+        print(f"校验失败: {e}", file=sys.stderr)
+        return 1
+
     from datetime import datetime
 
     bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -154,8 +188,31 @@ def cmd_submit(args: argparse.Namespace) -> int:
             return p
         return tok
 
-    def _expand_cmd(cmd_list: list[str]) -> list[str]:
-        return [_expand_venv(t) for t in cmd_list]
+    def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
+                    cwd_abs: str | None = None) -> list[str]:
+        """cmd 模板展开: {VENV:name} + {stageN_<key>} (N7, 前序 stage 产物路径)."""
+        out = []
+        for tok in cmd_list:
+            tok = _expand_venv(tok)
+            if isinstance(tok, str) and tok.startswith("{stage") and tok.endswith("}"):
+                # {stage0_ckpt} -> stage0 的 artifacts["ckpt"].path
+                inner = tok[1:-1]  # stage0_ckpt
+                parts = inner.split("_", 1)
+                if len(parts) == 2 and parts[0].startswith("stage") and parts[0][5:].isdigit():
+                    si = int(parts[0][5:])
+                    key = parts[1]
+                    arts = (stage_artifacts or {}).get(si)
+                    if arts is None:
+                        raise SchemaError(f"{tok}: 引用不存在的 stage {si} (N7)")
+                    a = arts.get(key)
+                    if not a or not a.get("path"):
+                        raise SchemaError(f"{tok}: stage{si} 未声明产物 key '{key}' (N7)")
+                    p = a["path"]
+                    if not os.path.isabs(p) and cwd_abs:
+                        p = os.path.normpath(os.path.join(cwd_abs, p))
+                    tok = p
+            out.append(tok)
+        return out
 
     with state.connect() as conn:
         # 同名批次未全部终态 -> 拒绝 (定案 6)
@@ -175,20 +232,24 @@ def cmd_submit(args: argparse.Namespace) -> int:
             norm["gpus"], norm["cwd"], norm["env"],
         )
         for i, t in enumerate(norm["tasks"]):
-            # cmd/stages 的 {VENV:} 展开为绝对路径 (spec 存展开后的)
+            # cmd/stages 的 {VENV:}/{stageN_<key>} 展开为绝对路径 (spec 存展开后的)
             cmd_e = _expand_cmd(t["cmd"]) if t["cmd"] else None
             stages_e = None
             if t["stages"]:
-                stages_e = [
-                    {
-                        "cmd": _expand_cmd(s["cmd"]),
-                        "artifacts": s["artifacts"],
-                        "probes": s.get("probes"),
-                        "retry_transform": s.get("retry_transform"),
-                        "paths_escape": s.get("paths_escape", False),
-                    }
-                    for s in t["stages"]
-                ]
+                # N7: stage j 可引用前序 stage 0..j-1 的产物
+                stage_art: dict[int, dict] = {}
+                stages_e = []
+                for j, s in enumerate(t["stages"]):
+                    stage_art[j] = s["artifacts"]
+                    stages_e.append(
+                        {
+                            "cmd": _expand_cmd(s["cmd"], stage_art, t["cwd_abs"]),
+                            "artifacts": s["artifacts"],
+                            "probes": s.get("probes"),
+                            "retry_transform": s.get("retry_transform"),
+                            "paths_escape": s.get("paths_escape", False),
+                        }
+                    )
             # 任务级 spec 存规范化后的 (含 cwd_abs, 供 executor 直接用)
             spec_json = {
                 "id": t["id"],

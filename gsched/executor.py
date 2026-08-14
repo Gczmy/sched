@@ -59,10 +59,19 @@ class Executor:
             merged_env[k] = str(v)
 
         if stages is not None:
+            # §3.4c 断点续跑: 已成功的 stage (产物已存在) 跳过, 只从失败 stage 起重跑
             parts = []
             for i, s in enumerate(stages):
+                arts = s.get("artifacts", {})
+                done = bool(arts) and all(
+                    os.path.isfile(str(a.get("path", ""))) for a in arts.values()
+                )
                 if on_stage_start:
                     on_stage_start(i)
+                if done:
+                    # stage 产物已存在: 跳过执行 (echo 标记)
+                    parts.append(f"echo [sched] stage{i} 产物已存在, 跳过")
+                    continue
                 parts.append(" ".join(shlex.quote(str(t)) for t in s["cmd"]))
             wrapper_cmd = ["bash", "-lc", " && ".join(parts)]
         else:

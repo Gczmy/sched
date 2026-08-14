@@ -292,7 +292,7 @@ class Dispatcher:
             # 产物校验 (D8)
             spec = json.loads(self._get_task_spec(conn, j) or "{}")
             artifacts = spec.get("artifacts", {})
-            if self._check_artifacts(artifacts):
+            if self._check_artifacts(artifacts, spec.get("cwd_abs") or "."):
                 state.update_job(conn, j["id"], status="done", rc=rc,
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} done rc=0 产物校验通过")
@@ -381,8 +381,12 @@ class Dispatcher:
 
     def _dispatch_ready_jobs(self) -> None:
         with state.connect() as conn:
+            # 只派发所属批次已解锁 (active/done) 的 pending job——
+            # queued 批次 (依赖未解锁) 的 job 不派发 (场景 2: 下游挂起)
             ready = conn.execute(
-                "SELECT * FROM jobs WHERE status='pending' ORDER BY rowid"
+                "SELECT j.* FROM jobs j JOIN batches b ON j.batch_id=b.id"
+                " WHERE j.status='pending' AND b.status IN ('active','done')"
+                " ORDER BY j.rowid"
             ).fetchall()
             for j in ready:
                 # 用同一事务 assign (避免嵌套 connect 的 database is locked)
@@ -462,14 +466,12 @@ class Dispatcher:
 
     def _should_skip(self, spec: dict, j) -> bool:
         """A2/O3: 产物指纹有效 且 规则校验通过 -> skip."""
-        from .artifacts import check_artifacts
-
         artifacts = spec.get("artifacts", {})
         if not artifacts:
             return False
         if not self._fingerprint_matches(spec, j):
             return False
-        return all(v is None for v in check_artifacts(artifacts).values())
+        return self._check_artifacts(artifacts, spec.get("cwd_abs") or ".")
 
     def _fingerprint_matches(self, spec: dict, j) -> bool:
         if not j["fingerprint"]:
@@ -485,13 +487,16 @@ class Dispatcher:
 
     def _clean_stale_artifacts(self, spec: dict, j) -> None:
         """§3.2 半成品: 产物存在但指纹/规则无效 -> 删除后启动."""
-        from .artifacts import check_artifacts
+        from .artifacts import check_artifact
 
+        cwd = spec.get("cwd_abs") or "."
         for key, a in spec.get("artifacts", {}).items():
             p = str(a["path"])
+            if p and not os.path.isabs(p):
+                p = os.path.normpath(os.path.join(cwd, p))
             if os.path.exists(p):
                 ok = self._fingerprint_matches(spec, j) and (
-                    check_artifacts({key: a}).get(key) is None
+                    check_artifact(p, a) is None
                 )
                 if not ok:
                     try:
@@ -514,10 +519,17 @@ class Dispatcher:
             self.host_dir, "logs", j["batch_id"], f"{j['task_id']}.log"
         )
 
-    def _check_artifacts(self, artifacts: dict) -> bool:
-        from .artifacts import check_artifacts
+    def _check_artifacts(self, artifacts: dict, cwd: str) -> bool:
+        """D8 产物校验: path 相对任务 cwd 解析 (E4 已保证在 cwd 内)."""
+        from .artifacts import check_artifact
 
-        return all(v is None for v in check_artifacts(artifacts).values())
+        for key, a in artifacts.items():
+            p = a.get("path")
+            if p and not os.path.isabs(p):
+                p = os.path.normpath(os.path.join(cwd, p))
+            if check_artifact(p or "", a) is not None:
+                return False
+        return True
 
     def _heartbeat(self) -> None:
         self._touch_heartbeat()
