@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sched"
+version = "0.1.0"
+description = "统一任务调度框架 (GPU 每卡一任务, 批次语义, 产物指纹, 可观测性)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+sched = "gsched.cli:main"
+
+[tool.setuptools]
+packages = ["gsched"]
