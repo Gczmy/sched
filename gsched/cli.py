@@ -111,8 +111,142 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dry_run_preview(norm: dict, cfg: dict) -> dict:
+    """§G4 A 类 dry-run: 纯只读预览 (不写 state).
+
+    返回 {"tasks": [{id, cmd_flat, stage_preds, skip, reason}],
+          "dep_status": {name: (status, n_done, n_total)}, "git_rev"}.
+    skip 预测 = 产物指纹有效 (A2) 且规则校验通过 (D8) -> skip;
+    依赖就绪 = depends_on 上游当前状态 (O1 name->id 解析, 一次 SELECT).
+    """
+    from .artifacts import check_artifact
+    from .fingerprint import compute_fingerprint
+
+    def _expand_venv(tok: str) -> str:
+        if isinstance(tok, str) and tok.startswith("{VENV:") and tok.endswith("}"):
+            name = tok[len("{VENV:"):-1]
+            p = cfg.get("venvs", {}).get(name)
+            if not p:
+                raise SchemaError(f"venv 未定义: {name}")
+            return p
+        return tok
+
+    def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
+                    cwd_abs: str | None = None) -> list[str]:
+        out = []
+        for tok in cmd_list:
+            tok = _expand_venv(tok)
+            if isinstance(tok, str) and tok.startswith("{stage") and tok.endswith("}"):
+                inner = tok[1:-1]
+                parts = inner.split("_", 1)
+                if len(parts) == 2 and parts[0].startswith("stage") and parts[0][5:].isdigit():
+                    si = int(parts[0][5:])
+                    key = parts[1]
+                    arts = (stage_artifacts or {}).get(si)
+                    if arts is None:
+                        raise SchemaError(f"{tok}: 引用不存在的 stage {si} (N7)")
+                    a = arts.get(key)
+                    if not a or not a.get("path"):
+                        raise SchemaError(f"{tok}: stage{si} 未声明产物 key '{key}' (N7)")
+                    p = a["path"]
+                    if not os.path.isabs(p) and cwd_abs:
+                        p = os.path.normpath(os.path.join(cwd_abs, p))
+                    tok = p
+            out.append(tok)
+        return out
+
+    def _pred_stage(cmd_e: list[str], arts: dict, cwd_abs: str) -> tuple[str, str]:
+        """单 stage 预测: (skip/run, 原因). 产物路径相对 cwd 解析."""
+        if not arts:
+            return "run", "无产物声明 (必跑)"
+        bad: list[str] = []
+        for key, a in arts.items():
+            p = a.get("path")
+            if p and not os.path.isabs(p):
+                p = os.path.normpath(os.path.join(cwd_abs, p))
+            r = check_artifact(p or "", a)
+            if r is not None:
+                bad.append(f"{key}:{r}")
+        if bad:
+            return "run", "产物缺失/无效: " + "; ".join(bad)
+        return "skip", "产物已就绪且规则通过"
+
+    # 1) 展开命令 + skip 预测 (逐 stage, 对齐 dispatcher._should_skip 语义)
+    venv_paths = cfg.get("venvs", {})
+    preview_tasks = []
+    git_rev: str | None = None
+    n_skip = 0
+    n_run = 0
+    for t in norm["tasks"]:
+        cwd_abs = t["cwd_abs"]
+        stage_art: dict[int, dict] = {}
+        if t["stages"]:
+            stages_e = []
+            stage_preds = []
+            for j, s in enumerate(t["stages"]):
+                stage_art[j] = s["artifacts"]
+                cmd_e = _expand_cmd(s["cmd"], stage_art, cwd_abs)
+                stages_e.append(cmd_e)
+                # 指纹 (A2): 展开 cmd + git rev + venv
+                fp, _, rev = compute_fingerprint(
+                    None, [{"cmd": cmd_e}], cwd_abs, t["git"], venv_paths
+                )
+                git_rev = rev or git_rev
+                st, why = _pred_stage(cmd_e, s["artifacts"], cwd_abs)
+                stage_preds.append({"stage": j, "skip": st == "skip", "reason": why})
+                if st == "skip":
+                    n_skip += 1
+                else:
+                    n_run += 1
+            preview_tasks.append({
+                "id": t["id"],
+                "cmd_flat": " && ".join(" ".join(c) for c in stages_e),
+                "stages": stage_preds,
+                "skip": all(p["skip"] for p in stage_preds),
+            })
+        else:
+            cmd_e = _expand_cmd(t["cmd"], None, cwd_abs)
+            fp, _, rev = compute_fingerprint(
+                cmd_e, None, cwd_abs, t["git"], venv_paths
+            )
+            git_rev = rev or git_rev
+            st, why = _pred_stage(cmd_e, t["artifacts"], cwd_abs)
+            if st == "skip":
+                n_skip += 1
+            else:
+                n_run += 1
+            preview_tasks.append({
+                "id": t["id"],
+                "cmd_flat": " ".join(cmd_e),
+                "stages": [{"stage": 0, "skip": st == "skip", "reason": why}],
+                "skip": st == "skip",
+            })
+
+    # 2) 依赖就绪预览 (O1): depends_on name -> 最新批次 id + 状态
+    dep_status: dict[str, str] = {}
+    with state.connect() as conn:
+        for dep in norm["depends_on"]:
+            row = conn.execute(
+                "SELECT id, status FROM batches WHERE name=?"
+                " ORDER BY created_at DESC LIMIT 1",
+                (dep,),
+            ).fetchone()
+            if row:
+                dep_status[dep] = row["status"]
+            else:
+                dep_status[dep] = "NOT_FOUND"
+
+    return {
+        "tasks": preview_tasks,
+        "dep_status": dep_status,
+        "git_rev": git_rev,
+        "n_skip": n_skip,
+        "n_run": n_run,
+    }
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
-    """sched submit batch.json: 校验 -> 入队 (依赖环检测 + name 引用解析)."""
+    """sched submit batch.json [--dry-run]: 校验 -> 预览(dry) 或 入队."""
     cfg = _load_cfg()
     path = args.batch
     try:
@@ -227,6 +361,39 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        if getattr(args, "dry_run", False):
+            # §G4 A 类: 纯只读预览, 不 insert
+            prev = _dry_run_preview(norm, cfg)
+            print(f"=== dry-run: {norm['name']} ({len(norm['tasks'])} 任务, mode={norm['mode']}) ===")
+            if prev["dep_status"]:
+                print("--- 依赖就绪 ---")
+                for dep, st in prev["dep_status"].items():
+                    mark = "✅" if st == "done" else ("⚠️" if st in ("active", "queued") else "❌")
+                    note = {
+                        "done": "上游已终态, 本批提交后可直接派发",
+                        "blocked": "上游 blocked, 本批将挂起 waiting_dep",
+                        "active": "上游运行中, 本批将挂起等解锁",
+                        "queued": "上游排队中, 本批将挂起等解锁",
+                        "NOT_FOUND": "上游不存在 (O1 已拒绝, 这里仅为展示)",
+                    }.get(st, st)
+                    print(f"  {mark} {dep}: {st} — {note}")
+            print("--- 任务预览 ---")
+            for pt in prev["tasks"]:
+                tag = "SKIP" if pt["skip"] else "RUN "
+                print(f"  [{tag}] {pt['id']}")
+                for sp in pt["stages"]:
+                    st = "SKIP" if sp["skip"] else "RUN "
+                    print(f"      stage{sp['stage']} [{st}] {sp['reason']}")
+                print(f"      cmd: {pt['cmd_flat'][:120]}{"..." if len(pt['cmd_flat']) > 120 else ""}")
+            print("--- 汇总 ---")
+            print(f"  将跑 {prev['n_run']} / 将 skip {prev['n_skip']} / 共 {len(norm['tasks'])} 任务")
+            if prev["git_rev"]:
+                print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
+            if args.json:
+                print("==JSON==")
+                print(json.dumps(prev, ensure_ascii=False, indent=2))
+            return 0
 
         state.insert_batch(
             conn, bid, norm["name"], norm["mode"], norm["depends_on"],
@@ -761,6 +928,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("submit", help="提交 batch.json 批次")
     p.add_argument("batch", help="batch.json 路径")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只预览不入队 (skip 预测 + 依赖就绪 + 展开命令, §G4)")
+    p.add_argument("--json", action="store_true", help="dry-run 输出 JSON (供脚本解析)")
     p.set_defaults(fn=cmd_submit)
 
     p = sub.add_parser("run", help="一行提交单任务 (B14 L1)")
