@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 import time
 from datetime import datetime
@@ -393,7 +394,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             if prev["git_rev"]:
                 print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
             if args.json:
-                print("==JSON==")
+                # 只输出 JSON (对齐 status --json 惯例, 供脚本直接解析)
                 print(json.dumps(prev, ensure_ascii=False, indent=2))
             return 0
 
@@ -452,7 +453,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """sched run [flags] -- <cmd>: 一行提交单任务 (B14 L1 / N8 / O9 / P8 / R5)."""
     cfg = _load_cfg()
-    shell_cmd = " ".join(args.cmd)
+    # argparse REMAINDER 会把 `--` 分隔符也收进 args.cmd, 剥离之 (N8: `--` 后才是命令)
+    cmd_parts = list(args.cmd)
+    while cmd_parts and cmd_parts[0] == "--":
+        cmd_parts.pop(0)
+    shell_cmd = " ".join(cmd_parts)
     try:
         tokens = parse_shell_cmd(shell_cmd, "sched run")
     except SchemaError as e:
@@ -471,23 +476,44 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("错误: config.venvs 为空, 无法解析解释器", file=sys.stderr)
         return 1
     interp = venvs[venv_name]
-    cmd_array = [f"{{VENV:{venv_name}}}"] + tokens
-    base = tokens  # 用户给的 cmd 是纯命令, 解释器由框架补
 
-    batch_name = f"run-{tokens[0].split('/')[-1]}-{datetime.now().strftime('%H%M%S')}"
-    bid = f"{batch_name}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # 批次名到毫秒: 同一秒连续提交不碰撞 (batch.id UNIQUE)
+    ts = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
+    batch_name = f"run-{tokens[0].split('/')[-1]}-{ts[-6:]}"
+    bid = f"{batch_name}-{ts}"
 
     cwd = args.cwd or "{ROOT}"
     cwd_abs = os.path.realpath(os.path.expanduser(resolve_template(cwd, cfg)))
 
+    # resources: --cpu-only -> gpu:0 (CPU-only, 不占 GPU 槽位); --cpus 记录配额
+    resources: dict[str, Any] = {}
+    if args.cpu_only:
+        resources["gpu"] = 0
+    if args.cpus:
+        resources["cpus"] = args.cpus
+
+    # N8: `--` 后是 shell 字符串, 由 bash -lc 执行 (保持管道/重定向灵活性).
+    # 注意: args.cmd 经外层 shell 解析后内层引号已丢失 (argv 传参的固有限制),
+    # 这里对每个 token 分别 shlex.quote 再拼接, 重建正确的 shell 语法 ——
+    # `python -c "code"` 会变成 `python -c 'code'`, 带空格参数不会被拆散.
+    # venv 通过 PATH 注入生效: bash 解析 `python` -> venv/bin/python
+    # (executor 另注入 CUDA_VISIBLE_DEVICES: GPU 任务=卡号, CPU-only="")
+    venv_bin = os.path.dirname(interp)
+    shell_env = {
+        "PATH": venv_bin + os.pathsep + os.environ.get("PATH", ""),
+        "VIRTUAL_ENV": os.path.dirname(venv_bin),
+    }
+    shell_cmd_quoted = " ".join(shlex.quote(t) for t in cmd_parts)
+
     task_spec = {
         "id": "run",
-        "cmd": [interp] + base,  # {VENV:} 已展开为绝对路径
+        # bash -lc 执行 shell 字符串 (cmd[0] 非 {VENV:} 模板 —— run 是独立形态, 不走 batch 校验)
+        "cmd": ["/bin/bash", "-lc", shell_cmd_quoted],
         "stages": None,
         "cwd_abs": cwd_abs,
         "git": None,
-        "env": {},
-        "resources": {},
+        "env": shell_env,
+        "resources": resources,
         "duration_min": args.duration,
         "max_retry": 0,
         "artifacts": (
@@ -540,6 +566,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         jobs = conn.execute("SELECT * FROM jobs ORDER BY rowid").fetchall()
         # batch_id -> name 映射 (显示用, 避免截断 batch_id 丢 name 首字符)
         name_by_id = {b["id"]: b["name"] for b in batches}
+        # task spec 的 resources 预加载 (batch_id, task_id) -> resources (cpus 显示用)
+        res_by_task: dict[tuple[str, str], dict] = {}
+        for r in conn.execute("SELECT batch_id, id, spec FROM tasks").fetchall():
+            try:
+                spec = json.loads(r["spec"])
+            except (json.JSONDecodeError, TypeError):
+                spec = {}
+            res_by_task[(r["batch_id"], r["id"])] = spec.get("resources") or {}
         for j in jobs:
             if args.batch and j["batch_id"] not in [
                 b["id"] for b in conn.execute(
@@ -547,10 +581,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ).fetchall()
             ]:
                 continue
+            res = res_by_task.get((j["batch_id"], j["task_id"]), {})
             out["jobs"].append(
                 {
                     "id": j["id"], "batch": j["batch_id"], "task": j["task_id"],
                     "status": j["status"], "gpu": j["gpu"],
+                    "resources": res,
                     "retries": j["retries"], "failure": j["failure"],
                 }
             )
@@ -575,7 +611,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     print("=== 任务 ===")
     for j in out["jobs"]:
-        extra = f" gpu={j['gpu']}" if j["gpu"] is not None else ""
+        if j["gpu"] is not None:
+            extra = f" gpu={j['gpu']}"
+        elif j["resources"].get("gpu", 1) == 0:
+            extra = " cpu"
+        else:
+            extra = ""
+        cpus = j["resources"].get("cpus")
+        if cpus:
+            extra += f" cpus={cpus}"
         fail = f" ({j['failure']})" if j["failure"] else ""
         bname = name_by_id.get(j["batch"], j["batch"])
         print(f"  {bname:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{fail}")
@@ -613,7 +657,20 @@ def cmd_task(args: argparse.Namespace) -> int:
                 except (ValueError, TypeError):
                     pass
             print(f"  elapsed:   {dur}")
-            print(f"  gpu: {j['gpu']}  pgid: {j['pgid']}  retries: {j['retries']}")
+            spec = None
+            row = conn.execute(
+                "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+                (batch, task, j["version"]),
+            ).fetchone()
+            if row:
+                try:
+                    spec = json.loads(row["spec"])
+                except (json.JSONDecodeError, TypeError):
+                    spec = None
+            res = (spec or {}).get("resources") or {}
+            gpu_txt = "cpu" if j["gpu"] is None and res.get("gpu", 1) == 0 else j["gpu"]
+            cpus_txt = f" cpus={res['cpus']}" if res.get("cpus") else ""
+            print(f"  gpu: {gpu_txt}  pgid: {j['pgid']}  retries: {j['retries']}{cpus_txt}")
             print(f"  rc: {j['rc']}  failure: {j['failure'] or '-'}")
             print(f"  kill_reason: {j['kill_reason'] or '-'}")
             print(f"  git_rev: {j['git_rev'] or '-'}")
@@ -937,6 +994,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("run", help="一行提交单任务 (B14 L1)")
     p.add_argument("--gpus", type=int, default=1, help="申请 GPU 数量 (R5)")
+    p.add_argument("--cpus", type=int, default=None, help="CPU 配额 (记录+status 显示, B4)")
+    p.add_argument("--cpu-only", action="store_true",
+                   help="CPU-only 任务 (resources.gpu=0, 不占 GPU 槽位)")
     p.add_argument("--duration", type=int, default=None, help="预计时长(分钟), 超时=2x")
     p.add_argument("--cwd", default=None, help="工作目录 (默认 {ROOT})")
     p.add_argument("--out", default=None, help="产物路径 (声明后 done 需产物存在)")

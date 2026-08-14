@@ -26,6 +26,7 @@ POLL_SEC = 10
 HEARTBEAT_SEC = 30
 RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5)
 DEFAULT_MAX_RETRY = 1
+DEFAULT_MAX_CPU_JOBS = 2  # CPU-only 任务并发上限 (config max_cpu_jobs 可覆盖, §5b B4)
 
 
 class Dispatcher:
@@ -388,17 +389,33 @@ class Dispatcher:
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
                 " ORDER BY j.rowid"
             ).fetchall()
+            # CPU-only 并发上限: 当前 running 的 CPU-only 任务数 (gpu IS NULL)
+            max_cpu = int(self.cfg.get("max_cpu_jobs", DEFAULT_MAX_CPU_JOBS))
+            cpu_running = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL"
+            ).fetchone()[0]
             for j in ready:
-                # 用同一事务 assign (避免嵌套 connect 的 database is locked)
-                gpu = self._assign_in_tx(conn, j["id"])
-                if gpu is None:
-                    break  # 无空卡, 本轮回合结束 (不抢占)
+                spec = json.loads(self._get_task_spec(conn, j) or "{}")
+                resources = spec.get("resources") or {}
+                is_cpu_only = resources.get("gpu", 1) == 0
+                if is_cpu_only:
+                    if cpu_running >= max_cpu:
+                        continue  # CPU 槽满: 本任务等下轮, 不阻塞 GPU 任务派发
+                    gpu = None  # CPU-only: 不占 GPU 槽位
+                else:
+                    # 用同一事务 assign (避免嵌套 connect 的 database is locked)
+                    gpu = self._assign_in_tx(conn, j["id"])
+                    if gpu is None:
+                        break  # 无空卡, 本轮回合结束 (不抢占)
                 try:
                     self._launch_job(conn, j, gpu)
+                    if is_cpu_only:
+                        cpu_running += 1
                 except Exception as e:
-                    # 启动失败: 释放 GPU + 标 failed (走 retry 路径), 不中断整轮派发
+                    # 启动失败: 释放 GPU (如占) + 标 failed (走 retry 路径), 不中断整轮派发
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")
-                    self._release_in_tx(conn, j["id"])
+                    if gpu is not None:
+                        self._release_in_tx(conn, j["id"])
                     state.update_job(
                         conn, j["id"], status="failed", failure="launch",
                         finished_at=state.now(),
@@ -426,7 +443,7 @@ class Dispatcher:
             (state.now(), job_id),
         )
 
-    def _launch_job(self, conn, j, gpu: int) -> None:
+    def _launch_job(self, conn, j, gpu: int | None) -> None:
         spec = json.loads(self._get_task_spec(conn, j) or "{}")
         cwd = spec.get("cwd_abs") or resolve_template(self.cfg.get("default_project", "{ROOT}"), self.cfg)
         log_path = self._job_log_path(j)
@@ -436,7 +453,8 @@ class Dispatcher:
         if self._should_skip(spec, j):
             state.update_job(conn, j["id"], status="skip", finished_at=state.now())
             self.log_line(f"job {j['id']} skip (产物指纹有效, 不执行)")
-            self._release_in_tx(conn, j["id"])
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
             return
 
         # 半成品清理 (§3.2): 产物存在但无效 (指纹不匹配/规则不过) -> 删除后启动
@@ -462,7 +480,8 @@ class Dispatcher:
             conn, j["id"], status="running", gpu=gpu, pgid=pgid,
             started_at=state.now(), git_rev=git_rev, kill_reason=None,
         )
-        self.log_line(f"LAUNCH job {j['id']} gpu={gpu} pgid={pgid}")
+        tag = f"cpu" if gpu is None else f"gpu={gpu}"
+        self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
 
     def _should_skip(self, spec: dict, j) -> bool:
         """A2/O3: 产物指纹有效 且 规则校验通过 -> skip."""

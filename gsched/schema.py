@@ -162,10 +162,19 @@ def _validate_task(
             p = expand_path(a["path"], cfg, t_cwd_abs)
             _check_path_in_cwd(p, t_cwd_abs, f"{where}.artifacts.{key}")
 
-    # resources
+    # resources: {cpus: N, gpu: 0|1} —— gpu: 0 = CPU-only 任务 (不占 GPU 槽位, §5b B4)
     resources = t.get("resources", {})
     if not isinstance(resources, dict):
         raise SchemaError(f"{where}.resources: 必须是对象")
+    cpus = resources.get("cpus")
+    if cpus is not None:
+        if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
+            raise SchemaError(f"{where}.resources.cpus: 必须是正整数 (声明 CPU 配额)")
+    gpu_req = resources.get("gpu", 1)  # 缺省 gpu=1 (向后兼容: 每卡一任务)
+    if gpu_req not in (0, 1):
+        raise SchemaError(f"{where}.resources.gpu: 必须是 0 (CPU-only) 或 1 (占 1 GPU)")
+    resources = dict(resources)
+    resources["gpu"] = gpu_req
 
     # retry_transform / probes 透传
     retry_transform = t.get("retry_transform")

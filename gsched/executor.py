@@ -38,7 +38,7 @@ class Executor:
         stages: list[dict] | None,
         cwd: str,
         env: dict[str, str],
-        gpu: int,
+        gpu: int | None,
         log_path: str,
         on_stage_start: Callable[[int], None] | None = None,
     ) -> int:
@@ -46,13 +46,16 @@ class Executor:
 
         - 单 cmd: wrapper = 该 cmd 直接 Popen
         - 多 stage: wrapper 是 bash 串行执行各 stage (R2, killpg 一次全灭)
-        - 注入 CUDA_VISIBLE_DEVICES (不可覆盖, §4.1) + PYTHONUNBUFFERED=1
+        - GPU 任务: 注入 CUDA_VISIBLE_DEVICES=<gpu> (不可覆盖, §4.1)
+        - CPU-only 任务 (gpu=None): 注入 CUDA_VISIBLE_DEVICES="" 禁 GPU ——
+          XGB 等库启动时会初始化 CUDA context (即使 CPU 训练), 空串禁用
+        - 一律注入 PYTHONUNBUFFERED=1 (日志即时性)
         """
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         log_f = open(log_path, "a", encoding="utf-8")
 
         merged_env = dict(os.environ)
-        merged_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        merged_env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
         merged_env.setdefault("PYTHONUNBUFFERED", "1")
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
         for k, v in env.items():
