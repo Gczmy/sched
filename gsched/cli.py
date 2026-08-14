@@ -385,7 +385,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 for sp in pt["stages"]:
                     st = "SKIP" if sp["skip"] else "RUN "
                     print(f"      stage{sp['stage']} [{st}] {sp['reason']}")
-                print(f"      cmd: {pt['cmd_flat'][:120]}{"..." if len(pt['cmd_flat']) > 120 else ""}")
+                flat = pt["cmd_flat"]
+                shown = flat[:120] + ("..." if len(flat) > 120 else "")
+                print(f"      cmd: {shown}")
             print("--- 汇总 ---")
             print(f"  将跑 {prev['n_run']} / 将 skip {prev['n_skip']} / 共 {len(norm['tasks'])} 任务")
             if prev["git_rev"]:
