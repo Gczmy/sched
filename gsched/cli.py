@@ -566,14 +566,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         jobs = conn.execute("SELECT * FROM jobs ORDER BY rowid").fetchall()
         # batch_id -> name 映射 (显示用, 避免截断 batch_id 丢 name 首字符)
         name_by_id = {b["id"]: b["name"] for b in batches}
-        # task spec 的 resources 预加载 (batch_id, task_id) -> resources (cpus 显示用)
-        res_by_task: dict[tuple[str, str], dict] = {}
-        for r in conn.execute("SELECT batch_id, id, spec FROM tasks").fetchall():
+        # task spec 的 resources 预加载 (batch_id, task_id, version) -> resources
+        # (带 version: resubmit 新版本改了 resources 时, 旧 job 显示旧 spec 的值)
+        res_by_task: dict[tuple[str, str, int], dict] = {}
+        for r in conn.execute("SELECT batch_id, id, version, spec FROM tasks").fetchall():
             try:
                 spec = json.loads(r["spec"])
             except (json.JSONDecodeError, TypeError):
                 spec = {}
-            res_by_task[(r["batch_id"], r["id"])] = spec.get("resources") or {}
+            res_by_task[(r["batch_id"], r["id"], r["version"])] = spec.get("resources") or {}
         for j in jobs:
             if args.batch and j["batch_id"] not in [
                 b["id"] for b in conn.execute(
@@ -581,11 +582,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ).fetchall()
             ]:
                 continue
-            res = res_by_task.get((j["batch_id"], j["task_id"]), {})
+            res = res_by_task.get((j["batch_id"], j["task_id"], j["version"]), {})
             out["jobs"].append(
                 {
                     "id": j["id"], "batch": j["batch_id"], "task": j["task_id"],
-                    "status": j["status"], "gpu": j["gpu"],
+                    "status": j["status"], "gpu": j["gpu"], "version": j["version"],
                     "resources": res,
                     "retries": j["retries"], "failure": j["failure"],
                 }
@@ -598,15 +599,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "quarantined": g["quarantined"],
                 }
             )
-        # CPU 配额: running 任务 CPU 占用 (GPU 任务按 resources.cpus 或 gpu_job_cpus)
+        # CPU 配额: running 任务 CPU 占用 (与 dispatcher._task_cpus 同口径)
         cpus_total = cfg.get("cpus_total", 0)
         cpu_used = 0
         for j in conn.execute("SELECT * FROM jobs WHERE status='running'").fetchall():
-            res = res_by_task.get((j["batch_id"], j["task_id"]), {})
-            cpus = res.get("cpus")
-            if not cpus:
-                cpus = cfg.get("gpu_job_cpus", 8) if res.get("gpu", 1) != 0 else 1
-            cpu_used += int(cpus)
+            res = res_by_task.get((j["batch_id"], j["task_id"], j["version"]), {})
+            cpu_used += _task_cpus_of(res, cfg)
         out["cpu"] = {"used": cpu_used, "total": cpus_total}
 
     if args.json:
@@ -863,6 +861,16 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已更新, 请重提下游 (Q4)")
         print(f"已 resubmit: {batch}:{task} -> v{new_v} (排队尾)")
     return 0
+
+
+def _task_cpus_of(resources: dict, cfg: dict) -> int:
+    """任务 CPU 占用 (与 dispatcher._task_cpus 同口径, status 展示用)."""
+    cpus = resources.get("cpus")
+    if cpus:
+        return int(cpus)
+    if resources.get("gpu", 1) == 0:
+        return 1
+    return int(cfg.get("gpu_job_cpus", 8))
 
 
 def _tail_n(path: str, n: int) -> list[str]:

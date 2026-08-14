@@ -27,6 +27,7 @@ HEARTBEAT_SEC = 30
 RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5)
 DEFAULT_MAX_RETRY = 1
 DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
+DEFAULT_MAX_CPU_JOBS = 2  # cpus_total 未配置时回退: CPU-only 并发上限 (定案 7 旧语义)
 
 
 class Dispatcher:
@@ -389,11 +390,18 @@ class Dispatcher:
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
                 " ORDER BY j.rowid"
             ).fetchall()
-            # CPU 配额制 (§5b B4 升级): config.cpus_total = 节点总核数;
+            # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.
-            # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU)
+            # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU).
+            # cpus_total 未配置(0) -> 回退 max_cpu_jobs: CPU-only 并发上限 (定案 7 旧语义),
+            # GPU 任务不受 CPU 约束 (旧版行为).
             cpus_total = int(self.cfg.get("cpus_total", 0) or 0)
+            max_cpu_jobs = int(self.cfg.get("max_cpu_jobs", DEFAULT_MAX_CPU_JOBS))
             used_cpu = self._cpu_in_use(conn)
+            cpu_only_running = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL"
+            ).fetchone()[0]
+            gpu_full = False
             for j in ready:
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
                 resources = spec.get("resources") or {}
@@ -401,17 +409,25 @@ class Dispatcher:
                 task_cpus = self._task_cpus(spec)
                 if cpus_total > 0 and used_cpu + task_cpus > cpus_total:
                     # CPU 配额不足: 本任务等下轮 (CPU 超卖禁止, 与 GPU 同纪律)
+                    # 批内补位: continue 让后面的小任务可插队 (大任务等 GPU 释放同轮再试)
                     continue
                 if is_cpu_only:
+                    if cpus_total <= 0 and cpu_only_running >= max_cpu_jobs:
+                        continue  # 回退模式: CPU-only 并发上限 (旧语义)
                     gpu = None  # CPU-only: 不占 GPU 槽位
                 else:
+                    if gpu_full:
+                        continue  # GPU 已满: 跳过后续 GPU 任务, 继续扫 CPU-only (防饿死)
                     # 用同一事务 assign (避免嵌套 connect 的 database is locked)
                     gpu = self._assign_in_tx(conn, j["id"])
                     if gpu is None:
-                        break  # 无空卡, 本轮回合结束 (不抢占)
+                        gpu_full = True
+                        continue  # 无空卡: 本轮不再派 GPU 任务, 但 CPU-only 仍可派 (防饿死)
                 try:
                     self._launch_job(conn, j, gpu)
                     used_cpu += task_cpus
+                    if is_cpu_only:
+                        cpu_only_running += 1
                 except Exception as e:
                     # 启动失败: 释放 GPU (如占) + 标 failed (走 retry 路径), 不中断整轮派发
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")

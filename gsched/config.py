@@ -65,11 +65,11 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         raise ConfigError(f"{p}: 缺少 projects (多项目 root 映射)")
     if "venvs" not in cfg or not isinstance(cfg["venvs"], dict):
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
-    # CPU 配额制 (可选): cpus_total 节点总核数, gpu_job_cpus GPU 任务默认 CPU 占用
-    for k in ("cpus_total", "gpu_job_cpus", "max_cpu_jobs"):
+    # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用
+    for k, min_v in (("cpus_total", 0), ("gpu_job_cpus", 1), ("max_cpu_jobs", 1)):
         v = cfg.get(k)
-        if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < 1):
-            raise ConfigError(f"{p}: {k} 必须是正整数")
+        if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < min_v):
+            raise ConfigError(f"{p}: {k} 必须是整数且 >= {min_v}")
 
 
 def resolve_template(value: str, cfg: dict[str, Any], cwd: str | None = None) -> str:
