@@ -368,6 +368,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 }
             )
         jobs = conn.execute("SELECT * FROM jobs ORDER BY rowid").fetchall()
+        # batch_id -> name 映射 (显示用, 避免截断 batch_id 丢 name 首字符)
+        name_by_id = {b["id"]: b["name"] for b in batches}
         for j in jobs:
             if args.batch and j["batch_id"] not in [
                 b["id"] for b in conn.execute(
@@ -405,7 +407,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     for j in out["jobs"]:
         extra = f" gpu={j['gpu']}" if j["gpu"] is not None else ""
         fail = f" ({j['failure']})" if j["failure"] else ""
-        print(f"  {j['batch'][-20:]:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{fail}")
+        bname = name_by_id.get(j["batch"], j["batch"])
+        print(f"  {bname:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{fail}")
     print("=== GPU ===")
     for g in out["gpus"]:
         q = " QUARANTINED" if g["quarantined"] else ""
