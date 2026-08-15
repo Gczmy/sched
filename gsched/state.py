@@ -75,6 +75,17 @@ CREATE TABLE IF NOT EXISTS gpu_jobs (
   updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_gpu_jobs_gpu ON gpu_jobs(gpu_id);
+
+-- profile_cache 显存峰值库 (定案 39 待定项 3): profile_key 显式声明 (D1 不解析 cmd),
+-- 命中取 max(声明, 实测) 保守装箱. 独立表不复用 jobs (任务实例 vs 累积数据生命周期不同).
+-- 写入: daemon 注入 SCHED_PROFILE_OUT env -> 训练侧写 {"peak_gib": X} -> job rc=0
+-- 后 daemon upsert 本表 + 删临时 (失败只删不 upsert). 列名 peak_gib 与 JSON key 一致 (GiB).
+CREATE TABLE IF NOT EXISTS profile_cache (
+  profile_key TEXT PRIMARY KEY,
+  peak_gib    REAL NOT NULL,
+  updated_at  TEXT,
+  git_rev     TEXT
+);
 """
 
 

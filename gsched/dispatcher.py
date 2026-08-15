@@ -319,11 +319,13 @@ class Dispatcher:
             self.log_line(f"job {j['id']} cancelled (用户终止)")
             state.update_job(conn, j["id"], status="cancelled", finished_at=state.now())
             self._release_gpu_for_job(conn, j)
+            self._drop_profile(j)  # 失败路径: 只删临时不 upsert
             return
         if reason == "timed_out":
             self.log_line(f"job {j['id']} timed_out (超时)")
             state.update_job(conn, j["id"], status="timed_out", finished_at=state.now())
             self._release_gpu_for_job(conn, j)
+            self._drop_profile(j)
             return
 
         log_path = self._job_log_path(j)
@@ -336,6 +338,7 @@ class Dispatcher:
             )
             self.log_line(f"job {j['id']} failed (rc 缺失, {failure})")
             self._release_gpu_for_job(conn, j)
+            self._drop_profile(j)
             self._maybe_retry(conn, j)
             return
 
@@ -347,6 +350,8 @@ class Dispatcher:
                 state.update_job(conn, j["id"], status="done", rc=rc,
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} done rc=0 产物校验通过")
+                # profile 消费 (定案 39): rc=0 后 upsert profile_cache + 删临时
+                self._consume_profile(conn, j, spec)
             else:
                 state.update_job(conn, j["id"], status="failed", rc=rc,
                                  failure="artifact",
@@ -357,6 +362,7 @@ class Dispatcher:
             state.update_job(conn, j["id"], status="failed", rc=rc, failure=failure,
                              finished_at=state.now())
             self.log_line(f"job {j['id']} failed rc={rc} ({failure})")
+            self._drop_profile(j)  # 失败路径: 只删不 upsert
         self._release_gpu_for_job(conn, j)
         self._maybe_retry(conn, j)
 
@@ -364,6 +370,55 @@ class Dispatcher:
         """assigned -> releasing (立即, B5). 多归属计数释放 (§3.2e B)."""
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
+
+    # ---------- profile 消费 (定案 39 待定项 3, daemon 侧) ----------
+
+    def _profile_path(self, j) -> str:
+        return os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
+
+    def _consume_profile(self, conn, j, spec: dict) -> None:
+        """job 成功 (rc=0 且产物校验通过) 后: 读 peak_gib -> upsert profile_cache -> 删临时.
+
+        失败路径 (定案 39): 读取失败/JSON 畸形按"无 profile"忽略 (只删不 upsert);
+        任务未声明 resources.profile_key -> 只删 (profile_cache 按 key 索引, 无 key 不入库).
+        """
+        import json as _json
+
+        p = self._profile_path(j)
+        profile_key = (spec.get("resources") or {}).get("profile_key")
+        try:
+            if not os.path.isfile(p):
+                return
+            data = _json.loads(open(p, encoding="utf-8").read())
+            peak = data.get("peak_gib")
+            if peak is None:
+                return
+            peak = float(peak)
+        except (OSError, ValueError, TypeError, _json.JSONDecodeError):
+            return
+        finally:
+            # 无论成败删临时 (失败只删不 upsert, 防垃圾累积)
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        if not profile_key:
+            return  # 无 key 不入库 (文件已删)
+        conn.execute(
+            "INSERT INTO profile_cache (profile_key, peak_gib, updated_at, git_rev)"
+            " VALUES (?,?,?,?) "
+            "ON CONFLICT(profile_key) DO UPDATE SET peak_gib=excluded.peak_gib,"
+            " updated_at=excluded.updated_at, git_rev=excluded.git_rev",
+            (profile_key, peak, state.now(), j["git_rev"]),
+        )
+        self.log_line(f"profile upsert {profile_key} peak={peak:.2f} GiB")
+
+    def _drop_profile(self, j) -> None:
+        """失败/取消/超时路径: 只删临时文件不 upsert."""
+        try:
+            os.unlink(self._profile_path(j))
+        except OSError:
+            pass
 
     def _maybe_retry(self, conn, j) -> None:
         """失败重试: max_retry 内回 pending; 满 -> blocked (3.4)."""
@@ -579,11 +634,20 @@ class Dispatcher:
         # 半成品清理 (§3.2): 产物存在但无效 (指纹不匹配/规则不过) -> 删除后启动
         self._clean_stale_artifacts(spec, j)
 
+        # 显存峰值回写通道 (定案 39 profile 协议, daemon 侧注入):
+        #   注入 SCHED_PROFILE_OUT=<host_dir>/profiles/<job_id>.json, 训练侧写
+        #   {"peak_gib": X} (GiB); job rc=0 后 _consume_profile upsert profile_cache
+        #   并删临时; 失败路径只删不 upsert. 任务显式声明 SCHED_PROFILE_OUT 则尊重.
+        task_env = dict(spec.get("env", {}))
+        task_env.setdefault(
+            "SCHED_PROFILE_OUT", os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
+        )
+        os.makedirs(os.path.dirname(task_env["SCHED_PROFILE_OUT"]), exist_ok=True)
         pgid = self.executor.launch(
             cmd=spec.get("cmd"),
             stages=spec.get("stages"),
             cwd=cwd,
-            env=spec.get("env", {}),
+            env=task_env,
             gpu=gpu,
             log_path=log_path,
         )

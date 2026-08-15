@@ -374,6 +374,79 @@ else
 fi
 stop_daemon $S7B
 
+# ---------- 场景 8: profile 消费 (定案 39, daemon 侧) ----------
+echo "--- 场景 8: SCHED_PROFILE_OUT 注入 + upsert + 删临时 ---"
+S8=/tmp/sched_acc_u8; rm -rf $S8; mkdir -p $S8
+mk_config $S8
+# 任务: 训练侧模拟 - 写 SCHED_PROFILE_OUT 指向的文件 (peak_gib), 声明 profile_key
+cat > $S8/batch.json << EOF
+{
+  "name": "u8",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import json,os; json.dump({'peak_gib': 3.25}, open(os.environ['SCHED_PROFILE_OUT'],'w')); open('$S8/t1.txt','w').write('ok')"], "duration_min": 1, "resources": {"profile_key": "raft/b158/bs4096"}, "artifacts": {"a": {"path": "$S8/t1.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+LOG=$(run_batch $S8 $S8/batch.json)
+U8=0
+for _ in $(seq 1 30); do
+  R=$($PY -c "
+import sqlite3
+db='$S8/$HOST/state.db'
+c=sqlite3.connect(db)
+r=c.execute(\"SELECT peak_gib, git_rev FROM profile_cache WHERE profile_key='raft/b158/bs4096'\").fetchone()
+c.close()
+print(r[0] if r else 'NONE')" 2>/dev/null)
+  [ "$R" != "NONE" ] && { U8=1; PEAK=$R; break; }
+  sleep 1
+done
+if [ "$U8" = "1" ]; then
+  ok "场景8a: rc=0 后 upsert profile_cache (peak=$PEAK GiB)"
+else
+  bad "场景8a: profile_cache 未 upsert (peak=$R)"
+fi
+# 临时文件应已删除
+if [ ! -f "$S8/$HOST/profiles/"*u8*t1*.json ] 2>/dev/null; then
+  ok "场景8b: 临时 profile 文件已删除"
+else
+  bad "场景8b: 临时文件残留: $(ls $S8/$HOST/profiles/ 2>/dev/null)"
+fi
+stop_daemon $S8
+
+# ---------- 场景 8c: 失败任务只删不 upsert ----------
+echo "--- 场景 8c: 失败任务 profile 不入库 ---"
+S8C=/tmp/sched_acc_u8c; rm -rf $S8C; mkdir -p $S8C
+mk_config $S8C
+cat > $S8C/batch.json << EOF
+{
+  "name": "u8c",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import json,os; json.dump({'peak_gib': 9.9}, open(os.environ['SCHED_PROFILE_OUT'],'w')); exit(3)"], "duration_min": 1, "resources": {"profile_key": "raft/b158/bs4096_fail"}, "artifacts": {"a": {"path": "$S8C/none.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+LOG=$(run_batch $S8C $S8C/batch.json)
+U8C=0
+for _ in $(seq 1 30); do
+  R=$($PY -c "
+import sqlite3
+db='$S8C/$HOST/state.db'
+c=sqlite3.connect(db)
+r=c.execute(\"SELECT COUNT(*) FROM profile_cache WHERE profile_key='raft/b158/bs4096_fail'\").fetchone()[0]
+c.close()
+print(r)" 2>/dev/null)
+  [ "$R" = "0" ] && [ "$(gpu_status $S8C)" = "free" ] && { U8C=1; break; }
+  sleep 1
+done
+if [ "$U8C" = "1" ]; then
+  ok "场景8c: 失败任务 profile 未入库 + 临时已清 + GPU 回 free"
+else
+  bad "场景8c: 失败任务 profile 异常入库或未清理 (rows=$R, gpu=$(gpu_status $S8C))"
+fi
+stop_daemon $S8C
+
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ] || exit 1
