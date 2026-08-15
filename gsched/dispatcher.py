@@ -141,6 +141,14 @@ class Dispatcher:
                         conn, j["id"], status="cancelled", kill_reason="cancelled",
                         finished_at=state.now(),
                     )
+                    # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
+                    # (assigned -> releasing), 否则 cancelled 任务残留 assigned
+                    # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
+                    if j["gpu"] is not None:
+                        conn.execute(
+                            "UPDATE gpus SET status='releasing', updated_at=? WHERE idx=?",
+                            (state.now(), j["gpu"]),
+                        )
         self._cleanup_lock()
 
     # ---------- 主循环 ----------

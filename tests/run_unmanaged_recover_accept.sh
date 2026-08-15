@@ -129,9 +129,7 @@ else
     bad "场景2: unmanaged 未自动恢复 (实际: $(gpu_status $S2))"
   fi
 fi
-stop_daemon $S2
-
-# ---------- 场景 3: 恢复后新批次正常派发完成 ----------
+stop_daemon $S2# ---------- 场景 3: 恢复后新批次正常派发完成 ----------
 echo "--- 场景 3: unmanaged 恢复后新批次可派发 ---"
 S3=/tmp/sched_acc_u3; rm -rf $S3; mkdir -p $S3
 mk_config $S3
@@ -155,6 +153,44 @@ else
   bad "场景3: 批次任务未完成"
 fi
 stop_daemon $S3
+
+# ---------- 场景 4: daemon stop 收尾不残留 assigned 卡 (N11 修复) ----------
+echo "--- 场景 4: daemon stop 后 GPU 释放不残留 ---"
+S4=/tmp/sched_acc_u4; rm -rf $S4; mkdir -p $S4
+mk_config $S4
+cat > $S4/batch.json << EOF
+{
+  "name": "u4",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(30); open('$S4/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S4/t1.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+LOG=$(run_batch $S4 $S4/batch.json)
+for _ in $(seq 1 15); do
+  [ "$(gpu_status $S4)" = "assigned" ] && break
+  sleep 1
+done
+if [ "$(gpu_status $S4)" != "assigned" ]; then
+  bad "场景4: 前置失败, 任务未 running (实际: $(gpu_status $S4))"
+else
+  export SCHED_STATE=$S4 SCHED_CONFIG=$S4/config.json
+  $PY -m gsched.cli daemon stop >/dev/null 2>&1; sleep 1
+  # 重启 daemon 让 settle_releasing 把 releasing 转 free (fake 立即)
+  env SCHED_STATE=$S4 SCHED_CONFIG=$S4/config.json SCHED_FAKE_GPUS=0 \
+      $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
+  for _ in $(seq 1 15); do
+    [ "$(gpu_status $S4)" = "free" ] && break
+    sleep 1
+  done
+  if [ "$(gpu_status $S4)" = "free" ]; then
+    ok "场景4: daemon stop 后 GPU 释放回 free (不残留 assigned)"
+  else
+    bad "场景4: GPU 残留 (实际: $(gpu_status $S4))"
+  fi
+fi
+stop_daemon $S4
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
