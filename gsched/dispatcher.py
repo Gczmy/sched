@@ -193,10 +193,12 @@ class Dispatcher:
 
     def _settle_batch_status(self) -> None:
         """P1: 批次终态. done = 全部任务成功终态 (done/skip);
-        任一 failed/blocked/cancelled/timed_out -> blocked (interrupted 除外 R4)."""
+        任一 failed/blocked/cancelled/timed_out -> blocked (interrupted 除外 R4).
+        定案 37 (2026-08-15): blocked 批次人工 retry/resubmit 解除失败终态后
+        -> 自动回 active 继续派发 (本次事故需手动 UPDATE 的 gap)."""
         with state.connect() as conn:
             batches = conn.execute(
-                "SELECT * FROM batches WHERE status='active'"
+                "SELECT * FROM batches WHERE status IN ('active','blocked')"
             ).fetchall()
             for b in batches:
                 jobs = conn.execute(
@@ -214,10 +216,17 @@ class Dispatcher:
                     s in ("failed", "blocked", "cancelled", "timed_out")
                     for s in statuses
                 ):
+                    if b["status"] == "active":
+                        conn.execute(
+                            "UPDATE batches SET status='blocked' WHERE id=?", (b["id"],)
+                        )
+                        self.log_line(f"批次 {b['name']} blocked (有失败任务, 等人工)")
+                elif b["status"] == "blocked":
+                    # 人工 retry/resubmit 已解除全部失败终态 (只剩 pending/running 等)
                     conn.execute(
-                        "UPDATE batches SET status='blocked' WHERE id=?", (b["id"],)
+                        "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
                     )
-                    self.log_line(f"批次 {b['name']} blocked (有失败任务, 等人工)")
+                    self.log_line(f"批次 {b['name']} 失败终态解除 -> active (人工 retry 生效)")
 
     # ---------- 节点重启恢复 (D4) ----------
 

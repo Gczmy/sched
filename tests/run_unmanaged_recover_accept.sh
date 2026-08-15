@@ -154,6 +154,53 @@ else
 fi
 stop_daemon $S3
 
+# ---------- 场景 5: blocked 批次 retry 后自动回 active (定案 37) ----------
+echo "--- 场景 5: blocked 批次 retry 后自动回 active ---"
+S5=/tmp/sched_acc_u5; rm -rf $S5; mkdir -p $S5
+mk_config $S5
+cat > $S5/batch.json << EOF
+{
+  "name": "u5",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(5); open('$S5/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S5/t1.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+LOG=$(run_batch $S5 $S5/batch.json)
+for _ in $(seq 1 15); do
+  [ "$(gpu_status $S5)" = "assigned" ] && break
+  sleep 1
+done
+if [ "$(gpu_status $S5)" != "assigned" ]; then
+  bad "场景5: 前置失败, 任务未 running"
+else
+  # stop 杀任务 -> 批次 blocked; 重启 daemon
+  export SCHED_STATE=$S5 SCHED_CONFIG=$S5/config.json
+  $PY -m gsched.cli daemon stop >/dev/null 2>&1; sleep 1
+  env SCHED_STATE=$S5 SCHED_CONFIG=$S5/config.json SCHED_FAKE_GPUS=0 \
+      $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
+  sleep 3
+  if ! $PY -m gsched.cli status --json 2>/dev/null | grep -q '"status": "blocked"'; then
+    bad "场景5: 前置失败, 批次未 blocked"
+  else
+    # 人工 retry -> 任务 pending -> daemon 下一轮自动回 active 并重跑
+    export SCHED_STATE=$S5 SCHED_CONFIG=$S5/config.json
+    $PY -m gsched.cli retry u5:t1 >/dev/null 2>&1
+    # retry 后需等 daemon tick (10s) 回 active + 派发 + 任务跑 5s
+    for _ in $(seq 1 40); do
+      if [ -f "$S5/t1.txt" ]; then break; fi
+      sleep 1
+    done
+    if [ -f "$S5/t1.txt" ]; then
+      ok "场景5: retry 后批次自动回 active 并重跑完成 (无手工 UPDATE)"
+    else
+      bad "场景5: retry 后未自动重跑 (批次可能仍 blocked)"
+    fi
+  fi
+fi
+stop_daemon $S5
+
 # ---------- 场景 4: daemon stop 收尾不残留 assigned 卡 (N11 修复) ----------
 echo "--- 场景 4: daemon stop 后 GPU 释放不残留 ---"
 S4=/tmp/sched_acc_u4; rm -rf $S4; mkdir -p $S4
