@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -16,6 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from . import state, __version__
+from .executor import PROGRESS_RE
 from .config import (
     ConfigError,
     config_path,
@@ -632,9 +634,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         cpus = j["resources"].get("cpus")
         if cpus:
             extra += f" cpus={cpus}"
+        # P4: running 任务进度列 (从日志尾部 best-effort 解析 epoch/trial)
+        prog = ""
+        if j["status"] == "running":
+            p = _job_progress(j["batch"], j["task"])
+            if p:
+                prog = f" {p}"
         fail = f" ({j['failure']})" if j["failure"] else ""
         bname = name_by_id.get(j["batch"], j["batch"])
-        print(f"  {bname:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{fail}")
+        print(f"  {bname:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{prog}{fail}")
     print("=== GPU ===")
     for g in out["gpus"]:
         q = " QUARANTINED" if g["quarantined"] else ""
@@ -853,25 +861,81 @@ def _resolve_task_ref(ref: str) -> tuple[str, str]:
     return b, task
 
 
+def _rev_diff_warn(conn, j) -> str | None:
+    """P3: job.git_rev vs 当前仓库 rev (任务 cwd) 不一致 -> 返回警告文本.
+
+    retry/resubmit 复用提交时的旧 spec —— 代码更新后重跑的是旧命令,
+    lsr infer 数据修复事故 (2026-08-15 事故记录 3) 的直接教训.
+    """
+    if not j["git_rev"]:
+        return None
+    row = conn.execute(
+        "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+        (j["batch_id"], j["task_id"], j["version"]),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        spec = json.loads(row["spec"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    cwd = (spec or {}).get("cwd_abs")
+    if not cwd:
+        return None
+    from .fingerprint import _git_rev
+
+    cur = _git_rev(cwd)
+    if not cur or cur == j["git_rev"]:
+        return None
+    return (f"⚠️ 代码已更新 ({j['git_rev'][:12]} -> {cur[:12]}): retry 复用提交时的"
+            "旧 spec; 如需新 spec 请用 sched resubmit 或重新提交批次")
+
+
 def cmd_retry(args: argparse.Namespace) -> int:
-    """sched retry <batch>:<task>: 解锁 blocked/cancelled/timed_out 重跑 (重置 retries/reason)."""
-    batch, task = _resolve_task_ref(args.task)
+    """sched retry <batch>[:task]: 解锁失败终态重跑.
+
+    - <batch>:<task> -> 单任务
+    - <batch> (无 :task) -> 批次级: 该批所有 failed/blocked/cancelled/timed_out 任务
+    - P3: git_rev 与当前仓库不一致 -> 警告 (retry 复用旧 spec)
+    """
+    ref = args.task
     with state.connect() as conn:
-        j = conn.execute(
-            "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1",
-            (batch, task),
-        ).fetchone()
-        if not j:
-            print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
-            return 1
-        if j["status"] not in ("blocked", "cancelled", "timed_out", "failed"):
-            print(f"任务 {j['id']} 状态 {j['status']} 不可 retry")
-            return 1
-        state.update_job(
-            conn, j["id"], status="pending", retries=0, kill_reason=None,
-            pgid=None, gpu=None, rc=None, failure=None,
-        )
-        print(f"已解锁重跑: {j['id']}")
+        if ":" in ref:
+            batch, task = _resolve_task_ref(ref)
+            targets = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1",
+                (batch, task),
+            ).fetchall()
+            if not targets:
+                print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
+                return 1
+        else:
+            b = _batch_id_from_name(ref)
+            if not b:
+                print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+                return 1
+            targets = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND status IN"
+                " ('blocked','cancelled','timed_out','failed')",
+                (b,),
+            ).fetchall()
+        if not targets:
+            print(f"无失败终态任务: {ref}")
+            return 0
+        n = 0
+        for j in targets:
+            if j["status"] not in ("blocked", "cancelled", "timed_out", "failed"):
+                continue
+            w = _rev_diff_warn(conn, j)
+            if w:
+                print(w)
+            state.update_job(
+                conn, j["id"], status="pending", retries=0, kill_reason=None,
+                pgid=None, gpu=None, rc=None, failure=None,
+            )
+            print(f"已解锁重跑: {j['id']}")
+            n += 1
+        print(f"({n} 个任务)")
     from . import daemon
     print(daemon.ensure_running())  # 定案 38: retry 产生可派发工作, daemon 未运行自动拉起
     return 0
@@ -928,11 +992,133 @@ def _task_cpus_of(resources: dict, cfg: dict) -> int:
     return int(cfg.get("gpu_job_cpus", 8))
 
 
-def _tail_n(path: str, n: int) -> list[str]:
-    """读取文件最后 n 行 (纯 stdlib, 大文件不整体读入)."""
-    lines: list[str] = []
-    with open(path, "rb") as f:
+def _job_progress(batch_id: str, task_id: str) -> str | None:
+    """P4: running 任务进度 (从日志尾部解析 epoch/trial, best-effort).
+
+    日志路径与 dispatcher._job_log_path 同构: {STATE}/{host}/logs/{batch}/{task}.log.
+    """
+    log_path = os.path.join(
+        state.default_state_dir(), state.hostname(), "logs", batch_id, f"{task_id}.log"
+    )
+    if not os.path.exists(log_path):
+        return None
+    lines = _tail_n(log_path, 200)
+    for line in reversed(lines):
+        m = PROGRESS_RE.search(line)
+        if m:
+            cur = m.group(1)
+            total = m.group(2) or "?"
+            return f"{cur}/{total}"
+    return None
+
+
+def cmd_diag(args: argparse.Namespace) -> int:
+    """sched diag <batch>[:task]: 一站式失败诊断 (P1).
+
+    - <batch>:<task> -> 单任务
+    - <batch> (无 :task) -> 批次级: 所有非 done/skip 任务
+    每任务输出: 状态/rc/failure + 实际命令 + git rev 对比 + 日志尾部 15 行.
+    """
+    ref = args.task
+    with state.connect() as conn:
+        if ":" in ref:
+            batch, task = _resolve_task_ref(ref)
+            targets = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
+                " ORDER BY version DESC LIMIT 1",
+                (batch, task),
+            ).fetchall()
+            if not targets:
+                print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
+                return 1
+        else:
+            b = _batch_id_from_name(ref)
+            if not b:
+                print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+                return 1
+            targets = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND status NOT IN ('done','skip')"
+                " ORDER BY rowid",
+                (b,),
+            ).fetchall()
+        if not targets:
+            print(f"无异常任务: {ref}")
+            return 0
+        cfg = _load_cfg()
+        for j in targets:
+            _diag_one(conn, j, cfg)
+    return 0
+
+
+def _diag_one(conn, j, cfg: dict) -> None:
+    """单任务诊断块: 状态 + 命令 + git 对比 + 日志尾部."""
+    batch, task = j["batch_id"], j["task_id"]
+    print(f"=== {batch}:{task} (v{j['version']}) ===")
+    print(f"  status: {j['status']}  rc: {j['rc'] or '-'}  failure: {j['failure'] or '-'}")
+    print(f"  retries: {j['retries']}  gpu: {j['gpu'] or '-'}")
+    w = _rev_diff_warn(conn, j)
+    if w:
+        print(f"  {w}")
+    else:
+        print(f"  git_rev: {j['git_rev'] or '-'}")
+    row = conn.execute(
+        "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+        (batch, task, j["version"]),
+    ).fetchone()
+    spec: dict = {}
+    if row:
         try:
+            spec = json.loads(row["spec"])
+        except (json.JSONDecodeError, TypeError):
+            spec = {}
+    for line in _diag_cmds(spec, cfg):
+        print(f"  cmd: {line}")
+    log_path = os.path.join(
+        state.default_state_dir(), state.hostname(), "logs", batch, f"{task}.log"
+    )
+    print(f"  log: {log_path}")
+    tail = _tail_n(log_path, 15)
+    if tail:
+        print("  --- 日志尾部 15 行 ---")
+        for l in tail:
+            print(f"  | {l}")
+    print()
+
+
+def _diag_cmds(spec: dict, cfg: dict) -> list[str]:
+    """展示实际命令 (简化展开: {VENV:}->路径, {ROOT}->cwd; stage 引用保留原样)."""
+    cwd = spec.get("cwd_abs") or "."
+    venvs = cfg.get("venvs", {})
+
+    def expand(tok: str) -> str:
+        if tok.startswith("{VENV:") and tok.endswith("}"):
+            name = tok[len("{VENV:"):-1]
+            return venvs.get(name, tok)
+        if tok == "{ROOT}":
+            return cwd
+        return tok
+
+    out: list[str] = []
+    if spec.get("cmd"):
+        out.append(" ".join(shlex.quote(expand(t)) for t in spec["cmd"]))
+    for st in spec.get("stages") or []:
+        nm = st.get("name", "?")
+        cmd = st.get("cmd")
+        if cmd:
+            out.append(f"[{nm}] " + " ".join(shlex.quote(expand(t)) for t in cmd))
+        else:
+            out.append(f"[{nm}] (无 cmd)")
+    return out or ["(无命令, spec 为空)"]
+
+
+def _tail_n(path: str, n: int) -> list[str]:
+    """读取文件最后 n 行 (纯 stdlib, 大文件不整体读入).
+
+    文件不存在/不可读 -> 返回 [] (diag 对 pending 任务无日志文件不崩).
+    """
+    lines: list[str] = []
+    try:
+        with open(path, "rb") as f:
             f.seek(0, 2)  # 到文件尾
             size = f.tell()
             block = 8192
@@ -944,8 +1130,8 @@ def _tail_n(path: str, n: int) -> list[str]:
                 buf = f.read(read) + buf
                 lines = buf.split(b"\n")
             lines = buf.split(b"\n")
-        except OSError:
-            return []
+    except OSError:
+        return []
     return [l.decode("utf-8", errors="replace") for l in lines if l]
 
 
@@ -1103,9 +1289,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_cancel)
 
-    p = sub.add_parser("retry", help="解锁 blocked 重跑")
-    p.add_argument("task", help="<batch>:<task>")
+    p = sub.add_parser("retry", help="解锁 blocked 重跑 (批次级或单任务)")
+    p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部失败终态)")
     p.set_defaults(fn=cmd_retry)
+
+    p = sub.add_parser("diag", help="一站式失败诊断 (状态+命令+git+日志)")
+    p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部非 done/skip)")
+    p.set_defaults(fn=cmd_diag)
 
     p = sub.add_parser("resubmit", help="重新提交 (新版本排队尾)")
     p.add_argument("task", help="<batch>:<task>")
