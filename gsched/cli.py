@@ -762,7 +762,12 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    """sched cancel <batch>[:task]: 组级 kill -> cancelled (N2 kill_reason)."""
+    """sched cancel <batch>[:task]: 取消批次/任务 (running 组级 kill + pending 直接标 cancelled).
+
+    - running: 先写 kill_reason 再 killpg (N2), daemon reap 时收尾
+    - pending: 排队中未开始, 无进程可杀, 直接标 cancelled (终态, 不重试)
+    - 下游依赖告警 (Q4): 上游取消后有 cancelled 终态, 依赖它的批次将永久挂起
+    """
     ref = args.batch
     if not args.yes:
         print(f"确认取消 {ref}? 加 --yes 执行 (N2: 先写 kill_reason 再 killpg)")
@@ -782,6 +787,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "SELECT * FROM jobs WHERE batch_id=? AND task_id=? AND status='running'",
                 (b, t),
             ).fetchall()
+            pendings = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND task_id=? AND status='pending'",
+                (b, t),
+            ).fetchall()
         else:
             b = _batch_id_from_name(ref)
             if not b:
@@ -791,9 +800,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "SELECT * FROM jobs WHERE batch_id=? AND status='running'",
                 (b,),
             ).fetchall()
-        if not targets:
-            print(f"无运行中任务: {ref}")
-            return 0
+            pendings = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND status='pending'",
+                (b,),
+            ).fetchall()
+        n = 0
         for j in targets:
             # O5: killpg 前 kill -0 确认存活; 已死则清 reason
             if j["pgid"] and ex.alive(j["pgid"]):
@@ -806,6 +817,29 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                     finished_at=state.now(),
                 )
                 print(f"{j['id']} 已自然结束, 标记 cancelled")
+            n += 1
+        for j in pendings:
+            # 排队中未启动: 无进程可杀, 直接标终态 (daemon 不再派发)
+            state.update_job(
+                conn, j["id"], status="cancelled", kill_reason="cancelled",
+                finished_at=state.now(),
+            )
+            print(f"已取消排队任务 {j['id']} (pending, 未启动)")
+            n += 1
+        if n == 0:
+            print(f"无运行中/排队任务: {ref}")
+            return 0
+        # Q4: 下游依赖告警 (与 resubmit 对称; 上游含 cancelled 终态, 下游永不解锁)
+        name = conn.execute(
+            "SELECT name FROM batches WHERE id=?", (b,)
+        ).fetchone()
+        if name:
+            deps = conn.execute(
+                "SELECT name FROM batches WHERE depends_on LIKE ?",
+                (f'%"{name["name"]}"%',),
+            ).fetchall()
+            for d in deps:
+                print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已取消, 下游将挂起 (Q4)")
     return 0
 
 
