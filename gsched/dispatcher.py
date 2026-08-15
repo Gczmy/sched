@@ -28,6 +28,7 @@ RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5)
 DEFAULT_MAX_RETRY = 1
 DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
 DEFAULT_MAX_CPU_JOBS = 2  # cpus_total 未配置时回退: CPU-only 并发上限 (定案 7 旧语义)
+DEFAULT_IDLE_TIMEOUT_MIN = 360  # 空转自动退出 (定案 38): 默认 6h, 0 = 禁用
 
 
 class Dispatcher:
@@ -49,6 +50,10 @@ class Dispatcher:
         )
         # venv 路径映射 (指纹用)
         self.venv_paths = cfg.get("venvs", {})
+        # 空转自动退出 (定案 38): 默认 360min (6h), 0 = 禁用; last_activity 内存态,
+        # 重启重置; 崩溃循环 (反复拉起又立即崩) 永不 idle 退出为已知取舍
+        self.idle_timeout_min = int(cfg.get("idle_timeout_min", DEFAULT_IDLE_TIMEOUT_MIN))
+        self.last_activity = time.time()
 
     def log_line(self, msg: str) -> None:
         line = f"[{state.now()}] {msg}"
@@ -168,6 +173,8 @@ class Dispatcher:
         while True:
             try:
                 self._heartbeat()
+                if self._idle_check():
+                    break
                 self._tick()
             except KeyboardInterrupt:
                 break
@@ -177,6 +184,30 @@ class Dispatcher:
                 break
             time.sleep(POLL_SEC)
         self._cleanup_lock()
+
+    def _idle_check(self) -> bool:
+        """定案 38: 连续 idle 超时优雅退出.
+
+        idle = jobs 表无 pending/running/waiting_dep 任务 (blocked/failed/cancelled
+        等人工态不计 activity —— 批次 blocked 时 daemon 不派发, 空转无意义).
+        返回 True = 触发退出 (主循环 break, 随后 _cleanup_lock).
+        """
+        if self.idle_timeout_min <= 0:
+            return False  # 0 = 禁用
+        with state.connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','running','waiting_dep')"
+            ).fetchone()[0]
+        now = time.time()
+        if n > 0:
+            self.last_activity = now
+            return False
+        if now - self.last_activity >= self.idle_timeout_min * 60:
+            self.log_line(
+                f"连续 {self.idle_timeout_min}min 无任务 (idle_timeout_min), 自动退出"
+            )
+            return True
+        return False
 
     def _tick(self) -> None:
         self._reap_finished_jobs()

@@ -201,6 +201,75 @@ else
 fi
 stop_daemon $S5
 
+# ---------- 场景 6: 空转自动退出 + submit 自动拉起 (定案 38) ----------
+echo "--- 场景 6: idle 自动退出 + submit 自动拉起 daemon ---"
+daemon_alive() { # $1=state_dir -> 1 alive / 0 dead
+  export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
+  $PY -c "from gsched import daemon; import sys; sys.exit(0 if daemon.is_running() else 1)" 2>/dev/null && echo 1 || echo 0
+}
+S6=/tmp/sched_acc_u6; rm -rf $S6; mkdir -p $S6
+cat > $S6/config.json << EOF
+{
+  "schema_version": 1, "user": "$(whoami)", "node": "testnode",
+  "state_dir": "$S6", "gpus": [0], "idle_timeout_min": 1,
+  "projects": {"default": {"root": "$ROOT", "git": false}},
+  "default_project": "default",
+  "venvs": {"k": "$PY"}
+}
+EOF
+# u6a: 提交即自动拉起 daemon (ensure_running, SCHED_FAKE_GPUS 驱动 fake)
+cat > $S6/batch_a.json << EOF
+{
+  "name": "u6a",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S6/a.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S6/a.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+env SCHED_STATE=$S6 SCHED_CONFIG=$S6/config.json SCHED_FAKE_GPUS=0 \
+    $PY -m gsched.cli submit $S6/batch_a.json >/dev/null 2>&1
+for _ in $(seq 1 20); do
+  [ -f "$S6/a.txt" ] && break
+  sleep 1
+done
+if [ ! -f "$S6/a.txt" ]; then
+  bad "场景6: u6a 未完成 (自动拉起失败?)"
+else
+  # 等 idle 超时 (idle_timeout_min=1 -> 60s + tick 边界)
+  for _ in $(seq 1 30); do
+    [ "$(daemon_alive $S6)" = "0" ] && break
+    sleep 3
+  done
+  if [ "$(daemon_alive $S6)" = "0" ]; then
+    ok "场景6a: 连续 idle 1min 后 daemon 自动退出"
+  else
+    bad "场景6a: daemon 未自动退出 (idle_timeout 未生效)"
+  fi
+fi
+# u6b: 提交新批次 -> ensure_running 自动拉起 daemon -> 完成
+cat > $S6/batch_b.json << EOF
+{
+  "name": "u6b",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S6/b.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S6/b.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+env SCHED_STATE=$S6 SCHED_CONFIG=$S6/config.json SCHED_FAKE_GPUS=0 \
+    $PY -m gsched.cli submit $S6/batch_b.json >/dev/null 2>&1
+for _ in $(seq 1 20); do
+  [ -f "$S6/b.txt" ] && break
+  sleep 1
+done
+if [ -f "$S6/b.txt" ] && [ "$(daemon_alive $S6)" = "1" ]; then
+  ok "场景6b: submit 自动拉起 daemon 并完成新批次 (idle 退出后自愈)"
+else
+  bad "场景6b: 自动拉起未生效 (产物=$( [ -f "$S6/b.txt" ] && echo yes || echo no ), daemon=$(daemon_alive $S6))"
+fi
+stop_daemon $S6
+
 # ---------- 场景 4: daemon stop 收尾不残留 assigned 卡 (N11 修复) ----------
 echo "--- 场景 4: daemon stop 后 GPU 释放不残留 ---"
 S4=/tmp/sched_acc_u4; rm -rf $S4; mkdir -p $S4

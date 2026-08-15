@@ -447,6 +447,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
 
     print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
+    from . import daemon
+    print(daemon.ensure_running())  # 定案 38: daemon 未运行自动拉起 (idle 退出后)
     return 0
 
 
@@ -537,6 +539,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print(f"已入队: {bid} (gpus={args.gpus} 张, duration={args.duration}min)")
     print(f"  status/cancel 用批次名: {batch_name}")
+    from . import daemon
+    print(daemon.ensure_running())  # 定案 38: daemon 未运行自动拉起 (idle 退出后)
     return 0
 
 
@@ -821,6 +825,8 @@ def cmd_retry(args: argparse.Namespace) -> int:
             pgid=None, gpu=None, rc=None, failure=None,
         )
         print(f"已解锁重跑: {j['id']}")
+    from . import daemon
+    print(daemon.ensure_running())  # 定案 38: retry 产生可派发工作, daemon 未运行自动拉起
     return 0
 
 
@@ -860,6 +866,8 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
         for d in deps:
             print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已更新, 请重提下游 (Q4)")
         print(f"已 resubmit: {batch}:{task} -> v{new_v} (排队尾)")
+    from . import daemon
+    print(daemon.ensure_running())  # 定案 38: resubmit 产生可派发工作, daemon 未运行自动拉起
     return 0
 
 

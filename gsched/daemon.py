@@ -64,6 +64,18 @@ def is_running() -> bool:
     return _pid_alive(_read_pid()) and _heartbeat_fresh()
 
 
+def ensure_running() -> str:
+    """定案 38: 所有"会产生可派发工作"的命令 (submit/run/retry/resubmit) 共享的
+    再启动通道——daemon 未运行 (含 idle 自动退出后) 自动拉起.
+
+    fake 由 SCHED_FAKE_GPUS 环境变量驱动 (验收/测试场景), 与 daemon start --fake 一致.
+    start 本身幂等: 已在运行则跳过.
+    """
+    if is_running():
+        return "daemon 已在运行"
+    return start(fake=bool(os.environ.get("SCHED_FAKE_GPUS")))
+
+
 def status_str() -> str:
     pid = _read_pid()
     if _pid_alive(pid) and _heartbeat_fresh():
