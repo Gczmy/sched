@@ -95,16 +95,53 @@ class Allocator:
                         "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
                         (job_id, now(), idx),
                     )
+                    # 多归属: 写 gpu_jobs 行 (独占 = 每卡 1 行; gpus.job_id 镜像双写)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, updated_at)"
+                        " VALUES (?,?,?)",
+                        (idx, job_id, now()),
+                    )
                     return idx
         return None
 
     def release(self, job_id: str) -> None:
-        """任务 reap 时: assigned -> releasing (立即, 不等物理)."""
+        """任务 reap 时: 多归属计数释放 (§3.2e B).
+
+        DELETE gpu_jobs 行 -> 卡还有 co-tenant? 有 = 保持 assigned (不误杀);
+        无 = 转 releasing (最后任务结束, 等进程离场). 同一事务 (WAL 串行).
+        """
         with connect() as conn:
-            conn.execute(
-                "UPDATE gpus SET status='releasing', updated_at=? WHERE job_id=?",
-                (now(), job_id),
-            )
+            gpu = conn.execute(
+                "SELECT gpu_id FROM gpu_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            conn.execute("DELETE FROM gpu_jobs WHERE job_id=?", (job_id,))
+            if gpu is None:
+                # 无 gpu_jobs 行 (历史/异常): 回退旧逻辑 (镜像列反查)
+                conn.execute(
+                    "UPDATE gpus SET status='releasing', job_id=NULL, updated_at=? "
+                    "WHERE job_id=?",
+                    (now(), job_id),
+                )
+                return
+            idx = gpu["gpu_id"]
+            remain = conn.execute(
+                "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=?", (idx,)
+            ).fetchone()["n"]
+            if remain > 0:
+                # 还有 co-tenant: 保持 assigned, 镜像改指剩余任一 job
+                other = conn.execute(
+                    "SELECT job_id FROM gpu_jobs WHERE gpu_id=? LIMIT 1", (idx,)
+                ).fetchone()
+                conn.execute(
+                    "UPDATE gpus SET job_id=?, updated_at=? WHERE idx=?",
+                    (other["job_id"], now(), idx),
+                )
+            else:
+                conn.execute(
+                    "UPDATE gpus SET status='releasing', job_id=NULL, updated_at=? "
+                    "WHERE idx=?",
+                    (now(), idx),
+                )
 
     def settle_releasing(self) -> list[int]:
         """releasing 卡: compute 进程消失 -> free (连续 2 次采样, M7/M8).
@@ -134,6 +171,10 @@ class Allocator:
                             "UPDATE gpus SET status='free', job_id=NULL, updated_at=? WHERE idx=?",
                             (now(), idx),
                         )
+                        # 防御: releasing 卡应已无 gpu_jobs 行 (计数释放), 清残留
+                        conn.execute(
+                            "DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,)
+                        )
                         freed.append(idx)
                 else:
                     self._reset_confirm(idx)  # 中间不干净: 中断连续计数
@@ -141,6 +182,10 @@ class Allocator:
                         conn.execute(
                             "UPDATE gpus SET status='unmanaged', job_id=NULL, updated_at=? WHERE idx=?",
                             (now(), idx),
+                        )
+                        # 防御: unmanaged 卡不应有 gpu_jobs 行 (任务已离场)
+                        conn.execute(
+                            "DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,)
                         )
         return freed
 
@@ -222,6 +267,10 @@ class Allocator:
                     conn.execute(
                         "UPDATE gpus SET status='free', job_id=NULL, updated_at=? WHERE idx=?",
                         (now(), idx),
+                    )
+                    # 防御: unmanaged 卡不应有 gpu_jobs 行
+                    conn.execute(
+                        "DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,)
                     )
                     moved.append(idx)
         return moved

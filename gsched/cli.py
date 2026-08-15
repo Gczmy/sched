@@ -978,6 +978,8 @@ def cmd_gpu_free(args: argparse.Namespace) -> int:
             "UPDATE gpus SET status='free', job_id=NULL, quarantined=0, updated_at=? WHERE idx=?",
             (state.now(), args.idx),
         )
+        # 多归属 (§3.2e): 清该卡 gpu_jobs 残留 (强制回 free 应无挂靠 job)
+        conn.execute("DELETE FROM gpu_jobs WHERE gpu_id=?", (args.idx,))
         print(f"GPU{args.idx} 已强制回 free")
     return 0
 

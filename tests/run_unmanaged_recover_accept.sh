@@ -308,6 +308,72 @@ else
 fi
 stop_daemon $S4
 
+# ---------- 场景 7: gpu_jobs 迁移 + 独占生命周期 (§3.2e A2/B, 定案 39) ----------
+echo "--- 场景 7: gpu_jobs 迁移 + 独占模式零行为变化 ---"
+# 7a 迁移验证: 独立目录, 手工造旧库 (gpus.job_id 非空, 无 gpu_jobs 表)
+S7=/tmp/sched_acc_u7a; rm -rf $S7; mkdir -p $S7
+SCHED_STATE=$S7 $PY - <<EOF
+import os, sqlite3, sys
+sys.path.insert(0, '$ROOT/sched')
+st = __import__('gsched.state', fromlist=['x'])
+db = '$S7/$HOST/state.db'
+os.makedirs(os.path.dirname(db), exist_ok=True)
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE batches (id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'mix',
+ depends_on TEXT NOT NULL DEFAULT '[]', gpus TEXT, cwd TEXT, env TEXT, status TEXT NOT NULL DEFAULT 'queued', created_at TEXT NOT NULL);
+CREATE TABLE tasks (batch_id TEXT NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+ spec TEXT NOT NULL, order_idx INTEGER NOT NULL, PRIMARY KEY (batch_id, id, version));
+CREATE TABLE jobs (id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, task_id TEXT NOT NULL, version INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending', gpu INTEGER, pgid INTEGER, kill_reason TEXT, rc INTEGER, failure TEXT,
+ retries INTEGER NOT NULL DEFAULT 0, fingerprint TEXT, stage_fingerprints TEXT, git_rev TEXT,
+ submitted_at TEXT, started_at TEXT, finished_at TEXT, UNIQUE (batch_id, task_id, version));
+CREATE TABLE gpus (idx INTEGER PRIMARY KEY, status TEXT NOT NULL, job_id TEXT,
+ quarantined INTEGER NOT NULL DEFAULT 0, ignore_until TEXT, updated_at TEXT);
+INSERT INTO gpus VALUES (0,'assigned','job_A',0,NULL,'2026-08-15 12:00:00');
+INSERT INTO gpus VALUES (1,'free',NULL,0,NULL,'2026-08-15 12:00:00');
+""")
+c.commit(); c.close()
+st.init_db()
+c = sqlite3.connect(db); c.row_factory = sqlite3.Row
+rows = [(r['gpu_id'], r['job_id']) for r in c.execute("SELECT * FROM gpu_jobs").fetchall()]
+c.close()
+assert rows == [(0, 'job_A')], rows
+print('MIGRATE_OK')
+EOF
+if [ $? -eq 0 ]; then ok "场景7a: gpus.job_id 存量行迁移到 gpu_jobs (每卡 1 行)"; else bad "场景7a: 迁移失败"; fi
+# 7b 独占生命周期: 干净目录, 正常批次 -> assigned 有 gpu_jobs 行 -> 完成后行清空 + 回 free
+S7B=/tmp/sched_acc_u7b; rm -rf $S7B; mkdir -p $S7B
+mk_config $S7B
+cat > $S7B/batch.json << EOF
+{
+  "name": "u7b",
+  "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S7B/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S7B/t1.txt"}}, "paths_escape": true}
+  ]
+}
+EOF
+LOG=$(run_batch $S7B $S7B/batch.json)
+GPJ=0
+for _ in $(seq 1 30); do
+  N=$($PY -c "
+import sqlite3
+db='$S7B/$HOST/state.db'
+c=sqlite3.connect(db)
+n=c.execute(\"SELECT COUNT(*) FROM gpu_jobs\").fetchone()[0]
+c.close()
+print(n)" 2>/dev/null)
+  [ "$N" = "0" ] && [ "$(gpu_status $S7B)" = "free" ] && { GPJ=1; break; }
+  sleep 1
+done
+if [ "$GPJ" = "1" ]; then
+  ok "场景7b: 独占任务完成后 gpu_jobs 计数归零 + GPU 回 free (零行为变化)"
+else
+  bad "场景7b: gpu_jobs 残留或 GPU 未回 free (rows=$N, gpu=$(gpu_status $S7B))"
+fi
+stop_daemon $S7B
+
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ] || exit 1

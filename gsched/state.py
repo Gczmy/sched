@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS gpus (
   ignore_until TEXT,
   updated_at TEXT
 );
+
+-- gpu_jobs 关联表 (co-location 多归属, §3.2e A2): gpu_id <-> job_id 多对一.
+-- 独占模式 = 每卡至多 1 行; gpus.job_id 保留作"主 job 镜像" (兼容/回滚, 镜像语义
+-- = 首个 assign 的 job). vram_gib = 装箱值 (max(声明, profile 实测), 单位 GiB).
+CREATE TABLE IF NOT EXISTS gpu_jobs (
+  gpu_id   INTEGER NOT NULL,
+  job_id   TEXT PRIMARY KEY,
+  vram_gib REAL,
+  updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_gpu_jobs_gpu ON gpu_jobs(gpu_id);
 """
 
 
@@ -82,12 +93,25 @@ def db_path() -> str:
 
 
 def init_db() -> str:
-    """建目录 + 建表, 返回 db 路径. 幂等."""
+    """建目录 + 建表 + 迁移, 返回 db 路径. 幂等."""
     p = db_path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with connect() as conn:
         conn.executescript(SCHEMA)
+        migrate_gpu_jobs(conn)
     return p
+
+
+def migrate_gpu_jobs(conn: sqlite3.Connection) -> None:
+    """迁移 (§3.2e E): 现有 gpus.job_id 非空行 -> INSERT gpu_jobs (每卡 1 行).
+
+    独占模式 = 每卡 1 行 = 现状语义; 远程有运行中任务 (assigned) 只迁移状态
+    不动进程. 幂等 (INSERT OR IGNORE 按 job_id 主键). 迁移后独占行为必须零变化.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO gpu_jobs (gpu_id, job_id, updated_at) "
+        "SELECT idx, job_id, updated_at FROM gpus WHERE job_id IS NOT NULL"
+    )
 
 
 @contextmanager
