@@ -595,6 +595,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "status": j["status"], "gpu": j["gpu"], "version": j["version"],
                     "resources": res,
                     "retries": j["retries"], "failure": j["failure"],
+                    "started_at": j["started_at"], "finished_at": j["finished_at"],
                 }
             )
         gpus = conn.execute("SELECT * FROM gpus ORDER BY idx").fetchall()
@@ -643,6 +644,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         fail = f" ({j['failure']})" if j["failure"] else ""
         bname = name_by_id.get(j["batch"], j["batch"])
         print(f"  {bname:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{prog}{fail}")
+        if args.detail:
+            # P5: 中间档视图 — 每任务起止时间/耗时/version
+            t0 = j.get("started_at") or "-"
+            t1 = j.get("finished_at") or "-"
+            dur = "-"
+            if j.get("started_at") and j.get("finished_at"):
+                try:
+                    a = datetime.fromisoformat(j["started_at"])
+                    b = datetime.fromisoformat(j["finished_at"])
+                    dur = f"{int((b - a).total_seconds())}s"
+                except (ValueError, TypeError):
+                    pass
+            print(f"      v{j['version']}  start={t0}  end={t1}  耗时={dur}")
     print("=== GPU ===")
     for g in out["gpus"]:
         q = " QUARANTINED" if g["quarantined"] else ""
@@ -938,6 +952,38 @@ def cmd_retry(args: argparse.Namespace) -> int:
         print(f"({n} 个任务)")
     from . import daemon
     print(daemon.ensure_running())  # 定案 38: retry 产生可派发工作, daemon 未运行自动拉起
+    return 0
+
+
+def cmd_markers(args: argparse.Namespace) -> int:
+    """sched markers: 一行查看批次终态 marker (P7).
+
+    daemon 在批次进入终态 (done/blocked) 时写 {STATE}/markers/{name}.{kind},
+    blocked 解除回 active 时删 .blocked. 按修改时间倒序, 最新在前.
+    """
+    d = os.path.join(state.default_state_dir(), "markers")
+    if not os.path.isdir(d):
+        print("(无 marker — 尚无批次进入终态)")
+        return 0
+    files = [f for f in os.listdir(d) if f.endswith((".done", ".blocked"))]
+    if not files:
+        print("(无 marker)")
+        return 0
+    files.sort(
+        key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True
+    )
+    for f in files:
+        p = os.path.join(d, f)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                content = fh.read().strip()
+        except OSError:
+            content = "(不可读)"
+        mark = "✅" if f.endswith(".done") else "❌"
+        mtime = datetime.fromtimestamp(
+            os.path.getmtime(p)
+        ).strftime("%m-%d %H:%M")
+        print(f"  {mark} {f:<42} {mtime}  {content}")
     return 0
 
 
@@ -1272,6 +1318,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("status", help="三视图总览")
     p.add_argument("batch", nargs="?", default=None)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--detail", action="store_true",
+                   help="任务视图含起止时间/耗时/version (P5)")
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("task", help="单任务详情")
@@ -1283,6 +1331,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=50, help="最大行数 (默认 50)")
     p.add_argument("--status", default=None, help="按状态过滤, 逗号分隔 (如 done,failed)")
     p.set_defaults(fn=cmd_history)
+
+    p = sub.add_parser("markers", help="批次终态 marker 一行查看 (P7)")
+    p.set_defaults(fn=cmd_markers)
 
     p = sub.add_parser("cancel", help="取消 (组级 kill)")
     p.add_argument("batch", help="<batch> 或 <batch>:<task>")

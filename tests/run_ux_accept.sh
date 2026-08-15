@@ -121,6 +121,54 @@ grep -q "代码已更新" $S1/retry2_out.txt && ok "P3 git rev 警告输出 (dea
 wait_status $S1 u1 done 3 40 && ok "第二次 retry 后全部 done" \
   || bad "未全 done (running=$(count_status $S1 u1 running) failed=$(count_status $S1 u1 failed) pending=$(count_status $S1 u1 pending))"
 
+# ---------- 场景 5: status --detail (P5) + 终态 marker (P7) ----------
+echo "--- 场景 5: status --detail + sched markers ---"
+S3=/tmp/sched_acc_u5; rm -rf $S3; mkdir -p $S3
+mk_config $S3 false
+cat > $S3/batch.json << EOF
+{
+  "name": "u5", "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; print('Epoch 1/3'); time.sleep(2)"], "duration_min": 1},
+    {"id": "t2", "cmd": ["{VENV:k}", "-c", "print('ok2')"], "duration_min": 1}
+  ]
+}
+EOF
+export SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json
+$PY -m gsched.cli submit $S3/batch.json >/dev/null 2>&1 || { bad "u5 submit 失败"; exit 1; }
+SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
+# P5: running 任务 --detail 显示时间字段
+wait_status $S3 u5 running 1 15 && ok "u5:t1 进入 running" || bad "u5:t1 未 running"
+sleep 2
+$PY -m gsched.cli status u5 --detail > $S3/detail_out.txt 2>&1
+grep -q "start=" $S3/detail_out.txt && grep -q "耗时=" $S3/detail_out.txt \
+  && ok "P5 status --detail 含起止时间/耗时" \
+  || bad "P5 --detail 缺时间字段 (输出: $(head -8 $S3/detail_out.txt))"
+# P7: 批次 done 后 marker 文件 + sched markers
+wait_status $S3 u5 done 2 30 && ok "u5 全部 done" || bad "u5 未全 done"
+[ -f $S3/markers/u5.done ] && ok "P7 marker 文件 u5.done 已写" || bad "marker u5.done 缺失"
+$PY -m gsched.cli markers > $S3/markers_out.txt 2>&1
+grep -q "u5.done" $S3/markers_out.txt && ok "sched markers 列出 u5.done" \
+  || bad "sched markers 缺 u5.done (输出: $(cat $S3/markers_out.txt))"
+# blocked marker: 失败任务也应有 marker
+cat > $S3/bad.json << EOF
+{
+  "name": "u5bad", "mode": "mix",
+  "tasks": [
+    {"id": "x1", "max_retry": 0,
+     "cmd": ["{VENV:k}", "-c", "import sys; print('boomx'); sys.exit(1)"], "duration_min": 1}
+  ]
+}
+EOF
+$PY -m gsched.cli submit $S3/bad.json >/dev/null 2>&1
+wait_status $S3 u5bad failed 1 20 && ok "u5bad 失败" || bad "u5bad 未失败"
+sleep 2
+[ -f $S3/markers/u5bad.blocked ] && grep -q "x1" $S3/markers/u5bad.blocked \
+  && ok "P7 blocked marker 含失败任务列表" || bad "blocked marker 缺失/无失败列表"
+$PY -m gsched.cli markers > $S3/markers2_out.txt 2>&1
+grep -q "u5bad.blocked" $S3/markers2_out.txt && ok "sched markers 列出 blocked" \
+  || bad "sched markers 缺 blocked (输出: $(cat $S3/markers2_out.txt))"
+
 # ---------- 场景 4: status 进度列 (P4) ----------
 echo "--- 场景 4: running 任务 status 显示进度列 ---"
 S2=/tmp/sched_acc_u4; rm -rf $S2; mkdir -p $S2
@@ -144,7 +192,7 @@ grep -q "3/30" $S2/status_out.txt && ok "status 显示进度 3/30" \
 $PY -m gsched.cli cancel u4 --yes >/dev/null 2>&1
 wait_status $S2 u4 cancelled 1 15 && ok "清理: u4 已 cancel" || bad "u4 cancel 失败"
 
-stop_daemon $S1; stop_daemon $S2
+stop_daemon $S1; stop_daemon $S2; stop_daemon $S3
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="

@@ -95,6 +95,22 @@ class StateError(Exception):
 
 
 def hostname() -> str:
+    """state 子目录名: daemon 所在计算节点名 (P6, 2026-08-15).
+
+    优先读 config.json 的 node 字段 (daemon 常驻计算节点, 多机共享 home 时
+    登录节点 CLI 也读同一 state.db); 无 config/无 node 字段 fallback 本机
+    hostname. 背景: 登录节点 gethostname() = hpdc-gateway != ambiorix,
+    登录节点 sched status 读到空目录 (旧坑: 只能 tmux 进计算节点查状态).
+    """
+    try:
+        from .config import ConfigError, load_config
+
+        cfg = load_config()
+        node = cfg.get("node")
+        if node:
+            return str(node)
+    except ConfigError:
+        pass
     import socket
 
     return socket.gethostname()

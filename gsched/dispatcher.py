@@ -278,6 +278,10 @@ class Dispatcher:
                     conn.execute(
                         "UPDATE batches SET status='done' WHERE id=?", (b["id"],)
                     )
+                    self._write_marker(
+                        b["name"], "done",
+                        f"{len(statuses)} 任务全部成功终态 (done/skip)",
+                    )
                     self.log_line(f"批次 {b['name']} done (全部任务成功终态)")
                 elif any(
                     s in ("failed", "blocked", "cancelled", "timed_out")
@@ -287,13 +291,51 @@ class Dispatcher:
                         conn.execute(
                             "UPDATE batches SET status='blocked' WHERE id=?", (b["id"],)
                         )
+                        fails = [
+                            r["task_id"] for r in conn.execute(
+                                "SELECT task_id FROM jobs WHERE batch_id=? AND status IN"
+                                " ('failed','blocked','cancelled','timed_out')",
+                                (b["id"],),
+                            ).fetchall()
+                        ]
+                        self._write_marker(
+                            b["name"], "blocked",
+                            f"失败任务: {','.join(fails) if fails else '-'}",
+                        )
                         self.log_line(f"批次 {b['name']} blocked (有失败任务, 等人工)")
                 elif b["status"] == "blocked":
                     # 人工 retry/resubmit 已解除全部失败终态 (只剩 pending/running 等)
                     conn.execute(
                         "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
                     )
+                    self._remove_marker(b["name"], "blocked")  # P7: 解除阻塞删除 marker
                     self.log_line(f"批次 {b['name']} 失败终态解除 -> active (人工 retry 生效)")
+
+    # ---------- P7: 批次终态 marker (2026-08-15) ----------
+
+    def _marker_dir(self) -> str:
+        d = os.path.join(state.default_state_dir(), "markers")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _write_marker(self, name: str, kind: str, detail: str) -> None:
+        """P7: 批次进入终态 (done/blocked) 写 marker 文件, 供一行查看 (sched markers).
+
+        文件: {STATE}/markers/{name}.{kind} (node 无关全局; 按名覆盖幂等).
+        """
+        p = os.path.join(self._marker_dir(), f"{name}.{kind}")
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(f"{state.now()} | {detail}\n")
+        except OSError:
+            pass  # marker 非关键路径, 写失败不影响调度
+
+    def _remove_marker(self, name: str, kind: str) -> None:
+        p = os.path.join(self._marker_dir(), f"{name}.{kind}")
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
     # ---------- 节点重启恢复 (D4) ----------
 
