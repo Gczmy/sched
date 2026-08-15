@@ -646,8 +646,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 (g["idx"],),
             ).fetchall()
         if gj:
+            # 注意: 不嵌套 f-string (PEP 701 嵌套引号需 Py3.12+, 远程 3.11 兼容)
             jobs_txt = ",".join(
-                f"{r['job_id']}{f'({r['vram_gib']}GiB)' if r['vram_gib'] else ''}"
+                r["job_id"] + (f"({r['vram_gib']}GiB)" if r["vram_gib"] else "")
                 for r in gj
             )
         print(f"  GPU{g['idx']} [{g['status']:<10}] job={jobs_txt}{q}")
