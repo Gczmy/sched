@@ -177,6 +177,29 @@ def _validate_task(
     resources["gpu"] = gpu_req
     if gpu_req == 0 and "cpus" not in resources:
         resources["cpus"] = 1  # CPU-only 缺省 1 核 (配额制调度用)
+    # co-location (§3.2e 待定项 2, 定案 39): gpu_share 必须声明 vram_gib (GiB,
+    # 装箱必须有名数, 缺省 = 无法装箱); vram_gib 非法值拒绝.
+    gpu_share = resources.get("gpu_share", False)
+    if gpu_share not in (True, False):
+        raise SchemaError(f"{where}.resources.gpu_share: 必须是布尔")
+    vram = resources.get("vram_gib")
+    if gpu_share:
+        if vram is None:
+            raise SchemaError(
+                f"{where}.resources: gpu_share=true 必须声明 vram_gib (GiB 峰值)"
+            )
+        if not isinstance(vram, (int, float)) or isinstance(vram, bool) or vram <= 0:
+            raise SchemaError(f"{where}.resources.vram_gib: 必须是正数 (GiB)")
+    elif vram is not None and (
+        not isinstance(vram, (int, float)) or isinstance(vram, bool) or vram <= 0
+    ):
+        raise SchemaError(f"{where}.resources.vram_gib: 必须是正数 (GiB)")
+    resources["gpu_share"] = gpu_share
+    if vram is not None:
+        resources["vram_gib"] = float(vram)
+    profile_key = resources.get("profile_key")
+    if profile_key is not None and not isinstance(profile_key, str):
+        raise SchemaError(f"{where}.resources.profile_key: 必须是字符串")
 
     # retry_transform / probes 透传
     retry_transform = t.get("retry_transform")

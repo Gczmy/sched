@@ -638,7 +638,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("=== GPU ===")
     for g in out["gpus"]:
         q = " QUARANTINED" if g["quarantined"] else ""
-        print(f"  GPU{g['idx']} [{g['status']:<10}] job={g['job']}{q}")
+        # 多归属展示 (定案 39 E 连带): assigned 卡显示 gpu_jobs 全部 job (共享共存)
+        jobs_txt = str(g["job"]) if g["job"] else "None"
+        with state.connect() as conn:
+            gj = conn.execute(
+                "SELECT job_id, vram_gib FROM gpu_jobs WHERE gpu_id=? ORDER BY job_id",
+                (g["idx"],),
+            ).fetchall()
+        if gj:
+            jobs_txt = ",".join(
+                f"{r['job_id']}{f'({r['vram_gib']}GiB)' if r['vram_gib'] else ''}"
+                for r in gj
+            )
+        print(f"  GPU{g['idx']} [{g['status']:<10}] job={jobs_txt}{q}")
     c = out.get("cpu")
     if c:
         total_txt = str(c["total"]) if c["total"] else "未配置"

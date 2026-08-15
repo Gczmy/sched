@@ -54,6 +54,11 @@ class Dispatcher:
         # 重启重置; 崩溃循环 (反复拉起又立即崩) 永不 idle 退出为已知取舍
         self.idle_timeout_min = int(cfg.get("idle_timeout_min", DEFAULT_IDLE_TIMEOUT_MIN))
         self.last_activity = time.time()
+        # co-location L3 冻结 (定案 39): 卡显存 > freeze_pct 冻结不再 pack.
+        # 内存态 (仅运行时保护, 重启重置); 仅 co_locate 开启时启用, 60s 采样一次.
+        self._frozen_gpus: set[int] = set()
+        self._last_freeze_sample = 0.0
+        self._co_locate = bool(cfg.get("co_locate", False))
 
     def log_line(self, msg: str) -> None:
         line = f"[{state.now()}] {msg}"
@@ -160,6 +165,8 @@ class Dispatcher:
         # GPU 表初始化 (配置集 -> free; 幂等)
         with state.connect() as conn:
             state.init_gpus(conn, self.allocator.gpu_list)
+        # 容量探测 (定案 39: daemon 启动时缓存每卡 GiB 容量, 装箱用)
+        self.allocator.probe_capacity()
         if not self.fake:
             self._check_node_restart()
         self.log_line(
@@ -207,9 +214,40 @@ class Dispatcher:
             return True
         return False
 
+    def _l3_freeze_sample(self) -> None:
+        """L3 运行时保护 (定案 39): 每 60s 采样 assigned 卡显存, > freeze_pct 冻结.
+
+        fake 模式: 用 gpu_jobs SUM(vram_gib) 模拟已占显存 (真实环境测不到).
+        冻结只影响共享装箱 (pack), 独占任务不受影响 (free 卡照派).
+        """
+        if not self._co_locate:
+            return
+        now_t = time.time()
+        if now_t - self._last_freeze_sample < 60:
+            return
+        self._last_freeze_sample = now_t
+        freeze_pct = float(self.cfg.get("co_locate_freeze_pct", 85))
+        with state.connect() as conn:
+            rows = conn.execute(
+                "SELECT idx FROM gpus WHERE status='assigned'"
+            ).fetchall()
+            for r in rows:
+                idx = r["idx"]
+                cap = self.allocator.mem_total(idx)
+                if cap <= 0:
+                    continue
+                used = self.allocator.vram_used(conn, idx)
+                if used > freeze_pct / 100.0 * cap:
+                    if idx not in self._frozen_gpus:
+                        self._frozen_gpus.add(idx)
+                        self.log_line(f"L3 冻结: GPU{idx} 装箱显存 {used:.1f}/{cap:.0f} GiB")
+                else:
+                    self._frozen_gpus.discard(idx)
+
     def _tick(self) -> None:
         self._reap_finished_jobs()
         self.allocator.settle_releasing()
+        self._l3_freeze_sample()
         moved = self.allocator.probe_free()
         for g in moved:
             self.log_line(f"unmanaged: GPU{g} 被外部占用/孤儿, 不派发")
@@ -520,7 +558,7 @@ class Dispatcher:
                     if gpu_full:
                         continue  # GPU 已满: 跳过后续 GPU 任务, 继续扫 CPU-only (防饿死)
                     # 用同一事务 assign (避免嵌套 connect 的 database is locked)
-                    gpu = self._assign_in_tx(conn, j["id"])
+                    gpu = self._assign_in_tx(conn, j["id"], spec)
                     if gpu is None:
                         gpu_full = True
                         continue  # 无空卡: 本轮不再派 GPU 任务, 但 CPU-only 仍可派 (防饿死)
@@ -564,24 +602,76 @@ class Dispatcher:
             used += self._task_cpus(spec)
         return used
 
-    def _assign_in_tx(self, conn, job_id: str) -> int | None:
-        """事务内 assign: 可用集 = 配置集 - quarantine, 只派 free 卡."""
+    def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None) -> int | None:
+        """事务内 assign (定案 39 L2 共享装箱).
+
+        独占任务 (gpu_share 缺省 false): free 卡 -> assigned (现状语义).
+        共享任务 (gpu_share=true 且 config co_locate=true): free 卡 ∪ 有余量的
+        assigned 卡 (SUM(vram_gib)+新任务 ≤ co_locate_safety×容量 且 未冻结 且
+        每卡任务数 < co_locate_max_jobs) -> First-Fit 选卡.
+        组合缺格 (gpu_share=true × co_locate=false): 按独占跑 + 告警 (声明是意愿,
+        全局开关是许可). 鲸鱼排除: vram_gib > safety×容量 -> 返回 None (装箱必失败,
+        由调用方按无卡处理).
+        """
+        spec = spec or {}
+        resources = spec.get("resources") or {}
+        gpu_share = bool(resources.get("gpu_share"))
+        co_locate = bool(self.cfg.get("co_locate", False))
+        if gpu_share and not co_locate:
+            self.log_line(f"job {job_id} gpu_share=true 但 co_locate 未开启 -> 按独占跑 + 告警")
+            gpu_share = False
+        # 装箱值 = max(声明 vram_gib, profile_cache.peak_gib) (定案 39 L1, profile 命中)
+        task_vram = None
+        if gpu_share:
+            task_vram = float(resources.get("vram_gib", 0.0) or 0.0)
+            pk = resources.get("profile_key")
+            if pk:
+                row = conn.execute(
+                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?", (pk,)
+                ).fetchone()
+                if row and row["peak_gib"]:
+                    task_vram = max(task_vram, float(row["peak_gib"]))
+            safety = float(self.cfg.get("co_locate_safety", 0.7))
         for idx in self.allocator.gpu_list:
             row = conn.execute(
                 "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
             ).fetchone()
-            if row and row["status"] == "free" and not row["quarantined"]:
+            if not row or row["quarantined"]:
+                continue
+            if row["status"] == "free":
+                # 独占 / 共享都可用 free 卡
                 conn.execute(
                     "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
                     (job_id, state.now(), idx),
                 )
-                # 多归属 (§3.2e A2): 写 gpu_jobs 行 (独占 = 每卡 1 行, 镜像双写)
                 conn.execute(
-                    "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, updated_at)"
-                    " VALUES (?,?,?)",
-                    (idx, job_id, state.now()),
+                    "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
+                    " VALUES (?,?,?,?)",
+                    (idx, job_id, task_vram, state.now()),
                 )
                 return idx
+            if row["status"] == "assigned" and gpu_share:
+                # 共享: 装箱约束 (显存 + CPU 同查 + 任务数上限 + 冻结)
+                if idx in self._frozen_gpus:
+                    continue
+                cap = self.allocator.mem_total(idx)
+                if cap <= 0:
+                    continue  # 容量未知: 不冒险共享
+                used = self.allocator.vram_used(conn, idx)
+                if used + task_vram > safety * cap:
+                    continue
+                if self.allocator.job_count(conn, idx) >= int(
+                    self.cfg.get("co_locate_max_jobs", 3)
+                ):
+                    continue
+                # 镜像列语义 (首个 assign 为镜像): 已有镜像不动, 新 job 只加 gpu_jobs 行
+                conn.execute(
+                    "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
+                    " VALUES (?,?,?,?)",
+                    (idx, job_id, task_vram, state.now()),
+                )
+                return idx
+        return None
         return None
 
     def _release_in_tx(self, conn, job_id: str) -> None:

@@ -22,9 +22,79 @@ class Allocator:
         self.gpu_list = gpu_list  # 配置集 (D3: 实际可用集 = 配置集 - quarantine)
         self.fake = fake or bool(os.environ.get("SCHED_FAKE_GPUS"))
         if self.fake:
-            # 模拟 GPU 数 (0,1,2,3 语义)
-            n = len(os.environ.get("SCHED_FAKE_GPUS", "").split(","))
-            self.gpu_list = list(range(n))
+            # 模拟 GPU 数 (0,1,2,3 语义); 支持 "idx:mem" 形式带容量 (GiB, 验收用)
+            parts = [p for p in os.environ.get("SCHED_FAKE_GPUS", "").split(",") if p]
+            idxs, self._fake_mem = [], {}
+            for p in parts:
+                if ":" in p:
+                    i, m = p.split(":", 1)
+                    idxs.append(int(i))
+                    self._fake_mem[int(i)] = float(m)
+                else:
+                    idxs.append(int(p))
+            if not idxs:
+                idxs = [0]
+            self.gpu_list = idxs
+
+    # ---------- 容量 (定案 39 待定项 4: 容量来源 daemon 启动探测) ----------
+
+    def probe_capacity(self) -> None:
+        """daemon 启动时探测每卡总容量 (GiB) 缓存进 gpus.mem_total_gib.
+
+        fake 模式: SCHED_FAKE_GPUS 可带 "idx:mem" (如 "0:24,1:24"), 缺省 24 GiB.
+        真实: nvidia-smi --query-gpu=memory.total (MiB / 1024 = GiB).
+        """
+        with connect() as conn:
+            if self.fake:
+                for idx in self.gpu_list:
+                    mem = self._fake_mem.get(idx, 24.0)
+                    conn.execute(
+                        "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (mem, idx)
+                    )
+                return
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=index,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                for line in out.stdout.splitlines():
+                    parts = line.split(",")
+                    if len(parts) != 2:
+                        continue
+                    idx, mi = int(parts[0].strip()), int(parts[1].strip())
+                    if idx in self.gpu_list:
+                        conn.execute(
+                            "UPDATE gpus SET mem_total_gib=? WHERE idx=?",
+                            (round(mi / 1024.0, 1), idx),
+                        )
+            except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+                pass
+
+    def mem_total(self, idx: int) -> float:
+        """该卡总容量 (GiB); 未探测/缺失 -> 0 (调用方按无容量处理)."""
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT mem_total_gib FROM gpus WHERE idx=?", (idx,)
+            ).fetchone()
+        if row and row["mem_total_gib"]:
+            return float(row["mem_total_gib"])
+        return self._fake_mem.get(idx, 0.0) if self.fake else 0.0
+
+    def vram_used(self, conn, idx: int) -> float:
+        """该卡已装箱显存 (SUM gpu_jobs.vram_gib, 定案 39 L2). 共享装箱用."""
+        row = conn.execute(
+            "SELECT COALESCE(SUM(vram_gib), 0.0) AS s FROM gpu_jobs WHERE gpu_id=?",
+            (idx,),
+        ).fetchone()
+        return float(row["s"])
+
+    def job_count(self, conn, idx: int) -> int:
+        """该卡当前 job 数 (co_locate_max_jobs 上限用)."""
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=?", (idx,)
+        ).fetchone()
+        return int(row["n"])
 
     # ---------- 物理探测 (仅边界校验) ----------
 

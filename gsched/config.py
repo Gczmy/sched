@@ -70,6 +70,21 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         v = cfg.get(k)
         if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < min_v):
             raise ConfigError(f"{p}: {k} 必须是整数且 >= {min_v}")
+    # co-location (定案 39 待定项 4, 实验性默认关):
+    #   co_locate: bool 全局开关; co_locate_safety 安全系数 [0.5,0.85] 默认 0.7;
+    #   co_locate_max_jobs 每卡任务数上限 [2,8] 默认 3; co_locate_freeze_pct L3 冻结阈值 (0,100) 默认 85
+    if cfg.get("co_locate") is not None and not isinstance(cfg["co_locate"], bool):
+        raise ConfigError(f"{p}: co_locate 必须是布尔 (全局开关)")
+    for k, lo, hi, dfl in (
+        ("co_locate_safety", 0.5, 0.85, 0.7),
+        ("co_locate_max_jobs", 2, 8, 3),
+        ("co_locate_freeze_pct", 1, 100, 85),
+    ):
+        v = cfg.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not (lo <= v <= hi):
+            raise ConfigError(f"{p}: {k} 必须在 [{lo}, {hi}] 范围 (默认 {dfl})")
 
 
 def resolve_template(value: str, cfg: dict[str, Any], cwd: str | None = None) -> str:

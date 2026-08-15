@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS gpus (
   job_id   TEXT,
   quarantined INTEGER NOT NULL DEFAULT 0,
   ignore_until TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  mem_total_gib REAL
 );
 
 -- gpu_jobs 关联表 (co-location 多归属, §3.2e A2): gpu_id <-> job_id 多对一.
@@ -123,6 +124,10 @@ def migrate_gpu_jobs(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO gpu_jobs (gpu_id, job_id, updated_at) "
         "SELECT idx, job_id, updated_at FROM gpus WHERE job_id IS NOT NULL"
     )
+    # 容量列迁移 (定案 39 待定项 4 容量来源): 旧库无 mem_total_gib 列 -> ALTER 补齐
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(gpus)").fetchall()]
+    if "mem_total_gib" not in cols:
+        conn.execute("ALTER TABLE gpus ADD COLUMN mem_total_gib REAL")
 
 
 @contextmanager
