@@ -447,6 +447,57 @@ else
 fi
 stop_daemon $S8C
 
+# ---------- 场景 9: M8 releasing 判据 (compute-apps pid 归属对照, §3.2e C) ----------
+echo "--- 场景 9: M8 pid 归属判据 (残留框架进程等 / 外部进程判净) ---"
+S9=/tmp/sched_acc_u9; rm -rf $S9; mkdir -p $S9
+SCHED_STATE=$S9 SCHED_FAKE_GPUS=0 $PY - <<'EOF'
+import os, sys
+sys.path.insert(0, os.getcwd() + '/sched')
+import gsched.state as st
+st.init_db()
+with st.connect() as conn:
+    st.init_gpus(conn, [0])
+    # 造一个已知 job (pgid=111, 框架记录在案): M8 归属对照用
+    conn.execute("INSERT INTO jobs (id,batch_id,task_id,version,status,pgid,submitted_at) "
+                 "VALUES ('known','b','t',1,'done',111,'2026-08-15 12:00:00')")
+from gsched.allocator import Allocator
+al = Allocator([0], fake=True)
+
+def set_releasing():
+    with st.connect() as conn:
+        # 注意: 必须用本地时间 (datetime('now','localtime')) —— 框架 state.now() 是本地,
+        # settle_releasing 用 time.mktime 解析 (假定本地); 用 UTC 会算出 ~8h  elapsed
+        # 误触发 5min -> unmanaged 分支
+        conn.execute("UPDATE gpus SET status='releasing', job_id=NULL, updated_at=datetime('now','localtime') WHERE idx=0")
+
+def gpu_status():
+    with st.connect() as conn:
+        return conn.execute("SELECT status FROM gpus WHERE idx=0").fetchone()['status']
+
+# 9a: 残留框架进程 (pid 111 的 pgid 属已知 job pgid=111) -> 卡不转 free
+set_releasing()
+os.environ['SCHED_FAKE_COMPUTE_APPS'] = '0:111'
+assert al._card_has_compute(0) is True, al._card_has_compute(0)  # 残留框架进程
+assert al.settle_releasing() == []
+assert gpu_status() == 'releasing', gpu_status()
+print('9a OK')
+# 9b: 外部进程 (pid 999 不属于任何已知 job) -> 判干净 -> free
+os.environ['SCHED_FAKE_COMPUTE_APPS'] = '0:999'
+assert al._card_has_compute(0) is False, al._card_has_compute(0)  # 外部进程
+assert al.settle_releasing() == [0]
+assert gpu_status() == 'free', gpu_status()
+print('9b OK')
+# 9c: 无进程 -> free (常规路径不受影响)
+set_releasing()
+os.environ['SCHED_FAKE_COMPUTE_APPS'] = ''
+assert al._card_has_compute(0) is False
+assert al.settle_releasing() == [0]
+assert gpu_status() == 'free', gpu_status()
+print('9c OK')
+print('M8_OK')
+EOF
+if [ $? -eq 0 ]; then ok "场景9: M8 pid 归属判据 (残留框架进程等 / 外部进程判净 / 无进程即 free)"; else bad "场景9: M8 判据失败"; fi
+
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ] || exit 1

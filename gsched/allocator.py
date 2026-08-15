@@ -21,6 +21,7 @@ class Allocator:
     def __init__(self, gpu_list: list[int], fake: bool = False):
         self.gpu_list = gpu_list  # 配置集 (D3: 实际可用集 = 配置集 - quarantine)
         self.fake = fake or bool(os.environ.get("SCHED_FAKE_GPUS"))
+        self._uuid_map: dict[str, int] | None = None  # gpu_uuid->idx 缓存 (M8, 建一次)
         if self.fake:
             # 模拟 GPU 数 (0,1,2,3 语义); 支持 "idx:mem" 形式带容量 (GiB, 验收用)
             parts = [p for p in os.environ.get("SCHED_FAKE_GPUS", "").split(",") if p]
@@ -98,22 +99,108 @@ class Allocator:
 
     # ---------- 物理探测 (仅边界校验) ----------
 
-    def _compute_pids(self) -> list[int]:
-        """nvidia-smi compute 进程列表 (M8 主判据). fake 模式返回空."""
+    def _compute_pids_by_card(self) -> dict[int, list[int]] | None:
+        """compute-apps 按卡列 pid (M8 主判据, 新建路径 §3.2e C).
+
+        返回 {idx: [pid,...]}; None = 查询失败 (调用方回退 util==0 兜底).
+        fake: SCHED_FAKE_COMPUTE_APPS="idx:pid1,pid2;idx:pid3" 模拟
+        (空/未设置 -> {}, 即无进程).
+        """
         if self.fake:
-            return []
+            out: dict[int, list[int]] = {}
+            raw = os.environ.get("SCHED_FAKE_COMPUTE_APPS", "")
+            for part in raw.split(";"):
+                if not part.strip() or ":" not in part:
+                    continue
+                idx_s, pids_s = part.split(":", 1)
+                try:
+                    idx = int(idx_s.strip())
+                except ValueError:
+                    continue
+                out[idx] = [
+                    int(p.strip())
+                    for p in pids_s.split(",")
+                    if p.strip()
+                ]
+            return out
         try:
             out = subprocess.run(
-                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid",
+                 "--format=csv,noheader"],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             if out.returncode != 0:
-                return []
-            return [int(l.strip()) for l in out.stdout.splitlines() if l.strip()]
+                return None
+            uuid_map = self._uuid_to_idx()
+            by_card: dict[int, list[int]] = {}
+            for line in out.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) != 2:
+                    continue
+                pid_s, uuid = parts[0].strip(), parts[1].strip()
+                idx = uuid_map.get(uuid)
+                if idx is not None:
+                    by_card.setdefault(idx, []).append(int(pid_s))
+            return by_card
         except (subprocess.SubprocessError, ValueError, FileNotFoundError):
-            return []
+            return None
+
+    def _uuid_to_idx(self) -> dict[str, int]:
+        """gpu_uuid -> idx 映射 (§3.2e C: compute-apps 返回 UUID 非 idx).
+
+        --query-gpu=index,uuid 建一次 (daemon 启动时首次调用缓存).
+        fake 返回空 (fake 路径不走 UUID).
+        """
+        if self.fake:
+            return {}
+        if self._uuid_map is None:
+            self._uuid_map = {}
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=index,uuid",
+                     "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                for line in out.stdout.splitlines():
+                    parts = line.split(",")
+                    if len(parts) == 2:
+                        try:
+                            self._uuid_map[parts[1].strip()] = int(
+                                parts[0].strip()
+                            )
+                        except ValueError:
+                            pass
+            except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+                pass
+        return self._uuid_map
+
+    def _pgid_of(self, pid: int) -> int | None:
+        """pid -> pgid (os.getpgid, stdlib 同用户无 sudo 可行). 已死/权限 -> None.
+
+        fake: pid 本身即 pgid (验收模拟, 与 SCHED_FAKE_COMPUTE_APPS 配合).
+        """
+        if self.fake:
+            return pid
+        try:
+            return os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return None
+
+    def _known_job_pgids(self) -> set[int]:
+        """jobs 表已知 pgid 集 (M8 归属判定: 该卡已知 job 的 pgid).
+
+        计数释放保证 releasing 时卡上无框架 job, 残留进程来自刚结束的 job
+        (jobs.pgid 保留, retry/resubmit 才清空).
+        """
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT pgid FROM jobs WHERE pgid IS NOT NULL"
+            ).fetchall()
+        return {int(r["pgid"]) for r in rows}
 
     def _util(self, idx: int) -> int:
         """单卡 util (仅 unmanaged 抽查用). fake 返回 0."""
@@ -260,10 +347,30 @@ class Allocator:
         return freed
 
     def _card_has_compute(self, idx: int) -> bool:
-        """该卡是否有 compute 进程 (releasing 主判据, M8). fake 返回 False."""
-        if self.fake:
+        """M8 主判据: 该卡是否有未离场的 compute 进程 (§3.2e C).
+
+        层次:
+          1. compute-apps 按卡列 pid -> 逐 os.getpgid(pid) 对照 jobs.pgid:
+             - 任一 pid 属于已知 job pgid -> 残留框架进程 -> True (等离场)
+             - 无 pid / 全外部进程 -> False (干净)
+          2. 兜底: compute-apps 查询失败 -> util==0 (现状语义)
+
+        行为路径变化 (评审确认): 外部进程判干净 -> 回 free -> 同 tick 的
+        probe_free 立即抓回 unmanaged (util>0), 无 free 窗口可派发 (dispatch
+        在 probe_free 之后).
+        """
+        by_card = self._compute_pids_by_card()
+        if by_card is None:
+            return self._util(idx) > 0  # 兜底: 查询失败回退 util 判据
+        pids = by_card.get(idx, [])
+        if not pids:
             return False
-        return self._util(idx) > 0
+        known = self._known_job_pgids()
+        for pid in pids:
+            pgid = self._pgid_of(pid)
+            if pgid is not None and pgid in known:
+                return True  # 残留框架进程: 等离场
+        return False  # 全外部进程: 干净
 
     def _confirm_release(self, idx: int) -> bool:
         """M7 冷却确认: 连续 2 次采样均无进程才转 free.

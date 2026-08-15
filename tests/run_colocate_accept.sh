@@ -26,7 +26,8 @@ echo "=== co-location 共享装箱验收 (fake-gpu 显存模拟) ==="
 
 # ---------- S1/S2/S3: 装箱核心 (直接调 _assign_in_tx 单元验证) ----------
 echo "--- S1/S2/S3: First-Fit 装箱 + 计数释放 ---"
-SCHED_STATE=/tmp/sched_coloc_s1 SCHED_FAKE_GPUS="0:24,1:24" $PY - <<'EOF'
+S1=/tmp/sched_coloc_s1; rm -rf $S1; mkdir -p $S1
+SCHED_STATE=$S1 SCHED_FAKE_GPUS="0:24,1:24" $PY - <<'EOF'
 import os, sys, tempfile
 sys.path.insert(0, os.getcwd() + '/sched')
 import gsched.state as st
@@ -157,7 +158,8 @@ if [ $? -eq 0 ]; then ok "S5: 组合缺格 - gpu_share × co_locate=false -> 独
 
 # ---------- S6: L3 冻结 ----------
 echo "--- S6: L3 冻结 ---"
-SCHED_STATE=/tmp/sched_coloc_s6 SCHED_FAKE_GPUS="0:24" $PY - <<'EOF'
+S6=/tmp/sched_coloc_s6; rm -rf $S6; mkdir -p $S6
+SCHED_STATE=$S6 SCHED_FAKE_GPUS="0:24" $PY - <<'EOF'
 import os, sys
 sys.path.insert(0, os.getcwd() + '/sched')
 import gsched.state as st
