@@ -176,6 +176,9 @@ class Dispatcher:
         moved = self.allocator.probe_free()
         for g in moved:
             self.log_line(f"unmanaged: GPU{g} 被外部占用/孤儿, 不派发")
+        restored = self.allocator.probe_unmanaged()
+        for g in restored:
+            self.log_line(f"unmanaged 自动恢复: GPU{g} 真实空闲 -> free")
         self._unlock_dependent_batches()
         self._settle_batch_status()  # P1: 批次终态收敛
         self._dispatch_ready_jobs()

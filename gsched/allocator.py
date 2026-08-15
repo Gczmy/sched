@@ -197,6 +197,35 @@ class Allocator:
         open(flag, "w").close()
         return False
 
+    def probe_unmanaged(self) -> list[int]:
+        """unmanaged 卡周期复查 (Q3 扩展): 物理真实空闲 (util==0) 连续 2 次采样
+        -> 自动回 free, 无需人工 gpu-free.
+
+        背景 (2026-08-15 排雷): 非 sched 外部进程占卡触发孤儿防线 (probe_free)
+        误判为 unmanaged 后, 外部进程退出但状态不恢复, GPU 永久空置 -> 曾需人工
+        sched gpu-free. 本函数让 unmanaged 卡在真实空闲后自动回到派发池.
+        边界: quarantined 卡不自动恢复 (P2 用户显式标记, 需 gpu-ok 解除).
+        """
+        moved: list[int] = []
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT idx FROM gpus WHERE status='unmanaged' AND quarantined=0"
+            ).fetchall()
+            for row in rows:
+                idx = row["idx"]
+                # 物理判据 (M8): util==0 视为无 compute 进程; fake 模式恒空闲 (验收用)
+                if not self.fake and self._util(idx) != 0:
+                    self._reset_confirm(idx)
+                    continue
+                # 与 settle_releasing 同确认 (M7): 连续 2 次采样才回 free (防抖动)
+                if self._confirm_release(idx):
+                    conn.execute(
+                        "UPDATE gpus SET status='free', job_id=NULL, updated_at=? WHERE idx=?",
+                        (now(), idx),
+                    )
+                    moved.append(idx)
+        return moved
+
     def probe_free(self) -> list[int]:
         """free 卡抽查: 有 compute 进程 或 util>0 -> unmanaged (孤儿防线)."""
         if self.fake:
