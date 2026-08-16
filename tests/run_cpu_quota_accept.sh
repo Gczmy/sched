@@ -30,7 +30,7 @@ run_batch() { # $1=state_dir  $2=config  $3=batch  -> daemon log 路径
   # fake 单卡 (SCHED_FAKE_GPUS 由 env 传入)
   env SCHED_STATE=$st SCHED_CONFIG=$cfg SCHED_FAKE_GPUS=0 \
       $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-  echo "$st/$(hostname)/scheduler.log"
+  echo "$st/testnode/scheduler.log"   # 定案 43 (P6): hostname() 读 config node
 }
 
 wait_done() { # $1=state_dir $2=batch_name  -> 轮询批次终态 (最多 30s)
@@ -160,7 +160,7 @@ export SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json
 $PY -m gsched.cli submit $S3/batch.json >/dev/null 2>&1
 env SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json SCHED_FAKE_GPUS=0,1,2,3 \
     $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-LOG=$S3/$(hostname)/scheduler.log
+LOG=$S3/testnode/scheduler.log
 sleep 3
 if grep -q "LAUNCH.*g0.*gpu=0" "$LOG" && grep -q "LAUNCH.*g1.*gpu=1" "$LOG" \
    && ! grep -q "LAUNCH.*g2" "$LOG"; then

@@ -14,7 +14,7 @@ import os
 import subprocess
 from typing import Any
 
-from .state import connect, get_gpu, now
+from .state import connect, get_gpu, now, release_gpu
 
 
 class Allocator:
@@ -264,7 +264,7 @@ class Allocator:
     def release(self, job_id: str) -> None:
         """任务 reap 时: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
         with connect() as conn:
-            state.release_gpu(conn, job_id)
+            release_gpu(conn, job_id)
 
     def settle_releasing(self) -> list[int]:
         """releasing 卡: compute 进程消失 -> free (连续 2 次采样, M7/M8).

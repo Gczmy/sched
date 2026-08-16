@@ -18,7 +18,7 @@ set -u
 cd "$(dirname "$0")/../.."   # 仓库根
 PY=${PY:-/Users/zzc/miniconda3/envs/vnpy_env/bin/python}
 ROOT=$(pwd)
-HOST=$(hostname)
+HOST=testnode   # 定案 43 (P6): hostname() 读 config node 字段, 测试 config 统一 node=testnode
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }

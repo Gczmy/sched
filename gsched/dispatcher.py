@@ -138,6 +138,14 @@ class Dispatcher:
                 os.unlink(self.pid_file)
             except OSError:
                 pass
+        # 定案 38 "优雅退出 = 停心跳+清锁" (2026-08-16 修): idle 退出/stop 必须删
+        # heartbeat 文件, 否则 is_running() 看 mtime<60s 仍判 alive -> submit 不
+        # 触发拉起 (6b 场景: 任务 pending 无人派发). 崩溃路径不删 (60s 自然过期).
+        if os.path.exists(self.heartbeat_file):
+            try:
+                os.unlink(self.heartbeat_file)
+            except OSError:
+                pass
 
     def stop(self) -> None:
         """daemon stop: 未完成任务标 cancelled 收尾 (N11)."""
@@ -674,6 +682,36 @@ class Dispatcher:
                 if row and row["peak_gib"]:
                     task_vram = max(task_vram, float(row["peak_gib"]))
             safety = float(self.cfg.get("co_locate_safety", 0.7))
+        # 独占任务: 第一张 free 卡 (现状语义, 定案 6 每卡独占)
+        if not gpu_share:
+            for idx in self.allocator.gpu_list:
+                row = conn.execute(
+                    "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
+                ).fetchone()
+                if not row or row["quarantined"]:
+                    continue
+                if row["status"] == "free":
+                    conn.execute(
+                        "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
+                        (job_id, state.now(), idx),
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
+                        " VALUES (?,?,?,?)",
+                        (idx, job_id, task_vram, state.now()),
+                    )
+                    return idx
+            return None
+
+        # 共享任务: Least-Loaded 装箱 (定案 40, 2026-08-16).
+        #   动机: First-Fit 会把轻任务全堆 GPU0 (raft 峰值 0.3-0.6GiB 摸不到显存
+        #   约束, 仅靠任务数上限换卡) -> GPU0 满载 GPU1/2/3 空转. 改为候选
+        #   (free ∪ 有余量 assigned) 中选 vram_used 最小的一张, 轻任务均匀分散
+        #   到全部卡; 平局取最小 idx (确定性, 与定案 2 声明顺序一致).
+        #   独占卡 (gpu_jobs 含 vram_gib IS NULL 行) 视为满: 独占占整卡不可再装箱,
+        #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
+        best_idx: int | None = None
+        best_used = float("inf")
         for idx in self.allocator.gpu_list:
             row = conn.execute(
                 "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
@@ -681,21 +719,16 @@ class Dispatcher:
             if not row or row["quarantined"]:
                 continue
             if row["status"] == "free":
-                # 独占 / 共享都可用 free 卡
-                conn.execute(
-                    "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
-                    (job_id, state.now(), idx),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
-                    " VALUES (?,?,?,?)",
-                    (idx, job_id, task_vram, state.now()),
-                )
-                return idx
-            if row["status"] == "assigned" and gpu_share:
-                # 共享: 装箱约束 (显存 + CPU 同查 + 任务数上限 + 冻结)
+                used = 0.0
+            elif row["status"] == "assigned":
                 if idx in self._frozen_gpus:
                     continue
+                excl = conn.execute(
+                    "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=? AND vram_gib IS NULL",
+                    (idx,),
+                ).fetchone()
+                if excl and excl["n"]:
+                    continue  # 卡上有独占任务, 占整卡
                 cap = self.allocator.mem_total(idx)
                 if cap <= 0:
                     continue  # 容量未知: 不冒险共享
@@ -706,15 +739,28 @@ class Dispatcher:
                     self.cfg.get("co_locate_max_jobs", 3)
                 ):
                     continue
-                # 镜像列语义 (首个 assign 为镜像): 已有镜像不动, 新 job 只加 gpu_jobs 行
-                conn.execute(
-                    "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
-                    " VALUES (?,?,?,?)",
-                    (idx, job_id, task_vram, state.now()),
-                )
-                return idx
-        return None
-        return None
+            else:
+                continue
+            if used < best_used:
+                best_used = used
+                best_idx = idx
+        if best_idx is None:
+            return None
+        srow = conn.execute(
+            "SELECT status FROM gpus WHERE idx=?", (best_idx,)
+        ).fetchone()
+        if srow["status"] == "free":
+            conn.execute(
+                "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
+                (job_id, state.now(), best_idx),
+            )
+        # 镜像列语义 (首个 assign 为镜像): 已有镜像不动, 新 job 只加 gpu_jobs 行
+        conn.execute(
+            "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
+            " VALUES (?,?,?,?)",
+            (best_idx, job_id, task_vram, state.now()),
+        )
+        return best_idx
 
     def _release_in_tx(self, conn, job_id: str) -> None:
         """事务内释放: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
