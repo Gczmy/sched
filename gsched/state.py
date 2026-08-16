@@ -169,6 +169,46 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def release_gpu(conn: sqlite3.Connection, job_id: str) -> None:
+    """事务内多归属计数释放 (§3.2e B). 调用方持有事务 (WAL 串行).
+
+    DELETE gpu_jobs 行 -> 卡还有 co-tenant? 有 = 保持 assigned (不误杀);
+    无 = 转 releasing (最后任务结束, 等进程离场). 幂等: 重复调用无害
+    (gpu_jobs 无行 -> 回退镜像反查, 找不到也无操作)。
+    """
+    gpu = conn.execute(
+        "SELECT gpu_id FROM gpu_jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+    conn.execute("DELETE FROM gpu_jobs WHERE job_id=?", (job_id,))
+    if gpu is None:
+        # 无 gpu_jobs 行 (历史/异常): 回退旧逻辑 (镜像列反查)
+        conn.execute(
+            "UPDATE gpus SET status='releasing', job_id=NULL, updated_at=? "
+            "WHERE job_id=?",
+            (now(), job_id),
+        )
+        return
+    idx = gpu["gpu_id"]
+    remain = conn.execute(
+        "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=?", (idx,)
+    ).fetchone()["n"]
+    if remain > 0:
+        # 还有 co-tenant: 保持 assigned, 镜像改指剩余任一 job
+        other = conn.execute(
+            "SELECT job_id FROM gpu_jobs WHERE gpu_id=? LIMIT 1", (idx,)
+        ).fetchone()
+        conn.execute(
+            "UPDATE gpus SET job_id=?, updated_at=? WHERE idx=?",
+            (other["job_id"], now(), idx),
+        )
+    else:
+        conn.execute(
+            "UPDATE gpus SET status='releasing', job_id=NULL, updated_at=? "
+            "WHERE idx=?",
+            (now(), idx),
+        )
+
+
 # ---------- 批次 ----------
 
 def insert_batch(

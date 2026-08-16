@@ -839,6 +839,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                     finished_at=state.now(),
                 )
                 print(f"{j['id']} 已自然结束, 标记 cancelled")
+            # 立即释放 GPU (排雷 2026-08-16): 不能只依赖 daemon reap ——
+            # daemon idle 超时退出后, cancelled 任务会残留 assigned 孤儿卡
+            # (本次 GPU1 事故: patchtst_s2024 cancel 后卡永久占用)。事务内
+            # 释放 (复用 state.release_gpu, 幂等: daemon reap 重复调用无害)。
+            if j["gpu"] is not None:
+                state.release_gpu(conn, j["id"])
             n += 1
         for j in pendings:
             # 排队中未启动: 无进程可杀, 直接标终态 (daemon 不再派发)

@@ -717,37 +717,8 @@ class Dispatcher:
         return None
 
     def _release_in_tx(self, conn, job_id: str) -> None:
-        """事务内释放: 多归属计数释放 (§3.2e B). 返回该 job 是否转 releasing."""
-        gpu = conn.execute(
-            "SELECT gpu_id FROM gpu_jobs WHERE job_id=?", (job_id,)
-        ).fetchone()
-        conn.execute("DELETE FROM gpu_jobs WHERE job_id=?", (job_id,))
-        if gpu is None:
-            conn.execute(
-                "UPDATE gpus SET status='releasing', job_id=NULL, updated_at=? "
-                "WHERE job_id=?",
-                (state.now(), job_id),
-            )
-            return
-        idx = gpu["gpu_id"]
-        remain = conn.execute(
-            "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=?", (idx,)
-        ).fetchone()["n"]
-        if remain > 0:
-            # 还有 co-tenant: 保持 assigned, 镜像改指剩余任一 job
-            other = conn.execute(
-                "SELECT job_id FROM gpu_jobs WHERE gpu_id=? LIMIT 1", (idx,)
-            ).fetchone()
-            conn.execute(
-                "UPDATE gpus SET job_id=?, updated_at=? WHERE idx=?",
-                (other["job_id"], state.now(), idx),
-            )
-        else:
-            conn.execute(
-                "UPDATE gpus SET status='releasing', job_id=NULL, updated_at=? "
-                "WHERE idx=?",
-                (state.now(), idx),
-            )
+        """事务内释放: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
+        state.release_gpu(conn, job_id)
 
     def _launch_job(self, conn, j, gpu: int | None) -> None:
         spec = json.loads(self._get_task_spec(conn, j) or "{}")
