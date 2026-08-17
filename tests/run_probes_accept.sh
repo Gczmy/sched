@@ -174,6 +174,43 @@ wait_status $S4 p4 failed 1 40 && ok "无 probes 任务正常收敛 (rc 路径, 
   || bad "未收敛 (got $(count_status $S4 p4 failed) failed)"
 stop_daemon $S4
 
+# ---------- 场景 5: SIGKILL 升级 (L3) ----------
+# 任务忽略 SIGTERM: probe kill 发 SIGTERM 无效 -> daemon 逐轮 SIGKILL 升级
+# -> 进程真实死亡 (不与 cancel 脱节, 防占卡直至 releasing 超时)
+echo "--- 场景 5: probe SIGKILL 升级 (进程忽略 SIGTERM) ---"
+S5=/tmp/sched_prb5; rm -rf $S5; mkdir -p $S5
+mk_config $S5
+cat > $S5/batch.json << EOF
+{
+  "name": "p5", "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import signal,time,os; signal.signal(signal.SIGTERM, signal.SIG_IGN); open('$S5/pid.txt','w').write(str(os.getpid())); print('FATAL Traceback', flush=True); time.sleep(120)"],
+     "duration_min": 5, "max_retry": 0,
+     "probes": {"fail_on_log": "Traceback"}}
+  ]
+}
+EOF
+export SCHED_STATE=$S5 SCHED_CONFIG=$S5/config.json
+$PY -m gsched.cli submit $S5/batch.json >/dev/null 2>&1 || { bad "p5 submit 失败"; exit 1; }
+SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
+wait_status $S5 p5 blocked 1 40 && ok "fail_on_log 命中 -> blocked (忽略 SIGTERM 的任务)" \
+  || bad "未 blocked (got blocked=$(count_status $S5 p5 blocked))"
+# SIGKILL 升级: 等 1-2 轮 tick 后进程应真实死亡 (忽略 SIGTERM 也逃不掉 SIGKILL)
+PID="$(cat $S5/pid.txt 2>/dev/null)"
+DEAD=0
+if [ -n "$PID" ]; then
+  for _ in $(seq 1 25); do
+    # 用 ps stat 而非 kill -0: SIGKILL 后进程成 zombie (父 daemon 未 reap),
+    # kill -0 对 zombie 仍返回 0 -> 误判存活。zombie 不再执行/占卡, 视为已杀。
+    ST=$(ps -o stat= -p "$PID" 2>/dev/null | tr -d ' ')
+    if [ -z "$ST" ] || [ "${ST#Z}" != "$ST" ]; then DEAD=1; break; fi
+    sleep 1
+  done
+fi
+[ "$DEAD" = "1" ] && ok "SIGKILL 升级生效: 忽略 SIGTERM 的进程最终被杀 (pid=$PID)" \
+  || bad "进程未被 SIGKILL 升级杀死 (pid=$PID stat=$ST)"
+stop_daemon $S5
+
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" = "0" ]

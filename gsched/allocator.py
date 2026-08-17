@@ -437,8 +437,13 @@ class Allocator:
             ).fetchall()
             for row in rows:
                 idx = row["idx"]
-                # 物理判据 (M8): util==0 视为无 compute 进程; fake 模式恒空闲 (验收用)
-                if not self.fake and self._util(idx) != 0:
+                # 物理判据 (M8): 与 probe_free 的孤儿判据精确对称 ——
+                # probe_free 用 util>0 OR compute-apps 有进程 判"被占", 这里用
+                # 其否定判"真实空闲"。只用 util!=0 会在"外部进程驻留显存但 util=0"
+                # 的场景永不恢复 (不对称 bug, 审查 B2); fake 模式恒空闲 (验收用)。
+                if not self.fake and (
+                    self._util(idx) != 0 or self._card_has_compute(idx)
+                ):
                     self._reset_confirm(idx)
                     continue
                 # 与 settle_releasing 同确认 (M7): 连续 2 次采样才回 free (防抖动)
@@ -474,19 +479,6 @@ class Allocator:
                         )
                         moved.append(idx)
         return moved
-
-    def _confirm_occupied(self, idx: int) -> bool:
-        marker = os.path.join(
-            os.environ.get("SCHED_STATE", os.path.expanduser("~/.sched")),
-            "occupied_confirm",
-        )
-        os.makedirs(marker, exist_ok=True)
-        flag = os.path.join(marker, f"gpu{idx}")
-        if os.path.exists(flag):
-            os.unlink(flag)
-            return True
-        open(flag, "w").close()
-        return False
 
     def available_gpus(self) -> list[int]:
         """当前 free 卡 (派发候选). 注册表权威."""

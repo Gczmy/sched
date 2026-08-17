@@ -662,7 +662,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         # P4: running 任务进度列 (从日志尾部 best-effort 解析 epoch/trial)
         prog = ""
         if j["status"] == "running":
-            p = _job_progress(j["batch"], j["task"])
+            p = _job_progress(j["batch"], j["task"], j["version"])
             if p:
                 prog = f" {p}"
         fail = f" ({j['failure']})" if j["failure"] else ""
@@ -1060,13 +1060,15 @@ def _task_cpus_of(resources: dict, cfg: dict) -> int:
     return int(cfg.get("gpu_job_cpus", 8))
 
 
-def _job_progress(batch_id: str, task_id: str) -> str | None:
+def _job_progress(batch_id: str, task_id: str, version: int) -> str | None:
     """P4: running 任务进度 (从日志尾部解析 epoch/trial, best-effort).
 
-    日志路径与 dispatcher._job_log_path 同构: {STATE}/{host}/logs/{batch}/{task}.log.
+    日志路径与 dispatcher._job_log_path 同构: {STATE}/{host}/logs/{batch}/{task}-v{version}.log
+    (审查 L1: 带 version 防 resubmit 新版本覆盖旧日志).
     """
     log_path = os.path.join(
-        state.default_state_dir(), state.hostname(), "logs", batch_id, f"{task_id}.log"
+        state.default_state_dir(), state.hostname(), "logs", batch_id,
+        f"{task_id}-v{version}.log",
     )
     if not os.path.exists(log_path):
         return None
@@ -1206,8 +1208,17 @@ def _tail_n(path: str, n: int) -> list[str]:
 def cmd_log(args: argparse.Namespace) -> int:
     """sched log <batch>:<task> [-f] [-n N]: tail 任务日志 (纯 stdlib, 无 subprocess)."""
     batch, task = _resolve_task_ref(args.task)
+    # 审查 L1: 取最新版本构造带版本日志路径 (与 dispatcher._job_log_path 一致)
+    with state.connect() as conn:
+        row = conn.execute(
+            "SELECT version FROM jobs WHERE batch_id=? AND task_id=?"
+            " ORDER BY version DESC LIMIT 1",
+            (batch, task),
+        ).fetchone()
+    version = row["version"] if row else 1
     log_path = os.path.join(
-        state.default_state_dir(), state.hostname(), "logs", batch, f"{task}.log"
+        state.default_state_dir(), state.hostname(), "logs", batch,
+        f"{task}-v{version}.log",
     )
     if not os.path.exists(log_path):
         print(f"日志不存在: {log_path}", file=sys.stderr)

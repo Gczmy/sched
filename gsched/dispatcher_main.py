@@ -37,9 +37,13 @@ def main() -> int:
     d = Dispatcher(cfg, fake=fake)
 
     def _sigterm(signum, frame):
-        print("[daemon] SIGTERM 收尾: 未完成任务标 cancelled")
-        d.stop()
-        sys.exit(0)
+        # 审查 B1: 信号处理器绝不直接 d.stop() —— SIGTERM 可能落在主循环任一
+        # `with state.connect()` 块内 (每 tick 都持事务), stop() 嵌套开连接会
+        # database is locked (WAL 单写者) 炸出 handler, 导致 running 任务未标
+        # cancelled、GPU 卡残留 assigned (与 N11 事故同族). 只置标志, 主循环
+        # 在 tick 边界 (任何 connect() 块之外) 执行收尾.
+        print("[daemon] SIGTERM: 请求优雅停止 (主循环 tick 边界收尾)")
+        d.request_stop()
 
     signal.signal(signal.SIGTERM, _sigterm)
     signal.signal(signal.SIGINT, _sigterm)

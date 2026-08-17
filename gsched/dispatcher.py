@@ -64,6 +64,13 @@ class Dispatcher:
         self._frozen_gpus: set[int] = set()
         self._last_freeze_sample = 0.0
         self._co_locate = bool(cfg.get("co_locate", False))
+        # 审查 B1: 优雅停止请求标志 (信号处理器只置此标志, 主循环 tick 边界消费).
+        # 内存态 (无跨进程语义), SIGTERM/SIGINT handler 调用 request_stop().
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        """信号处理器入口: 只置标志 (绝不在 handler 里开 DB 连接)."""
+        self._stop_requested = True
 
     def log_line(self, msg: str) -> None:
         line = f"[{state.now()}] {msg}"
@@ -153,23 +160,37 @@ class Dispatcher:
                 pass
 
     def stop(self) -> None:
-        """daemon stop: 未完成任务标 cancelled 收尾 (N11)."""
-        with state.connect() as conn:
-            running = state.all_jobs(conn)
-            for j in running:
-                if j["status"] == "running":
-                    if j["pgid"]:
-                        self.executor.kill_pgid(j["pgid"])
-                    state.update_job(
-                        conn, j["id"], status="cancelled", kill_reason="cancelled",
-                        finished_at=state.now(),
-                    )
-                    # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
-                    # (assigned -> releasing), 否则 cancelled 任务残留 assigned
-                    # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
-                    # 多归属 (定案 36 + §3.2e B): 计数释放, co-tenant 不误杀
-                    if j["gpu"] is not None:
-                        self._release_in_tx(conn, j["id"])
+        """daemon stop: 未完成任务标 cancelled 收尾 (N11).
+
+        审查 B1: 主循环 tick 边界调用 (任何 connect() 块之外), 不再由信号
+        handler 嵌套调用; 锁冲突 (database is locked) 短暂重试兜底, 防与
+        同轮其他连接竞争。幂等: 重复调用无害 (无 running 任务则空转)。
+        """
+        import sqlite3 as _sq
+
+        for attempt in range(3):
+            try:
+                with state.connect() as conn:
+                    for j in state.all_jobs(conn):
+                        if j["status"] == "running":
+                            if j["pgid"]:
+                                self.executor.kill_pgid(j["pgid"])
+                            state.update_job(
+                                conn, j["id"], status="cancelled", kill_reason="cancelled",
+                                finished_at=state.now(),
+                            )
+                            # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
+                            # (assigned -> releasing), 否则 cancelled 任务残留 assigned
+                            # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
+                            # 多归属 (定案 36 + §3.2e B): 计数释放, co-tenant 不误杀
+                            if j["gpu"] is not None:
+                                self._release_in_tx(conn, j["id"])
+                break
+            except _sq.OperationalError as e:
+                if attempt == 2 or "locked" not in str(e):
+                    self.log_line(f"stop 收尾失败: {e}")
+                    break
+                time.sleep(1)
         self._cleanup_lock()
 
     # ---------- 主循环 ----------
@@ -191,6 +212,10 @@ class Dispatcher:
         while True:
             try:
                 self._heartbeat()
+                if self._stop_requested:
+                    self.log_line("收到停止请求 (tick 边界), 收尾未完成任务")
+                    self.stop()
+                    break
                 if self._idle_check():
                     break
                 self._tick()
@@ -200,7 +225,13 @@ class Dispatcher:
                 self.log_line(f"tick 异常: {e}")
             if once:
                 break
-            time.sleep(POLL_SEC)
+            # B1: 可中断 sleep —— time.sleep(POLL_SEC) 被信号打断后 PEP 475 自动
+            # 续睡, SIGTERM 要等满整轮才被响应 (daemon stop CLI 10s 超时 SIGKILL,
+            # 任务没收尾). 拆成 1s 片逐片查停止标志, 停止延迟 ≤1s.
+            for _ in range(POLL_SEC):
+                if self._stop_requested:
+                    break
+                time.sleep(1)
         self._cleanup_lock()
 
     def _idle_check(self) -> bool:
@@ -444,12 +475,15 @@ class Dispatcher:
     def _check_probes(self) -> None:
         """L6 probes 日志门控 (§3.4d R3): 运行中任务按声明匹配日志模式.
 
-        - fail_on_log 命中: 组级 kill -> 标 failed (failure='probe') -> blocked
-          (probe 命中视为确定失败, 不 retry); 交 reap 释放 GPU
-        - ready_on_log 命中: 组级 kill -> 标 done (产物校验仍执行, 失败降级
+        - fail_on_log 命中: 组级 kill -> 直接 blocked (failure='probe', 不 retry)
+          (probe 命中视为确定失败)
+        - ready_on_log 命中: 组级 kill -> done (产物校验仍执行, 失败降级
           failed —— probe 只是"看起来成功", 产物才是最终裁判)
         - kill 用 killpg (组级), 与 cancel 同机制; 状态先行写入使 reap 按
           kill_reason/终态收尾, 不误判为 rc 失败
+        - SIGKILL 升级 (审查 L3): 已触发 kill 的 job (kill_reason='probe') 若
+          pgid 仍存活 -> 逐轮 SIGKILL, 与 cancel 的升级语义对齐 (防进程忽略
+          SIGTERM 占卡直至 releasing 超时)
         """
         with state.connect() as conn:
             for j in state.all_jobs(conn):
@@ -496,6 +530,12 @@ class Dispatcher:
                     else:
                         self._consume_profile(conn, j, spec)
                     self._release_gpu_for_job(conn, j)
+            # L3: SIGKILL 升级 —— probe kill 已触发但进程忽略 SIGTERM 仍存活
+            # (终态 done/blocked 的 job 不会再进上面的 running 循环, 在此补杀)
+            for j in state.all_jobs(conn):
+                if j["kill_reason"] == "probe" and j["pgid"] and self.executor.alive(j["pgid"]):
+                    self.log_line(f"probe kill 升级: job {j['id']} SIGTERM 未生效 -> SIGKILL")
+                    self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
 
     def _reap_finished_jobs(self) -> None:
         with state.connect() as conn:
@@ -797,10 +837,12 @@ class Dispatcher:
     def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None) -> int | None:
         """事务内 assign (定案 39 L2 共享装箱).
 
-        独占任务 (gpu_share 缺省 false): free 卡 -> assigned (现状语义).
+        独占任务 (gpu_share 缺省 false): free 卡 -> assigned (现状语义);
+        声明 resources.vram_gib 时跳过容量不足的卡 (异构适配, 定案 46 B).
         共享任务 (gpu_share=true 且 config co_locate=true): free 卡 ∪ 有余量的
         assigned 卡 (SUM(vram_gib)+新任务 ≤ co_locate_safety×容量 且 未冻结 且
-        每卡任务数 < co_locate_max_jobs) -> First-Fit 选卡.
+        每卡任务数 < co_locate_max_jobs) -> **归一化负载选卡 (min
+        (used+task_vram)/cap, 定案 46 A; 非 First-Fit)**.
         组合缺格 (gpu_share=true × co_locate=false): 按独占跑 + 告警 (声明是意愿,
         全局开关是许可). 鲸鱼排除: vram_gib > safety×容量 -> 返回 None (装箱必失败,
         由调用方按无卡处理).
@@ -1032,8 +1074,10 @@ class Dispatcher:
         return row["spec"] if row else None
 
     def _job_log_path(self, j) -> str:
+        # 审查 L1: 带 version —— resubmit 新版本不再覆盖旧 job 日志
+        # (否则 log -f/probes/diag 读到串扰内容)。
         return os.path.join(
-            self.host_dir, "logs", j["batch_id"], f"{j['task_id']}.log"
+            self.host_dir, "logs", j["batch_id"], f"{j['task_id']}-v{j['version']}.log"
         )
 
     def _check_artifacts(self, artifacts: dict, cwd: str) -> bool:
