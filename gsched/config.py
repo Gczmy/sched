@@ -28,6 +28,43 @@ def default_state_dir() -> str:
     return os.environ.get("SCHED_STATE", DEFAULT_STATE_DIR)
 
 
+def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float]]:
+    """归一化 config.gpus -> (卡号列表, 显存覆盖表 idx->GiB).
+
+    支持两种形态 (向后兼容):
+      [0, 1, 2, 3]                       纯卡号 (显存自动探测)
+      [{"idx": 0, "mem_gib": 24}, ...]  带显存覆盖 (不写 mem_gib 或缺省 -> 自动探测)
+    mem_gib 语义 = 该卡总容量 (GiB), 覆盖 daemon 启动 nvidia-smi 探测值
+    (手动配置异构卡容量 / 无 nvidia-smi 的环境用).
+    """
+    raw = cfg.get("gpus") or []
+    idxs: list[int] = []
+    mem: dict[int, float] = {}
+    for g in raw:
+        if isinstance(g, dict):
+            idx = g.get("idx")
+            if idx is None or not isinstance(idx, int) or isinstance(idx, bool):
+                raise ConfigError(f"gpus 对象形态必须有整数 idx: {g}")
+            idxs.append(idx)
+            m = g.get("mem_gib")
+            if m is not None:
+                if not isinstance(m, (int, float)) or isinstance(m, bool) or m <= 0:
+                    raise ConfigError(f"gpus[{idx}].mem_gib 必须 > 0 的数字 (GiB): {g}")
+                mem[idx] = float(m)
+        else:
+            if not isinstance(g, int) or isinstance(g, bool):
+                raise ConfigError(f"gpus 必须是卡号整数数组或 {idx} 对象数组: {g}")
+            idxs.append(g)
+    # 去重保序 (同一卡重复声明 -> 后者覆盖显存, 卡号只留一个)
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for i in idxs:
+        if i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    return uniq, mem
+
+
 def config_path() -> str:
     """config.json 路径: SCHED_CONFIG 覆盖 > {STATE}/config.json."""
     if os.environ.get("SCHED_CONFIG"):
@@ -70,6 +107,10 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         v = cfg.get(k)
         if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < min_v):
             raise ConfigError(f"{p}: {k} 必须是整数且 >= {min_v}")
+    # gpus 归一化校验 (两种形态, 2026-08-17): 纯卡号数组向后兼容;
+    # 对象数组 {idx, mem_gib} 支持显存覆盖 (异构卡容量/无 nvidia-smi 环境)
+    if "gpus" in cfg and cfg["gpus"] is not None:
+        parse_gpus(cfg)  # 抛 ConfigError = 非法
     # co-location (定案 39 待定项 4, 实验性默认关):
     #   co_locate: bool 全局开关; co_locate_safety 安全系数 [0.5,0.85] 默认 0.7;
     #   co_locate_max_jobs 每卡任务数上限 [2,8] 默认 3; co_locate_freeze_pct L3 冻结阈值 (0,100) 默认 85

@@ -45,8 +45,13 @@ class Dispatcher:
             os.path.join(self.host_dir, "scheduler.log"), "a", encoding="utf-8"
         )
         self.executor = Executor()
+        # gpus 归一化 (2026-08-17 缺口 1/2): 纯卡号数组或 {idx,mem_gib} 对象数组;
+        # config 未配 -> Allocator 自动探测全卡 (定案 1 第三级回退)
+        from .config import parse_gpus
+
+        gpu_list, mem_overrides = parse_gpus(cfg)
         self.allocator = Allocator(
-            gpu_list=cfg.get("gpus") or [], fake=fake
+            gpu_list=gpu_list, fake=fake, mem_overrides=mem_overrides,
         )
         # venv 路径映射 (指纹用)
         self.venv_paths = cfg.get("venvs", {})

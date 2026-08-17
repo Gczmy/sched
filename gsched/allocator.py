@@ -18,8 +18,14 @@ from .state import connect, get_gpu, now, release_gpu
 
 
 class Allocator:
-    def __init__(self, gpu_list: list[int], fake: bool = False):
+    def __init__(
+        self,
+        gpu_list: list[int],
+        fake: bool = False,
+        mem_overrides: dict[int, float] | None = None,
+    ):
         self.gpu_list = gpu_list  # 配置集 (D3: 实际可用集 = 配置集 - quarantine)
+        self.mem_overrides = mem_overrides or {}  # config.gpus[{idx,mem_gib}] 手动覆盖
         self.fake = fake or bool(os.environ.get("SCHED_FAKE_GPUS"))
         self._uuid_map: dict[str, int] | None = None  # gpu_uuid->idx 缓存 (M8, 建一次)
         if self.fake:
@@ -36,19 +42,44 @@ class Allocator:
             if not idxs:
                 idxs = [0]
             self.gpu_list = idxs
+        elif not self.gpu_list:
+            # 缺口 2 (2026-08-17): config 未配 gpus -> 自动探测全卡
+            # (定案 1 第三级回退, 之前文档写了但代码没实现)
+            self.gpu_list = self._detect_gpus()
+
+    def _detect_gpus(self) -> list[int]:
+        """自动探测全卡 (nvidia-smi -L). 无 nvidia-smi/失败 -> 空 (纯 CPU)."""
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10,
+            )
+            idxs = []
+            for line in out.stdout.splitlines():
+                head = line.split(":", 1)[0].strip()
+                if head.startswith("GPU ") and head[4:].isdigit():
+                    idxs.append(int(head[4:]))
+            return idxs
+        except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+            return []
 
     # ---------- 容量 (定案 39 待定项 4: 容量来源 daemon 启动探测) ----------
 
     def probe_capacity(self) -> None:
         """daemon 启动时探测每卡总容量 (GiB) 缓存进 gpus.mem_total_gib.
 
-        fake 模式: SCHED_FAKE_GPUS 可带 "idx:mem" (如 "0:24,1:24"), 缺省 24 GiB.
-        真实: nvidia-smi --query-gpu=memory.total (MiB / 1024 = GiB).
+        优先级 (2026-08-17 缺口 1): config.gpus[{idx,mem_gib}] 手动覆盖 >
+        fake SCHED_FAKE_GPUS "idx:mem" > nvidia-smi 探测 (MiB/1024 = GiB).
+        覆盖场景: 异构卡容量手动指定 / 无 nvidia-smi 环境 (容量进 DB 供装箱).
         """
         with connect() as conn:
+            if self.mem_overrides:
+                for idx, mem in self.mem_overrides.items():
+                    conn.execute(
+                        "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (mem, idx)
+                    )
             if self.fake:
                 for idx in self.gpu_list:
-                    mem = self._fake_mem.get(idx, 24.0)
+                    mem = self.mem_overrides.get(idx, self._fake_mem.get(idx, 24.0))
                     conn.execute(
                         "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (mem, idx)
                     )
@@ -64,7 +95,7 @@ class Allocator:
                     if len(parts) != 2:
                         continue
                     idx, mi = int(parts[0].strip()), int(parts[1].strip())
-                    if idx in self.gpu_list:
+                    if idx in self.gpu_list and idx not in self.mem_overrides:
                         conn.execute(
                             "UPDATE gpus SET mem_total_gib=? WHERE idx=?",
                             (round(mi / 1024.0, 1), idx),

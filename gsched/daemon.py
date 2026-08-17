@@ -202,7 +202,9 @@ def check(fake: bool = False) -> list[dict[str, str]]:
 
     # nvidia-smi (2026-08-15: CPU-only 环境降级) —— config.gpus 空 = 纯 CPU 部署,
     # 无 GPU 需求时 nvidia-smi 缺失合法 (warn); 声明了 GPU 但本机无 nvidia-smi 才 fail
-    gpus = cfg.get("gpus") or []
+    from .config import parse_gpus
+
+    gpus, _ = parse_gpus(cfg)
     if fake:
         add("nvidia-smi", "fake 模式跳过", "ok")
     elif shutil.which("nvidia-smi"):

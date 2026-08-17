@@ -1213,13 +1213,37 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_list_gpus(args: argparse.Namespace) -> int:
+    """GPU 状态视图 (2026-08-17 缺口 3: 加显存列 mem_total_gib)."""
     with state.connect() as conn:
         rows = conn.execute("SELECT * FROM gpus ORDER BY idx").fetchall()
         for g in rows:
             q = " (QUARANTINED)" if g["quarantined"] else ""
+            mem = g["mem_total_gib"]
+            mem_s = f"{float(mem):.1f}GiB" if mem else "mem=?"
             print(
-                f"GPU{g['idx']} [{g['status']:<10}] job={g['job'] or '-'}{q}"
+                f"GPU{g['idx']} [{g['status']:<10}] {mem_s:>8} job={g['job_id'] or '-'}{q}"
             )
+    return 0
+
+
+def cmd_gpu_set_mem(args: argparse.Namespace) -> int:
+    """sched gpu-set-mem <idx> <gib>: 运行时覆盖该卡容量 (GiB).
+
+    config.gpus[{idx,mem_gib}] 是启动时覆盖 (daemon 重启后探测覆盖); 本命令
+    立即生效, 适合临时改容量 (如共享装箱余量调整) 不重启 daemon.
+    """
+    if args.gib <= 0:
+        print(f"错误: mem_gib 必须 > 0 (got {args.gib})", file=sys.stderr)
+        return 1
+    with state.connect() as conn:
+        row = conn.execute("SELECT * FROM gpus WHERE idx=?", (args.idx,)).fetchone()
+        if not row:
+            print(f"错误: GPU{args.idx} 不在配置集 (sched list-gpus 查看)", file=sys.stderr)
+            return 1
+        conn.execute(
+            "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (float(args.gib), args.idx)
+        )
+        print(f"GPU{args.idx} 容量已设为 {float(args.gib):.1f} GiB (下次 daemon 重启探测会覆盖, 如需持久化改 config.gpus)")
     return 0
 
 
@@ -1356,8 +1380,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-n", type=int, default=20)
     p.set_defaults(fn=cmd_log)
 
-    p = sub.add_parser("list-gpus", help="GPU 状态视图")
+    p = sub.add_parser("list-gpus", help="GPU 状态视图 (含显存)")
     p.set_defaults(fn=cmd_list_gpus)
+
+    p = sub.add_parser("gpu-set-mem", help="运行时覆盖 GPU 容量 (GiB)")
+    p.add_argument("idx", type=int)
+    p.add_argument("gib", type=float)
+    p.set_defaults(fn=cmd_gpu_set_mem)
 
     p = sub.add_parser("gpu-ok", help="解除 quarantine")
     p.add_argument("idx", type=int)
