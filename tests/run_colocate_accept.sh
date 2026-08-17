@@ -61,7 +61,7 @@ al.release('job1')  # 最后任务结束 -> releasing
 with st.connect() as conn:
     g = conn.execute("SELECT status FROM gpus WHERE idx=0").fetchone()
     assert g['status'] == 'releasing', g['status']
-assert al.settle_releasing() == [0]  # fake settle -> free
+assert al.settle_releasing() == ([0], [])  # fake settle -> free
 print('S1/S2 OK')
 # S3: Least-Loaded 装箱 (定案 40): 同大小任务均匀分散, 平局取最小 idx
 #   a0->0 (全 free 平局取小), a1->1 (GPU1 更空), a2->0 (平局取小), a3->1,

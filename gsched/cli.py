@@ -529,6 +529,30 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     from .fingerprint import compute_fingerprint
 
+    if getattr(args, "dry_run", False):
+        # §G4 A 类 (与 submit 同一预览路径): 纯只读, 不 insert, 不拉起 daemon
+        norm = {
+            "name": batch_name,
+            "tasks": [task_spec],
+            "depends_on": [],
+        }
+        prev = _dry_run_preview(norm, cfg)
+        print(f"=== dry-run: {batch_name} (1 任务, mode=mix) ===")
+        for pt in prev["tasks"]:
+            tag = "SKIP" if pt["skip"] else "RUN "
+            print(f"  [{tag}] {pt['id']}")
+            for sp in pt["stages"]:
+                st = "SKIP" if sp["skip"] else "RUN "
+                print(f"      stage{sp['stage']} [{st}] {sp['reason']}")
+            flat = pt["cmd_flat"]
+            shown = flat[:120] + ("..." if len(flat) > 120 else "")
+            print(f"      cmd: {shown}")
+        print("--- 汇总 ---")
+        print(f"  将跑 {prev['n_run']} / 将 skip {prev['n_skip']} / 共 1 任务")
+        if prev["git_rev"]:
+            print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
+        return 0
+
     with state.connect() as conn:
         state.insert_batch(
             conn, bid, batch_name, "mix", [], None, "{ROOT}", None
@@ -1334,6 +1358,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cwd", default=None, help="工作目录 (默认 {ROOT})")
     p.add_argument("--out", default=None, help="产物路径 (声明后 done 需产物存在)")
     p.add_argument("--venv", default=None, help="venv 语义名 (默认 config 第一个)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="预览不提交 (§G4 A 类: 展开命令 + skip 预测, 纯只读)")
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- 后的 shell 命令")
     p.set_defaults(fn=cmd_run)
 

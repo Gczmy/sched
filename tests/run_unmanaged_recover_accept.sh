@@ -478,20 +478,20 @@ def gpu_status():
 set_releasing()
 os.environ['SCHED_FAKE_COMPUTE_APPS'] = '0:111'
 assert al._card_has_compute(0) is True, al._card_has_compute(0)  # 残留框架进程
-assert al.settle_releasing() == []
+assert al.settle_releasing() == ([], [])
 assert gpu_status() == 'releasing', gpu_status()
 print('9a OK')
 # 9b: 外部进程 (pid 999 不属于任何已知 job) -> 判干净 -> free
 os.environ['SCHED_FAKE_COMPUTE_APPS'] = '0:999'
 assert al._card_has_compute(0) is False, al._card_has_compute(0)  # 外部进程
-assert al.settle_releasing() == [0]
+assert al.settle_releasing() == ([0], [])
 assert gpu_status() == 'free', gpu_status()
 print('9b OK')
 # 9c: 无进程 -> free (常规路径不受影响)
 set_releasing()
 os.environ['SCHED_FAKE_COMPUTE_APPS'] = ''
 assert al._card_has_compute(0) is False
-assert al.settle_releasing() == [0]
+assert al.settle_releasing() == ([0], [])
 assert gpu_status() == 'free', gpu_status()
 print('9c OK')
 print('M8_OK')

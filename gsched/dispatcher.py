@@ -259,8 +259,11 @@ class Dispatcher:
 
     def _tick(self) -> None:
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
+        self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
         self._reap_finished_jobs()
-        self.allocator.settle_releasing()
+        _freed, _to = self.allocator.settle_releasing()
+        for g in _to:
+            self._diag_unreleased(g)  # 事故记录 4 建议 3: 超时未释放 -> 诊断输出
         self._l3_freeze_sample()
         moved = self.allocator.probe_free()
         for g in moved:
@@ -438,6 +441,62 @@ class Dispatcher:
                 self.log_line(f"cancel req {r['id']}: job {j['id']} killpg SIGTERM (pgid={pgid})")
                 # 请求本轮不 finish: 下轮 tick 复查, 仍存活则 SIGKILL 升级
 
+    def _check_probes(self) -> None:
+        """L6 probes 日志门控 (§3.4d R3): 运行中任务按声明匹配日志模式.
+
+        - fail_on_log 命中: 组级 kill -> 标 failed (failure='probe') -> blocked
+          (probe 命中视为确定失败, 不 retry); 交 reap 释放 GPU
+        - ready_on_log 命中: 组级 kill -> 标 done (产物校验仍执行, 失败降级
+          failed —— probe 只是"看起来成功", 产物才是最终裁判)
+        - kill 用 killpg (组级), 与 cancel 同机制; 状态先行写入使 reap 按
+          kill_reason/终态收尾, 不误判为 rc 失败
+        """
+        with state.connect() as conn:
+            for j in state.all_jobs(conn):
+                if j["status"] != "running" or not j["pgid"]:
+                    continue
+                spec = json.loads(self._get_task_spec(conn, j) or "{}")
+                probes = spec.get("probes") or {}
+                fail_pat = probes.get("fail_on_log")
+                ready_pat = probes.get("ready_on_log")
+                if not fail_pat and not ready_pat:
+                    continue
+                log_path = self._job_log_path(j)
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    continue  # 日志未就绪, 下轮再查
+                if fail_pat and fail_pat in text:
+                    self.log_line(
+                        f"probe fail_on_log 命中: job {j['id']} ({fail_pat!r}) -> kill + blocked"
+                    )
+                    self.executor.kill_pgid(j["pgid"])
+                    # probe 命中视为确定失败: 不 retry, 直接 blocked (等人工)
+                    state.update_job(
+                        conn, j["id"], status="blocked", failure="probe",
+                        kill_reason="probe", finished_at=state.now(),
+                    )
+                    self._release_gpu_for_job(conn, j)
+                    continue
+                if ready_pat and ready_pat in text:
+                    self.log_line(
+                        f"probe ready_on_log 命中: job {j['id']} ({ready_pat!r}) -> kill + done"
+                    )
+                    self.executor.kill_pgid(j["pgid"])
+                    state.update_job(
+                        conn, j["id"], status="done", kill_reason="probe",
+                        finished_at=state.now(),
+                    )
+                    # ready 命中但产物校验不过 -> 降级 failed (probe 只是看起来成功)
+                    artifacts = spec.get("artifacts", {})
+                    if not self._check_artifacts(artifacts, spec.get("cwd_abs") or "."):
+                        self.log_line(f"job {j['id']} ready probe 但产物校验失败 -> 降级 failed")
+                        state.update_job(conn, j["id"], status="failed", failure="artifact")
+                    else:
+                        self._consume_profile(conn, j, spec)
+                    self._release_gpu_for_job(conn, j)
+
     def _reap_finished_jobs(self) -> None:
         with state.connect() as conn:
             for j in state.all_jobs(conn):
@@ -514,6 +573,33 @@ class Dispatcher:
         """assigned -> releasing (立即, B5). 多归属计数释放 (§3.2e B)."""
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
+
+    def _diag_unreleased(self, idx: int) -> None:
+        """事故记录 4 建议 3: releasing 冷却上限 (5min) 到期仍被占 -> 输出诊断.
+
+        真实环境: nvidia-smi 列出该卡 compute 进程 + 已知 job pgid 对照, 引导
+        人工清理 (kill -9). fake 模式: 只记录警告 (无真实 nvidia-smi).
+        """
+        if self.fake:
+            self.log_line(f"⚠️ releasing 超时: GPU{idx} 5min 冷却到期仍有 compute 进程 -> 转 unmanaged (fake)")
+            return
+        self.log_line(
+            f"⚠️ releasing 超时: GPU{idx} 5min 冷却到期仍有 compute 进程 -> 转 unmanaged. "
+            f"残留进程列表 (nvidia-smi):"
+        )
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid,process_name,gpu_uuid", "--format=csv,noheader", "-i", str(idx)],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in (out.stdout or "").strip().splitlines():
+                self.log_line(f"  {line.strip()}")
+            self.log_line(
+                f"  处置: 确认无价值进程后 kill -9 <pid> 清理, 卡会自动回 free "
+                f"(probe_unmanaged); 或 sched gpu-free {idx} 强制回 free"
+            )
+        except (subprocess.SubprocessError, ValueError, OSError):
+            self.log_line(f"  (nvidia-smi 查询失败, 请手动执行 nvidia-smi -i {idx}")
 
     # ---------- profile 消费 (定案 39 待定项 3, daemon 侧) ----------
 

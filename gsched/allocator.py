@@ -297,14 +297,18 @@ class Allocator:
         with connect() as conn:
             release_gpu(conn, job_id)
 
-    def settle_releasing(self) -> list[int]:
+    def settle_releasing(self) -> tuple[list[int], list[int]]:
         """releasing 卡: compute 进程消失 -> free (连续 2 次采样, M7/M8).
 
-        返回本轮转 free 的卡号. 5 分钟未释放 -> unmanaged (冷却上限).
+        返回 (freed, timeout) 两列表: freed = 本轮转 free 的卡号;
+        timeout = 冷却上限 (5min) 到期仍被占的卡号 (已转 unmanaged) ——
+        调用方 (dispatcher) 据此输出 nvidia-smi 进程列表诊断, 引导人工清理
+        (事故记录 4 修复建议 3).
         """
         import time as _t
 
         freed: list[int] = []
+        timeout: list[int] = []
         with connect() as conn:
             rows = conn.execute(
                 "SELECT idx, updated_at FROM gpus WHERE status='releasing'"
@@ -341,7 +345,8 @@ class Allocator:
                         conn.execute(
                             "DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,)
                         )
-        return freed
+                        timeout.append(idx)
+        return freed, timeout
 
     def _card_has_compute(self, idx: int) -> bool:
         """M8 主判据: 该卡是否有未离场的 compute 进程 (§3.2e C).
