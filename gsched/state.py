@@ -87,6 +87,20 @@ CREATE TABLE IF NOT EXISTS profile_cache (
   updated_at  TEXT,
   git_rev     TEXT
 );
+
+-- cancel 控制队列 (事故记录 4, 2026-08-17): CLI (登录节点) 看不到计算节点
+-- 进程组 (PID namespace 跨节点, 定案 44 同类) -> 不本地 killpg, 改为写控制
+-- 请求落库, daemon (计算节点) 每轮 tick 拉取处理: 本地 alive 预检 (O5) +
+-- 写 kill_reason + killpg + reap 释放 GPU. pending 任务无进程, CLI 直标不需请求.
+CREATE TABLE IF NOT EXISTS control_requests (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id      TEXT NOT NULL,
+  op          TEXT NOT NULL DEFAULT 'cancel',
+  status      TEXT NOT NULL DEFAULT 'pending',  -- pending / done
+  created_at  TEXT NOT NULL,
+  processed_at TEXT,
+  result      TEXT
+);
 """
 
 
@@ -286,6 +300,42 @@ def insert_job(
 def update_job(conn: sqlite3.Connection, job_id: str, **fields: Any) -> None:
     cols = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
+
+
+# ---------- 控制请求队列 (事故记录 4: cancel 转发 daemon) ----------
+
+def insert_control_request(
+    conn: sqlite3.Connection, job_id: str, op: str = "cancel",
+) -> int:
+    """CLI 写入控制请求 (cancel 转发 daemon 执行 kill, 事故记录 4).
+
+    返回请求 id. daemon 每轮 tick 拉取 pending 请求, 在计算节点本地完成
+    alive 预检 + 写 kill_reason + killpg + reap 释放 GPU——登录节点看不到
+    计算节点进程组 (PID namespace, 定案 44 同类), CLI 绝不本地 killpg.
+    """
+    cur = conn.execute(
+        "INSERT INTO control_requests (job_id, op, status, created_at)"
+        " VALUES (?,?,?,?)",
+        (job_id, op, "pending", now()),
+    )
+    return int(cur.lastrowid)
+
+
+def pending_control_requests(conn: sqlite3.Connection):
+    """拉取所有 pending 控制请求 (daemon tick 用)."""
+    return conn.execute(
+        "SELECT * FROM control_requests WHERE status='pending' ORDER BY id"
+    ).fetchall()
+
+
+def finish_control_request(
+    conn: sqlite3.Connection, req_id: int, result: str,
+) -> None:
+    conn.execute(
+        "UPDATE control_requests SET status='done', processed_at=?, result=?"
+        " WHERE id=?",
+        (now(), result, req_id),
+    )
 
 
 def get_job(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:

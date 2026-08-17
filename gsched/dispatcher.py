@@ -253,6 +253,7 @@ class Dispatcher:
                     self._frozen_gpus.discard(idx)
 
     def _tick(self) -> None:
+        self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
         self._reap_finished_jobs()
         self.allocator.settle_releasing()
         self._l3_freeze_sample()
@@ -387,6 +388,51 @@ class Dispatcher:
 
     # ---------- reap ----------
 
+    def _process_control_requests(self) -> None:
+        """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.
+
+        CLI (登录节点) 看不到计算节点进程组 (PID namespace 跨节点, 定案 44 同类),
+        本地 killpg 恒失败曾致孤儿占卡 13 分钟。现在 CLI 只写 control_requests 队列,
+        本方法每轮 tick 拉取并在本地完成:
+          1. alive 预检 (O5): 进程已自然结束 -> 清 kill_reason 让 reap 按 rc 判
+          2. 写 kill_reason=cancelled (N2: 先写 reason 再 killpg)
+          3. killpg SIGTERM; 下一轮仍存活 -> SIGKILL 升级 (绝不静默, 修复建议 2)
+        GPU 释放交给 reap (_handle_job_done cancelled 分支), 与正常路径一致.
+        """
+        with state.connect() as conn:
+            reqs = state.pending_control_requests(conn)
+            if not reqs:
+                return
+            for r in reqs:
+                j = state.get_job(conn, r["job_id"])
+                if j is None or j["status"] != "running" or not j["pgid"]:
+                    # 任务已不在 running (已 done/failed/cancelled 或 pgid 丢失)
+                    state.finish_control_request(conn, r["id"], "job 非 running, 无需 kill")
+                    self.log_line(f"cancel req {r['id']}: job {r['job_id']} 非 running, 跳过")
+                    continue
+                pgid = j["pgid"]
+                if not self.executor.alive(pgid):
+                    # 已死。区分: 若是我们上一轮 SIGTERM 杀死的 -> 保留 reason,
+                    # reap 判 cancelled; 若从未 kill (自然结束) -> 清 reason 按 rc 判 (O5)
+                    if j["kill_reason"] == "cancelled":
+                        state.finish_control_request(conn, r["id"], "SIGTERM 生效, 已退出")
+                        self.log_line(f"cancel req {r['id']}: job {j['id']} SIGTERM 生效 (等 reap 收敛 cancelled)")
+                    else:
+                        state.update_job(conn, j["id"], kill_reason=None)
+                        state.finish_control_request(conn, r["id"], "进程已自然结束 (O5)")
+                        self.log_line(f"cancel req {r['id']}: job {j['id']} 进程已自然结束 (O5), 清 reason")
+                    continue
+                if j["kill_reason"] == "cancelled":
+                    # 上一轮已 SIGTERM 但仍存活 -> SIGKILL 升级
+                    self.executor.kill_pgid(pgid, signal.SIGKILL)
+                    state.finish_control_request(conn, r["id"], "SIGKILL 升级")
+                    self.log_line(f"⚠️ cancel req {r['id']}: job {j['id']} SIGTERM 未生效 -> SIGKILL (pgid={pgid})")
+                    continue
+                state.update_job(conn, j["id"], kill_reason="cancelled")
+                self.executor.kill_pgid(pgid)  # SIGTERM
+                self.log_line(f"cancel req {r['id']}: job {j['id']} killpg SIGTERM (pgid={pgid})")
+                # 请求本轮不 finish: 下轮 tick 复查, 仍存活则 SIGKILL 升级
+
     def _reap_finished_jobs(self) -> None:
         with state.connect() as conn:
             for j in state.all_jobs(conn):
@@ -404,6 +450,11 @@ class Dispatcher:
         if rc is None:
             rc = j["rc"]
         if reason == "cancelled":
+            # 修复建议 2 (事故记录 4): reap 前二次校验——标 cancelled 但进程仍
+            # 存活 (SIGTERM 未生效/孤儿逃逸) -> 绝不静默, SIGKILL 兜底
+            if j["pgid"] and self.executor.alive(j["pgid"]):
+                self.log_line(f"⚠️ 兜底: job {j['id']} 标 cancelled 但 pgid={j['pgid']} 仍存活 -> SIGKILL")
+                self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
             self.log_line(f"job {j['id']} cancelled (用户终止)")
             state.update_job(conn, j["id"], status="cancelled", finished_at=state.now())
             self._release_gpu_for_job(conn, j)

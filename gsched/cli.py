@@ -784,19 +784,19 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    """sched cancel <batch>[:task]: 取消批次/任务 (running 组级 kill + pending 直接标 cancelled).
+    """sched cancel <batch>[:task]: 取消批次/任务.
 
-    - running: 先写 kill_reason 再 killpg (N2), daemon reap 时收尾
+    - running: **转发 daemon 执行 kill** (事故记录 4, 2026-08-17): CLI 在登录
+      节点看不到计算节点进程组 (PID namespace, 定案 44 同类), 本地 killpg
+      恒失败曾致孤儿占卡 —— 改为写 control_requests 队列, daemon 每轮 tick
+      在计算节点本地完成 alive 预检 (O5) + 写 kill_reason + killpg + reap 释放.
     - pending: 排队中未开始, 无进程可杀, 直接标 cancelled (终态, 不重试)
     - 下游依赖告警 (Q4): 上游取消后有 cancelled 终态, 依赖它的批次将永久挂起
     """
     ref = args.batch
     if not args.yes:
-        print(f"确认取消 {ref}? 加 --yes 执行 (N2: 先写 kill_reason 再 killpg)")
+        print(f"确认取消 {ref}? 加 --yes 执行 (转发 daemon: 先写 kill_reason 再 killpg)")
         return 1
-    from .executor import Executor
-
-    ex = Executor()
     with state.connect() as conn:
         if ":" in ref:
             # R1: <batch_name>:<task> — batch 段是 name, 解析为最新 id
@@ -828,23 +828,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ).fetchall()
         n = 0
         for j in targets:
-            # O5: killpg 前 kill -0 确认存活; 已死则清 reason
-            if j["pgid"] and ex.alive(j["pgid"]):
-                state.update_job(conn, j["id"], kill_reason="cancelled")
-                ex.kill_pgid(j["pgid"])
-                print(f"已取消 {j['id']} (pgid={j['pgid']})")
-            else:
-                state.update_job(
-                    conn, j["id"], status="cancelled", kill_reason="cancelled",
-                    finished_at=state.now(),
-                )
-                print(f"{j['id']} 已自然结束, 标记 cancelled")
-            # 立即释放 GPU (排雷 2026-08-16): 不能只依赖 daemon reap ——
-            # daemon idle 超时退出后, cancelled 任务会残留 assigned 孤儿卡
-            # (本次 GPU1 事故: patchtst_s2024 cancel 后卡永久占用)。事务内
-            # 释放 (复用 state.release_gpu, 幂等: daemon reap 重复调用无害)。
-            if j["gpu"] is not None:
-                state.release_gpu(conn, j["id"])
+            # 事故记录 4: 不本地 killpg (登录节点看不到计算节点进程组)。
+            # 写控制请求, daemon 在计算节点本地执行 alive 预检 + kill_reason
+            # + killpg + reap 释放 GPU。请求幂等: 同一 job 重复 cancel 无副作用。
+            state.insert_control_request(conn, j["id"])
+            print(f"已转发取消 {j['id']} (daemon 执行 kill, pgid={j['pgid']})")
             n += 1
         for j in pendings:
             # 排队中未启动: 无进程可杀, 直接标终态 (daemon 不再派发)
@@ -868,6 +856,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ).fetchall()
             for d in deps:
                 print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已取消, 下游将挂起 (Q4)")
+    # 转发后确认: daemon 处理是异步的 (POLL_SEC=10s tick), 等几秒让下一轮
+    # tick 完成 alive 预检 + killpg; 不阻塞等待终态 (reap 下一轮才收敛).
+    if n > 0:
+        print("(daemon 将在下轮 tick 执行 kill, 可用 sched status 复查)")
     return 0
 
 
