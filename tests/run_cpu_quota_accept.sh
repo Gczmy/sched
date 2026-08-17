@@ -16,8 +16,9 @@
 # =============================================================================
 set -u
 cd "$(dirname "$0")/../.."   # 仓库根
-PY=${PY:-/Users/zzc/miniconda3/envs/vnpy_env/bin/python}
+PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
+export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -67,7 +68,7 @@ cat > $S1/config.json << EOF
   "cpus_total": 32, "gpu_job_cpus": 8,
   "projects": {"default": {"root": "$ROOT", "git": false}},
   "default_project": "default",
-  "venvs": {"k": "/Users/zzc/miniconda3/envs/vnpy_env/bin/python"}
+  "venvs": {"k": "$PY"}
 }
 EOF
 cat > $S1/batch.json << EOF
@@ -104,7 +105,7 @@ cat > $S2/config.json << EOF
   "state_dir": "$S2", "gpus": [0],
   "projects": {"default": {"root": "$ROOT", "git": false}},
   "default_project": "default",
-  "venvs": {"k": "/Users/zzc/miniconda3/envs/vnpy_env/bin/python"}
+  "venvs": {"k": "$PY"}
 }
 EOF
 cat > $S2/batch.json << EOF
@@ -139,7 +140,7 @@ cat > $S3/config.json << EOF
   "cpus_total": 8, "gpu_job_cpus": 4,
   "projects": {"default": {"root": "$ROOT", "git": false}},
   "default_project": "default",
-  "venvs": {"k": "/Users/zzc/miniconda3/envs/vnpy_env/bin/python"}
+  "venvs": {"k": "$PY"}
 }
 EOF
 cat > $S3/batch.json << EOF

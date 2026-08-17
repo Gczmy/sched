@@ -16,8 +16,9 @@
 # =============================================================================
 set -u
 cd "$(dirname "$0")/../.."   # 仓库根
-PY=${PY:-/Users/zzc/miniconda3/envs/vnpy_env/bin/python}
+PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
+export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 HOST=testnode   # 定案 43 (P6): hostname() 读 config node 字段, 测试 config 统一 node=testnode
 
 PASS=0; FAIL=0
