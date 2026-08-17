@@ -738,8 +738,17 @@ class Dispatcher:
                 if row and row["peak_gib"]:
                     task_vram = max(task_vram, float(row["peak_gib"]))
             safety = float(self.cfg.get("co_locate_safety", 0.7))
-        # 独占任务: 第一张 free 卡 (现状语义, 定案 6 每卡独占)
+        # 独占任务: 第一张能装下的 free 卡 (定案 6 每卡独占; 2026-08-17 方案 B:
+        # 异构容量适配——任务声明 resources.vram_gib 时跳过容量不足的卡, 防大任务
+        # 被派到小卡 OOM. 未声明维持现状 (不声明不校验).)
+        excl_vram = None
         if not gpu_share:
+            v = resources.get("vram_gib")
+            if v is not None:
+                try:
+                    excl_vram = float(v)
+                except (TypeError, ValueError):
+                    excl_vram = None
             for idx in self.allocator.gpu_list:
                 row = conn.execute(
                     "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
@@ -747,6 +756,10 @@ class Dispatcher:
                 if not row or row["quarantined"]:
                     continue
                 if row["status"] == "free":
+                    if excl_vram is not None:
+                        cap = self.allocator.mem_total(idx)
+                        if cap > 0 and excl_vram > cap:
+                            continue  # 声明峰值超过该卡容量: 换下一张 (异构适配)
                     conn.execute(
                         "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
                         (job_id, state.now(), idx),
@@ -759,15 +772,18 @@ class Dispatcher:
                     return idx
             return None
 
-        # 共享任务: Least-Loaded 装箱 (定案 40, 2026-08-16).
+        # 共享任务: 归一化负载装箱 (定案 40 Least-Loaded + 2026-08-17 方案 A).
         #   动机: First-Fit 会把轻任务全堆 GPU0 (raft 峰值 0.3-0.6GiB 摸不到显存
         #   约束, 仅靠任务数上限换卡) -> GPU0 满载 GPU1/2/3 空转. 改为候选
-        #   (free ∪ 有余量 assigned) 中选 vram_used 最小的一张, 轻任务均匀分散
-        #   到全部卡; 平局取最小 idx (确定性, 与定案 2 声明顺序一致).
+        #   (free ∪ 有余量 assigned) 中选负载率最低的一张, 轻任务均匀分散到全部卡.
+        #   2026-08-17 异构升级: 选卡标准从"绝对已用最小"(min used) 改为
+        #   "负载率最低"(min used/cap)——16GB+24GB 混用时按比例均衡, 轻任务
+        #   自动倾向大卡 (绝对 used 会优先堆小卡, 大卡空转). free 卡 used=0
+        #   负载率 0 天然优先. 平局取最小 idx (确定性, 与定案 2 声明顺序一致).
         #   独占卡 (gpu_jobs 含 vram_gib IS NULL 行) 视为满: 独占占整卡不可再装箱,
         #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
         best_idx: int | None = None
-        best_used = float("inf")
+        best_load = float("inf")
         for idx in self.allocator.gpu_list:
             row = conn.execute(
                 "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
@@ -776,6 +792,7 @@ class Dispatcher:
                 continue
             if row["status"] == "free":
                 used = 0.0
+                cap = self.allocator.mem_total(idx)
             elif row["status"] == "assigned":
                 if idx in self._frozen_gpus:
                     continue
@@ -797,8 +814,15 @@ class Dispatcher:
                     continue
             else:
                 continue
-            if used < best_used:
-                best_used = used
+            # 归一化负载 = 放入后负载率 (used+task)/cap 最小 — 回答"放哪张最均衡"
+            # (当前负载 used/cap 会误选: 16GB@4GiB(0.25) vs 24GB@8GiB(0.33),
+            #  放 8GiB 任务后 16GB->0.75 反而失衡, 应选 24GB->0.67)
+            if cap > 0:
+                load = (used + task_vram) / cap
+            else:
+                load = 0.0  # free 且容量未知: 第一个任务总能放 (现状语义)
+            if load < best_load:
+                best_load = load
                 best_idx = idx
         if best_idx is None:
             return None

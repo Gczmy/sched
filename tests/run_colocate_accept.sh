@@ -192,6 +192,66 @@ print('S7 OK')
 EOF
 if [ $? -eq 0 ]; then ok "S7: Least-Loaded 均衡 (5×0.6 -> 0/1/2/3/0) + 独占卡不 pack"; else bad "S7 失败"; fi
 
+# ---------- S8: 异构容量归一化负载 (16GB + 24GB 混用, 方案 A) ----------
+# 16GB@4GiB(load 0.25) vs 24GB@8GiB(load 0.33): 放 8GiB 任务后 16GB->0.75 / 24GB->0.67
+# 归一化负载应选 24GB 卡 (绝对 used 8>4 会误选 16GB 卡 -> 大卡空转)
+echo "--- S8: 异构容量归一化负载 (16+24 混用) ---"
+S8=/tmp/sched_coloc_s8; rm -rf $S8; mkdir -p $S8
+SCHED_STATE=$S8 SCHED_FAKE_GPUS="0:16,1:24" $PY - <<'EOF'
+import os, sys
+sys.path.insert(0, os.getcwd() + '/sched')
+import gsched.state as st
+st.init_db()
+with st.connect() as conn:
+    st.init_gpus(conn, [0, 1])
+from gsched.allocator import Allocator
+al = Allocator([0, 1], fake=True)
+al.probe_capacity()
+assert al.mem_total(0) == 16 and al.mem_total(1) == 24, (al.mem_total(0), al.mem_total(1))
+from gsched.dispatcher import Dispatcher
+d = Dispatcher({'co_locate': True, 'co_locate_safety': 0.7, 'co_locate_max_jobs': 3,
+                'gpus': [0, 1], 'venvs': {}, 'default_project': '{ROOT}'}, fake=True)
+with st.connect() as conn:
+    # 预置: 16GB 卡已用 4GiB (load 0.25) / 24GB 卡已用 8GiB (load 0.33)
+    conn.execute("UPDATE gpus SET status='assigned' WHERE idx=0")
+    conn.execute("UPDATE gpus SET status='assigned' WHERE idx=1")
+    conn.execute("INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at) VALUES (0,'a',4,datetime('now'))")
+    conn.execute("INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at) VALUES (1,'b',8,datetime('now'))")
+    # 8GiB 任务: 放 16GB 卡 load=(4+8)/16=0.75; 放 24GB 卡 load=(8+8)/24=0.67 -> 选 24GB (卡 1)
+    g = d._assign_in_tx(conn, 'big8', {'resources': {'gpu_share': True, 'vram_gib': 8}})
+    assert g == 1, f'归一化负载应选 24GB 卡, got {g}'
+    # 容量硬约束仍逐卡正确: 16GB 卡 4+14=18 > 16*0.7=11.2 -> 拒绝; 24GB 卡 8+14=22 > 16.8 -> 也拒绝
+    assert d._assign_in_tx(conn, 'too14', {'resources': {'gpu_share': True, 'vram_gib': 14}}) is None
+print('S8 OK')
+EOF
+if [ $? -eq 0 ]; then ok "S8: 异构归一化负载 - 24GB 卡 load 更低被选中 (不堆小卡) + 容量硬约束逐卡正确"; else bad "S8 失败"; fi
+
+# ---------- S9: 独占容量适配 (方案 B: 声明 vram 跳过容量不足卡) ----------
+echo "--- S9: 独占容量适配 ---"
+S9=/tmp/sched_coloc_s9; rm -rf $S9; mkdir -p $S9
+SCHED_STATE=$S9 SCHED_FAKE_GPUS="0:16,1:24" $PY - <<'EOF'
+import os, sys
+sys.path.insert(0, os.getcwd() + '/sched')
+import gsched.state as st
+st.init_db()
+with st.connect() as conn:
+    st.init_gpus(conn, [0, 1])
+from gsched.allocator import Allocator
+al = Allocator([0, 1], fake=True)
+al.probe_capacity()
+from gsched.dispatcher import Dispatcher
+d = Dispatcher({'gpus': [0, 1], 'venvs': {}, 'default_project': '{ROOT}'}, fake=True)
+with st.connect() as conn:
+    # 独占任务声明 vram 20GiB: 16GB 卡装不下 -> 跳过 -> 派到 24GB 卡
+    g = d._assign_in_tx(conn, 'big', {'resources': {'vram_gib': 20}})
+    assert g == 1, f'20GiB 任务应跳过 16GB 卡派到 24GB 卡, got {g}'
+    # 未声明 vram: 维持现状 (不声明不校验) -> 第一张 free 卡 (卡 0)
+    g2 = d._assign_in_tx(conn, 'no_decl', {})
+    assert g2 == 0, f'未声明维持现状应取第一张 free 卡, got {g2}'
+print('S9 OK')
+EOF
+if [ $? -eq 0 ]; then ok "S9: 独占容量适配 - 声明 vram 20GiB 跳过 16GB 卡选 24GB 卡 + 未声明维持现状"; else bad "S9 失败"; fi
+
 # ---------- S6: L3 冻结 ----------
 echo "--- S6: L3 冻结 ---"
 S6=/tmp/sched_coloc_s6; rm -rf $S6; mkdir -p $S6
