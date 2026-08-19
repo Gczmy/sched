@@ -749,7 +749,7 @@ def cmd_task(args: argparse.Namespace) -> int:
             print(f"  rc: {j['rc']}  failure: {j['failure'] or '-'}")
             print(f"  kill_reason: {j['kill_reason'] or '-'}")
             print(f"  git_rev: {j['git_rev'] or '-'}")
-            print(f"  log: {state.default_state_dir()}/{state.hostname()}/logs/{batch}/{task}.log")
+            print(f"  log: {state.default_state_dir()}/{state.hostname()}/logs/{batch}/{task}-v{j['version']}.log")
     return 0
 
 
@@ -1144,7 +1144,8 @@ def _diag_one(conn, j, cfg: dict) -> None:
     for line in _diag_cmds(spec, cfg):
         print(f"  cmd: {line}")
     log_path = os.path.join(
-        state.default_state_dir(), state.hostname(), "logs", batch, f"{task}.log"
+        state.default_state_dir(), state.hostname(), "logs", batch,
+        f"{task}-v{j['version']}.log",  # C1 修复: 与 dispatcher._job_log_path 同构
     )
     print(f"  log: {log_path}")
     tail = _tail_n(log_path, 15)
