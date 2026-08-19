@@ -40,6 +40,7 @@ class Dispatcher:
         os.makedirs(self.host_dir, exist_ok=True)
         self.pid_file = os.path.join(self.host_dir, "daemon.pid")
         self.heartbeat_file = os.path.join(self.host_dir, "daemon.heartbeat")
+        self._prev_hb_ts: float | None = None  # acquire_lock 触心跳前采样 (D4 用)
         self.lock_dir = os.path.join(self.host_dir, "dispatcher.lock")
         self.log = open(
             os.path.join(self.host_dir, "scheduler.log"), "a", encoding="utf-8"
@@ -104,6 +105,12 @@ class Dispatcher:
             return False
         with open(self.pid_file, "w") as f:
             f.write(str(os.getpid()))
+        # H2 修复: 触心跳前采样旧 mtime 供 _check_node_restart 用;
+        # 否则 touch 后 hb_ts≈now > boot_ts, D4 节点重启检测恒不触发
+        try:
+            self._prev_hb_ts = os.path.getmtime(self.heartbeat_file)
+        except OSError:
+            self._prev_hb_ts = None
         self._touch_heartbeat()
         return True
 
@@ -388,14 +395,18 @@ class Dispatcher:
     # ---------- 节点重启恢复 (D4) ----------
 
     def _check_node_restart(self) -> None:
-        """心跳在但 uptime < daemon 启动时间 -> 节点重启 -> interrupted (D4)."""
-        if not os.path.exists(self.heartbeat_file):
+        """心跳在但 uptime < daemon 启动时间 -> 节点重启 -> interrupted (D4).
+
+        H2 修复: 必须用 acquire_lock 触心跳**之前**采样的 _prev_hb_ts,
+        否则 hb_ts≈now > boot_ts 恒为 False, 检测永不触发.
+        """
+        hb_ts = getattr(self, "_prev_hb_ts", None)
+        if hb_ts is None:
             return
         with open("/proc/uptime") as f:
             uptime = float(f.read().split()[0])
         try:
             boot_ts = time.time() - uptime
-            hb_ts = os.path.getmtime(self.heartbeat_file)
             if boot_ts > hb_ts:
                 self.log_line("D4: 检测到节点重启, running 任务标 interrupted (不计 retries)")
                 with state.connect() as conn:
