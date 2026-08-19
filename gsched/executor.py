@@ -55,11 +55,13 @@ class Executor:
         log_f = open(log_path, "a", encoding="utf-8")
 
         merged_env = dict(os.environ)
+        for k, v in env.items():
+            merged_env[k] = str(v)
+        # H8 修复: 钉卡/fake 剥离放在任务 env 合并**之后** (§4.1 不可覆盖);
+        # 否则任务 env 里的 CUDA_VISIBLE_DEVICES/SCHED_FAKE_GPUS 静默覆盖钉卡
         merged_env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
         merged_env.setdefault("PYTHONUNBUFFERED", "1")
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
-        for k, v in env.items():
-            merged_env[k] = str(v)
 
         if stages is not None:
             # §3.4c 断点续跑: 已成功的 stage (产物已存在) 跳过, 只从失败 stage 起重跑
