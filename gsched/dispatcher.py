@@ -305,13 +305,32 @@ class Dispatcher:
         self._l3_freeze_sample()
         moved = self.allocator.probe_free()
         for g in moved:
+            if self._gpu_ignored(g):
+                continue  # C2: gpu-ignore 人工确认, 静默 unmanaged 告警 (卡仍不派发)
             self.log_line(f"unmanaged: GPU{g} 被外部占用/孤儿, 不派发")
         restored = self.allocator.probe_unmanaged()
         for g in restored:
+            self._clear_gpu_ignore(g)  # 恢复 free 自动复位 ignore 标记 (下次占用重新告警)
             self.log_line(f"unmanaged 自动恢复: GPU{g} 真实空闲 -> free")
         self._unlock_dependent_batches()
         self._settle_batch_status()  # P1: 批次终态收敛
         self._dispatch_ready_jobs()
+
+    def _gpu_ignored(self, idx: int) -> bool:
+        """gpu-ignore 人工确认标记 (C2 修复): ignore_until 非 NULL = 静默告警.
+
+        列名沿用 schema (ignore_until), 语义为"人工确认于该时刻"——unmanaged
+        是持久状态, 用 NULL/非 NULL 表达是否已确认, 恢复 free 时自动清 NULL.
+        """
+        with state.connect() as conn:
+            row = state.get_gpu(conn, idx)
+            return bool(row and row["ignore_until"])
+
+    def _clear_gpu_ignore(self, idx: int) -> None:
+        with state.connect() as conn:
+            conn.execute(
+                "UPDATE gpus SET ignore_until=NULL WHERE idx=?", (idx,)
+            )
 
     def _settle_batch_status(self) -> None:
         """P1: 批次终态. done = 全部任务成功终态 (done/skip);

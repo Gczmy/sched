@@ -1295,13 +1295,17 @@ def cmd_gpu_ok(args: argparse.Namespace) -> int:
 
 
 def cmd_gpu_ignore(args: argparse.Namespace) -> int:
-    """静默告警 unmanaged 卡 (Q3)."""
+    """静默告警 unmanaged 卡 (Q3).
+
+    ignore_until 非 NULL = 已人工确认, dispatcher 不再每轮告警 (C2 修复:
+    此前该列只写不读, 命令为空操作); 卡恢复 free 时标记自动复位.
+    """
     with state.connect() as conn:
         conn.execute(
             "UPDATE gpus SET ignore_until=?, updated_at=? WHERE idx=?",
             (state.now(), state.now(), args.idx),
         )
-        print(f"GPU{args.idx} 已忽略告警 (卡仍占用, 不派发)")
+        print(f"GPU{args.idx} 已忽略告警 (卡仍占用, 不派发; 恢复 free 时自动复位)")
     return 0
 
 
@@ -1312,7 +1316,8 @@ def cmd_gpu_free(args: argparse.Namespace) -> int:
         return 1
     with state.connect() as conn:
         conn.execute(
-            "UPDATE gpus SET status='free', job_id=NULL, quarantined=0, updated_at=? WHERE idx=?",
+            "UPDATE gpus SET status='free', job_id=NULL, quarantined=0,"
+            " ignore_until=NULL, updated_at=? WHERE idx=?",
             (state.now(), args.idx),
         )
         # 多归属 (§3.2e): 清该卡 gpu_jobs 残留 (强制回 free 应无挂靠 job)
