@@ -544,9 +544,14 @@ class Dispatcher:
             # L3: SIGKILL 升级 —— probe kill 已触发但进程忽略 SIGTERM 仍存活
             # (终态 done/blocked 的 job 不会再进上面的 running 循环, 在此补杀)
             for j in state.all_jobs(conn):
-                if j["kill_reason"] == "probe" and j["pgid"] and self.executor.alive(j["pgid"]):
+                if j["kill_reason"] != "probe" or not j["pgid"]:
+                    continue
+                if self.executor.alive(j["pgid"]):
                     self.log_line(f"probe kill 升级: job {j['id']} SIGTERM 未生效 -> SIGKILL")
                     self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
+                # H4 修复: 补杀/确认死亡后清 pgid, 解除对历史终态 job 的永久
+                # 探测 —— 否则 OS 复用该 pgid 后每轮 SIGKILL 无关进程组
+                state.update_job(conn, j["id"], pgid=None)
 
     def _reap_finished_jobs(self) -> None:
         with state.connect() as conn:
