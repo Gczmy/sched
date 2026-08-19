@@ -691,8 +691,13 @@ class Dispatcher:
             pass
 
     def _maybe_retry(self, conn, j) -> None:
-        """失败重试: max_retry 内回 pending; 满 -> blocked (3.4)."""
-        if j["status"] != "failed":
+        """失败重试: max_retry 内回 pending; 满 -> blocked (3.4).
+
+        调用方传入的是更新前的 Row 快照 (status 还是 running/pending),
+        必须重新取行才能看到刚写入的 failed/failure/retries.
+        """
+        j = state.get_job(conn, j["id"])
+        if j is None or j["status"] != "failed":
             return
         if j["failure"] == "perm":
             # H4: 权限错不重试
