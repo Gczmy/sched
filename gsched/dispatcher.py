@@ -948,6 +948,10 @@ class Dispatcher:
             if row["status"] == "free":
                 used = 0.0
                 cap = self.allocator.mem_total(idx)
+                # H5 修复: free 卡同样做鲸鱼排除 (docstring 承诺: vram_gib >
+                # safety×容量 -> 不装箱), 否则大任务被装上小空卡启动即 OOM
+                if cap > 0 and task_vram > safety * cap:
+                    continue
             elif row["status"] == "assigned":
                 if idx in self._frozen_gpus:
                     continue
