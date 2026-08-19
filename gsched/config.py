@@ -137,18 +137,24 @@ def resolve_template(value: str, cfg: dict[str, Any], cwd: str | None = None) ->
     if not isinstance(value, str) or not value.startswith(TEMPLATE_PREFIX):
         return value
 
-    name = value[1:-1] if value.endswith(TEMPLATE_SUFFIX) else value[1:]
+    # H7 修复: 取首个 {...} 段做替换并保留余量; 旧逻辑 value[1:] 会把
+    # "{ROOT}/nn/data" 当成名为 "ROOT}/nn/data" 的未知模板原样返回
+    end = value.find(TEMPLATE_SUFFIX)
+    if end == -1:
+        return value  # 无闭合括号: 非模板, 保持原样
+    name = value[1:end]
+    rest = value[end + 1:]
     if name == "ROOT":
-        return _project_root(cfg, cfg.get("default_project", "a_share"))
+        return _project_root(cfg, cfg.get("default_project", "a_share")) + rest
     if name.startswith("PROJECT:"):
-        return _project_root(cfg, name.split(":", 1)[1])
+        return _project_root(cfg, name.split(":", 1)[1]) + rest
     if name.startswith("VENV:"):
         venv = cfg.get("venvs", {}).get(name[len("VENV:"):])
         if not venv:
             raise ConfigError(f"venv 未在 config.venvs 中定义: {name}")
-        return str(venv)
+        return str(venv) + rest
     if name == "STATE":
-        return default_state_dir()
+        return default_state_dir() + rest
     return value  # 未知模板: 保持原样
 
 
