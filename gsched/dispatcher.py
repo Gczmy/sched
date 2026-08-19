@@ -727,7 +727,13 @@ class Dispatcher:
             self.log_line(f"job {j['id']} blocked (重试满)")
 
     def _requeue_for_retry(self, conn, j) -> None:
-        """interrupted -> pending (D4, 不计 retries)."""
+        """interrupted -> pending (D4, 不计 retries).
+
+        H3 修复: 回队前必须释放 GPU 占用 (assigned -> releasing + 删 gpu_jobs
+        行), 否则节点重启后卡仍 assigned 给已死 job, GPU 永久泄漏.
+        """
+        if j["gpu"] is not None:
+            self._release_in_tx(conn, j["id"])
         state.update_job(
             conn, j["id"], status="pending", pgid=None, rc=None,
             kill_reason=None, gpu=None,
