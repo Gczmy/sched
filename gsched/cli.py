@@ -479,6 +479,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not venv_name:
         print("错误: config.venvs 为空, 无法解析解释器", file=sys.stderr)
         return 1
+    if venv_name not in venvs:  # M12: 未知名友好报错 (原 KeyError 裸 traceback)
+        print(
+            f"错误: venv '{venv_name}' 未在 config.venvs 中定义"
+            f" (可用: {', '.join(venvs) or '无'})",
+            file=sys.stderr,
+        )
+        return 1
     interp = venvs[venv_name]
 
     # 批次名到毫秒: 同一秒连续提交不碰撞 (batch.id UNIQUE)
