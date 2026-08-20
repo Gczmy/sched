@@ -161,8 +161,7 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
     def _expand_root(tok: str) -> str:
         """cmd 里的 {ROOT} 模板展开为项目根目录绝对路径."""
         if isinstance(tok, str) and "{ROOT}" in tok:
-            root = _project_root(cfg, cfg.get("default_project", "a_share"))
-            return tok.replace("{ROOT}", root)
+            return resolve_template(tok, cfg)
         return tok
 
     def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
@@ -363,8 +362,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     def _expand_root(tok: str) -> str:
         """cmd 里的 {ROOT} 模板展开为项目根目录绝对路径."""
         if isinstance(tok, str) and "{ROOT}" in tok:
-            root = _project_root(cfg, cfg.get("default_project", "a_share"))
-            return tok.replace("{ROOT}", root)
+            return resolve_template(tok, cfg)
         return tok
 
     def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
