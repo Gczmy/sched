@@ -1053,8 +1053,12 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             conn, f"{batch}-{task}-v{new_v}", batch, task, new_v, fp, stage_fps
         )
         # Q4: 检测下游依赖告警
+        # C5 修复: name 从 DB 查 (与 cmd_cancel 同法) —— batch id 形如
+        # {name}-{时间戳} 且 name 可含 '-', split("-")[0] 会截错导致漏报
+        brow = state.get_batch(conn, batch)
+        bname = brow["name"] if brow else batch
         deps = conn.execute(
-            "SELECT name FROM batches WHERE depends_on LIKE ?", (f'%"{batch.split("-")[0]}"%',)
+            "SELECT name FROM batches WHERE depends_on LIKE ?", (f'%"{bname}"%',)
         ).fetchall()
         for d in deps:
             print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已更新, 请重提下游 (Q4)")
