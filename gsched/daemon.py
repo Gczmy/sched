@@ -111,11 +111,13 @@ def start(fake: bool = False) -> str:
     log_path = os.path.join(_host_dir(), "daemon.log")
 
     # 构造 dispatcher 命令 (本进程作为 daemon 入口)
+    env = dict(os.environ)
     if fake:
-        env = dict(os.environ)
         env["SCHED_FAKE_GPUS"] = env.get("SCHED_FAKE_GPUS", "0,1,2,3")
     else:
-        env = dict(os.environ)
+        # M5: 非 fake 启动显式剥离 fake 标志 —— 用户 shell 残留
+        # SCHED_FAKE_GPUS (验收测试后常见) 会把正式 daemon 拉成 fake 模式
+        env.pop("SCHED_FAKE_GPUS", None)
 
     cmd = [sys.executable, "-m", "gsched.dispatcher_main", "--daemon"]
     proc = subprocess.Popen(
