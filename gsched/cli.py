@@ -1395,6 +1395,82 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- 通知 (设计 docs/sched_notify_design.md) ----------
+
+def cmd_notify_test(args: argparse.Namespace) -> int:
+    """sched notify-test: 发测试通知, 验证 config.notify 各渠道可用."""
+    from . import notify
+
+    cfg = _load_cfg()
+    ncfg = cfg.get("notify")
+    if not ncfg:
+        print("config.notify 未配置 (功能关闭); 参见 docs/sched_notify_design.md §3")
+        return 1
+    event = {
+        "event": "batch_done",
+        "batch": "notify-test", "batch_id": "-",
+        "node": state.hostname(), "git_rev": None,
+        "started_at": state.now(), "finished_at": state.now(),
+        "duration_min": 0,
+        "counts": {"done": 1}, "failures": [],
+    }
+    results = notify.send(event, cfg)
+    if not results:
+        print("事件 batch_done 不在 notify.on 列表, 未发送任何渠道")
+        return 1
+    fails = 0
+    for r in results:
+        print(f"  {r}")
+        if r.startswith("FAIL"):
+            fails += 1
+    return 1 if fails else 0
+
+
+def cmd_notify_inbox(args: argparse.Namespace) -> int:
+    """sched notify-inbox: 列通知事件 (LLM agent 检查点, 设计 §10 L1)."""
+    from . import notify
+
+    files = notify.list_inbox(unacked_only=not args.all)
+    if args.json:
+        out = []
+        for p in files:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    out.append(json.load(f) | {"_file": p})
+            except (OSError, json.JSONDecodeError):
+                out.append({"_file": p, "_error": "不可读"})
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    if not files:
+        print("(inbox 空 — 无未读通知事件)")
+        return 0
+    for p in files:
+        try:
+            with open(p, encoding="utf-8") as f:
+                ev = json.load(f)
+            mark = "✅" if ev.get("event") == "batch_done" else "❌"
+            n_fail = len(ev.get("failures") or [])
+            extra = f" ({n_fail} 失败)" if n_fail else ""
+            print(f"  {mark} {os.path.basename(p):<52} {ev.get('batch')}{extra}")
+        except (OSError, json.JSONDecodeError):
+            print(f"  ⚠️ {os.path.basename(p)} (不可读)")
+    print(f"\n共 {len(files)} 条; 处理后确认: sched notify-ack <文件路径>")
+    return 0
+
+
+def cmd_notify_ack(args: argparse.Namespace) -> int:
+    """sched notify-ack <文件>: 确认事件 (rename .acked, N 天后自动清理)."""
+    from . import notify
+
+    try:
+        new = notify.ack(args.file)
+    except FileNotFoundError:
+        print(f"错误: 事件文件不存在: {args.file}", file=sys.stderr)
+        return 1
+    print(f"已确认: {new}")
+    return 0
+
+
 # ---------- 入口 ----------
 
 def main(argv: list[str] | None = None) -> int:
@@ -1496,6 +1572,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("action", choices=["start", "stop", "status", "check"])
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
     p.set_defaults(fn=cmd_daemon)
+
+    p = sub.add_parser("notify-test", help="发测试通知验证 config.notify 配置")
+    p.set_defaults(fn=cmd_notify_test)
+
+    p = sub.add_parser("notify-inbox", help="列通知事件 (agent 检查点, 设计 §10)")
+    p.add_argument("--all", action="store_true", help="含已确认 (.acked)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_notify_inbox)
+
+    p = sub.add_parser("notify-ack", help="确认通知事件 (rename .acked)")
+    p.add_argument("file", help="事件文件路径 (notify-inbox 列出)")
+    p.set_defaults(fn=cmd_notify_ack)
 
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
