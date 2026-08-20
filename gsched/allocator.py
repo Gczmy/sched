@@ -16,6 +16,8 @@ from typing import Any
 
 from .state import connect, get_gpu, now, release_gpu
 
+_UNSET = object()  # P3: by_card 预取参数哨兵 (区分"未传"与"查询失败返回 None")
+
 
 class Allocator:
     def __init__(
@@ -28,6 +30,7 @@ class Allocator:
         self.mem_overrides = mem_overrides or {}  # config.gpus[{idx,mem_gib}] 手动覆盖
         self.fake = fake or bool(os.environ.get("SCHED_FAKE_GPUS"))
         self._uuid_map: dict[str, int] | None = None  # gpu_uuid->idx 缓存 (M8, 建一次)
+        self._mem_cache: dict[int, float] = {}  # 容量进程内缓存 (P3: 静态值, 不重复开 DB 连接)
         if self.fake:
             # 模拟 GPU 数 (0,1,2,3 语义); 支持 "idx:mem" 形式带容量 (GiB, 验收用)
             parts = [p for p in os.environ.get("SCHED_FAKE_GPUS", "").split(",") if p]
@@ -77,12 +80,14 @@ class Allocator:
                     conn.execute(
                         "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (mem, idx)
                     )
+                    self._mem_cache[idx] = float(mem)
             if self.fake:
                 for idx in self.gpu_list:
                     mem = self.mem_overrides.get(idx, self._fake_mem.get(idx, 24.0))
                     conn.execute(
                         "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (mem, idx)
                     )
+                    self._mem_cache[idx] = float(mem)
                 return
             try:
                 out = subprocess.run(
@@ -96,22 +101,34 @@ class Allocator:
                         continue
                     idx, mi = int(parts[0].strip()), int(parts[1].strip())
                     if idx in self.gpu_list and idx not in self.mem_overrides:
+                        gib = round(mi / 1024.0, 1)
                         conn.execute(
                             "UPDATE gpus SET mem_total_gib=? WHERE idx=?",
-                            (round(mi / 1024.0, 1), idx),
+                            (gib, idx),
                         )
+                        self._mem_cache[idx] = gib
             except (subprocess.SubprocessError, ValueError, FileNotFoundError):
                 pass
 
     def mem_total(self, idx: int) -> float:
-        """该卡总容量 (GiB); 未探测/缺失 -> 0 (调用方按无容量处理)."""
+        """该卡总容量 (GiB); 未探测/缺失 -> 0 (调用方按无容量处理).
+
+        P3: 进程内缓存 —— 容量是启动探测的静态值, 原实现在装箱热路径
+        (_assign_in_tx 逐卡逐任务) 每次新开独立 DB 连接。
+        gpu-set-mem 的外部修改需重启 daemon 生效 (与探测覆盖语义一致)。
+        """
+        if idx in self._mem_cache:
+            return self._mem_cache[idx]
         with connect() as conn:
             row = conn.execute(
                 "SELECT mem_total_gib FROM gpus WHERE idx=?", (idx,)
             ).fetchone()
         if row and row["mem_total_gib"]:
-            return float(row["mem_total_gib"])
-        return self._fake_mem.get(idx, 0.0) if self.fake else 0.0
+            val = float(row["mem_total_gib"])
+        else:
+            val = self._fake_mem.get(idx, 0.0) if self.fake else 0.0
+        self._mem_cache[idx] = val
+        return val
 
     def vram_used(self, conn, idx: int) -> float:
         """该卡已装箱显存 (SUM gpu_jobs.vram_gib, 定案 39 L2). 共享装箱用."""
@@ -320,9 +337,13 @@ class Allocator:
             rows = conn.execute(
                 "SELECT idx, updated_at FROM gpus WHERE status='releasing'"
             ).fetchall()
+            # P3: 循环外预取一次 compute-apps 和已知 pgid, 逐卡分发
+            # (每卡各查一次 = 2N 次子进程/全表扫描, N=卡数)
+            by_card = self._compute_pids_by_card() if rows else None
+            known = self._known_job_pgids() if rows else None
             for row in rows:
                 idx = row["idx"]
-                has_proc = self._card_has_compute(idx)
+                has_proc = self._card_has_compute(idx, by_card, known)
                 # 冷却起点 = updated_at (R6: daemon 重启不重置)
                 try:
                     elapsed = _t.time() - _t.mktime(
@@ -355,26 +376,31 @@ class Allocator:
                         timeout.append(idx)
         return freed, timeout
 
-    def _card_any_occupied(self, idx: int) -> bool | None:
+    def _card_any_occupied(self, idx: int, by_card: Any = _UNSET) -> bool | None:
         """probe 占用判据 (审查 M7): 有 compute 进程 (不分归属) 或 util>0 -> True.
 
         与 _card_has_compute 的区别: 不做 pgid 归属判定 —— 外部进程驻留显存
         即使 util=0 也判占用, 否则 probe_free 永远抓不出 "驻留但空闲" 的外部
         进程, 派发新任务上卡会显存冲突 (归属判定只用于 settle_releasing 等离场)。
         None = 查询失败 (M8 fail-closed: 调用方保持现状不转态)。
+
+        P3: by_card 传入预取的 compute-apps 结果 (每轮 tick 查一次按卡分发);
+        显式传 None = 查询已失败 (fail-closed); 不传 (哨兵) = 自行查询。
         """
+        if by_card is _UNSET:
+            by_card = self._compute_pids_by_card()
         if self.fake:
-            by_card = self._compute_pids_by_card() or {}
-            return bool(by_card.get(idx))  # fake: util 恒 0, 只看模拟进程
+            return bool((by_card or {}).get(idx))  # fake: util 恒 0, 只看模拟进程
         util = self._util_opt(idx)
-        by_card = self._compute_pids_by_card()
         if util is not None and util > 0:
             return True
         if by_card is None:
             return None  # util=0/未知 且 compute-apps 查不出: 无法排除驻留进程
         return bool(by_card.get(idx))
 
-    def _card_has_compute(self, idx: int) -> bool:
+    def _card_has_compute(
+        self, idx: int, by_card: Any = _UNSET, known: set[int] | None = None
+    ) -> bool:
         """M8 主判据: 该卡是否有未离场的 compute 进程 (§3.2e C).
 
         层次:
@@ -386,14 +412,19 @@ class Allocator:
         行为路径变化 (评审确认): 外部进程判干净 -> 回 free -> 同 tick 的
         probe_free 用 _card_any_occupied (不分归属) 立即抓回 unmanaged,
         无 free 窗口可派发 (dispatch 在 probe_free 之后).
+
+        P3: by_card/known 可预取 (settle_releasing 每轮查一次按卡分发),
+        不再逐卡各查一次 nvidia-smi + 全表 DISTINCT。
         """
-        by_card = self._compute_pids_by_card()
+        if by_card is _UNSET:
+            by_card = self._compute_pids_by_card()
         if by_card is None:
             return self._util(idx) > 0  # 兜底: 查询失败回退 util 判据
         pids = by_card.get(idx, [])
         if not pids:
             return False
-        known = self._known_job_pgids()
+        if known is None:
+            known = self._known_job_pgids()
         for pid in pids:
             pgid = self._pgid_of(pid)
             if pgid is not None and pgid in known:
@@ -473,12 +504,14 @@ class Allocator:
             rows = conn.execute(
                 "SELECT idx FROM gpus WHERE status='unmanaged' AND quarantined=0"
             ).fetchall()
+            # P3: 循环外预取一次 compute-apps 逐卡分发
+            by_card = self._compute_pids_by_card() if rows else None
             for row in rows:
                 idx = row["idx"]
                 # 物理判据 (审查 M7/M8): 有 compute 进程 (不分归属) 或 util>0
                 # 判占用 —— 外部进程驻留显存但 util=0 也不能回 free;
                 # occ=None (nvidia-smi 故障) -> fail-closed 保持 unmanaged
-                occ = self._card_any_occupied(idx)
+                occ = self._card_any_occupied(idx, by_card)
                 if occ is None or occ:
                     self._reset_confirm(idx)
                     continue
@@ -508,9 +541,11 @@ class Allocator:
             rows = conn.execute(
                 "SELECT idx FROM gpus WHERE status='free'"
             ).fetchall()
+            # P3: 循环外预取一次 compute-apps 逐卡分发
+            by_card = self._compute_pids_by_card() if rows else None
             for row in rows:
                 idx = row["idx"]
-                occ = self._card_any_occupied(idx)
+                occ = self._card_any_occupied(idx, by_card)
                 if occ is None:
                     self._reset_occupied(idx)  # 查询失败: 中断连续计数 (M10)
                     continue  # nvidia-smi 故障: fail-closed 保持现状 (M8)

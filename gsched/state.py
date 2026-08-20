@@ -119,20 +119,35 @@ def hostname() -> str:
     M16: 回退仅限 config **不存在** (未 init 的环境); 存在但解析失败必须
     报错 —— 静默回退会让登录节点在 config 损坏时读到本机空目录, 正是本
     函数要根治的旧坑的复活路径.
+
+    P3: 进程内缓存 (path, mtime) —— 原实现每次 connect() 都完整 load_config
+    (读+解析+校验), daemon 每 tick 开多个连接导致 config.json 每秒被解析
+    近一遍。mtime 变化自动失效, CLI 短进程与 daemon 长驻均安全。
     """
     from .config import config_path, load_config
 
-    if not os.path.isfile(config_path()):
+    p = config_path()
+    if not os.path.isfile(p):
         import socket
 
         return socket.gethostname()
+    try:
+        key = (p, os.path.getmtime(p))
+    except OSError:
+        key = (p, None)
+    if key in _hostname_cache:
+        return _hostname_cache[key]
     cfg = load_config()  # 存在但损坏: ConfigError 上抛, 不静默回退
     node = cfg.get("node")
     if node:
-        return str(node)
-    import socket
+        result = str(node)
+    else:
+        import socket
 
-    return socket.gethostname()
+        result = socket.gethostname()
+    _hostname_cache.clear()
+    _hostname_cache[key] = result
+    return result
 
 
 def db_path() -> str:
@@ -186,6 +201,9 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+_hostname_cache: dict = {}  # P3: hostname() 进程内缓存 {(path, mtime): node}
 
 
 def release_gpu(conn: sqlite3.Connection, job_id: str) -> None:
