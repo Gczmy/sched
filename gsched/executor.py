@@ -161,8 +161,12 @@ class Executor:
         try:
             os.killpg(pgid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             return False
+        except PermissionError:
+            # 决策 6A: 进程存在但无权探测 (跨用户) -> 判活 (保守: 不误标 rc=137
+            # 失败、不参与 SIGKILL 升级误杀), 与 dispatcher._pid_exists 对齐
+            return True
 
     # ---------- 日志 ----------
 
