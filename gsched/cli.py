@@ -490,6 +490,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     cwd_abs = os.path.realpath(os.path.expanduser(resolve_template(cwd, cfg)))
 
     # resources: --cpu-only -> gpu:0 (CPU-only, 不占 GPU 槽位); --cpus 记录配额
+    # C3 修复: --gpus >1 此前被静默忽略且回显说谎 (schema resources.gpu ∈ {0,1},
+    # 多卡未打通 allocator); 直接拒绝, 不再假装支持
+    if args.gpus and args.gpus > 1 and not args.cpu_only:
+        print(
+            "错误: 暂不支持多卡任务 (--gpus 仅接受 1; 多卡训练请用 batch.json 拆多任务)",
+            file=sys.stderr,
+        )
+        return 1
     resources: dict[str, Any] = {}
     if args.cpu_only:
         resources["gpu"] = 0
@@ -563,7 +571,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         state.insert_job(conn, f"{bid}-run-v1", bid, "run", 1, fp, stage_fps)
 
-    print(f"已入队: {bid} (gpus={args.gpus} 张, duration={args.duration}min)")
+    res_txt = "cpu-only" if args.cpu_only else "gpu=1"
+    print(f"已入队: {bid} ({res_txt}, duration={args.duration}min)")
     print(f"  status/cancel 用批次名: {batch_name}")
     from . import daemon
     print(daemon.ensure_running())  # 定案 38: daemon 未运行自动拉起 (idle 退出后)
