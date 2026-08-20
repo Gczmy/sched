@@ -457,11 +457,21 @@ class Dispatcher:
                     if j["pgid"] and self.executor.alive(j["pgid"]):
                         self.log_line(f"A3: 接管 running job {j['id']} (pgid={j['pgid']})")
                     else:
-                        self.log_line(f"A3: job {j['id']} pgid 已死, 标 failed")
-                        state.update_job(
-                            conn, j["id"], status="failed",
-                            finished_at=state.now(),
-                        )
+                        # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
+                        # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
+                        spec = json.loads(self._get_task_spec(conn, j) or "{}")
+                        if self._should_skip(spec, j):
+                            state.update_job(
+                                conn, j["id"], status="done",
+                                finished_at=state.now(),
+                            )
+                            self.log_line(f"A3: job {j['id']} pgid 已死但产物/指纹有效 -> done")
+                        else:
+                            self.log_line(f"A3: job {j['id']} pgid 已死, 标 failed")
+                            state.update_job(
+                                conn, j["id"], status="failed",
+                                finished_at=state.now(),
+                            )
                         self._release_gpu_for_job(conn, j)
 
     # ---------- reap ----------
