@@ -317,6 +317,7 @@ class Dispatcher:
 
     def _tick(self) -> None:
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
+        self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
         self._reap_finished_jobs()
         _freed, _to = self.allocator.settle_releasing()
@@ -536,6 +537,52 @@ class Dispatcher:
                 self.executor.kill_pgid(pgid)  # SIGTERM
                 self.log_line(f"cancel req {r['id']}: job {j['id']} killpg SIGTERM (pgid={pgid})")
                 # 请求本轮不 finish: 下轮 tick 复查, 仍存活则 SIGKILL 升级
+
+    def _check_timeouts(self) -> None:
+        """H6 任务级超时看门狗: running 超 duration_min (schema 已校验) -> timed_out.
+
+        与 cancel 同结构 (自愈升级, 零同 tick 竞态):
+          1. kill_reason='timed_out' 的 running job: 仍存活 -> SIGKILL 升级
+             (这些 job 是**上一轮** tick SIGTERM 的, 有 10s 优雅退出窗口)
+          2. 其余 running job: 超 duration_min -> 先写 kill_reason 再 SIGTERM,
+             reap 按 reason 收尾 (_handle_job_done timed_out 分支, 不 retry ——
+             超时任务重跑大概率再超时)
+        """
+        with state.connect() as conn:
+            escal = conn.execute(
+                "SELECT * FROM jobs WHERE status='running'"
+                " AND kill_reason='timed_out' AND pgid IS NOT NULL"
+            ).fetchall()
+            for j in escal:
+                if self.executor.alive(j["pgid"]):
+                    self.log_line(
+                        f"⚠️ job {j['id']} 超时 SIGTERM 未生效 -> SIGKILL (pgid={j['pgid']})"
+                    )
+                    self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status='running'"
+                " AND kill_reason IS NULL AND started_at IS NOT NULL"
+                " AND pgid IS NOT NULL"
+            ).fetchall()
+            for j in rows:
+                spec = json.loads(self._get_task_spec(conn, j) or "{}")
+                dur = spec.get("duration_min")
+                if not dur:
+                    continue
+                try:
+                    started = time.mktime(
+                        time.strptime(j["started_at"], "%Y-%m-%d %H:%M:%S")
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if time.time() - started <= float(dur) * 60:
+                    continue
+                state.update_job(conn, j["id"], kill_reason="timed_out")
+                self.executor.kill_pgid(j["pgid"])  # SIGTERM
+                self.log_line(
+                    f"job {j['id']} 超时 (duration_min={dur}) -> killpg SIGTERM"
+                    f" (pgid={j['pgid']})"
+                )
 
     def _check_probes(self) -> None:
         """L6 probes 日志门控 (§3.4d R3): 运行中任务按声明匹配日志模式.
