@@ -158,6 +158,12 @@ def _validate_task(
     for key, a in artifacts.items():
         if not isinstance(a, dict) or not a.get("path"):
             raise SchemaError(f"{where}.artifacts.{key}: 缺 path")
+        # M14: min_bytes 未校验会在 reap 路径 int() ValueError 炸整轮
+        mb = a.get("min_bytes")
+        if mb is not None and (
+            not isinstance(mb, int) or isinstance(mb, bool) or mb < 0
+        ):
+            raise SchemaError(f"{where}.artifacts.{key}.min_bytes: 必须是非负整数")
         if not t.get("paths_escape"):
             p = expand_path(a["path"], cfg, t_cwd_abs)
             _check_path_in_cwd(p, t_cwd_abs, f"{where}.artifacts.{key}")
@@ -171,7 +177,8 @@ def _validate_task(
         if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
             raise SchemaError(f"{where}.resources.cpus: 必须是正整数 (声明 CPU 配额)")
     gpu_req = resources.get("gpu", 1)  # 缺省 gpu=1 (向后兼容: 每卡一任务)
-    if gpu_req not in (0, 1):
+    # M14: bool 穿透 —— JSON true/false == 1/0, 与 cpus/vram 的排除保持一致
+    if isinstance(gpu_req, bool) or gpu_req not in (0, 1):
         raise SchemaError(f"{where}.resources.gpu: 必须是 0 (CPU-only) 或 1 (占 1 GPU)")
     resources = dict(resources)
     resources["gpu"] = gpu_req
@@ -205,8 +212,15 @@ def _validate_task(
     retry_transform = t.get("retry_transform")
     probes = t.get("probes")
     duration_min = t.get("duration_min")
-    if duration_min is not None and not isinstance(duration_min, (int, float)):
+    if duration_min is not None and (
+        not isinstance(duration_min, (int, float)) or isinstance(duration_min, bool)
+    ):
         raise SchemaError(f"{where}.duration_min: 必须是数字 (分钟)")
+    # M14: max_retry 原先完全未校验 —— 字符串/负数会在 dispatcher 比较处
+    # TypeError 炸掉整轮 reap
+    max_retry = t.get("max_retry", 1)
+    if not isinstance(max_retry, int) or isinstance(max_retry, bool) or max_retry < 0:
+        raise SchemaError(f"{where}.max_retry: 必须是非负整数")
 
     return {
         "id": tid,
@@ -217,7 +231,7 @@ def _validate_task(
         "env": t.get("env", {}),
         "resources": resources,
         "duration_min": duration_min,
-        "max_retry": t.get("max_retry", 1),
+        "max_retry": max_retry,
         "artifacts": artifacts,
         "retry_transform": retry_transform,
         "probes": probes,
@@ -241,6 +255,11 @@ def _validate_stage(s: Any, cfg: dict, t_cwd_abs: str, where: str) -> dict:
     for key, a in artifacts.items():
         if not isinstance(a, dict) or not a.get("path"):
             raise SchemaError(f"{where}.artifacts.{key}: 缺 path")
+        mb = a.get("min_bytes")
+        if mb is not None and (
+            not isinstance(mb, int) or isinstance(mb, bool) or mb < 0
+        ):
+            raise SchemaError(f"{where}.artifacts.{key}.min_bytes: 必须是非负整数")
         if not s.get("paths_escape"):
             p = expand_path(a["path"], cfg, t_cwd_abs)
             _check_path_in_cwd(p, t_cwd_abs, f"{where}.artifacts.{key}")
