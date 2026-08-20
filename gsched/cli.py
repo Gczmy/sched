@@ -1002,10 +1002,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
 def cmd_markers(args: argparse.Namespace) -> int:
     """sched markers: 一行查看批次终态 marker (P7).
 
-    daemon 在批次进入终态 (done/blocked) 时写 {STATE}/markers/{name}.{kind},
-    blocked 解除回 active 时删 .blocked. 按修改时间倒序, 最新在前.
+    daemon 在批次进入终态 (done/blocked) 时写 {STATE}/<hostname>/markers/{name}.{kind}
+    (决策 5B 按节点隔离), blocked 解除回 active 时删 .blocked. 按修改时间倒序, 最新在前.
     """
-    d = os.path.join(state.default_state_dir(), "markers")
+    d = os.path.join(state.default_state_dir(), state.hostname(), "markers")
     if not os.path.isdir(d):
         print("(无 marker — 尚无批次进入终态)")
         return 0

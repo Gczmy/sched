@@ -14,7 +14,7 @@ import os
 import subprocess
 from typing import Any
 
-from .state import connect, get_gpu, now, release_gpu
+from .state import connect, default_state_dir, get_gpu, hostname, now, release_gpu
 
 _UNSET = object()  # P3: by_card 预取参数哨兵 (区分"未传"与"查询失败返回 None")
 
@@ -446,6 +446,13 @@ class Allocator:
                 return True  # 残留框架进程: 等离场
         return False  # 全外部进程: 干净
 
+    def _confirm_flag(self, kind: str, idx: int) -> str:
+        """连续采样确认标记路径 (决策 5B: 按节点隔离 + 统一走 state 路径函数,
+        不再手写 os.environ["SCHED_STATE"] 默认值)."""
+        return os.path.join(
+            default_state_dir(), hostname(), kind, f"gpu{idx}"
+        )
+
     def _confirm_release(self, idx: int) -> bool:
         """M7 冷却确认: 连续 2 次采样均无进程才转 free.
 
@@ -453,12 +460,8 @@ class Allocator:
         """
         if self.fake:
             return True
-        marker = os.path.join(
-            os.environ.get("SCHED_STATE", os.path.expanduser("~/.sched")),
-            "release_confirm",
-        )
-        os.makedirs(marker, exist_ok=True)
-        flag = os.path.join(marker, f"gpu{idx}")
+        flag = self._confirm_flag("release_confirm", idx)
+        os.makedirs(os.path.dirname(flag), exist_ok=True)
         if os.path.exists(flag):
             os.unlink(flag)
             return True
@@ -469,11 +472,7 @@ class Allocator:
         """中断连续计数 (采样到进程)."""
         if self.fake:
             return
-        flag = os.path.join(
-            os.environ.get("SCHED_STATE", os.path.expanduser("~/.sched")),
-            "release_confirm",
-            f"gpu{idx}",
-        )
+        flag = self._confirm_flag("release_confirm", idx)
         if os.path.exists(flag):
             os.unlink(flag)
 
@@ -481,11 +480,7 @@ class Allocator:
         """中断 unmanaged 连续计数 (采样干净/查询失败, 审查 M10)."""
         if self.fake:
             return
-        flag = os.path.join(
-            os.environ.get("SCHED_STATE", os.path.expanduser("~/.sched")),
-            "occupied_confirm",
-            f"gpu{idx}",
-        )
+        flag = self._confirm_flag("occupied_confirm", idx)
         if os.path.exists(flag):
             os.unlink(flag)
 
@@ -493,12 +488,8 @@ class Allocator:
         """unmanaged 探测连续 2 次 (M7)."""
         if self.fake:
             return True
-        marker = os.path.join(
-            os.environ.get("SCHED_STATE", os.path.expanduser("~/.sched")),
-            "occupied_confirm",
-        )
-        os.makedirs(marker, exist_ok=True)
-        flag = os.path.join(marker, f"gpu{idx}")
+        flag = self._confirm_flag("occupied_confirm", idx)
+        os.makedirs(os.path.dirname(flag), exist_ok=True)
         if os.path.exists(flag):
             os.unlink(flag)
             return True

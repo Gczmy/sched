@@ -409,14 +409,16 @@ class Dispatcher:
     # ---------- P7: 批次终态 marker (2026-08-15) ----------
 
     def _marker_dir(self) -> str:
-        d = os.path.join(state.default_state_dir(), "markers")
+        # 决策 5B: 按节点隔离 ({STATE}/<hostname>/markers) —— 共享 NFS 多节点
+        # 时同名批次 marker 不再互相覆盖 (与 state.db/logs/profiles 一致)
+        d = os.path.join(self.host_dir, "markers")
         os.makedirs(d, exist_ok=True)
         return d
 
     def _write_marker(self, name: str, kind: str, detail: str) -> None:
         """P7: 批次进入终态 (done/blocked) 写 marker 文件, 供一行查看 (sched markers).
 
-        文件: {STATE}/markers/{name}.{kind} (node 无关全局; 按名覆盖幂等).
+        文件: {STATE}/<hostname>/markers/{name}.{kind} (决策 5B 按节点隔离; 按名覆盖幂等).
         """
         p = os.path.join(self._marker_dir(), f"{name}.{kind}")
         try:
