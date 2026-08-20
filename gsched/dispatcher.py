@@ -1025,6 +1025,19 @@ class Dispatcher:
         state.release_gpu(conn, job_id)
 
     def _launch_job(self, conn, j, gpu: int | None) -> None:
+        # M1 修复: 条件更新抢占 —— SELECT 快照到 launch 之间 (指纹计算/产物清理
+        # 可达秒级) CLI 可能已把 pending 标 cancelled; 只有仍为 pending 才允许
+        # 转 running, 否则放弃派发并释放本事务已 assign 的卡
+        cur = conn.execute(
+            "UPDATE jobs SET status='running', started_at=?"
+            " WHERE id=? AND status='pending'",
+            (state.now(), j["id"]),
+        )
+        if cur.rowcount == 0:
+            self.log_line(f"job {j['id']} 派发竞态: 已非 pending (或被 cancel), 放弃启动")
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return
         spec = json.loads(self._get_task_spec(conn, j) or "{}")
         cwd = spec.get("cwd_abs") or resolve_template(self.cfg.get("default_project", "{ROOT}"), self.cfg)
         log_path = self._job_log_path(j)
@@ -1067,8 +1080,8 @@ class Dispatcher:
         except Exception:
             pass
         state.update_job(
-            conn, j["id"], status="running", gpu=gpu, pgid=pgid,
-            started_at=state.now(), git_rev=git_rev, kill_reason=None,
+            conn, j["id"], gpu=gpu, pgid=pgid,
+            git_rev=git_rev, kill_reason=None,
         )
         tag = f"cpu" if gpu is None else f"gpu={gpu}"
         self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
