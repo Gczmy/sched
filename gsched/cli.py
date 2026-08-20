@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -312,7 +313,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     from datetime import datetime
 
-    bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # M13: 批次 id 到毫秒 (与 cmd_run 一致) —— 秒级精度下同秒重提/并发 submit
+    # 撞主键抛裸 IntegrityError; 毫秒 + IntegrityError 兜底友好报错
+    bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
     from .fingerprint import compute_fingerprint
 
@@ -400,10 +403,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 print(json.dumps(prev, ensure_ascii=False, indent=2))
             return 0
 
-        state.insert_batch(
-            conn, bid, norm["name"], norm["mode"], norm["depends_on"],
-            norm["gpus"], norm["cwd"], norm["env"],
-        )
+        try:
+            state.insert_batch(
+                conn, bid, norm["name"], norm["mode"], norm["depends_on"],
+                norm["gpus"], norm["cwd"], norm["env"],
+            )
+        except sqlite3.IntegrityError:
+            # M13: 并发 submit 同时通过定案 6 检查 -> 撞主键, 转友好错误
+            print(f"错误: 批次 id 冲突 {bid} (并发提交?), 请重试", file=sys.stderr)
+            return 1
         for i, t in enumerate(norm["tasks"]):
             # cmd/stages 的 {VENV:}/{stageN_<key>} 展开为绝对路径 (spec 存展开后的)
             cmd_e = _expand_cmd(t["cmd"]) if t["cmd"] else None
