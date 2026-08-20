@@ -225,6 +225,7 @@ class Dispatcher:
         # 接管: running 任务 pgid 存活则继续等 (A3/3.2b)
         self._adopt_running()
 
+        tick_failures = 0
         while True:
             try:
                 self._heartbeat()
@@ -235,10 +236,18 @@ class Dispatcher:
                 if self._idle_check():
                     break
                 self._tick()
+                tick_failures = 0
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                self.log_line(f"tick 异常: {e}")
+                tick_failures += 1
+                self.log_line(f"tick 异常 (连续 {tick_failures} 次): {e}")
+                # M11: tick 持续异常 (DB 损坏/磁盘满等) 时心跳照更会骗过看门狗
+                # —— status 显示运行中但调度停摆。连续 5 次退出并清锁/停心跳,
+                # 让外部判死并可重新拉起
+                if tick_failures >= 5:
+                    self.log_line("tick 连续 5 次异常, 退出 (停心跳让外部判死)")
+                    break
             if once:
                 break
             # B1: 可中断 sleep —— time.sleep(POLL_SEC) 被信号打断后 PEP 475 自动
