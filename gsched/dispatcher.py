@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import time
+from datetime import datetime
 from typing import Any
 
 from . import state
@@ -26,6 +27,7 @@ POLL_SEC = 10
 HEARTBEAT_SEC = 30
 RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5)
 DEFAULT_MAX_RETRY = 1
+RETRY_BACKOFF_SEC = 30  # 失败重试退避 (M2): 防秒级崩溃任务紧密崩溃循环
 DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
 DEFAULT_MAX_CPU_JOBS = 2  # cpus_total 未配置时回退: CPU-only 并发上限 (定案 7 旧语义)
 DEFAULT_IDLE_TIMEOUT_MIN = 360  # 空转自动退出 (定案 38): 默认 6h, 0 = 禁用
@@ -819,7 +821,18 @@ class Dispatcher:
                 "SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL"
             ).fetchone()[0]
             gpu_full = False
+            now_ts = datetime.now()
             for j in ready:
+                # M2: 重试退避 —— 失败重试 (retries>0) 的 job 等 RETRY_BACKOFF_SEC
+                # 再派发, 防秒级崩溃任务同 tick 重新拉起形成紧密崩溃循环
+                # (与 _maybe_retry 日志承诺的 30s 退避一致)
+                if j["retries"] and j["finished_at"]:
+                    try:
+                        ft = datetime.strptime(j["finished_at"], "%Y-%m-%d %H:%M:%S")
+                    except (ValueError, TypeError):
+                        ft = None
+                    if ft and (now_ts - ft).total_seconds() < RETRY_BACKOFF_SEC:
+                        continue  # 退避中, 下轮再试
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
                 resources = spec.get("resources") or {}
                 is_cpu_only = resources.get("gpu", 1) == 0
