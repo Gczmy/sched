@@ -77,6 +77,22 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
     if not isinstance(env, dict):
         raise SchemaError("env 必须是对象")
 
+    # 批次级通知覆盖 (设计 §3): false = 本批不通知; {"email_to": [...]} 改收件人;
+    # 缺省/true = 跟随全局 config.notify
+    bnotify = spec.get("notify")
+    if bnotify is not None:
+        if isinstance(bnotify, bool):
+            pass
+        elif isinstance(bnotify, dict):
+            et = bnotify.get("email_to")
+            if et is not None and (
+                not isinstance(et, list)
+                or not all(isinstance(x, str) for x in et)
+            ):
+                raise SchemaError("notify.email_to 必须是邮箱字符串数组")
+        else:
+            raise SchemaError('notify 必须是布尔或对象 (如 {"email_to": [...]})')
+
     # 批次 cwd: 模板展开
     batch_cwd = resolve_template(spec.get("cwd", "{ROOT}"), cfg)
     batch_cwd_abs = os.path.realpath(
@@ -102,6 +118,7 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         "cwd": spec.get("cwd", "{ROOT}"),
         "cwd_abs": batch_cwd_abs,
         "env": env,
+        "notify": bnotify,
         "tasks": norm_tasks,
     }
 

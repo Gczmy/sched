@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS batches (
   gpus        TEXT,
   cwd         TEXT,
   env         TEXT,
+  notify      TEXT,
   status      TEXT NOT NULL DEFAULT 'queued',
   created_at  TEXT NOT NULL
 );
@@ -178,6 +179,10 @@ def migrate_gpu_jobs(conn: sqlite3.Connection) -> None:
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(gpus)").fetchall()]
     if "mem_total_gib" not in cols:
         conn.execute("ALTER TABLE gpus ADD COLUMN mem_total_gib REAL")
+    # 批次级通知覆盖列 (设计 §3): 旧库无 notify 列 -> ALTER 补齐
+    bcols = [r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()]
+    if "notify" not in bcols:
+        conn.execute("ALTER TABLE batches ADD COLUMN notify TEXT")
 
 
 @contextmanager
@@ -257,12 +262,13 @@ def insert_batch(
     gpus: list[int] | None,
     cwd: str | None,
     env: dict | None,
+    notify: Any = None,
 ) -> None:
     import json
 
     conn.execute(
-        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,status,created_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             bid,
             name,
@@ -271,6 +277,7 @@ def insert_batch(
             json.dumps(gpus) if gpus is not None else None,
             cwd,
             json.dumps(env) if env else None,
+            json.dumps(notify) if notify is not None else None,
             "queued",
             now(),
         ),

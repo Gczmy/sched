@@ -112,6 +112,48 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     # 对象数组 {idx, mem_gib} 支持显存覆盖 (异构卡容量/无 nvidia-smi 环境)
     if "gpus" in cfg and cfg["gpus"] is not None:
         parse_gpus(cfg)  # 抛 ConfigError = 非法
+    # 通知 (设计 docs/sched_notify_design.md §3, 可选; 缺省 = 功能关闭)
+    nf = cfg.get("notify")
+    if nf is not None:
+        if not isinstance(nf, dict):
+            raise ConfigError(f"{p}: notify 必须是对象")
+        on = nf.get("on")
+        if on is not None and (
+            not isinstance(on, list)
+            or not all(e in ("batch_done", "batch_blocked") for e in on)
+        ):
+            raise ConfigError(
+                f"{p}: notify.on 必须是 batch_done/batch_blocked 子集数组"
+            )
+        em = nf.get("email")
+        if em is not None:
+            if not isinstance(em, dict):
+                raise ConfigError(f"{p}: notify.email 必须是对象")
+            for k in ("smtp_host", "from"):
+                if not em.get(k) or not isinstance(em[k], str):
+                    raise ConfigError(f"{p}: notify.email 缺少 {k}")
+            to = em.get("to")
+            if not isinstance(to, list) or not to or not all(
+                isinstance(x, str) for x in to
+            ):
+                raise ConfigError(f"{p}: notify.email.to 必须是非空邮箱数组")
+            port = em.get("smtp_port", 465)
+            if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+                raise ConfigError(f"{p}: notify.email.smtp_port 非法: {port}")
+            # password_env 可选 (决策 3): 缺省 = 无认证内网 relay
+            if em.get("password_env") is not None and not isinstance(
+                em["password_env"], str
+            ):
+                raise ConfigError(f"{p}: notify.email.password_env 必须是环境变量名")
+        for ch in ("file", "webhook"):
+            if nf.get(ch) is not None and not isinstance(nf[ch], dict):
+                raise ConfigError(f"{p}: notify.{ch} 必须是对象")
+        if nf.get("command") is not None and (
+            not isinstance(nf["command"], list)
+            or not all(isinstance(x, str) for x in nf["command"])
+        ):
+            raise ConfigError(f"{p}: notify.command 必须是命令数组 (v1.5 预留)")
+
     # co-location (定案 39 待定项 4, 实验性默认关):
     #   co_locate: bool 全局开关; co_locate_safety 安全系数 [0.5,0.85] 默认 0.7;
     #   co_locate_max_jobs 每卡任务数上限 [2,8] 默认 3; co_locate_freeze_pct L3 冻结阈值 (0,100) 默认 85

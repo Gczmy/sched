@@ -399,7 +399,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         try:
             state.insert_batch(
                 conn, bid, norm["name"], norm["mode"], norm["depends_on"],
-                norm["gpus"], norm["cwd"], norm["env"],
+                norm["gpus"], norm["cwd"], norm["env"], norm.get("notify"),
             )
         except sqlite3.IntegrityError:
             # M13: 并发 submit 同时通过定案 6 检查 -> 撞主键, 转友好错误
