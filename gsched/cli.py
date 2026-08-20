@@ -1490,10 +1490,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_help()
         return 1
     # 所有命令先确保建表 (幂等; daemon 侧也建, 双保险)
+    # M18: init 失败 (state 目录不可写/磁盘满/DB 损坏) 不再静默吞噬 ——
+    # 打 warning 继续 (只读命令可能仍可用), 失败会在第一次 SQL 处显式报错
     try:
         state.init_db()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"警告: state DB 初始化失败 ({e}), 后续命令可能报错", file=sys.stderr)
     try:
         return args.fn(args)
     except KeyboardInterrupt:
