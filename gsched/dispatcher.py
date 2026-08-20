@@ -1098,7 +1098,11 @@ class Dispatcher:
         #   注入 SCHED_PROFILE_OUT=<host_dir>/profiles/<job_id>.json, 训练侧写
         #   {"peak_gib": X} (GiB); job rc=0 后 _consume_profile upsert profile_cache
         #   并删临时; 失败路径只删不 upsert. 任务显式声明 SCHED_PROFILE_OUT 则尊重.
-        task_env = dict(spec.get("env", {}))
+        # M15: 批次级 env 生效 —— batch.env 打底 + task.env 覆盖, 此前批次 env
+        # 校验入库后无读取方被静默丢弃
+        b = state.get_batch(conn, j["batch_id"])
+        batch_env = json.loads(b["env"]) if b and b["env"] else {}
+        task_env = {**batch_env, **dict(spec.get("env", {}))}
         task_env.setdefault(
             "SCHED_PROFILE_OUT", os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
         )
