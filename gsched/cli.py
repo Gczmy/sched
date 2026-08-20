@@ -158,11 +158,19 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
             return p
         return tok
 
+    def _expand_root(tok: str) -> str:
+        """cmd 里的 {ROOT} 模板展开为项目根目录绝对路径."""
+        if isinstance(tok, str) and "{ROOT}" in tok:
+            root = _project_root(cfg, cfg.get("default_project", "a_share"))
+            return tok.replace("{ROOT}", root)
+        return tok
+
     def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
                     cwd_abs: str | None = None) -> list[str]:
         out = []
         for tok in cmd_list:
             tok = _expand_venv(tok)
+            tok = _expand_root(tok)
             if isinstance(tok, str) and tok.startswith("{stage") and tok.endswith("}"):
                 inner = tok[1:-1]
                 parts = inner.split("_", 1)
@@ -352,12 +360,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
             return p
         return tok
 
+    def _expand_root(tok: str) -> str:
+        """cmd 里的 {ROOT} 模板展开为项目根目录绝对路径."""
+        if isinstance(tok, str) and "{ROOT}" in tok:
+            root = _project_root(cfg, cfg.get("default_project", "a_share"))
+            return tok.replace("{ROOT}", root)
+        return tok
+
     def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
                     cwd_abs: str | None = None) -> list[str]:
-        """cmd 模板展开: {VENV:name} + {stageN_<key>} (N7, 前序 stage 产物路径)."""
+        """cmd 模板展开: {VENV:name} + {ROOT} + {stageN_<key>} (N7, 前序 stage 产物路径)."""
         out = []
         for tok in cmd_list:
             tok = _expand_venv(tok)
+            tok = _expand_root(tok)
             if isinstance(tok, str) and tok.startswith("{stage") and tok.endswith("}"):
                 # {stage0_ckpt} -> stage0 的 artifacts["ckpt"].path
                 inner = tok[1:-1]  # stage0_ckpt
