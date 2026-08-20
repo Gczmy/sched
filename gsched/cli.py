@@ -345,10 +345,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     with state.connect() as conn:
         # 同名批次未全部终态 -> 拒绝 (定案 6)
+        # 决策 7A: dry-run 跳过该检查 —— 纯只读预览不产生副作用, 拦截反而
+        # 挡住"现有批次终态后要提交什么"的预览场景; 预览中降级为提示
         existing = conn.execute(
             "SELECT status FROM batches WHERE name=?", (norm["name"],)
         ).fetchall()
-        if any(b["status"] not in ("done", "blocked") for b in existing):
+        conflict = any(b["status"] not in ("done", "blocked") for b in existing)
+        if conflict and not getattr(args, "dry_run", False):
             print(
                 f"错误: 同名批次 '{norm['name']}' 已有未终态批次 (定案 6),"
                 " 请改名或用 sched resubmit",
@@ -360,6 +363,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             # §G4 A 类: 纯只读预览, 不 insert
             prev = _dry_run_preview(norm, cfg)
             print(f"=== dry-run: {norm['name']} ({len(norm['tasks'])} 任务, mode={norm['mode']}) ===")
+            if conflict:
+                print(f"  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
             if prev["dep_status"]:
                 print("--- 依赖就绪 ---")
                 for dep, st in prev["dep_status"].items():
