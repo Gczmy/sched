@@ -13,10 +13,11 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime
 
-from . import state
+from . import notify, state
 from .allocator import Allocator
 from .executor import Executor, pid_cmdline_matches
 from .fingerprint import compute_fingerprint
@@ -42,6 +43,7 @@ class Dispatcher:
         self.pid_file = os.path.join(self.host_dir, "daemon.pid")
         self.heartbeat_file = os.path.join(self.host_dir, "daemon.heartbeat")
         self._prev_hb_ts: float | None = None  # acquire_lock 触心跳前采样 (D4 用)
+        self._notify_threads: list[threading.Thread] = []  # 在途通知线程 (退出前 join)
         self._probe_offsets: dict[str, int] = {}  # job_id -> 日志已扫字节偏移 (P2)
         self.lock_dir = os.path.join(self.host_dir, "dispatcher.lock")
         self.log = open(
@@ -156,6 +158,11 @@ class Dispatcher:
         os.utime(self.heartbeat_file, None)
 
     def _cleanup_lock(self) -> None:
+        # 通知线程收尾: 退出前等在途通知发完 (超时则放弃, 记 log)
+        for t in self._notify_threads:
+            t.join(timeout=10)
+            if t.is_alive():
+                self.log_line("notify 线程超时未结束, 放弃等待")
         if os.path.isdir(self.lock_dir):
             try:
                 os.rmdir(self.lock_dir)
@@ -336,6 +343,10 @@ class Dispatcher:
         self._unlock_dependent_batches()
         self._settle_batch_status()  # P1: 批次终态收敛
         self._dispatch_ready_jobs()
+        try:
+            notify.cleanup_acked()  # 顺带清理 7 天前已确认通知 (设计 §6)
+        except Exception as e:
+            self.log_line(f"notify 清理异常: {e}")
 
     def _gpu_ignored(self, idx: int) -> bool:
         """gpu-ignore 人工确认标记 (C2 修复): ignore_until 非 NULL = 静默告警.
@@ -378,6 +389,7 @@ class Dispatcher:
                         f"{len(statuses)} 任务全部成功终态 (done/skip)",
                     )
                     self.log_line(f"批次 {b['name']} done (全部任务成功终态)")
+                    self._notify_batch(conn, b)  # 终态通知 (设计 §2, 一次性迁移点)
                 elif any(
                     s in ("failed", "blocked", "cancelled", "timed_out")
                     for s in statuses
@@ -398,6 +410,7 @@ class Dispatcher:
                             f"失败任务: {','.join(fails) if fails else '-'}",
                         )
                         self.log_line(f"批次 {b['name']} blocked (有失败任务, 等人工)")
+                        self._notify_batch(conn, b)  # 终态通知 (cancelled 也发, 决策 4)
                 elif b["status"] == "blocked":
                     # 人工 retry/resubmit 已解除全部失败终态 (只剩 pending/running 等)
                     conn.execute(
@@ -406,8 +419,48 @@ class Dispatcher:
                     self._remove_marker(b["name"], "blocked")  # P7: 解除阻塞删除 marker
                     self.log_line(f"批次 {b['name']} 失败终态解除 -> active (人工 retry 生效)")
 
-    # ---------- P7: 批次终态 marker (2026-08-15) ----------
+    # ---------- 批次终态通知 (设计 docs/sched_notify_design.md) ----------
 
+    def _notify_batch(self, conn, b) -> None:
+        """批次进终态 -> 异步投递 (email/file 渠道). 故障只记日志, 绝不影响调度.
+
+        - 一次性迁移点触发 (与 _write_marker 同处), 天然去重无需已发记录
+        - 批次级覆盖 (设计 §3): batches.notify=false 关; {"email_to": [...]} 改收件人
+        - 调用方传入的 b 是 UPDATE 前的 Row 快照 —— 必须重读 (同 H1 教训)
+        - 发送在 daemon 线程, 退出时 _cleanup_lock join 等发完 (定案 38 交互)
+        """
+        try:
+            b = state.get_batch(conn, b["id"])  # 重读: 拿到刚写入的终态
+            bnf = json.loads(b["notify"]) if b["notify"] else None
+            if bnf is False:
+                return  # 批次级关闭
+            ncfg = self.cfg.get("notify") or {}
+            if not ncfg:
+                return  # 全局未配置 = 功能关闭
+            cfg = self.cfg
+            if isinstance(bnf, dict) and bnf.get("email_to") and ncfg.get("email"):
+                # 批次级改收件人: 浅拷覆盖, 不动全局 cfg
+                cfg = dict(self.cfg)
+                em = dict(ncfg["email"])
+                em["to"] = bnf["email_to"]
+                cfg["notify"] = dict(ncfg, email=em)
+            event = notify.build_event(conn, b, self.host_dir)
+
+            def _send() -> None:
+                try:
+                    for r in notify.send(event, cfg):
+                        if not r.startswith("ok:"):
+                            self.log_line(f"notify [{b['name']}]: {r}")
+                except Exception as e:  # noqa: BLE001 — 通知绝不影响调度 (§6)
+                    self.log_line(f"notify [{b['name']}] 线程异常: {e}")
+
+            t = threading.Thread(target=_send, daemon=True)
+            t.start()
+            self._notify_threads.append(t)
+        except Exception as e:  # noqa: BLE001 — 构造事件失败也不影响批次收敛
+            self.log_line(f"notify [{b['name']}] 构造失败: {e}")
+
+    # ---------- P7: 批次终态 marker (2026-08-15) ----------
     def _marker_dir(self) -> str:
         # 决策 5B: 按节点隔离 ({STATE}/<hostname>/markers) —— 共享 NFS 多节点
         # 时同名批次 marker 不再互相覆盖 (与 state.db/logs/profiles 一致)
