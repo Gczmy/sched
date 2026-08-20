@@ -47,7 +47,7 @@ def _batch_id_from_name(name: str) -> str | None:
     """batch name -> 最新批次 id (带时间戳). 找不到返回 None."""
     with state.connect() as conn:
         row = conn.execute(
-            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (name,),
         ).fetchone()
     return row["id"] if row else None
@@ -235,7 +235,7 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
         for dep in norm["depends_on"]:
             row = conn.execute(
                 "SELECT id, status FROM batches WHERE name=?"
-                " ORDER BY created_at DESC LIMIT 1",
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (dep,),
             ).fetchone()
             if row:
@@ -273,7 +273,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     with state.connect() as conn:
         for dep in norm["depends_on"]:
             row = conn.execute(
-                "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC LIMIT 1",
+                "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (dep,),
             ).fetchone()
             if not row:

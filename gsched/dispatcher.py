@@ -811,8 +811,9 @@ class Dispatcher:
 
     def _batch_successful(self, conn, batch_name: str) -> bool:
         """§2.4: depends_on 批次全部任务成功终态 (done/skip) 才解锁."""
+        # M19: created_at 秒级精度可能并列, 加 rowid 次序保证锚定最新批次
         b = conn.execute(
-            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (batch_name,),
         ).fetchone()
         if not b:
