@@ -115,16 +115,21 @@ def hostname() -> str:
     登录节点 CLI 也读同一 state.db); 无 config/无 node 字段 fallback 本机
     hostname. 背景: 登录节点 gethostname() = hpdc-gateway != ambiorix,
     登录节点 sched status 读到空目录 (旧坑: 只能 tmux 进计算节点查状态).
-    """
-    try:
-        from .config import ConfigError, load_config
 
-        cfg = load_config()
-        node = cfg.get("node")
-        if node:
-            return str(node)
-    except ConfigError:
-        pass
+    M16: 回退仅限 config **不存在** (未 init 的环境); 存在但解析失败必须
+    报错 —— 静默回退会让登录节点在 config 损坏时读到本机空目录, 正是本
+    函数要根治的旧坑的复活路径.
+    """
+    from .config import config_path, load_config
+
+    if not os.path.isfile(config_path()):
+        import socket
+
+        return socket.gethostname()
+    cfg = load_config()  # 存在但损坏: ConfigError 上抛, 不静默回退
+    node = cfg.get("node")
+    if node:
+        return str(node)
     import socket
 
     return socket.gethostname()

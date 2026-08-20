@@ -108,8 +108,11 @@ def cmd_init(args: argparse.Namespace) -> int:
             "kronos_ft": input("kronos_ft venv python 路径: ").strip(),
         },
     }
-    with open(p, "w", encoding="utf-8") as f:
+    # M16: 原子写 —— 崩溃不留截断的 config.json (截断会导致 load_config 全线报错)
+    tmp_p = p + ".tmp"
+    with open(tmp_p, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_p, p)
     print(f"已生成 {p}")
     print("下一步: `sched daemon start --check` 跑前置检查 (M0)")
     return 0
