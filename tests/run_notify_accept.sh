@@ -12,6 +12,7 @@
 #   4. notify-inbox / notify-ack CLI: 列出 -> 确认 -> .acked
 #   5. email 渠道异常 (SMTP 拒连) 不影响 file 渠道与批次收敛
 #   6. 批次级 notify=false -> 不发
+#   7. command 渠道: stdin 收事件 JSON; rc!=0 记 FAIL 不影响其他渠道
 #
 # 用法: bash sched/tests/run_notify_accept.sh
 # 退出码: 0 = 全过, 1 = 有失败
@@ -222,6 +223,62 @@ sleep 2
 [ "$(count_inbox $S6 '*.json')" = "0" ] && ok "notify=false -> inbox 无文件" \
   || bad "notify=false 仍发通知 (inbox: $(ls $(inbox $S6) 2>/dev/null))"
 stop_daemon $S6
+
+# ---------- 场景 7: command 渠道 (stdin 事件 JSON + rc!=0 降级) ----------
+echo "--- 场景 7: command 渠道 ---"
+S7=/tmp/sched_ntf7; rm -rf $S7; mkdir -p $S7
+# sink 脚本: stdin 落盘 (模拟唤醒 agent 的接收端)
+cat > $S7/sink.sh << EOF
+#!/bin/bash
+cat > $S7/sink.json
+EOF
+chmod +x $S7/sink.sh
+mk_config $S7 "{\"file\": {}, \"command\": [\"bash\", \"$S7/sink.sh\"]}"
+cat > $S7/batch.json << EOF
+{
+  "name": "n7", "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
+  ]
+}
+EOF
+export SCHED_STATE=$S7 SCHED_CONFIG=$S7/config.json
+$PY -m gsched.cli submit $S7/batch.json >/dev/null 2>&1 || { bad "n7 submit 失败"; exit 1; }
+start_fake $S7
+for _ in $(seq 1 30); do [ -f $S7/sink.json ] && break; sleep 1; done
+if [ -f $S7/sink.json ]; then
+  $PY -c "
+import json
+ev = json.load(open('$S7/sink.json'))
+assert ev['event'] == 'batch_done' and ev['batch'] == 'n7', ev
+" && ok "command 渠道 stdin 收到完整事件 JSON" || bad "sink 内容异常: $(cat $S7/sink.json)"
+else
+  bad "command 渠道未触发 (sink.json 不存在)"
+fi
+# rc!=0 降级: 换必败命令, file 渠道仍落盘
+S7B=/tmp/sched_ntf7b; rm -rf $S7B; mkdir -p $S7B
+mk_config $S7B "{\"file\": {}, \"command\": [\"$PY\", \"-c\", \"import sys; sys.exit(3)\"]}"
+cat > $S7B/batch.json << EOF
+{
+  "name": "n7b", "mode": "mix",
+  "tasks": [
+    {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
+  ]
+}
+EOF
+export SCHED_STATE=$S7B SCHED_CONFIG=$S7B/config.json
+$PY -m gsched.cli submit $S7B/batch.json >/dev/null 2>&1 || { bad "n7b submit 失败"; exit 1; }
+start_fake $S7B
+wait_inbox $S7B '*.done.json' 1 30 && ok "command rc!=0 时 file 渠道仍落盘" \
+  || bad "command 异常拖垮 file 渠道 (inbox: $(ls $(inbox $S7B) 2>/dev/null))"
+sleep 1
+grep -q "FAIL: command" $S7B/testnode/scheduler.log 2>/dev/null \
+  && ok "command rc!=0 记 FAIL 进 scheduler.log" \
+  || bad "scheduler.log 无 command FAIL 记录"
+[ -f $S7B/testnode/markers/n7b.done ] && ok "批次正常收敛 (command 异常不影响调度)" \
+  || bad "n7b 未收敛"
+stop_daemon $S7
+stop_daemon $S7B
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
