@@ -7,6 +7,7 @@
 - email: smtplib, 协议按 port 自动选 (465 SSL / 587 STARTTLS / 其他明文),
   password_env 可选 (缺省 = 无认证内网 relay); 密码不落盘 (决策 3)
 - file: 事件 JSON 落 {STATE}/<node>/notify_inbox/ —— LLM agent 的拉渠道 (§10)
+- command: 事件 JSON 走 stdin 喂用户脚本 —— LLM agent 的推渠道 (§10, v1.5)
 - 故障降级: 单渠道异常只记入返回结果, 绝不上抛影响调度
 """
 
@@ -16,6 +17,7 @@ import json
 import os
 import re
 import smtplib
+import subprocess
 from email.header import Header
 from email.mime.text import MIMEText
 from typing import Any
@@ -23,6 +25,7 @@ from typing import Any
 from . import state
 
 SMTP_TIMEOUT_SEC = 10
+COMMAND_TIMEOUT_SEC = 10  # command 渠道子进程超时 (§6 每渠道 timeout=10)
 ACKED_KEEP_DAYS = 7  # acked 事件保留天数 (dispatcher tick 顺带清理)
 
 ALL_EVENTS = ("batch_done", "batch_blocked")
@@ -163,8 +166,28 @@ def _send_file(event: dict[str, Any], _ncfg: dict[str, Any]) -> str:
     return f"file -> {p}"
 
 
-CHANNELS = {"email": _send_email, "file": _send_file}
-_RESERVED = ("webhook", "command")  # webhook 预留占位; command 排期 v1.5 (§8 步骤 4)
+def _send_command(event: dict[str, Any], ncfg: dict[str, Any]) -> str:
+    """command 渠道 (§10 L2 推): 事件 JSON 走 stdin 喂用户脚本, 唤醒 LLM agent.
+
+    脚本由用户按 harness 定制 (tmux send-keys / headless 调用, 示例见
+    sched/scripts/notify_*.sh), 框架只负责喂 stdin, 不绑定任何 harness。
+    rc!=0 / 超时 -> 抛异常交 send() 降级为 FAIL (与其他渠道同语义)。
+    """
+    cmd: list[str] = ncfg["command"]
+    p = subprocess.run(
+        cmd,
+        input=json.dumps(event, ensure_ascii=False),
+        capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SEC,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"rc={p.returncode} stderr={p.stderr.strip()[:200]}"
+        )
+    return f"command -> {cmd[0]}"
+
+
+CHANNELS = {"email": _send_email, "file": _send_file, "command": _send_command}
+_RESERVED = ("webhook",)  # 预留占位 (决策 2): schema 保留字段, 实现时只加函数
 
 
 def inbox_dir() -> str:

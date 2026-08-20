@@ -152,7 +152,7 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             not isinstance(nf["command"], list)
             or not all(isinstance(x, str) for x in nf["command"])
         ):
-            raise ConfigError(f"{p}: notify.command 必须是命令数组 (v1.5 预留)")
+            raise ConfigError(f"{p}: notify.command 必须是命令数组")
 
     # co-location (定案 39 待定项 4, 实验性默认关):
     #   co_locate: bool 全局开关; co_locate_safety 安全系数 [0.5,0.85] 默认 0.7;
