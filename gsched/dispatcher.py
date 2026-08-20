@@ -43,6 +43,7 @@ class Dispatcher:
         self.pid_file = os.path.join(self.host_dir, "daemon.pid")
         self.heartbeat_file = os.path.join(self.host_dir, "daemon.heartbeat")
         self._prev_hb_ts: float | None = None  # acquire_lock 触心跳前采样 (D4 用)
+        self._probe_offsets: dict[str, int] = {}  # job_id -> 日志已扫字节偏移 (P2)
         self.lock_dir = os.path.join(self.host_dir, "dispatcher.lock")
         self.log = open(
             os.path.join(self.host_dir, "scheduler.log"), "a", encoding="utf-8"
@@ -564,8 +565,17 @@ class Dispatcher:
                     continue
                 log_path = self._job_log_path(j)
                 try:
+                    # P2: 增量扫描 —— 记录已扫偏移只读新增字节 (重叠回退最长
+                    # 模式长度防跨块切断); 日志截断/轮转则从头重扫
+                    off = self._probe_offsets.get(j["id"], 0)
+                    size = os.path.getsize(log_path)
+                    if size < off:
+                        off = 0
+                    longest = max(len(fail_pat or ""), len(ready_pat or ""))
                     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(max(0, off - longest))
                         text = f.read()
+                    self._probe_offsets[j["id"]] = size
                 except OSError:
                     continue  # 日志未就绪, 下轮再查
                 if fail_pat and fail_pat in text:
@@ -610,6 +620,10 @@ class Dispatcher:
                 # H4 修复: 补杀/确认死亡后清 pgid, 解除对历史终态 job 的永久
                 # 探测 —— 否则 OS 复用该 pgid 后每轮 SIGKILL 无关进程组
                 state.update_job(conn, j["id"], pgid=None)
+            # P2: 清理已不在 running 的 job 的偏移记录, 防内存随历史膨胀
+            live = {j["id"] for j in running}
+            for jid in [k for k in self._probe_offsets if k not in live]:
+                del self._probe_offsets[jid]
 
     def _reap_finished_jobs(self) -> None:
         with state.connect() as conn:

@@ -42,6 +42,19 @@ def pid_cmdline_matches(pid: int, needle: str) -> bool:
     return needle in cmd
 
 
+def read_tail(path: str, max_bytes: int = 1024 * 1024) -> str:
+    """尾部读取 (P2): seek 到文件末尾前 max_bytes, 不整读 GB 级日志进内存.
+
+    文件不存在/不可读 -> 抛 OSError (调用方按现状捕获处理)。
+    首行可能是半行 (块边界切开), 子串/正则匹配场景无害。
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        return f.read().decode("utf-8", "replace")
+
+
 class Executor:
     def __init__(
         self,
@@ -151,8 +164,7 @@ class Executor:
 
     def tail(self, log_path: str, n: int = 20) -> str:
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            lines = read_tail(log_path, 256 * 1024).splitlines(keepends=True)
             return "".join(lines[-n:])
         except OSError:
             return "(日志不存在)"
@@ -160,8 +172,7 @@ class Executor:
     def parse_progress(self, log_path: str) -> str | None:
         """第 3 层进度: 从日志尾部解析 epoch/trial 进度 (best-effort)."""
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()[-200:]
+            lines = read_tail(log_path, 256 * 1024).splitlines()[-200:]
         except OSError:
             return None
         for line in reversed(lines):
@@ -173,10 +184,12 @@ class Executor:
         return None
 
     def failed_classify(self, log_path: str) -> tuple[str, str | None]:
-        """B2 失败分类: 从日志找 OOM / gpu_fault / perm / error."""
+        """B2 失败分类: 从日志找 OOM / gpu_fault / perm / error.
+
+        P2: 读尾部 4MiB (失败特征一般在尾部), 不再整读 GB 级日志进内存。
+        """
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
+            text = read_tail(log_path, 4 * 1024 * 1024)
         except OSError:
             return "error", None
         if "CUDA out of memory" in text or "OutOfMemoryError" in text:
