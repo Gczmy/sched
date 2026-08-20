@@ -17,6 +17,7 @@ from typing import Any
 
 from . import state
 from .config import ConfigError, load_config
+from .executor import pid_cmdline_matches
 
 HOST_DIR = os.path.join(state.default_state_dir(), state.hostname())
 
@@ -143,6 +144,12 @@ def stop() -> str:
         _cleanup()
         return "daemon 未运行"
     # N11: 先标 cancelled 再 kill (由 dispatcher 的 SIGTERM handler 收尾)
+    # M4: kill 前身份校验 —— pid 文件残留 + PID 复用时凭数字发信号会误杀
+    # 无关用户进程; cmdline 不含 gsched 则放弃 kill 只清理状态文件
+    if not pid_cmdline_matches(pid, "gsched"):
+        _cleanup()
+        return (f"daemon pid={pid} 的 cmdline 不含 gsched (PID 复用?), "
+                "已放弃 kill 只清理状态文件")
     os.kill(pid, 15)  # SIGTERM -> dispatcher.stop()
     for _ in range(20):
         time.sleep(0.5)

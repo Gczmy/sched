@@ -23,6 +23,25 @@ PROGRESS_RE = re.compile(
 )
 
 
+def pid_cmdline_matches(pid: int, needle: str) -> bool:
+    """kill 前身份校验 (审查 M4): /proc/<pid>/cmdline 含 needle 才认作目标进程.
+
+    防 PID 复用误杀: pid 文件残留 + OS 复用该 PID 时, 只凭数字发信号会杀错
+    无关用户进程。进程不存在 -> False; /proc 不可用 (macOS 开发) -> True
+    (无法校验, 回退现状行为)。
+    """
+    if not os.path.isdir("/proc"):
+        return True  # /proc 不可用 (macOS 等): 无法校验, 回退现状
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except FileNotFoundError:
+        return False  # 进程已不存在
+    except OSError:
+        return True  # 读取失败: 无法校验, 回退现状
+    return needle in cmd
+
+
 class Executor:
     def __init__(
         self,

@@ -19,7 +19,7 @@ from typing import Any
 
 from . import state
 from .allocator import Allocator
-from .executor import Executor
+from .executor import Executor, pid_cmdline_matches
 from .fingerprint import compute_fingerprint
 from .config import ConfigError, load_config, resolve_template
 
@@ -91,15 +91,22 @@ class Dispatcher:
         if os.path.isdir(self.lock_dir):
             pid = self._read_pid()
             if pid and self._pid_exists(pid) and not self._heartbeat_fresh():
-                # 卡死场景 (O2): 先杀再清锁
-                self.log_line(f"F4: 检测到卡死 daemon pid={pid}, SIGTERM -> 5s -> SIGKILL")
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    time.sleep(5)
-                    if self._pid_exists(pid):
-                        os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                # M4: kill 前身份校验 —— pid 文件残留 + PID 复用时凭数字发
+                # 信号会误杀无关进程; cmdline 不含 gsched 则只清锁不杀
+                if not pid_cmdline_matches(pid, "gsched"):
+                    self.log_line(
+                        f"F4: 残留 pid={pid} cmdline 非 gsched (PID 复用?), 只清锁不 kill"
+                    )
+                else:
+                    # 卡死场景 (O2): 先杀再清锁
+                    self.log_line(f"F4: 检测到卡死 daemon pid={pid}, SIGTERM -> 5s -> SIGKILL")
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(5)
+                        if self._pid_exists(pid):
+                            os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             self._cleanup_lock()
         try:
             os.makedirs(self.lock_dir)
