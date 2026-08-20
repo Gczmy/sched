@@ -234,7 +234,12 @@ class Allocator:
         return {int(r["pgid"]) for r in rows}
 
     def _util(self, idx: int) -> int:
-        """单卡 util (仅 unmanaged 抽查用). fake 返回 0."""
+        """单卡 util. fake 返回 0; 查询失败返回 0 (旧语义, settle_releasing 兜底用)."""
+        u = self._util_opt(idx)
+        return u if u is not None else 0
+
+    def _util_opt(self, idx: int) -> int | None:
+        """单卡 util; 查询失败 -> None (审查 M8: probe 路径 fail-closed 用)."""
         if self.fake:
             return 0
         try:
@@ -250,9 +255,11 @@ class Allocator:
                 text=True,
                 timeout=10,
             )
+            if out.returncode != 0:
+                return None
             return int(out.stdout.strip().splitlines()[0])
         except (subprocess.SubprocessError, ValueError, IndexError, FileNotFoundError):
-            return 0
+            return None
 
     # ---------- 注册表状态机 (唯一权威) ----------
 
@@ -348,6 +355,25 @@ class Allocator:
                         timeout.append(idx)
         return freed, timeout
 
+    def _card_any_occupied(self, idx: int) -> bool | None:
+        """probe 占用判据 (审查 M7): 有 compute 进程 (不分归属) 或 util>0 -> True.
+
+        与 _card_has_compute 的区别: 不做 pgid 归属判定 —— 外部进程驻留显存
+        即使 util=0 也判占用, 否则 probe_free 永远抓不出 "驻留但空闲" 的外部
+        进程, 派发新任务上卡会显存冲突 (归属判定只用于 settle_releasing 等离场)。
+        None = 查询失败 (M8 fail-closed: 调用方保持现状不转态)。
+        """
+        if self.fake:
+            by_card = self._compute_pids_by_card() or {}
+            return bool(by_card.get(idx))  # fake: util 恒 0, 只看模拟进程
+        util = self._util_opt(idx)
+        by_card = self._compute_pids_by_card()
+        if util is not None and util > 0:
+            return True
+        if by_card is None:
+            return None  # util=0/未知 且 compute-apps 查不出: 无法排除驻留进程
+        return bool(by_card.get(idx))
+
     def _card_has_compute(self, idx: int) -> bool:
         """M8 主判据: 该卡是否有未离场的 compute 进程 (§3.2e C).
 
@@ -358,8 +384,8 @@ class Allocator:
           2. 兜底: compute-apps 查询失败 -> util==0 (现状语义)
 
         行为路径变化 (评审确认): 外部进程判干净 -> 回 free -> 同 tick 的
-        probe_free 立即抓回 unmanaged (util>0), 无 free 窗口可派发 (dispatch
-        在 probe_free 之后).
+        probe_free 用 _card_any_occupied (不分归属) 立即抓回 unmanaged,
+        无 free 窗口可派发 (dispatch 在 probe_free 之后).
         """
         by_card = self._compute_pids_by_card()
         if by_card is None:
@@ -437,13 +463,11 @@ class Allocator:
             ).fetchall()
             for row in rows:
                 idx = row["idx"]
-                # 物理判据 (M8): 与 probe_free 的孤儿判据精确对称 ——
-                # probe_free 用 util>0 OR compute-apps 有进程 判"被占", 这里用
-                # 其否定判"真实空闲"。只用 util!=0 会在"外部进程驻留显存但 util=0"
-                # 的场景永不恢复 (不对称 bug, 审查 B2); fake 模式恒空闲 (验收用)。
-                if not self.fake and (
-                    self._util(idx) != 0 or self._card_has_compute(idx)
-                ):
+                # 物理判据 (审查 M7/M8): 有 compute 进程 (不分归属) 或 util>0
+                # 判占用 —— 外部进程驻留显存但 util=0 也不能回 free;
+                # occ=None (nvidia-smi 故障) -> fail-closed 保持 unmanaged
+                occ = self._card_any_occupied(idx)
+                if occ is None or occ:
                     self._reset_confirm(idx)
                     continue
                 # 与 settle_releasing 同确认 (M7): 连续 2 次采样才回 free (防抖动)
@@ -460,7 +484,11 @@ class Allocator:
         return moved
 
     def probe_free(self) -> list[int]:
-        """free 卡抽查: 有 compute 进程 或 util>0 -> unmanaged (孤儿防线)."""
+        """free 卡抽查: 有 compute 进程 (不分归属) 或 util>0 -> unmanaged (孤儿防线).
+
+        审查 M7/M8: 判据不分 pgid 归属 (外部驻留进程也判占用); 查询失败
+        (occ=None) fail-closed 保持 free 不转态, 并中断连续计数.
+        """
         if self.fake:
             return []
         moved: list[int] = []
@@ -470,7 +498,10 @@ class Allocator:
             ).fetchall()
             for row in rows:
                 idx = row["idx"]
-                if self._util(idx) > 0 or self._card_has_compute(idx):
+                occ = self._card_any_occupied(idx)
+                if occ is None:
+                    continue  # nvidia-smi 故障: fail-closed 保持现状 (M8)
+                if occ:
                     # 连续 2 次 (M7): 这里用标记确认
                     if self._confirm_occupied(idx):
                         conn.execute(
