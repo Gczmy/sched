@@ -28,6 +28,9 @@
 | `sched markers` | 批次终态一览 | |
 | `sched list-gpus` | GPU 状态/显存 | |
 | `sched gpu-set-mem/ok/ignore/free` | 卡管理 | 未知 idx 会报错 |
+| `sched notify-inbox` | 列批次终态通知事件（agent 检查点） | `--all` 含已确认 / `--json` |
+| `sched notify-ack <文件>` | 确认通知事件（rename `.acked`，7 天后自动清理） | |
+| `sched notify-test` | 发测试通知验证 config.notify 各渠道 | |
 
 ### 状态语义速查
 
@@ -38,7 +41,7 @@
 ### 通知与检查点
 
 - 批次终态 marker：`{SCHED_STATE}/<node>/markers/<批次名>.done|.blocked`
-- （实施中，见 `docs/sched_notify_design.md`）notify_inbox：`{SCHED_STATE}/<node>/notify_inbox/*.json`，agent 每次被唤醒先查未读事件再开工
+- notify_inbox：`{SCHED_STATE}/<node>/notify_inbox/*.json`（已实施，见 `docs/sched_notify_design.md`）——批次终态事件落盘（需 config.json 配 `notify.file` 渠道），agent 每次被唤醒先 `sched notify-inbox` 查未读事件再开工，处理后 `sched notify-ack` 确认
 
 ### 参考文档
 
