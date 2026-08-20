@@ -23,7 +23,6 @@ from .config import (
     ConfigError,
     config_path,
     default_state_dir,
-    expand_path,
     load_config,
     resolve_template,
 )
@@ -51,20 +50,6 @@ def _batch_id_from_name(name: str) -> str | None:
             (name,),
         ).fetchone()
     return row["id"] if row else None
-
-
-def _job_id(batch_id: str, task_id: str, version: int = 0) -> str:
-    """jobs.id = {batch}-{task}-v{version}; version<=0 取最新."""
-    if version > 0:
-        return f"{batch_id}-{task_id}-v{version}"
-    with state.connect() as conn:
-        row = conn.execute(
-            "SELECT version FROM jobs WHERE batch_id=? AND task_id=?"
-            " ORDER BY version DESC LIMIT 1",
-            (batch_id, task_id),
-        ).fetchone()
-        v = row["version"] if row else 1
-    return f"{batch_id}-{task_id}-v{v}"
 
 
 def _parse_task_ref(ref: str) -> tuple[str, str]:
@@ -605,6 +590,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         batches = conn.execute(
             "SELECT * FROM batches ORDER BY created_at DESC"
         ).fetchall()
+        if args.batch and not any(b["name"] == args.batch for b in batches):
+            # 与 history/cancel/retry/diag 一致: 批次名不存在要报错而非静默空表
+            print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+            return 1
         for b in batches:
             if args.batch and b["name"] != args.batch:
                 continue
@@ -1000,6 +989,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
             state.update_job(
                 conn, j["id"], status="pending", retries=0, kill_reason=None,
                 pgid=None, gpu=None, rc=None, failure=None,
+                started_at=None, finished_at=None,  # 清陈旧时间戳, pending 期间不显示旧耗时
             )
             print(f"已解锁重跑: {j['id']}")
             n += 1
@@ -1208,8 +1198,8 @@ def _diag_cmds(spec: dict, cfg: dict) -> list[str]:
     out: list[str] = []
     if spec.get("cmd"):
         out.append(" ".join(shlex.quote(expand(t)) for t in spec["cmd"]))
-    for st in spec.get("stages") or []:
-        nm = st.get("name", "?")
+    for i, st in enumerate(spec.get("stages") or []):
+        nm = f"stage{i}"  # stage dict 无 name 键, 用索引 (与 executor echo 标记一致)
         cmd = st.get("cmd")
         if cmd:
             out.append(f"[{nm}] " + " ".join(shlex.quote(expand(t)) for t in cmd))
@@ -1269,7 +1259,12 @@ def cmd_log(args: argparse.Namespace) -> int:
             pos = os.path.getsize(log_path)
             while True:
                 time.sleep(1)
-                cur = os.path.getsize(log_path)
+                try:
+                    cur = os.path.getsize(log_path)
+                except OSError:
+                    # 日志被删除 (state 清理/重建): 报错退出, 不再裸 traceback
+                    print(f"\n日志已消失: {log_path}", file=sys.stderr, flush=True)
+                    return 1
                 if cur > pos:
                     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                         f.seek(pos)
@@ -1322,6 +1317,10 @@ def cmd_gpu_set_mem(args: argparse.Namespace) -> int:
 def cmd_gpu_ok(args: argparse.Namespace) -> int:
     """解除 quarantine (P2)."""
     with state.connect() as conn:
+        row = conn.execute("SELECT idx FROM gpus WHERE idx=?", (args.idx,)).fetchone()
+        if not row:
+            print(f"错误: GPU{args.idx} 不在配置集 (sched list-gpus 查看)", file=sys.stderr)
+            return 1
         conn.execute(
             "UPDATE gpus SET quarantined=0, updated_at=? WHERE idx=?",
             (state.now(), args.idx),
@@ -1337,6 +1336,10 @@ def cmd_gpu_ignore(args: argparse.Namespace) -> int:
     此前该列只写不读, 命令为空操作); 卡恢复 free 时标记自动复位.
     """
     with state.connect() as conn:
+        row = conn.execute("SELECT idx FROM gpus WHERE idx=?", (args.idx,)).fetchone()
+        if not row:
+            print(f"错误: GPU{args.idx} 不在配置集 (sched list-gpus 查看)", file=sys.stderr)
+            return 1
         conn.execute(
             "UPDATE gpus SET ignore_until=?, updated_at=? WHERE idx=?",
             (state.now(), state.now(), args.idx),
@@ -1351,6 +1354,10 @@ def cmd_gpu_free(args: argparse.Namespace) -> int:
         print(f"确认 GPU{args.idx} 无真实外部任务后强制回 free? 加 --yes", file=sys.stderr)
         return 1
     with state.connect() as conn:
+        row = conn.execute("SELECT idx FROM gpus WHERE idx=?", (args.idx,)).fetchone()
+        if not row:
+            print(f"错误: GPU{args.idx} 不在配置集 (sched list-gpus 查看)", file=sys.stderr)
+            return 1
         conn.execute(
             "UPDATE gpus SET status='free', job_id=NULL, quarantined=0,"
             " ignore_until=NULL, updated_at=? WHERE idx=?",
