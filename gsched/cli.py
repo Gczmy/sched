@@ -959,10 +959,15 @@ def cmd_retry(args: argparse.Namespace) -> int:
             if not b:
                 print(f"错误: 批次不存在: {ref}", file=sys.stderr)
                 return 1
+            # C4 修复: 每 task 只取最新 version —— 否则 resubmit 产生的旧版本
+            # 失败终态 job 会被复活, 与新版本并发执行写相同产物路径
             targets = conn.execute(
-                "SELECT * FROM jobs WHERE batch_id=? AND status IN"
-                " ('blocked','cancelled','timed_out','failed')",
-                (b,),
+                "SELECT j.* FROM jobs j"
+                " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+                "       WHERE batch_id=? GROUP BY task_id) t"
+                "   ON j.batch_id=? AND j.task_id=t.task_id AND j.version=t.mv"
+                " WHERE j.status IN ('blocked','cancelled','timed_out','failed')",
+                (b, b),
             ).fetchall()
         if not targets:
             print(f"无失败终态任务: {ref}")
