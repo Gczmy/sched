@@ -53,7 +53,8 @@ def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float]]:
                 mem[idx] = float(m)
         else:
             if not isinstance(g, int) or isinstance(g, bool):
-                raise ConfigError(f"gpus 必须是卡号整数数组或 {idx} 对象数组: {g}")
+                # M17: 原消息引用只在 dict 分支赋值的 idx -> NameError
+                raise ConfigError(f"gpus 必须是卡号整数数组或对象数组: {g}")
             idxs.append(g)
     # 去重保序 (同一卡重复声明 -> 后者覆盖显存, 卡号只留一个)
     seen: set[int] = set()
