@@ -84,11 +84,18 @@ class Executor:
 
         if stages is not None:
             # §3.4c 断点续跑: 已成功的 stage (产物已存在) 跳过, 只从失败 stage 起重跑
+            # M9 修复: 产物相对路径必须拼任务 cwd —— 否则相对 daemon 进程 cwd 判定,
+            # 找不到 -> 已成功 stage 全部重跑 (断点续跑静默失效)
             parts = []
             for i, s in enumerate(stages):
                 arts = s.get("artifacts", {})
                 done = bool(arts) and all(
-                    os.path.isfile(str(a.get("path", ""))) for a in arts.values()
+                    os.path.isfile(
+                        str(a.get("path", ""))
+                        if os.path.isabs(str(a.get("path", "")))
+                        else os.path.join(cwd, str(a.get("path", "")))
+                    )
+                    for a in arts.values()
                 )
                 if on_stage_start:
                     on_stage_start(i)
