@@ -15,17 +15,16 @@ import signal
 import subprocess
 import time
 from datetime import datetime
-from typing import Any
 
 from . import state
 from .allocator import Allocator
 from .executor import Executor, pid_cmdline_matches
 from .fingerprint import compute_fingerprint
-from .config import ConfigError, load_config, resolve_template
+from .config import resolve_template
 
 POLL_SEC = 10
 HEARTBEAT_SEC = 30
-RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5)
+# RELEASE_TIMEOUT_SEC 迁至 allocator.py (原处为死常量, 消费方在 settle_releasing)
 DEFAULT_MAX_RETRY = 1
 RETRY_BACKOFF_SEC = 30  # 失败重试退避 (M2): 防秒级崩溃任务紧密崩溃循环
 DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
@@ -604,6 +603,7 @@ class Dispatcher:
                     if not self._check_artifacts(artifacts, spec.get("cwd_abs") or "."):
                         self.log_line(f"job {j['id']} ready probe 但产物校验失败 -> 降级 failed")
                         state.update_job(conn, j["id"], status="failed", failure="artifact")
+                        self._drop_profile(j)  # 失败路径: 只删临时不 upsert (同 rc!=0)
                     else:
                         self._consume_profile(conn, j, spec)
                     self._release_gpu_for_job(conn, j)
@@ -690,6 +690,7 @@ class Dispatcher:
                                  failure="artifact",
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} failed (rc=0 但产物校验失败)")
+                self._drop_profile(j)  # 失败路径: 只删临时不 upsert (同 rc!=0)
         else:
             failure, _ = self.executor.failed_classify(log_path)
             state.update_job(conn, j["id"], status="failed", rc=rc, failure=failure,
@@ -729,7 +730,7 @@ class Dispatcher:
                 f"(probe_unmanaged); 或 sched gpu-free {idx} 强制回 free"
             )
         except (subprocess.SubprocessError, ValueError, OSError):
-            self.log_line(f"  (nvidia-smi 查询失败, 请手动执行 nvidia-smi -i {idx}")
+            self.log_line(f"  (nvidia-smi 查询失败, 请手动执行 nvidia-smi -i {idx})")
 
     # ---------- profile 消费 (定案 39 待定项 3, daemon 侧) ----------
 

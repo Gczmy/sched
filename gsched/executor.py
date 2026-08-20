@@ -121,14 +121,18 @@ class Executor:
         else:
             wrapper_cmd = [str(t) for t in (cmd or [])]
 
-        proc = subprocess.Popen(
-            wrapper_cmd,
-            cwd=cwd,
-            env=merged_env,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # 新进程组, pgid = proc.pid
-        )
+        try:
+            proc = subprocess.Popen(
+                wrapper_cmd,
+                cwd=cwd,
+                env=merged_env,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # 新进程组, pgid = proc.pid
+            )
+        except Exception:
+            log_f.close()  # Popen 失败 (cwd/cmd 非法等): 关闭句柄防 daemon 长驻 fd 泄漏
+            raise
         log_f.close()
         self._procs[proc.pid] = proc
         return proc.pid

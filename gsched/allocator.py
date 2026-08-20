@@ -18,6 +18,8 @@ from .state import connect, get_gpu, now, release_gpu
 
 _UNSET = object()  # P3: by_card 预取参数哨兵 (区分"未传"与"查询失败返回 None")
 
+RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5, 原 dispatcher.py:28 死常量迁此)
+
 
 class Allocator:
     def __init__(
@@ -364,7 +366,7 @@ class Allocator:
                         freed.append(idx)
                 else:
                     self._reset_confirm(idx)  # 中间不干净: 中断连续计数
-                    if elapsed > 300:
+                    if elapsed > RELEASE_TIMEOUT_SEC:
                         conn.execute(
                             "UPDATE gpus SET status='unmanaged', job_id=NULL, updated_at=? WHERE idx=?",
                             (now(), idx),

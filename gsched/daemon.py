@@ -217,7 +217,7 @@ def check(fake: bool = False) -> list[dict[str, str]]:
     if fake:
         add("nvidia-smi", "fake 模式跳过", "ok")
     elif shutil.which("nvidia-smi"):
-        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
         add("nvidia-smi", "可查询" if r.returncode == 0 else r.stderr.strip(), "ok" if r.returncode == 0 else "fail")
     elif not gpus:
         add("nvidia-smi", "未找到 (config.gpus 为空, 纯 CPU 部署合法)", "warn")
