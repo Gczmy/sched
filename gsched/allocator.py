@@ -431,6 +431,18 @@ class Allocator:
         if os.path.exists(flag):
             os.unlink(flag)
 
+    def _reset_occupied(self, idx: int) -> None:
+        """中断 unmanaged 连续计数 (采样干净/查询失败, 审查 M10)."""
+        if self.fake:
+            return
+        flag = os.path.join(
+            os.environ.get("SCHED_STATE", os.path.expanduser("~/.sched")),
+            "occupied_confirm",
+            f"gpu{idx}",
+        )
+        if os.path.exists(flag):
+            os.unlink(flag)
+
     def _confirm_occupied(self, idx: int) -> bool:
         """unmanaged 探测连续 2 次 (M7)."""
         if self.fake:
@@ -500,6 +512,7 @@ class Allocator:
                 idx = row["idx"]
                 occ = self._card_any_occupied(idx)
                 if occ is None:
+                    self._reset_occupied(idx)  # 查询失败: 中断连续计数 (M10)
                     continue  # nvidia-smi 故障: fail-closed 保持现状 (M8)
                 if occ:
                     # 连续 2 次 (M7): 这里用标记确认
@@ -509,6 +522,8 @@ class Allocator:
                             (now(), idx),
                         )
                         moved.append(idx)
+                else:
+                    self._reset_occupied(idx)  # 干净采样重置标记, 才是"连续 2 次" (M10)
         return moved
 
     def available_gpus(self) -> list[int]:
