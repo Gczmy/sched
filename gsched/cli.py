@@ -93,6 +93,41 @@ def cmd_init(args: argparse.Namespace) -> int:
             "kronos_ft": input("kronos_ft venv python 路径: ").strip(),
         },
     }
+    # ---- 通知配置引导 (docs/sched_notify_design.md §3) ----
+    notify_on = input("\n启用任务完成通知? (y/N) ").strip().lower()
+    if notify_on in ("y", "yes"):
+        cfg["notify"] = {
+            "on": ["batch_done", "batch_blocked"],
+        }
+        print("  渠道选择 (可多选, 逗号分隔):")
+        print("    1. file   — 写入 inbox (给 LLM agent 读, 推荐)")
+        print("    2. email  — 发送邮件 (需 SMTP 配置)")
+        print("    3. command — 调用脚本 (给 agent 推送唤醒)")
+        channels = input("  选择渠道 [1]: ").strip() or "1"
+        for ch in channels.split(","):
+            ch = ch.strip()
+            if ch == "1":
+                cfg["notify"]["file"] = {"enabled": True}
+            elif ch == "2":
+                smtp_host = input("  SMTP host [smtp.exmail.qq.com]: ").strip() or "smtp.exmail.qq.com"
+                smtp_port = int(input("  SMTP port [465]: ").strip() or "465")
+                email_to = input("  收件人邮箱: ").strip()
+                cfg["notify"]["email"] = {
+                    "smtp_host": smtp_host,
+                    "smtp_port": smtp_port,
+                    "user": input("  发件人邮箱: ").strip(),
+                    "password_env": "SCHED_SMTP_PASSWORD",
+                    "from": input("  发件人邮箱 (同上): ").strip(),
+                    "to": [email_to] if email_to else [],
+                }
+            elif ch == "3":
+                cmd_path = input("  command 脚本路径: ").strip()
+                if cmd_path:
+                    cfg["notify"]["command"] = {"cmd": cmd_path}
+        print(f"  通知已配置: {list(cfg['notify'].keys())}")
+    else:
+        print("  通知未启用 (后续可用 sched config-edit 手动添加 notify 段)")
+
     # M16: 原子写 —— 崩溃不留截断的 config.json (截断会导致 load_config 全线报错)
     tmp_p = p + ".tmp"
     with open(tmp_p, "w", encoding="utf-8") as f:

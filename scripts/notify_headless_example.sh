@@ -7,9 +7,11 @@
 # 用法 (config.json):
 #   "notify": {"command": ["bash", "sched/scripts/notify_headless_example.sh"]}
 #
-# 按你用的 harness 取消对应一行注释 (或换成别的 CLI):
-#   Claude Code: claude -p "..." (https://docs.anthropic.com/en/docs/claude-code)
-#   Kimi Code:   kimi -p "..."
+# 自动检测 harness CLI (按优先级):
+#   1. claude -p "..."  (Claude Code)
+#   2. kimi -p "..."    (Kimi Code)
+#   3. pi -p "..."      (Pi Coding Agent)
+#   4. 均不可用时打印 prompt 并 exit 1 (提醒用户安装)
 #
 # 事件 JSON 从 stdin 读入; 完整事件在 notify_inbox, prompt 只需点到为止。
 # =============================================================================
@@ -25,10 +27,23 @@ print(f'sched 批次 {ev[\"batch\"]} {status}。请运行 sched notify-inbox 查
       f'blocked 则按事件里的日志绝对路径排雷, 处理完 sched notify-ack 确认。')
 ")
 
-# --- 按 harness 二选一 (或自行替换) ---
-# claude -p "$PROMPT"
-# kimi -p "$PROMPT"
-
-echo "notify_headless_example: 未配置 harness CLI, prompt 为:" >&2
-echo "$PROMPT" >&2
-exit 1   # rc!=0 会让 notify.send 记 FAIL, 提醒用户完成配置
+# --- 自动检测 harness CLI ---
+if command -v claude &>/dev/null; then
+    echo "notify: 使用 claude 处理通知" >&2
+    claude -p "$PROMPT"
+    exit $?
+elif command -v kimi &>/dev/null; then
+    echo "notify: 使用 kimi 处理通知" >&2
+    kimi -p "$PROMPT"
+    exit $?
+elif command -v pi &>/dev/null; then
+    echo "notify: 使用 pi 处理通知" >&2
+    pi -p "$PROMPT"
+    exit $?
+else
+    echo "notify_headless_example: 未检测到 harness CLI (claude/kimi/pi)" >&2
+    echo "安装后取消 scripts/notify_headless_example.sh 中对应行注释" >&2
+    echo "prompt 为:" >&2
+    echo "$PROMPT" >&2
+    exit 1   # rc!=0 会让 notify.send 记 FAIL, 提醒用户完成配置
+fi

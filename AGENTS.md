@@ -40,9 +40,29 @@
 
 ### 通知与检查点
 
-- 批次终态 marker：`{SCHED_STATE}/<node>/markers/<批次名>.done|.blocked`
-- notify_inbox：`{SCHED_STATE}/<node>/notify_inbox/*.json`（已实施，见 `docs/sched_notify_design.md`）——批次终态事件落盘（需 config.json 配 `notify.file` 渠道），agent 每次被唤醒先 `sched notify-inbox` 查未读事件再开工，处理后 `sched notify-ack` 确认
-- command 推渠道（可选）：config.json 配 `notify.command` 指向用户脚本（事件 JSON 走 stdin），批次终态即唤醒 agent；示例 `sched/scripts/notify_tmux_example.sh`（tmux 注入）/ `notify_headless_example.sh`（无头调用）
+批次终态 marker：`{SCHED_STATE}/<node>/markers/<批次名>.done|.blocked`
+
+**通知快速入门（3 步启用）**：
+
+1. **配置 config.json**（手动或 `sched init` 交互引导）：
+   ```json
+   "notify": {
+     "on": ["batch_done", "batch_blocked"],
+     "file": {"enabled": true}
+   }
+   ```
+
+2. **验证**：`sched notify-test` → 应输出 `ok: file -> .../notify_inbox/...`
+
+3. **agent 使用**：每次被唤醒先 `sched notify-inbox` 查未读事件，处理后 `sched notify-ack <文件>` 确认
+
+**可用渠道**：
+- `file`（推荐）：事件 JSON 写 inbox，agent `ls + Read` 即可
+- `email`：需配置 SMTP（`notify.email.smtp_host/port/user/to`，密码走 `password_env` 环境变量）
+- `command`：调用用户脚本（事件 JSON 走 stdin），示例见 `sched/scripts/notify_*.sh`
+
+notify_inbox：`{SCHED_STATE}/<node>/notify_inbox/*.json`（已实施，见 `docs/sched_notify_design.md`）——批次终态事件落盘（需 config.json 配 `notify.file` 渠道），agent 每次被唤醒先 `sched notify-inbox` 查未读事件再开工，处理后 `sched notify-ack` 确认
+- command 推渠道（可选）：config.json 配 `notify.command` 指向用户脚本（事件 JSON 走 stdin），批次终态即唤醒 agent；示例 `sched/scripts/notify_tmux_example.sh`（tmux 注入）/ `notify_headless_example.sh`（无头调用，自动检测 claude/kimi/pi CLI）
 
 ### 参考文档
 
