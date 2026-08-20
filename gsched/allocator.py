@@ -244,11 +244,24 @@ class Allocator:
         """jobs 表已知 pgid 集 (M8 归属判定: 该卡已知 job 的 pgid).
 
         计数释放保证 releasing 时卡上无框架 job, 残留进程来自刚结束的 job
-        (jobs.pgid 保留, retry/resubmit 才清空).
+        (jobs.pgid 保留, retry/resubmit 才清空) —— 因此必须覆盖近期终态 job。
+
+        决策 3A 落地变体: 原决策字面"只查 running"会让 settle_releasing 把
+        刚结束 job 的残留进程误判为外部 -> 回 free -> probe_free 立即抓回
+        unmanaged (正常退出路径抖动)。改为 "running + 近 10 分钟终态" 有界
+        窗口: 覆盖进程优雅退出期 (远小于 releasing 5min 冷却), 又避免全表
+        DISTINCT 永久累积导致 OS 复用旧 pgid 后的误判 (原审查问题)。
         """
+        import time as _t
+
+        cutoff = _t.strftime(
+            "%Y-%m-%d %H:%M:%S", _t.localtime(_t.time() - 600)
+        )
         with connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT pgid FROM jobs WHERE pgid IS NOT NULL"
+                " AND (status='running' OR finished_at >= ?)",
+                (cutoff,),
             ).fetchall()
         return {int(r["pgid"]) for r in rows}
 
