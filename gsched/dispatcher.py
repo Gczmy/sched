@@ -490,6 +490,10 @@ class Dispatcher:
                         finished_at=state.now(),
                     )
                 self._release_gpu_for_job(conn, j)
+                # M3 (决策 2A): 与 reap 路径对齐 —— 接管标 failed 后也走 retry,
+                # 不再直接堵批次; 重试满 -> blocked 语义与正常运行路径一致
+                if state.get_job(conn, j["id"])["status"] == "failed":
+                    self._maybe_retry(conn, j)
 
     # ---------- reap ----------
 
