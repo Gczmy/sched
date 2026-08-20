@@ -42,6 +42,7 @@
 
 - 批次终态 marker：`{SCHED_STATE}/<node>/markers/<批次名>.done|.blocked`
 - notify_inbox：`{SCHED_STATE}/<node>/notify_inbox/*.json`（已实施，见 `docs/sched_notify_design.md`）——批次终态事件落盘（需 config.json 配 `notify.file` 渠道），agent 每次被唤醒先 `sched notify-inbox` 查未读事件再开工，处理后 `sched notify-ack` 确认
+- command 推渠道（可选）：config.json 配 `notify.command` 指向用户脚本（事件 JSON 走 stdin），批次终态即唤醒 agent；示例 `sched/scripts/notify_tmux_example.sh`（tmux 注入）/ `notify_headless_example.sh`（无头调用）
 
 ### 参考文档
 
