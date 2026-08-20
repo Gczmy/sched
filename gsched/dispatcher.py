@@ -187,20 +187,22 @@ class Dispatcher:
         for attempt in range(3):
             try:
                 with state.connect() as conn:
-                    for j in state.all_jobs(conn):
-                        if j["status"] == "running":
-                            if j["pgid"]:
-                                self.executor.kill_pgid(j["pgid"])
-                            state.update_job(
-                                conn, j["id"], status="cancelled", kill_reason="cancelled",
-                                finished_at=state.now(),
-                            )
-                            # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
-                            # (assigned -> releasing), 否则 cancelled 任务残留 assigned
-                            # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
-                            # 多归属 (定案 36 + §3.2e B): 计数释放, co-tenant 不误杀
-                            if j["gpu"] is not None:
-                                self._release_in_tx(conn, j["id"])
+                    rows = conn.execute(
+                        "SELECT * FROM jobs WHERE status='running'"
+                    ).fetchall()
+                    for j in rows:
+                        if j["pgid"]:
+                            self.executor.kill_pgid(j["pgid"])
+                        state.update_job(
+                            conn, j["id"], status="cancelled", kill_reason="cancelled",
+                            finished_at=state.now(),
+                        )
+                        # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
+                        # (assigned -> releasing), 否则 cancelled 任务残留 assigned
+                        # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
+                        # 多归属 (定案 36 + §3.2e B): 计数释放, co-tenant 不误杀
+                        if j["gpu"] is not None:
+                            self._release_in_tx(conn, j["id"])
                 break
             except _sq.OperationalError as e:
                 if attempt == 2 or "locked" not in str(e):
@@ -447,13 +449,15 @@ class Dispatcher:
             if boot_ts > hb_ts:
                 self.log_line("D4: 检测到节点重启, running 任务标 interrupted (不计 retries)")
                 with state.connect() as conn:
-                    for j in state.all_jobs(conn):
-                        if j["status"] == "running":
-                            state.update_job(
-                                conn, j["id"], status="interrupted",
-                                kill_reason=None,
-                            )
-                            self._requeue_for_retry(conn, j)
+                    rows = conn.execute(
+                        "SELECT * FROM jobs WHERE status='running'"
+                    ).fetchall()
+                    for j in rows:
+                        state.update_job(
+                            conn, j["id"], status="interrupted",
+                            kill_reason=None,
+                        )
+                        self._requeue_for_retry(conn, j)
         except (OSError, ValueError):
             pass
 
@@ -461,27 +465,30 @@ class Dispatcher:
 
     def _adopt_running(self) -> None:
         with state.connect() as conn:
-            for j in state.all_jobs(conn):
-                if j["status"] == "running":
-                    if j["pgid"] and self.executor.alive(j["pgid"]):
-                        self.log_line(f"A3: 接管 running job {j['id']} (pgid={j['pgid']})")
-                    else:
-                        # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
-                        # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
-                        spec = json.loads(self._get_task_spec(conn, j) or "{}")
-                        if self._should_skip(spec, j):
-                            state.update_job(
-                                conn, j["id"], status="done",
-                                finished_at=state.now(),
-                            )
-                            self.log_line(f"A3: job {j['id']} pgid 已死但产物/指纹有效 -> done")
-                        else:
-                            self.log_line(f"A3: job {j['id']} pgid 已死, 标 failed")
-                            state.update_job(
-                                conn, j["id"], status="failed",
-                                finished_at=state.now(),
-                            )
-                        self._release_gpu_for_job(conn, j)
+            # P1: SQL 层过滤 running
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status='running'"
+            ).fetchall()
+            for j in rows:
+                if j["pgid"] and self.executor.alive(j["pgid"]):
+                    self.log_line(f"A3: 接管 running job {j['id']} (pgid={j['pgid']})")
+                    continue
+                # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
+                # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
+                spec = json.loads(self._get_task_spec(conn, j) or "{}")
+                if self._should_skip(spec, j):
+                    state.update_job(
+                        conn, j["id"], status="done",
+                        finished_at=state.now(),
+                    )
+                    self.log_line(f"A3: job {j['id']} pgid 已死但产物/指纹有效 -> done")
+                else:
+                    self.log_line(f"A3: job {j['id']} pgid 已死, 标 failed")
+                    state.update_job(
+                        conn, j["id"], status="failed",
+                        finished_at=state.now(),
+                    )
+                self._release_gpu_for_job(conn, j)
 
     # ---------- reap ----------
 
@@ -544,9 +551,11 @@ class Dispatcher:
           SIGTERM 占卡直至 releasing 超时)
         """
         with state.connect() as conn:
-            for j in state.all_jobs(conn):
-                if j["status"] != "running" or not j["pgid"]:
-                    continue
+            # P1: SQL 层过滤, 不再每 tick 全表扫描历史 job
+            running = conn.execute(
+                "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
+            ).fetchall()
+            for j in running:
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
                 probes = spec.get("probes") or {}
                 fail_pat = probes.get("fail_on_log")
@@ -590,9 +599,11 @@ class Dispatcher:
                     self._release_gpu_for_job(conn, j)
             # L3: SIGKILL 升级 —— probe kill 已触发但进程忽略 SIGTERM 仍存活
             # (终态 done/blocked 的 job 不会再进上面的 running 循环, 在此补杀)
-            for j in state.all_jobs(conn):
-                if j["kill_reason"] != "probe" or not j["pgid"]:
-                    continue
+            # P1: SQL 层过滤, 不扫全表
+            escal = conn.execute(
+                "SELECT * FROM jobs WHERE kill_reason='probe' AND pgid IS NOT NULL"
+            ).fetchall()
+            for j in escal:
                 if self.executor.alive(j["pgid"]):
                     self.log_line(f"probe kill 升级: job {j['id']} SIGTERM 未生效 -> SIGKILL")
                     self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
@@ -602,9 +613,11 @@ class Dispatcher:
 
     def _reap_finished_jobs(self) -> None:
         with state.connect() as conn:
-            for j in state.all_jobs(conn):
-                if j["status"] != "running" or not j["pgid"]:
-                    continue
+            # P1: SQL 层过滤 running, 不再每 tick 全表扫描历史 job
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
+            ).fetchall()
+            for j in rows:
                 rc = self.executor.poll_rc(j["pgid"])
                 if rc is None:
                     continue  # 仍在运行
