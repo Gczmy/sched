@@ -156,6 +156,13 @@ class Executor:
             os.killpg(pgid, sig)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            # W-5: macOS 上僵尸进程组 killpg 抛 EPERM (而非 ESRCH)。与 alive()
+            # 决策 6A 口径一致: 无可杀目标/无权探测 = no-op 成功。若不捕获,
+            # 异常冒出 -> dispatcher._check_probes 的 state.connect() 事务整体
+            # 回滚 -> probe 已写入的 blocked/done 终态丢失 -> 任务被误判 failed
+            # 并 retry (日志门控失效, 平台无关的结构性脆弱点)。
+            pass
 
     def alive(self, pgid: int) -> bool:
         try:
