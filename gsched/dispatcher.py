@@ -1019,10 +1019,12 @@ class Dispatcher:
                         gpu_full = True
                         continue  # 无空卡: 本轮不再派 GPU 任务, 但 CPU-only 仍可派 (防饿死)
                 try:
-                    self._launch_job(conn, j, gpu)
-                    used_cpu += task_cpus
-                    if is_cpu_only:
-                        cpu_only_running += 1
+                    launched = self._launch_job(conn, j, gpu)
+                    # D1: 竞态放弃/skip 不占 CPU 配额 (skip 密集批次不再人为压低并发)
+                    if launched:
+                        used_cpu += task_cpus
+                        if is_cpu_only:
+                            cpu_only_running += 1
                 except Exception as e:
                     # 启动失败: 释放 GPU (如占) + 标 failed (走 retry 路径), 不中断整轮派发
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")
@@ -1202,7 +1204,12 @@ class Dispatcher:
         """事务内释放: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
         state.release_gpu(conn, job_id)
 
-    def _launch_job(self, conn, j, gpu: int | None) -> None:
+    def _launch_job(self, conn, j, gpu: int | None) -> bool:
+        """启动任务; 返回是否真正启动 (调用方据此计 CPU/并发配额, D1)。
+
+        未启动的正常返回路径: M1 竞态 (已非 pending) 与产物指纹 skip ——
+        二者都不该占用 CPU 配额 (skip 密集批次会人为压低并发)。
+        """
         # M1 修复: 条件更新抢占 —— SELECT 快照到 launch 之间 (指纹计算/产物清理
         # 可达秒级) CLI 可能已把 pending 标 cancelled; 只有仍为 pending 才允许
         # 转 running, 否则放弃派发并释放本事务已 assign 的卡
@@ -1215,7 +1222,7 @@ class Dispatcher:
             self.log_line(f"job {j['id']} 派发竞态: 已非 pending (或被 cancel), 放弃启动")
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
-            return
+            return False
         spec = json.loads(self._get_task_spec(conn, j) or "{}")
         cwd = spec.get("cwd_abs") or resolve_template(self.cfg.get("default_project", "{ROOT}"), self.cfg)
         log_path = self._job_log_path(j)
@@ -1227,7 +1234,7 @@ class Dispatcher:
             self.log_line(f"job {j['id']} skip (产物指纹有效, 不执行)")
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
-            return
+            return False
 
         # 半成品清理 (§3.2): 产物存在但无效 (指纹不匹配/规则不过) -> 删除后启动
         self._clean_stale_artifacts(spec, j)
@@ -1267,6 +1274,7 @@ class Dispatcher:
         )
         tag = f"cpu" if gpu is None else f"gpu={gpu}"
         self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
+        return True
 
     def _should_skip(self, spec: dict, j) -> bool:
         """A2/O3: 产物指纹有效 且 规则校验通过 -> skip."""

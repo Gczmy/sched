@@ -278,7 +278,7 @@ class Allocator:
             out = subprocess.run(
                 [
                     "nvidia-smi",
-                    f"--query-gpu=utilization.gpu",
+                    "--query-gpu=utilization.gpu",   # D2: 无占位 f-string -> 普通字符串
                     "--format=csv,noheader,nounits",
                     "-i",
                     str(idx),

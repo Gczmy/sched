@@ -62,7 +62,7 @@ class Executor:
     ):
         self.on_progress = on_progress  # 第 3 层: 从日志行解析进度 (best-effort)
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
-        self._rces: dict[int, int | None] = {}  # pgid -> rc (进程退出后)
+        # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
 
     def launch(
         self,
