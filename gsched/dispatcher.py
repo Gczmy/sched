@@ -723,9 +723,13 @@ class Dispatcher:
                 if self.executor.alive(j["pgid"]):
                     self.log_line(f"probe kill 升级: job {j['id']} SIGTERM 未生效 -> SIGKILL")
                     self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
-                # H4 修复: 补杀/确认死亡后清 pgid, 解除对历史终态 job 的永久
-                # 探测 —— 否则 OS 复用该 pgid 后每轮 SIGKILL 无关进程组
-                state.update_job(conn, j["id"], pgid=None)
+                    # A6: 进程仍存活 (含 D-state, SIGKILL 未立即生效) 时**不清**
+                    # pgid —— 否则下个 tick 不再命中本升级查询, 孤儿进程持卡
+                    # 永不重试; 与 _check_timeouts 逐轮升级语义一致
+                else:
+                    # H4 修复: 确认死亡后清 pgid, 解除对历史终态 job 的永久
+                    # 探测 —— 否则 OS 复用该 pgid 后每轮 SIGKILL 无关进程组
+                    state.update_job(conn, j["id"], pgid=None)
             # P2: 清理已不在 running 的 job 的偏移记录, 防内存随历史膨胀
             live = {j["id"] for j in running}
             for jid in [k for k in self._probe_offsets if k not in live]:
