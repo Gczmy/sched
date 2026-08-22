@@ -162,7 +162,7 @@ cat > $S4/batch.json << EOF
   "name": "p4", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(1); print('Traceback unrelated'); print('OK')"],
-     "duration_min": 5,
+     "duration_min": 5, "max_retry": 0,
      "artifacts": {"out": {"path": "$S4/out.txt"}}, "paths_escape": true}
   ]
 }
@@ -170,9 +170,11 @@ EOF
 export SCHED_STATE=$S4 SCHED_CONFIG=$S4/config.json
 $PY -m gsched.cli submit $S4/batch.json >/dev/null 2>&1 || { bad "p4 submit 失败"; exit 1; }
 SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-# 无 probes -> 任务自行退出 rc=0; 但产物缺失 -> failed (artifact)
-wait_status $S4 p4 failed 1 40 && ok "无 probes 任务正常收敛 (rc 路径, 产物缺失 -> failed)" \
-  || bad "未收敛 (got $(count_status $S4 p4 failed) failed)"
+# 无 probes -> 任务自行退出 rc=0; 产物缺失 -> failed(artifact) -> 重试耗尽
+# (max_retry=0, 复核注记) -> blocked 终态。断言 blocked + failure=artifact,
+# 而非 failed (failed 是瞬态, 立即被 _maybe_retry 转 blocked)。
+wait_status $S4 p4 blocked 1 40 && ok "无 probes 任务正常收敛 (rc 路径, 产物缺失 -> blocked/artifact)" \
+  || bad "未收敛 (got $(count_status $S4 p4 blocked) blocked)"
 stop_daemon $S4
 
 # ---------- 场景 5: SIGKILL 升级 (L3) ----------
