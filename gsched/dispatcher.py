@@ -19,7 +19,7 @@ from datetime import datetime
 
 from . import notify, state
 from .allocator import Allocator
-from .executor import Executor, pid_cmdline_matches
+from .executor import Executor, pid_cmdline_matches, read_tail
 from .fingerprint import compute_fingerprint
 from .config import resolve_template
 
@@ -68,6 +68,9 @@ class Dispatcher:
         # 内存态 (仅运行时保护, 重启重置); 仅 co_locate 开启时启用, 60s 采样一次.
         self._frozen_gpus: set[int] = set()
         self._last_freeze_sample = 0.0
+        # F2: 每卡显存采样环形缓冲 [(epoch_sec, used_gib)], 上限 ~2h (60s/点).
+        # 仅内存, daemon 重启丢失 —— 快照取"事发前时间线"用, 可接受 (定案 §2.5).
+        self._mem_samples: dict[int, list[tuple[float, float]]] = {}
         self._co_locate = bool(cfg.get("co_locate", False))
         # 审查 B1: 优雅停止请求标志 (信号处理器只置此标志, 主循环 tick 边界消费).
         # 内存态 (无跨进程语义), SIGTERM/SIGINT handler 调用 request_stop().
@@ -369,6 +372,11 @@ class Dispatcher:
                 if cap <= 0:
                     continue
                 used = self.allocator.vram_used(conn, idx)
+                # F2: 时间线采样 (冻结判定与快照共用同一次读数, 零额外开销)
+                buf = self._mem_samples.setdefault(idx, [])
+                buf.append((time.time(), round(float(used), 2)))
+                if len(buf) > 120:
+                    del buf[: len(buf) - 120]
                 if used > freeze_pct / 100.0 * cap:
                     if idx not in self._frozen_gpus:
                         self._frozen_gpus.add(idx)
@@ -834,6 +842,8 @@ class Dispatcher:
                 finished_at=state.now(),
             )
             self.log_line(f"job {j['id']} failed (rc 缺失, {failure})")
+            if failure in ("oom", "gpu_fault"):
+                self._capture_incident(conn, j, failure, log_path)
             self._release_gpu_for_job(conn, j)
             self._drop_profile(j)
             self._maybe_retry(conn, j)
@@ -860,6 +870,8 @@ class Dispatcher:
             state.update_job(conn, j["id"], status="failed", rc=rc, failure=failure,
                              finished_at=state.now())
             self.log_line(f"job {j['id']} failed rc={rc} ({failure})")
+            if failure in ("oom", "gpu_fault"):
+                self._capture_incident(conn, j, failure, log_path)
             self._drop_profile(j)  # 失败路径: 只删不 upsert
         self._release_gpu_for_job(conn, j)
         self._maybe_retry(conn, j)
@@ -944,6 +956,162 @@ class Dispatcher:
             os.unlink(self._profile_path(j))
         except OSError:
             pass
+
+    # ---------- F2: OOM 事故快照 (oom_rescheduling_research.md §2) ----------
+
+    def _capture_incident(self, conn, j, failure: str, log_path: str) -> None:
+        """failure ∈ {oom, gpu_fault} 时采集事故快照入 incidents 表.
+
+        必须在 _release_gpu_for_job 之前调用 (gpu_jobs 同卡邻居信息释放即失).
+        整体 try/except 兜底: 快照失败绝不阻塞 reap 主流程, 只 log 告警.
+        """
+        try:
+            self._capture_incident_impl(conn, j, failure, log_path)
+        except Exception as e:  # noqa: BLE001 — 旁路记录, 任何异常不外溢
+            self.log_line(f"⚠️ incident 快照失败 job={j['id']}: {e!r}")
+
+    def _capture_incident_impl(self, conn, j, failure: str, log_path: str) -> None:
+        gpu_idx = j["gpu"]
+        # --- 肇事任务声明值 / 历史实测峰值 ---
+        declared_vram = profile_peak = None
+        spec: dict = {}
+        row = conn.execute(
+            "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+            (j["batch_id"], j["task_id"], j["version"]),
+        ).fetchone()
+        if row:
+            try:
+                spec = json.loads(row["spec"])
+            except (json.JSONDecodeError, TypeError):
+                spec = {}
+        res = spec.get("resources") or {}
+        if res.get("vram_gib") is not None:
+            declared_vram = float(res["vram_gib"])
+        pk = res.get("profile_key")
+        if pk:
+            prow = conn.execute(
+                "SELECT peak_gib FROM profile_cache WHERE profile_key=?", (pk,)
+            ).fetchone()
+            if prow and prow["peak_gib"]:
+                profile_peak = float(prow["peak_gib"])
+        # --- 派发密度 (释放前判定): 同卡 >1 个框架任务 = shared ---
+        n_on_card = conn.execute(
+            "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=?", (gpu_idx,)
+        ).fetchone()["n"]
+        dispatch_mode = "shared" if n_on_card > 1 else "exclusive"
+        # --- 同卡邻居 (gpu_jobs JOIN jobs, 排除肇事者) ---
+        co_runners = []
+        for r in conn.execute(
+            "SELECT gj.job_id, gj.vram_gib, j.batch_id, j.task_id,"
+            " j.status, j.started_at"
+            " FROM gpu_jobs gj JOIN jobs j ON j.id = gj.job_id"
+            " WHERE gj.gpu_id=? AND gj.job_id != ?", (gpu_idx, j["id"]),
+        ).fetchall():
+            cpk_row = None
+            crow_spec = conn.execute(
+                "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=("
+                " SELECT MAX(version) FROM tasks WHERE batch_id=? AND id=?)",
+                (r["batch_id"], r["task_id"], r["batch_id"], r["task_id"]),
+            ).fetchone()
+            cpk = None
+            if crow_spec:
+                try:
+                    cres = (json.loads(crow_spec["spec"]).get("resources") or {})
+                    cpk = cres.get("profile_key")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if cpk:
+                cpk_row = conn.execute(
+                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?", (cpk,)
+                ).fetchone()
+            runtime_sec = None
+            if r["started_at"]:
+                try:
+                    t0 = datetime.strptime(
+                        r["started_at"], "%Y-%m-%d %H:%M:%S").timestamp()
+                    runtime_sec = int(time.time() - t0)
+                except ValueError:
+                    pass
+            co_runners.append({
+                "job_id": r["job_id"], "batch": r["batch_id"],
+                "task": r["task_id"], "status": r["status"],
+                "declared_vram_gib": r["vram_gib"],
+                "profile_peak_gib": (float(cpk_row["peak_gib"]) if cpk_row and cpk_row["peak_gib"] else None),
+                "runtime_sec": runtime_sec,
+            })
+        # --- 物理事实 (fake/查询失败 -> degraded) ---
+        cap_gib = self.allocator.mem_total(gpu_idx) or None
+        actual_used = self.allocator.phys_mem_used_gib(gpu_idx)
+        external_pids, ext_degraded = self.allocator.incident_external_pids(gpu_idx)
+        packed_sum = float(self.allocator.vram_used(conn, gpu_idx))
+        # --- 时间线: 最近 ~10 点 (相对秒) ---
+        buf = self._mem_samples.get(gpu_idx, [])[-10:]
+        now_t = time.time()
+        timeline = [
+            {"t_rel_sec": int(t - now_t), "used_gib": u} for (t, u) in buf
+        ]
+        # --- 日志摘录: 首个 OOM/Xid 特征 ±3 行, 封顶 4KiB ---
+        excerpt = self._incident_log_excerpt(log_path)
+        payload = {
+            "failed": {
+                "declared_vram_gib": declared_vram,
+                "profile_peak_gib": profile_peak,
+                "dispatch_mode": dispatch_mode,
+                "retries": j["retries"],
+                "git_rev": j["git_rev"],
+                "pgid": j["pgid"],
+                "rc": j["rc"],
+            },
+            "co_runners": co_runners,
+            "memory": {
+                "cap_gib": cap_gib,
+                "packed_sum_gib": round(packed_sum, 2),
+                "actual_used_gib": actual_used,
+                "external_pids": external_pids,
+                "note": "actual 含肇事进程异步销毁未释放部分; packed 为框架记账值",
+            },
+            "timeline": timeline,
+            "log_excerpt": excerpt,
+            "degraded": bool(ext_degraded or actual_used is None),
+            "failure_detail": failure,
+        }
+        state.insert_incident(
+            conn, state.now(), failure, gpu_idx, j["id"], j["batch_id"],
+            json.dumps(payload, ensure_ascii=False),
+        )
+        state.prune_incidents(
+            conn,
+            max_rows=int(self.cfg.get("incidents_max_rows", 200)),
+            ttl_days=int(self.cfg.get("incidents_ttl_days", 30)),
+        )
+        self.log_line(
+            f"📸 incident 快照: job {j['id']} {failure}@GPU{gpu_idx}"
+            f" mode={dispatch_mode} 邻居={len(co_runners)}"
+            f" 外部进程={len(external_pids)}"
+        )
+
+    def _incident_log_excerpt(self, log_path: str, ctx_lines: int = 3,
+                              max_bytes: int = 4096) -> str | None:
+        """日志中首个 OOM/Xid 特征行 ±ctx_lines, 超长截尾."""
+        import re as _re
+        try:
+            text = read_tail(log_path, 4 * 1024 * 1024)
+        except OSError:
+            return None
+        lines = text.splitlines()
+        hit = None
+        for i, l in enumerate(lines):
+            if ("CUDA out of memory" in l or "OutOfMemoryError" in l
+                    or _re.search(r"\bXid\b|\bECC\b", l)):
+                hit = i
+                break
+        if hit is None:
+            return None
+        lo = max(0, hit - ctx_lines)
+        seg = "\n".join(lines[lo : hit + ctx_lines + 1])
+        if len(seg) > max_bytes:
+            seg = seg[-max_bytes:]
+        return seg
 
     def _maybe_retry(self, conn, j) -> None:
         """失败重试: max_retry 内回 pending; 满 -> blocked (3.4).

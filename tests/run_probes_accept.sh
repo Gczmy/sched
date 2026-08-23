@@ -15,10 +15,10 @@
 # 退出码: 0 = 全过, 1 = 有失败 (输出 FAIL 行)
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -77,7 +77,8 @@ S1=/tmp/sched_prb1; rm -rf $S1; mkdir -p $S1
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
-  "name": "p1", "mode": "mix",
+  "name": "p1",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(1); print('FATAL Traceback boom', flush=True); time.sleep(120)"],
      "duration_min": 5, "max_retry": 3,
@@ -110,7 +111,8 @@ S2=/tmp/sched_prb2; rm -rf $S2; mkdir -p $S2
 mk_config $S2
 cat > $S2/batch.json << EOF
 {
-  "name": "p2", "mode": "mix",
+  "name": "p2",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(1); open('$S2/out.txt','w').write('ok'); print('ALL_DONE', flush=True); time.sleep(120)"],
      "duration_min": 5,
@@ -135,7 +137,8 @@ S3=/tmp/sched_prb3; rm -rf $S3; mkdir -p $S3
 mk_config $S3
 cat > $S3/batch.json << EOF
 {
-  "name": "p3", "mode": "mix",
+  "name": "p3",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(1); print('ALL_DONE', flush=True); time.sleep(120)"],
      "duration_min": 5, "max_retry": 0,
@@ -159,7 +162,8 @@ S4=/tmp/sched_prb4; rm -rf $S4; mkdir -p $S4
 mk_config $S4
 cat > $S4/batch.json << EOF
 {
-  "name": "p4", "mode": "mix",
+  "name": "p4",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(1); print('Traceback unrelated'); print('OK')"],
      "duration_min": 5, "max_retry": 0,
@@ -185,7 +189,8 @@ S5=/tmp/sched_prb5; rm -rf $S5; mkdir -p $S5
 mk_config $S5
 cat > $S5/batch.json << EOF
 {
-  "name": "p5", "mode": "mix",
+  "name": "p5",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import signal,time,os; signal.signal(signal.SIGTERM, signal.SIG_IGN); open('$S5/pid.txt','w').write(str(os.getpid())); print('FATAL Traceback', flush=True); time.sleep(120)"],
      "duration_min": 5, "max_retry": 0,

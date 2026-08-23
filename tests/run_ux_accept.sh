@@ -12,10 +12,10 @@
 # 退出码: 0 = 全过, 1 = 有失败 (输出 FAIL 行)
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -76,7 +76,8 @@ S1=/tmp/sched_acc_u1; rm -rf $S1; mkdir -p $S1
 mk_config $S1 true
 cat > $S1/batch.json << EOF
 {
-  "name": "u1", "mode": "mix",
+  "name": "u1",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 1},
     {"id": "t2", "max_retry": 0,
@@ -90,8 +91,8 @@ export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
 $PY -m gsched.cli submit $S1/batch.json >/dev/null 2>&1 || { bad "u1 submit 失败"; exit 1; }
 SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
 wait_status $S1 u1 done 1 30 && ok "t1 完成 done" || bad "t1 未 done"
-wait_status $S1 u1 failed 1 30 && ok "t2 失败 failed (批次 blocked, t3 pending 冻结)" \
-  || bad "t2 未 failed (got $(count_status $S1 u1 failed))"
+wait_status $S1 u1 blocked 1 30 && ok "t2 失败 -> blocked (批次 blocked, t3 pending 冻结)" \
+  || bad "t2 未 blocked (got $(count_status $S1 u1 blocked))"
 [ "$(count_status $S1 u1 pending)" = "1" ] && ok "t3 保持 pending 冻结" \
   || bad "t3 非 1 个 pending (got $(count_status $S1 u1 pending))"
 # P1: diag 批次级 (列出非 done/skip: t2 failed + t3 pending)
@@ -106,8 +107,8 @@ grep -q "已解锁重跑" $S1/retry_out.txt && ok "批次级 retry 解锁了失�
   || bad "retry 未解锁 (输出: $(cat $S1/retry_out.txt))"
 wait_status $S1 u1 done 2 40 && ok "retry 后 t1+t2 done (t2 第二次成功)" \
   || bad "t1+t2 未 done (running=$(count_status $S1 u1 running) failed=$(count_status $S1 u1 failed))"
-wait_status $S1 u1 failed 1 30 && ok "t3 首跑失败 (再 blocked)" \
-  || bad "t3 未失败 (failed=$(count_status $S1 u1 failed))"
+wait_status $S1 u1 blocked 1 30 && ok "t3 首跑失败 -> blocked (t2 已 done)" \
+  || bad "t3 未 blocked (blocked=$(count_status $S1 u1 blocked))"
 # 场景 3 合并: 第二次 retry 前把 t3 的 git_rev 改成旧值 -> 验证 P3 警告
 $PY -c "
 import sys; sys.path.insert(0, 'sched')
@@ -128,7 +129,8 @@ S3=/tmp/sched_acc_u5; rm -rf $S3; mkdir -p $S3
 mk_config $S3 false
 cat > $S3/batch.json << EOF
 {
-  "name": "u5", "mode": "mix",
+  "name": "u5",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; print('Epoch 1/3'); time.sleep(2)"], "duration_min": 1},
     {"id": "t2", "cmd": ["{VENV:k}", "-c", "print('ok2')"], "duration_min": 1}
@@ -147,14 +149,15 @@ grep -q "start=" $S3/detail_out.txt && grep -q "耗时=" $S3/detail_out.txt \
   || bad "P5 --detail 缺时间字段 (输出: $(head -8 $S3/detail_out.txt))"
 # P7: 批次 done 后 marker 文件 + sched markers
 wait_status $S3 u5 done 2 30 && ok "u5 全部 done" || bad "u5 未全 done"
-[ -f $S3/markers/u5.done ] && ok "P7 marker 文件 u5.done 已写" || bad "marker u5.done 缺失"
+[ -f $S3/testnode/markers/u5.done ] && ok "P7 marker 文件 u5.done 已写" || bad "marker u5.done 缺失"
 $PY -m gsched.cli markers > $S3/markers_out.txt 2>&1
 grep -q "u5.done" $S3/markers_out.txt && ok "sched markers 列出 u5.done" \
   || bad "sched markers 缺 u5.done (输出: $(cat $S3/markers_out.txt))"
 # blocked marker: 失败任务也应有 marker
 cat > $S3/bad.json << EOF
 {
-  "name": "u5bad", "mode": "mix",
+  "name": "u5bad",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "x1", "max_retry": 0,
      "cmd": ["{VENV:k}", "-c", "import sys; print('boomx'); sys.exit(1)"], "duration_min": 1}
@@ -162,9 +165,9 @@ cat > $S3/bad.json << EOF
 }
 EOF
 $PY -m gsched.cli submit $S3/bad.json >/dev/null 2>&1
-wait_status $S3 u5bad failed 1 20 && ok "u5bad 失败" || bad "u5bad 未失败"
+wait_status $S3 u5bad blocked 1 20 && ok "u5bad 失败 -> blocked" || bad "u5bad 未 blocked"
 sleep 2
-[ -f $S3/markers/u5bad.blocked ] && grep -q "x1" $S3/markers/u5bad.blocked \
+[ -f $S3/testnode/markers/u5bad.blocked ] && grep -q "x1" $S3/testnode/markers/u5bad.blocked \
   && ok "P7 blocked marker 含失败任务列表" || bad "blocked marker 缺失/无失败列表"
 $PY -m gsched.cli markers > $S3/markers2_out.txt 2>&1
 grep -q "u5bad.blocked" $S3/markers2_out.txt && ok "sched markers 列出 blocked" \
@@ -176,7 +179,8 @@ S2=/tmp/sched_acc_u4; rm -rf $S2; mkdir -p $S2
 mk_config $S2 false
 cat > $S2/batch.json << EOF
 {
-  "name": "u4", "mode": "mix",
+  "name": "u4",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('Epoch 3/30'); import time; time.sleep(60)"], "duration_min": 2}
   ]

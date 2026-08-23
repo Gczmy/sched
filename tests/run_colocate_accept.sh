@@ -15,10 +15,10 @@
 # 退出码: 0 = 全过, 1 = 有失败 (输出 FAIL 行)
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -95,7 +95,8 @@ export SCHED_STATE=$S4 SCHED_CONFIG=$S4/config.json SCHED_FAKE_GPUS="0:24"
 # 批次 A: 2 个 2GiB 共享任务
 cat > $S4/batch_a.json << EOF
 {
-  "name": "coloc_a", "mode": "mix",
+  "name": "coloc_a",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(3); open('$S4/a1.txt','w').write('ok')"], "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 2}, "artifacts": {"a": {"path": "$S4/a1.txt"}}, "paths_escape": true},
     {"id": "t2", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(3); open('$S4/a2.txt','w').write('ok')"], "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 2}, "artifacts": {"a": {"path": "$S4/a2.txt"}}, "paths_escape": true}
@@ -111,7 +112,8 @@ done
 # 批次 B (动态加入): 新 2GiB 任务 -> 应 pack 到 GPU0 (2+2+2=6 <= 16.8)
 cat > $S4/batch_b.json << EOF
 {
-  "name": "coloc_b", "mode": "mix",
+  "name": "coloc_b",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(3); open('$S4/b1.txt','w').write('ok')"], "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 2}, "artifacts": {"a": {"path": "$S4/b1.txt"}}, "paths_escape": true}
   ]

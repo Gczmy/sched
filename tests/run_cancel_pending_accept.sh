@@ -16,10 +16,10 @@
 # 退出码: 0 = 全过, 1 = 有失败 (输出 FAIL 行)
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -79,7 +79,8 @@ S1=/tmp/sched_acc_c1; rm -rf $S1; mkdir -p $S1
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
-  "name": "c1", "mode": "mix",
+  "name": "c1",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 1},
     {"id": "t2", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 1},
@@ -89,7 +90,8 @@ cat > $S1/batch.json << EOF
 EOF
 cat > $S1/down.json << EOF
 {
-  "name": "c1_down", "mode": "mix", "depends_on": ["c1"],
+  "name": "c1_down",
+  "project": "default", "mode": "mix", "depends_on": ["c1"],
   "tasks": [
     {"id": "d1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 1}
   ]
@@ -128,7 +130,8 @@ S2=/tmp/sched_acc_c2; rm -rf $S2; mkdir -p $S2
 mk_config $S2
 cat > $S2/batch.json << EOF
 {
-  "name": "c2", "mode": "mix",
+  "name": "c2",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 1},
     {"id": "t2", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 1},

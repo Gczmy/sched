@@ -95,6 +95,16 @@ CREATE TABLE IF NOT EXISTS profile_cache (
 -- 进程组 (PID namespace 跨节点, 定案 44 同类) -> 不本地 killpg, 改为写控制
 -- 请求落库, daemon (计算节点) 每轮 tick 拉取处理: 本地 alive 预检 (O5) +
 -- 写 kill_reason + killpg + reap 释放 GPU. pending 任务无进程, CLI 直标不需请求.
+CREATE TABLE IF NOT EXISTS incidents (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  gpu_idx    INTEGER,
+  job_id     TEXT,
+  batch_id   TEXT,
+  payload    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS control_requests (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id      TEXT NOT NULL,
@@ -165,6 +175,7 @@ def init_db() -> str:
         conn.executescript(SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
+        migrate_incidents(conn)
     return p
 
 
@@ -203,6 +214,81 @@ def migrate_project_columns(conn: sqlite3.Connection) -> None:
     bcols = [r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()]
     if "priority" not in bcols:
         conn.execute("ALTER TABLE batches ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+
+def migrate_incidents(conn: sqlite3.Connection) -> None:
+    """OOM 事故快照表 (调研 F2): 幂等补建 (init_db 与旧库升级共用)."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS incidents ("
+        " id         INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " ts         TEXT NOT NULL,"
+        " kind       TEXT NOT NULL,"
+        " gpu_idx    INTEGER,"
+        " job_id     TEXT,"
+        " batch_id   TEXT,"
+        " payload    TEXT NOT NULL)"
+    )
+
+
+def insert_incident(conn: sqlite3.Connection, ts: str, kind: str,
+                    gpu_idx: int | None, job_id: str | None,
+                    batch_id: str | None, payload_json: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO incidents (ts, kind, gpu_idx, job_id, batch_id, payload)"
+        " VALUES (?,?,?,?,?,?)",
+        (ts, kind, gpu_idx, job_id, batch_id, payload_json),
+    )
+    return int(cur.lastrowid)
+
+
+def prune_incidents(conn: sqlite3.Connection, max_rows: int = 200,
+                    ttl_days: int = 30) -> int:
+    """裁剪事故快照 (定案 Q3): 条数 + TTL 双限, blocked 引用的条目豁免.
+
+    返回删除行数. 豁免规则: job 当前仍处 blocked 状态的事故不裁 ——
+    保证事后 sched diag 永远能拿到证据 (直到任务被 retry/resubmit 解锁).
+    """
+    cutoff = (
+        datetime.now()
+        .timestamp()
+        - ttl_days * 86400
+    )
+    cutoff_str = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "DELETE FROM incidents WHERE ts < ?", (cutoff_str,)
+    )
+    # 条数裁剪: 保留最新 max_rows 条, 但跳过 blocked 引用的行
+    blocked_ids = {
+        r["id"]
+        for r in conn.execute(
+            "SELECT DISTINCT id FROM jobs WHERE status='blocked'"
+        ).fetchall()
+    }
+    keep_min = conn.execute(
+        "SELECT MIN(id) FROM (SELECT id FROM incidents ORDER BY id DESC LIMIT ?)",
+        (max_rows,),
+    ).fetchone()[0]
+    if keep_min is None:
+        return 0
+    # 注意 SQL NULL 三值逻辑: job_id 为 NULL 的行用 `IS NULL` 单独放行,
+    # 否则 `NULL NOT IN (...)` 求值为 NULL -> 裁剪静默空转
+    if blocked_ids:
+        placeholders = ",".join("?" * len(blocked_ids))
+        cur = conn.execute(
+            f"DELETE FROM incidents WHERE id < ?"
+            f" AND (job_id IS NULL OR job_id NOT IN ({placeholders}))",
+            (keep_min, *blocked_ids),
+        )
+    else:
+        cur = conn.execute("DELETE FROM incidents WHERE id < ?", (keep_min,))
+    return cur.rowcount
+
+
+def latest_incident_for_job(conn: sqlite3.Connection, job_id: str):
+    return conn.execute(
+        "SELECT * FROM incidents WHERE job_id=? ORDER BY id DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:

@@ -18,10 +18,10 @@
 # 退出码: 0 = 全过, 1 = 有失败
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -84,7 +84,8 @@ S1=/tmp/sched_ntf1; rm -rf $S1; mkdir -p $S1
 mk_config $S1 '{"file": {}}'
 cat > $S1/batch.json << EOF
 {
-  "name": "n1", "mode": "mix",
+  "name": "n1",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
   ]
@@ -112,7 +113,8 @@ S2=/tmp/sched_ntf2; rm -rf $S2; mkdir -p $S2
 mk_config $S2 '{"file": {}}'
 cat > $S2/batch.json << EOF
 {
-  "name": "n2", "mode": "mix",
+  "name": "n2",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import sys; sys.exit(1)"], "duration_min": 5, "max_retry": 0}
   ]
@@ -141,7 +143,8 @@ mk_config $S3 '{"file": {}}'
 # 首跑失败 (建 flag 后 exit 1), retry 后成功
 cat > $S3/batch.json << EOF
 {
-  "name": "n3", "mode": "mix",
+  "name": "n3",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import os,sys; f='$S3/flag'; sys.exit(0) if os.path.exists(f) else (open(f,'w').write('x'), sys.exit(1))[1]"],
      "duration_min": 5, "max_retry": 0}
@@ -184,7 +187,8 @@ S5=/tmp/sched_ntf5; rm -rf $S5; mkdir -p $S5
 mk_config $S5 '{"file": {}, "email": {"smtp_host": "127.0.0.1", "smtp_port": 1, "from": "sched@test", "to": ["x@test"]}}'
 cat > $S5/batch.json << EOF
 {
-  "name": "n5", "mode": "mix",
+  "name": "n5",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
   ]
@@ -207,7 +211,8 @@ S6=/tmp/sched_ntf6; rm -rf $S6; mkdir -p $S6
 mk_config $S6 '{"file": {}}'
 cat > $S6/batch.json << EOF
 {
-  "name": "n6", "mode": "mix", "notify": false,
+  "name": "n6",
+  "project": "default", "mode": "mix", "notify": false,
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
   ]
@@ -236,7 +241,8 @@ chmod +x $S7/sink.sh
 mk_config $S7 "{\"file\": {}, \"command\": [\"bash\", \"$S7/sink.sh\"]}"
 cat > $S7/batch.json << EOF
 {
-  "name": "n7", "mode": "mix",
+  "name": "n7",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
   ]
@@ -260,7 +266,8 @@ S7B=/tmp/sched_ntf7b; rm -rf $S7B; mkdir -p $S7B
 mk_config $S7B "{\"file\": {}, \"command\": [\"$PY\", \"-c\", \"import sys; sys.exit(3)\"]}"
 cat > $S7B/batch.json << EOF
 {
-  "name": "n7b", "mode": "mix",
+  "name": "n7b",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "print('ok')"], "duration_min": 5, "max_retry": 0}
   ]

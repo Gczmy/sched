@@ -1247,6 +1247,48 @@ def _job_progress(batch_id: str, task_id: str, version: int) -> str | None:
     return None
 
 
+def cmd_incidents(args: argparse.Namespace) -> int:
+    """sched incidents [id] [--limit N] [--job ID] [--gpu N]: 事故快照查询 (F2)."""
+    with state.connect() as conn:
+        if args.incident_id:
+            row = conn.execute(
+                "SELECT * FROM incidents WHERE id=?", (args.incident_id,)
+            ).fetchone()
+            if not row:
+                print(f"错误: incident #{args.incident_id} 不存在", file=sys.stderr)
+                return 1
+            _diag_incident(row)  # 详情视图复用 diag 渲染 (含判读)
+            print()
+            try:
+                full = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                return 0
+            print("--- 完整 payload ---")
+            print(json.dumps(full, ensure_ascii=False, indent=2))
+            return 0
+        q, params = "SELECT id, ts, kind, gpu_idx, job_id, batch_id FROM incidents", []
+        conds = []
+        if args.job:
+            conds.append("job_id=?"); params.append(args.job)
+        if args.gpu is not None:
+            conds.append("gpu_idx=?"); params.append(args.gpu)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(args.limit)
+        rows = conn.execute(q, params).fetchall()
+    if not rows:
+        print("无事故快照")
+        return 0
+    print(f"{'id':>4}  {'ts':<19} {'kind':<9} {'gpu':>3}  job / batch")
+    for r in rows:
+        print(f"{r['id']:>4}  {r['ts']:<19} {r['kind']:<9}"
+              f" {('-' if r['gpu_idx'] is None else r['gpu_idx']):>3}"
+              f"  {r['job_id']} / {r['batch_id']}")
+    print(f"\n共 {len(rows)} 条; 详情: sched incidents <id>")
+    return 0
+
+
 def cmd_diag(args: argparse.Namespace) -> int:
     """sched diag <batch>[:task]: 一站式失败诊断 (P1).
 
@@ -1313,12 +1355,94 @@ def _diag_one(conn, j, cfg: dict) -> None:
         f"{task}-v{j['version']}.log",  # C1 修复: 与 dispatcher._job_log_path 同构
     )
     print(f"  log: {log_path}")
+    # F2: failure=oom/gpu_fault 时附最新事故快照摘要 + 启发式判读
+    if (j["failure"] or "") in ("oom", "gpu_fault"):
+        inc = state.latest_incident_for_job(conn, j["id"])
+        if inc:
+            _diag_incident(inc)
+        else:
+            print("  incident: 无快照 (早于 P1 的失败或采集降级)")
     tail = _tail_n(log_path, 15)
     if tail:
         print("  --- 日志尾部 15 行 ---")
         for l in tail:
             print(f"  | {l}")
     print()
+
+
+def _incident_verdicts(payload: dict) -> list[str]:
+    """启发式判读: 只列假设不下结论 (数据会撒谎, 碎片化看起来就像任务太大)."""
+    v: list[str] = []
+    mem = payload.get("memory") or {}
+    ext = mem.get("external_pids") or []
+    ext_mem = sum(e.get("mem_mib") or 0 for e in ext) / 1024.0
+    if ext and ext_mem >= 1.0:
+        pids = ", ".join(str(e.get("pid")) for e in ext[:5])
+        v.append(f"疑似调度器外进程挤占显存 (pid {pids}, ~{ext_mem:.1f} GiB)"
+                 " —— 检查同卡其他用户")
+    elif mem.get("degraded"):
+        v.append("物理查询降级: 外部进程可能存在但不可见, 建议人工 nvidia-smi 复核")
+    failed = payload.get("failed") or {}
+    dpk, fpk = failed.get("declared_vram_gib"), failed.get("profile_peak_gib")
+    if dpk and fpk and fpk > dpk * 1.3:
+        v.append(f"历史实测峰值 {fpk:.1f} GiB > 声明 {dpk:.1f} GiB"
+                 " —— 声明值偏低, 装箱按声明算会低估占用")
+    for cr in payload.get("co_runners") or []:
+        cd, cp = cr.get("declared_vram_gib"), cr.get("profile_peak_gib")
+        if cd and cp and cp > cd * 1.5 and cp - cd > 2.0:
+            v.append(f"邻居 {cr.get('task')} 实测峰值 {cp:.1f} >> 声明 {cd:.1f}"
+                     " GiB —— 疑似邻居越界挤占")
+    actual, packed = mem.get("actual_used_gib"), mem.get("packed_sum_gib")
+    if (not ext and actual is not None and packed is not None
+            and not mem.get("degraded") and abs(actual - packed) <= packed * 0.2):
+        v.append("无外部进程且物理用量≈记账值 —— 任务本身过大或碎片化")
+    tl = payload.get("timeline") or []
+    if len(tl) >= 4:
+        used = [p["used_gib"] for p in tl]
+        span = max(used) - min(used)
+        cap = mem.get("cap_gib") or 1
+        if span > cap * 0.25:
+            v.append("事发前显存快速爬升 —— 任务随训练进度增长 (activation 累积类)")
+        elif span < cap * 0.05 and max(used) < cap * 0.9:
+            v.append("事发前显存平稳 —— 更像瞬时冲击 (外部进程落入 / 瞬时峰值)")
+    return v
+
+
+def _diag_incident(inc) -> None:
+    """打印单条事故快照摘要 + 判读."""
+    try:
+        payload = json.loads(inc["payload"])
+    except (json.JSONDecodeError, TypeError):
+        print("  incident: 快照 payload 解析失败")
+        return
+    f = payload.get("failed") or {}
+    m = payload.get("memory") or {}
+    print(f"  incident #{inc['id']} @{inc['ts']} kind={inc['kind']}"
+          f" gpu={inc['gpu_idx']} mode={f.get('dispatch_mode')}"
+          f"{' [degraded]' if payload.get('degraded') else ''}")
+    print(f"    肇事: declared={f.get('declared_vram_gib')}"
+          f" profile_peak={f.get('profile_peak_gib')}"
+          f" retries={f.get('retries')}")
+    print(f"    显存: cap={m.get('cap_gib')} packed={m.get('packed_sum_gib')}"
+          f" actual={m.get('actual_used_gib')}")
+    for cr in payload.get("co_runners") or []:
+        print(f"    邻居: {cr.get('batch')}:{cr.get('task')} [{cr.get('status')}]"
+              f" declared={cr.get('declared_vram_gib')}"
+              f" peak={cr.get('profile_peak_gib')}"
+              f" runtime={cr.get('runtime_sec')}s")
+    for e in m.get("external_pids") or []:
+        print(f"    外部进程: pid={e.get('pid')}"
+              f" mem_mib={e.get('mem_mib', '?')}")
+    verdicts = _incident_verdicts(payload)
+    if verdicts:
+        print("    --- 判读假设 ---")
+        for v in verdicts:
+            print(f"    ? {v}")
+    ex = payload.get("log_excerpt")
+    if ex:
+        print("    --- 日志摘录 ---")
+        for l in ex.splitlines()[-6:]:
+            print(f"    | {l}")
 
 
 def _diag_cmds(spec: dict, cfg: dict) -> list[str]:
@@ -1698,6 +1822,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("diag", help="一站式失败诊断 (状态+命令+git+日志)")
     p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部非 done/skip)")
     p.set_defaults(fn=cmd_diag)
+
+    p = sub.add_parser("incidents", help="事故快照查询 (OOM/gpu_fault 现场)")
+    p.add_argument("incident_id", nargs="?", type=int,
+                   help="指定快照 id 查看详情 (含完整 payload)")
+    p.add_argument("--limit", type=int, default=20, help="列表条数 (默认 20)")
+    p.add_argument("--job", help="按 job id 过滤")
+    p.add_argument("--gpu", type=int, default=None, help="按 GPU 过滤")
+    p.set_defaults(fn=cmd_incidents)
 
     p = sub.add_parser("resubmit", help="重新提交 (新版本排队尾)")
     p.add_argument("task", help="<batch>:<task>")

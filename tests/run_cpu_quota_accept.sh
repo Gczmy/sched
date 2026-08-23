@@ -15,10 +15,10 @@
 # 退出码: 0 = 全过, 1 = 有失败 (输出 FAIL 行)
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -74,6 +74,7 @@ EOF
 cat > $S1/batch.json << EOF
 {
   "name": "s1",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "gpu_long", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(3); open('$S1/gpu_long.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S1/gpu_long.txt"}}, "paths_escape": true},
@@ -111,6 +112,7 @@ EOF
 cat > $S2/batch.json << EOF
 {
   "name": "s2",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "c1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S2/c1.txt','w').write('ok')"], "resources": {"cpus": 8, "gpu": 0}, "duration_min": 1, "artifacts": {"a": {"path": "$S2/c1.txt"}}, "paths_escape": true},
@@ -146,6 +148,7 @@ EOF
 cat > $S3/batch.json << EOF
 {
   "name": "s3",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "g0", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S3/g0.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S3/g0.txt"}}, "paths_escape": true},

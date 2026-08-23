@@ -149,6 +149,74 @@ class Allocator:
 
     # ---------- 物理探测 (仅边界校验) ----------
 
+    def phys_mem_used_gib(self, idx: int) -> float | None:
+        """该卡物理已用显存 (GiB); OOM 快照用. 查询失败/fake -> None."""
+        if self.fake:
+            return None
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode != 0:
+                return None
+            for line in out.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) != 2:
+                    continue
+                if int(parts[0].strip()) == idx:
+                    return round(int(parts[1].strip()) / 1024.0, 2)
+        except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+            pass
+        return None
+
+    def incident_external_pids(self, idx: int) -> tuple[list[dict], bool]:
+        """OOM 快照用: 该卡上不属于框架已知进程组的 compute 进程 (调研 F2 §2.3).
+
+        判定: pid 的 pgid 不在已知集合 (running + 近 10min 终态, 见
+        _known_job_pgids) -> 外部. 已知近似: 同用户子进程若独立成组会被误判,
+        文档标注, 不追求完美.
+        返回 ([{pid, mem_mib?}, ...], degraded) —— degraded=True 表示查询失败
+        (此时外部进程可能存在但不可见).
+        """
+        by_card = self._compute_pids_by_card()
+        if by_card is None:
+            return [], True  # 查询失败 -> degraded
+        try:
+            known = self._known_job_pgids()
+        except Exception:  # noqa: BLE001 — 无表新库等边缘: 视为无已知进程
+            known = set()
+        # per-pid 显存: 一次查询建 {pid: mem_mib}; 失败不致命 (mem 缺省)
+        mem_by_pid: dict[int, int] = {}
+        if not self.fake:
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                uuid_map = self._uuid_to_idx() if out.returncode == 0 else {}
+                for line in out.stdout.splitlines():
+                    parts = [x.strip() for x in line.split(",")]
+                    if len(parts) != 3:
+                        continue
+                    pid_i = int(parts[0])
+                    if uuid_map.get(parts[2]) == idx:
+                        mem_by_pid[pid_i] = int(parts[1])
+            except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+                pass
+        ext: list[dict] = []
+        for pid in by_card.get(idx, []):
+            pgid = self._pgid_of(pid)
+            if pgid is not None and pgid in known:
+                continue  # 我们自己的 (含近 10min 终态残留)
+            d: dict = {"pid": pid}
+            if pid in mem_by_pid:
+                d["mem_mib"] = mem_by_pid[pid]
+            ext.append(d)
+        return ext, False
+
     def _compute_pids_by_card(self) -> dict[int, list[int]] | None:
         """compute-apps 按卡列 pid (M8 主判据, 新建路径 §3.2e C).
 

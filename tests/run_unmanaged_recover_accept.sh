@@ -15,10 +15,10 @@
 # 退出码: 0 = 全过, 1 = 有失败 (输出 FAIL 行)
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 HOST=testnode   # 定案 43 (P6): hostname() 读 config node 字段, 测试 config 统一 node=testnode
 
 PASS=0; FAIL=0
@@ -78,6 +78,7 @@ mk_config $S1
 cat > $S1/batch.json << EOF
 {
   "name": "u1",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S1/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S1/t1.txt"}}, "paths_escape": true}
@@ -103,6 +104,7 @@ mk_config $S2
 cat > $S2/batch.json << EOF
 {
   "name": "u2",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S2/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S2/t1.txt"}}, "paths_escape": true}
@@ -137,6 +139,7 @@ mk_config $S3
 cat > $S3/batch.json << EOF
 {
   "name": "u3",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S3/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S3/t1.txt"}}, "paths_escape": true}
@@ -162,6 +165,7 @@ mk_config $S5
 cat > $S5/batch.json << EOF
 {
   "name": "u5",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(5); open('$S5/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S5/t1.txt"}}, "paths_escape": true}
@@ -222,6 +226,7 @@ EOF
 cat > $S6/batch_a.json << EOF
 {
   "name": "u6a",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S6/a.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S6/a.txt"}}, "paths_escape": true}
@@ -252,6 +257,7 @@ fi
 cat > $S6/batch_b.json << EOF
 {
   "name": "u6b",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S6/b.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S6/b.txt"}}, "paths_escape": true}
@@ -278,6 +284,7 @@ mk_config $S4
 cat > $S4/batch.json << EOF
 {
   "name": "u4",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(30); open('$S4/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S4/t1.txt"}}, "paths_escape": true}
@@ -349,6 +356,7 @@ mk_config $S7B
 cat > $S7B/batch.json << EOF
 {
   "name": "u7b",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(2); open('$S7B/t1.txt','w').write('ok')"], "duration_min": 1, "artifacts": {"a": {"path": "$S7B/t1.txt"}}, "paths_escape": true}
@@ -383,6 +391,7 @@ mk_config $S8
 cat > $S8/batch.json << EOF
 {
   "name": "u8",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import json,os; json.dump({'peak_gib': 3.25}, open(os.environ['SCHED_PROFILE_OUT'],'w')); open('$S8/t1.txt','w').write('ok')"], "duration_min": 1, "resources": {"profile_key": "raft/b158/bs4096"}, "artifacts": {"a": {"path": "$S8/t1.txt"}}, "paths_escape": true}
@@ -422,6 +431,7 @@ mk_config $S8C
 cat > $S8C/batch.json << EOF
 {
   "name": "u8c",
+  "project": "default",
   "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import json,os; json.dump({'peak_gib': 9.9}, open(os.environ['SCHED_PROFILE_OUT'],'w')); exit(3)"], "duration_min": 1, "resources": {"profile_key": "raft/b158/bs4096_fail"}, "artifacts": {"a": {"path": "$S8C/none.txt"}}, "paths_escape": true}
@@ -453,14 +463,16 @@ echo "--- 场景 9: M8 pid 归属判据 (残留框架进程等 / 外部进程判
 S9=/tmp/sched_acc_u9; rm -rf $S9; mkdir -p $S9
 SCHED_STATE=$S9 SCHED_FAKE_GPUS=0 $PY - <<'EOF'
 import os, sys
-sys.path.insert(0, os.getcwd() + '/sched')
 import gsched.state as st
 st.init_db()
 with st.connect() as conn:
     st.init_gpus(conn, [0])
-    # 造一个已知 job (pgid=111, 框架记录在案): M8 归属对照用
-    conn.execute("INSERT INTO jobs (id,batch_id,task_id,version,status,pgid,submitted_at) "
-                 "VALUES ('known','b','t',1,'done',111,'2026-08-15 12:00:00')")
+    # 造一个已知 job (pgid=111): M8 归属对照用.
+    # 注意: _known_job_pgids 只认 running + 近 10min 终态 (决策 3A 变体),
+    # 故 finished_at 必须是当前时间, 否则 pgid 不在已知集合 -> 误判外部
+    conn.execute("INSERT INTO jobs (id,batch_id,task_id,version,status,pgid,submitted_at,finished_at) "
+                 "VALUES ('known','b','t',1,'done',111,"
+                 " datetime('now','localtime'), datetime('now','localtime'))")
 from gsched.allocator import Allocator
 al = Allocator([0], fake=True)
 

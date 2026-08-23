@@ -19,10 +19,10 @@
 # 退出码: 0 = 全过, 1 = 有失败
 # =============================================================================
 set -u
-cd "$(dirname "$0")/../.."   # 仓库根
+cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
-export PYTHONPATH="$ROOT/sched${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -80,7 +80,8 @@ S1=/tmp/sched_acc_cf1; rm -rf $S1; mkdir -p $S1
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
-  "name": "cf1", "mode": "mix",
+  "name": "cf1",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(120)"], "duration_min": 5}
   ]
@@ -128,7 +129,8 @@ time.sleep(120)
 EOF
 cat > $S2/batch.json << EOF
 {
-  "name": "cf2", "mode": "mix",
+  "name": "cf2",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "$S2/trap_sleep.py"], "duration_min": 5}
   ]
@@ -151,7 +153,8 @@ S3=/tmp/sched_acc_cf3; rm -rf $S3; mkdir -p $S3
 mk_config $S3
 cat > $S3/batch.json << EOF
 {
-  "name": "cf3", "mode": "mix",
+  "name": "cf3",
+  "project": "default", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 5},
     {"id": "t2", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(60)"], "duration_min": 5}
