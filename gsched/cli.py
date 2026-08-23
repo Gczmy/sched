@@ -728,7 +728,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             running_gpu_by_proj[r["project"]] = r["n"]
 
         def _quota_wait(j) -> bool:
-            proj = j.get("project") if "project" in j.keys() else None
+            proj = j["project"] if "project" in j.keys() else None
             if not proj or j["status"] != "pending":
                 return False
             pcfg = cfg.get("projects", {}).get(proj, {})
