@@ -970,11 +970,19 @@ class Dispatcher:
             # 只派发所属批次已解锁 (active/done) 的 pending job——
             # queued 批次 (依赖未解锁) 的 job 不派发 (场景 2: 下游挂起)
             ready = conn.execute(
-                "SELECT j.*, b.priority as batch_priority, b.project as batch_project"
+                "SELECT j.*, b.project as batch_project"
                 " FROM jobs j JOIN batches b ON j.batch_id=b.id"
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
-                " ORDER BY b.project DESC, b.priority DESC, j.rowid"
+                " ORDER BY j.rowid"
             ).fetchall()
+            # B11c: 项目级优先级排序 (config.projects.<name>.priority, 数值大者先派)
+            # 在 Python 层做——batches 表没有 priority 列, 且 project priority 来自
+            # config 而非 DB, SQL 无法直接引用
+            proj_prio = self._project_priority  # 局部引用, 避免循环内反复查属性
+            ready = sorted(ready, key=lambda j: (
+                -proj_prio(j["project"] or j.get("batch_project")),  # 高优先先派
+                j["rowid"],  # 同优先级按提交顺序 FIFO
+            ))
             # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.
             # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU).
