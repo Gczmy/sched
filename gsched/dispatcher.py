@@ -21,7 +21,7 @@ from . import notify, state
 from .allocator import Allocator
 from .executor import Executor, pid_cmdline_matches, read_tail
 from .fingerprint import compute_fingerprint
-from .config import resolve_template
+from .config import config_path, load_config, parse_gpus, resolve_template
 
 POLL_SEC = 10
 HEARTBEAT_SEC = 30
@@ -31,6 +31,9 @@ RETRY_BACKOFF_SEC = 30  # 失败重试退避 (M2): 防秒级崩溃任务紧密�
 DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
 DEFAULT_MAX_CPU_JOBS = 2  # cpus_total 未配置时回退: CPU-only 并发上限 (定案 7 旧语义)
 DEFAULT_IDLE_TIMEOUT_MIN = 360  # 空转自动退出 (定案 38): 默认 6h, 0 = 禁用
+# B12-a: 配置冷键 —— 变更拒绝热更新, 必须重启 daemon (调研 §2.3).
+# gpus 卡集/容量另经 parse_gpus 结构比对, 不在本列表.
+CONFIG_COLD_KEYS = ("node", "state_dir", "user", "schema_version")
 
 
 class Dispatcher:
@@ -72,6 +75,16 @@ class Dispatcher:
         # 仅内存, daemon 重启丢失 —— 快照取"事发前时间线"用, 可接受 (定案 §2.5).
         self._mem_samples: dict[int, list[tuple[float, float]]] = {}
         self._co_locate = bool(cfg.get("co_locate", False))
+        # B12-a: 钉住 host 目录名 —— node 属冷键, 文件后续变更被热更新拒绝,
+        # 但 state.connect() 若仍实时解析会把 DB 路径漂移到新节点的空目录。
+        # 钉住后 daemon 进程终身使用启动时目录; 重启后才接受新 node。
+        state.pin_hostname(state.hostname())
+        # 配置热更新 —— 基线路径与 mtime; 缓存字段刷新清单见 _reload_config_now
+        self._config_path = config_path()
+        try:
+            self._cfg_mtime = os.stat(self._config_path).st_mtime
+        except OSError:
+            self._cfg_mtime = 0.0
         # 审查 B1: 优雅停止请求标志 (信号处理器只置此标志, 主循环 tick 边界消费).
         # 内存态 (无跨进程语义), SIGTERM/SIGINT handler 调用 request_stop().
         self._stop_requested = False
@@ -385,6 +398,7 @@ class Dispatcher:
                     self._frozen_gpus.discard(idx)
 
     def _tick(self) -> None:
+        self._maybe_reload_config()  # B12-a: 配置热更新 (mtime 变化时)
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
         self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
@@ -614,6 +628,51 @@ class Dispatcher:
 
     # ---------- reap ----------
 
+    # ---------- B12-a: 配置热更新 (colocate_finetune_hotreload_research.md §2) ----------
+
+    def _maybe_reload_config(self) -> None:
+        """每 tick stat 一次 config.json, mtime 变化则重载.
+
+        失败(半写/非法 JSON/冷键变更)一律保留旧配置并告警; 基线 mtime 无论
+        成败都更新 —— 防止坏文件触发每 tick 重试风暴 (用户修复保存后新 mtime
+        自然再次触发).
+        """
+        try:
+            mtime = os.stat(self._config_path).st_mtime
+        except OSError:
+            return  # 文件暂时不可见 (NFS 抖动): 下轮再看
+        if mtime == self._cfg_mtime:
+            return
+        self._cfg_mtime = mtime
+        ok = self._reload_config_now()
+        self.log_line("✅ 配置已热更新" if ok else "⚠️ 配置热更新未生效 (保留旧配置)")
+
+    def _reload_config_now(self) -> bool:
+        """加载并校验新配置, 通过冷键检查后原子换引用 + 刷新缓存字段. 幂等."""
+        try:
+            new_cfg = load_config(self._config_path)
+            old_gpus = parse_gpus(self.cfg)
+            new_gpus = parse_gpus(new_cfg)
+        except Exception as e:  # ConfigError/json/OSError — 半写或非法
+            self.log_line(f"⚠️ 配置热更新失败 (保留旧配置): {e}")
+            return False
+        cold_diff = [k for k in CONFIG_COLD_KEYS
+                     if self.cfg.get(k) != new_cfg.get(k)]
+        if old_gpus != new_gpus:
+            cold_diff.append("gpus(卡集或容量覆盖)")
+        if cold_diff:
+            self.log_line(
+                f"⚠️ 配置含冷键变更 {cold_diff} —— 拒绝热更新, 请重启 daemon 生效"
+            )
+            return False
+        self.cfg = new_cfg
+        # 缓存字段刷新清单 (其余键均实时读 self.cfg, 换引用即生效):
+        self._co_locate = bool(new_cfg.get("co_locate", False))
+        self.venv_paths = new_cfg.get("venvs", {})
+        self.idle_timeout_min = int(
+            new_cfg.get("idle_timeout_min", DEFAULT_IDLE_TIMEOUT_MIN))
+        return True
+
     def _process_control_requests(self) -> None:
         """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.
 
@@ -630,6 +689,16 @@ class Dispatcher:
             if not reqs:
                 return
             for r in reqs:
+                if r["op"] == "config_reload":
+                    # B12-a: CLI `sched config reload` 的强制重载路径
+                    # (mtime 未变也执行; CLI 已本地预校验过语法)
+                    ok = self._reload_config_now()
+                    state.finish_control_request(
+                        conn, r["id"], "已生效" if ok else "失败 (见 scheduler.log)")
+                    self.log_line(
+                        f"config_reload req {r['id']}: "
+                        + ("✅ 配置已热更新" if ok else "⚠️ 未生效 (保留旧配置)"))
+                    continue
                 j = state.get_job(conn, r["job_id"])
                 if j is None or j["status"] != "running" or not j["pgid"]:
                     # 任务已不在 running (已 done/failed/cancelled 或 pgid 丢失)

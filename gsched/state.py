@@ -137,8 +137,10 @@ def hostname() -> str:
     (读+解析+校验), daemon 每 tick 开多个连接导致 config.json 每秒被解析
     近一遍。mtime 变化自动失效, CLI 短进程与 daemon 长驻均安全。
     """
-    from .config import config_path, load_config
+    from .config import ConfigError, config_path, load_config
 
+    if _pinned_host:
+        return _pinned_host["v"]
     p = config_path()
     if not os.path.isfile(p):
         import socket
@@ -150,7 +152,16 @@ def hostname() -> str:
         key = (p, None)
     if key in _hostname_cache:
         return _hostname_cache[key]
-    cfg = load_config()  # 存在但损坏: ConfigError 上抛, 不静默回退
+    try:
+        cfg = load_config()
+    except ConfigError:
+        # B12-a: 热更新窗口的半写/坏文件。有最近已知好值 -> 沿用 (daemon 与
+        # 长驻 CLI 进程不断链); 无历史 -> 保持 M16 语义上抛 (登录节点首查,
+        # 静默回退 gethostname 会读到本机空目录 —— 旧坑复活路径, 绝不放开)
+        last = _hostname_last_good.get("v")
+        if last is not None:
+            return str(last)
+        raise
     node = cfg.get("node")
     if node:
         result = str(node)
@@ -160,6 +171,7 @@ def hostname() -> str:
         result = socket.gethostname()
     _hostname_cache.clear()
     _hostname_cache[key] = result
+    _hostname_last_good["v"] = result   # B12-a: 坏配置窗口的兜底值
     return result
 
 
@@ -314,6 +326,19 @@ def now() -> str:
 
 
 _hostname_cache: dict = {}  # P3: hostname() 进程内缓存 {(path, mtime): node}
+_hostname_last_good: dict = {}  # B12-a: 最近一次成功解析的 node (ConfigError 兜底)
+_pinned_host: dict = {}         # B12-a: daemon 启动时钉住 (文件后续变更不再影响本进程)
+
+
+def pin_hostname(name: str) -> None:
+    """daemon 启动期钉住 host 目录名 (B12-a 冷键语义的执行面).
+
+    node 变更属冷键 —— 热更新会拒绝; 但若不钉住, state.connect() 每次仍从
+    文件实时解析, 文件一改 DB 路径立即漂移到空目录 (与 daemon 的拒绝与否
+    无关)。钉住后 daemon 进程终身使用启动时的目录; CLI 短进程不受影响,
+    保持动态解析 (登录节点读远端目录的既有语义).
+    """
+    _pinned_host["v"] = str(name)
 
 
 def release_gpu(conn: sqlite3.Connection, job_id: str) -> None:

@@ -1247,6 +1247,26 @@ def _job_progress(batch_id: str, task_id: str, version: int) -> str | None:
     return None
 
 
+def cmd_config_reload(args: argparse.Namespace) -> int:
+    """sched config reload: 请求 daemon 热更新配置 (B12-a).
+
+    CLI 本地先 load_config() 预校验 —— 语法/结构错误当场报给调用者,
+    通过后才写 control_request 让 daemon 下个 tick (<10s) 换配置.
+    冷键变更 (node/state_dir/user/gpus 卡集) daemon 会拒绝并提示重启.
+    """
+    try:
+        load_config()
+    except Exception as e:
+        print(f"配置校验失败 (未发送重载请求): {e}", file=sys.stderr)
+        return 1
+    with state.connect() as conn:
+        req_id = state.insert_control_request(
+            conn, "*config*", op="config_reload")
+    print(f"✅ 配置校验通过, 重载请求 #{req_id} 已入队 (daemon <10s 内生效)")
+    print("   注意: node/state_dir/user/gpus 卡集为冷键, 变更需重启 daemon")
+    return 0
+
+
 def cmd_incidents(args: argparse.Namespace) -> int:
     """sched incidents [id] [--limit N] [--job ID] [--gpu N]: 事故快照查询 (F2)."""
     with state.connect() as conn:
@@ -1822,6 +1842,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("diag", help="一站式失败诊断 (状态+命令+git+日志)")
     p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部非 done/skip)")
     p.set_defaults(fn=cmd_diag)
+
+    p = sub.add_parser("config", help="配置管理 (B12-a 热更新)")
+    sub_cfg = p.add_subparsers(dest="config_cmd", required=True)
+    p_reload = sub_cfg.add_parser("reload", help="请求 daemon 热更新 config.json")
+    p_reload.set_defaults(fn=cmd_config_reload)
 
     p = sub.add_parser("incidents", help="事故快照查询 (OOM/gpu_fault 现场)")
     p.add_argument("incident_id", nargs="?", type=int,
