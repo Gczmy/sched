@@ -655,9 +655,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """sched status [batch]: 三视图总览 + --json."""
+    """sched status [batch]: 三视图总览 + --json + --project (B11c)."""
     cfg = _load_cfg()
     out: dict[str, Any] = {"batches": [], "jobs": [], "gpus": []}
+    proj_filter = getattr(args, "project", None)
+    if proj_filter and proj_filter not in cfg.get("projects", {}):
+        known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "无"
+        print(f"错误: project 未在 config.projects 中定义: {proj_filter} (可选: {known})",
+              file=sys.stderr)
+        return 1
     with state.connect() as conn:
         batches = conn.execute(
             "SELECT * FROM batches ORDER BY created_at DESC"
@@ -669,6 +675,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         for b in batches:
             if args.batch and b["name"] != args.batch:
                 continue
+            # B11c: 项目过滤 (batches.project 列; NULL = 旧数据/无项目)
+            if proj_filter and b["project"] != proj_filter:
+                continue
             jobs = conn.execute(
                 "SELECT status FROM jobs WHERE batch_id=?", (b["id"],)
             ).fetchall()
@@ -679,6 +688,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "id": b["id"], "name": b["name"], "mode": b["mode"],
                     "status": b["status"], "depends_on": json.loads(b["depends_on"] or "[]"),
                     "progress": progress,
+                    "project": b["project"] if "project" in b.keys() else None,
                 }
             )
         jobs = conn.execute("SELECT * FROM jobs ORDER BY rowid").fetchall()
@@ -693,12 +703,21 @@ def cmd_status(args: argparse.Namespace) -> int:
             except (json.JSONDecodeError, TypeError):
                 spec = {}
             res_by_task[(r["batch_id"], r["id"], r["version"])] = spec.get("resources") or {}
-        for j in jobs:
-            if args.batch and j["batch_id"] not in [
+        proj_batch_ids = None
+        if proj_filter:
+            proj_batch_ids = {
+                b["id"] for b in conn.execute(
+                    "SELECT id FROM batches WHERE project=?", (proj_filter,)
+                ).fetchall()
+            }
+        elif args.batch:
+            proj_batch_ids = {
                 b["id"] for b in conn.execute(
                     "SELECT id FROM batches WHERE name=?", (args.batch,)
                 ).fetchall()
-            ]:
+            }
+        for j in jobs:
+            if proj_batch_ids is not None and j["batch_id"] not in proj_batch_ids:
                 continue
             res = res_by_task.get((j["batch_id"], j["task_id"], j["version"]), {})
             out["jobs"].append(
@@ -848,6 +867,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     """
     limit = getattr(args, "limit", 50)
     statuses = getattr(args, "status", None)
+    proj_filter = getattr(args, "project", None)
     with state.connect() as conn:
         batches = conn.execute(
             "SELECT id, name FROM batches ORDER BY created_at DESC"
@@ -862,11 +882,20 @@ def cmd_history(args: argparse.Namespace) -> int:
                 return 1
             where += " AND batch_id=?"
             params.append(b)
+        # B11c: 项目过滤 (jobs.project 列, insert_job 起即落库; 旧行 NULL 不命中)
+        if proj_filter and proj_filter not in cfg.get("projects", {}):
+            known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "无"
+            print(f"错误: project 未在 config.projects 中定义: {proj_filter} (可选: {known})",
+                  file=sys.stderr)
+            return 1
         if statuses:
             sts = [s.strip() for s in statuses.split(",") if s.strip()]
             if sts:
                 where += " AND status IN (%s)" % ",".join("?" * len(sts))
                 params.extend(sts)
+        if proj_filter:
+            where += " AND project=?"
+            params.append(proj_filter)
         rows = conn.execute(
             f"SELECT * FROM jobs {where} ORDER BY finished_at DESC LIMIT ?",
             (*params, limit),
@@ -917,6 +946,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             if not b:
                 print(f"错误: 批次不存在: {b_name}", file=sys.stderr)
                 return 1
+            # B11c: --project 归属校验 (同名批次可能属于不同项目)
+            proj_req = getattr(args, "project", None)
+            if proj_req:
+                brow = conn.execute(
+                    "SELECT project FROM batches WHERE id=?", (b,)
+                ).fetchone()
+                if brow and brow["project"] != proj_req:
+                    print(f"错误: 批次 {b_name} 属于项目 {brow['project']}, 非 {proj_req}",
+                          file=sys.stderr)
+                    return 1
             targets = conn.execute(
                 "SELECT * FROM jobs WHERE batch_id=? AND task_id=? AND status='running'",
                 (b, t),
@@ -1607,6 +1646,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.add_argument("--detail", action="store_true",
                    help="任务视图含起止时间/耗时/version (P5)")
+    p.add_argument("--project", default=None,
+                   help="按项目过滤 (B11c)")
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("task", help="单任务详情")
@@ -1617,6 +1658,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("batch", nargs="?", default=None)
     p.add_argument("--limit", type=int, default=50, help="最大行数 (默认 50)")
     p.add_argument("--status", default=None, help="按状态过滤, 逗号分隔 (如 done,failed)")
+    p.add_argument("--project", default=None, help="按项目过滤 (B11c)")
     p.set_defaults(fn=cmd_history)
 
     p = sub.add_parser("markers", help="批次终态 marker 一行查看 (P7)")

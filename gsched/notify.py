@@ -86,6 +86,7 @@ def build_event(conn, batch, host_dir: str) -> dict[str, Any]:
         "event": kind,
         "batch": batch["name"],
         "batch_id": batch["id"],
+        "project": batch["project"] if "project" in batch.keys() else None,
         "node": state.hostname(),
         "git_rev": git_rev,
         "started_at": started,
@@ -102,13 +103,15 @@ def render_subject(event: dict[str, Any]) -> str:
     n_all = sum(event["counts"].values())
     dur = f", 耗时 {event['duration_min']}min" if event["duration_min"] is not None else ""
     status = "done" if event["event"] == "batch_done" else "blocked"
-    return f"[sched] 批次 {event['batch']} {mark} {status} ({n_done}/{n_all} 任务{dur})"
+    proj = f"[{event['project']}] " if event.get("project") else ""
+    return f"[sched] {proj}批次 {event['batch']} {mark} {status} ({n_done}/{n_all} 任务{dur})"
 
 
 def render_text(event: dict[str, Any]) -> str:
     """纯文本正文 (email body; inbox JSON 里同字段, 供人读)."""
     lines = [
-        f"批次: {event['batch']} ({event['batch_id']})",
+        f"批次: {event['batch']} ({event['batch_id']})"
+        + (f"  [project: {event['project']}]" if event.get("project") else ""),
         f"状态: {'done' if event['event'] == 'batch_done' else 'blocked'}",
         f"节点: {event['node']}" + (f"    git: {event['git_rev']}" if event["git_rev"] else ""),
         f"耗时: {event['started_at']} → {event['finished_at']}",
