@@ -1041,6 +1041,13 @@ class Dispatcher:
                 -r["batch_priority"],
                 r["rid"],
             ))
+            # B11c: waiting_quota 只是"配额不足被跳过"的可见标记, 不是终态;
+            # 重新入候选前归一化回 pending, 否则 _launch_job 的 pending 条件
+            # 更新 (M1 竞态防护) 会永远拒绝启动
+            if any(r["status"] == "waiting_quota" for r in ready):
+                conn.execute(
+                    "UPDATE jobs SET status='pending' WHERE status='waiting_quota'"
+                )
             # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.
             # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU).
