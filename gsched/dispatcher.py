@@ -970,9 +970,10 @@ class Dispatcher:
             # 只派发所属批次已解锁 (active/done) 的 pending job——
             # queued 批次 (依赖未解锁) 的 job 不派发 (场景 2: 下游挂起)
             ready = conn.execute(
-                "SELECT j.* FROM jobs j JOIN batches b ON j.batch_id=b.id"
+                "SELECT j.*, b.priority as batch_priority, b.project as batch_project"
+                " FROM jobs j JOIN batches b ON j.batch_id=b.id"
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
-                " ORDER BY j.rowid"
+                " ORDER BY b.project DESC, b.priority DESC, j.rowid"
             ).fetchall()
             # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.

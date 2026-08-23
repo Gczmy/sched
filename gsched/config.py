@@ -101,6 +101,27 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         raise ConfigError(f"{p}: 缺少 node (daemon 所在计算节点名)")
     if "projects" not in cfg or not isinstance(cfg["projects"], dict):
         raise ConfigError(f"{p}: 缺少 projects (多项目 root 映射)")
+
+    # B11c: projects schema validation (multi-project quota/priority/affinity)
+    for proj_name, proj_cfg in cfg["projects"].items():
+        if not isinstance(proj_cfg, dict):
+            raise ConfigError(f"{p}: projects.{proj_name} 必须是对象")
+        if "root" not in proj_cfg:
+            raise ConfigError(f"{p}: projects.{proj_name} 缺少 root 字段")
+        if not isinstance(proj_cfg["root"], str) or not proj_cfg["root"]:
+            raise ConfigError(f"{p}: projects.{proj_name}.root 必须是非空字符串")
+        gq = proj_cfg.get("gpu_quota")
+        if gq is not None:
+            if not isinstance(gq, int) or isinstance(gq, bool) or gq < 0:
+                raise ConfigError(f"{p}: projects.{proj_name}.gpu_quota 必须是非负整数 (0=无限制)")
+        pr = proj_cfg.get("priority")
+        if pr is not None:
+            if not isinstance(pr, int) or isinstance(pr, bool):
+                raise ConfigError(f"{p}: projects.{proj_name}.priority 必须是整数")
+        ga = proj_cfg.get("gpu_affinity")
+        if ga is not None:
+            if not isinstance(ga, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in ga):
+                raise ConfigError(f"{p}: projects.{proj_name}.gpu_affinity 必须是卡号整数数组")
     if "venvs" not in cfg or not isinstance(cfg["venvs"], dict):
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用

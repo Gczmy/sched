@@ -93,6 +93,11 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         else:
             raise SchemaError('notify 必须是布尔或对象 (如 {"email_to": [...]})')
 
+    # 批次级 project 字段
+    project = spec.get("project")
+    if project is not None and not isinstance(project, str):
+        raise SchemaError("project: 必须是字符串")
+
     # 批次 cwd: 模板展开
     batch_cwd = resolve_template(spec.get("cwd", "{ROOT}"), cfg)
     batch_cwd_abs = os.path.realpath(
@@ -110,6 +115,10 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
             _validate_task(t, cfg, batch_cwd_abs, f"tasks[{i}]", seen_ids)
         )
 
+    project = spec.get("project")
+    if project is not None and not isinstance(project, str):
+        raise SchemaError("project: 必须是字符串")
+
     return {
         "name": name,
         "mode": mode,
@@ -120,6 +129,7 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         "env": env,
         "notify": bnotify,
         "tasks": norm_tasks,
+        "project": project,
     }
 
 
@@ -239,6 +249,10 @@ def _validate_task(
     if not isinstance(max_retry, int) or isinstance(max_retry, bool) or max_retry < 0:
         raise SchemaError(f"{where}.max_retry: 必须是非负整数")
 
+    project = t.get("project")
+    if project is not None and not isinstance(project, str):
+        raise SchemaError(f"{where}.project: 必须是字符串")
+
     return {
         "id": tid,
         "cmd": cmd,
@@ -253,6 +267,7 @@ def _validate_task(
         "retry_transform": retry_transform,
         "probes": probes,
         "paths_escape": t.get("paths_escape", False),
+        "project": project,
     }
 
 

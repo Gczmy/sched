@@ -449,6 +449,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             state.insert_batch(
                 conn, bid, norm["name"], norm["mode"], norm["depends_on"],
                 norm["gpus"], norm["cwd"], norm["env"], norm.get("notify"),
+                norm.get("project"),
             )
         except sqlite3.IntegrityError:
             # M13: 并发 submit 同时通过定案 6 检查 -> 撞主键, 转友好错误
@@ -488,14 +489,17 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "retry_transform": t["retry_transform"],
                 "probes": t["probes"],
             }
-            state.insert_task(conn, bid, t["id"], 1, spec_json, i)
+            state.insert_task(
+                conn, bid, t["id"], 1, spec_json, i,
+                norm.get("project"),
+            )
             # Job 指纹 (A2): 指纹用展开后的 cmd (venv 路径入指纹)
             fp, stage_fps, rev = compute_fingerprint(
                 cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {})
             )
             state.insert_job(
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
-                fp, stage_fps,
+                fp, stage_fps, norm.get("project"),
             )
 
     print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
@@ -622,7 +626,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         state.insert_batch(
             conn, bid, batch_name, "mix", [], None, "{ROOT}", None
         )
-        state.insert_task(conn, bid, "run", 1, task_spec, 0)
+        state.insert_task(conn, bid, "run", 1, task_spec, 0, norm.get("project"))
         fp, stage_fps, rev = compute_fingerprint(
             task_spec["cmd"], None, cwd_abs, None, cfg.get("venvs", {})
         )
@@ -1103,7 +1107,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
         spec = json.loads(t["spec"])
         new_v = j["version"] + 1
         # 新版本任务记录 (同 spec) + 新 Job
-        state.insert_task(conn, batch, task, new_v, spec, 0)
+        state.insert_task(conn, batch, task, new_v, spec, 0, norm.get("project"))
 
         from .fingerprint import compute_fingerprint
 
@@ -1522,6 +1526,29 @@ def cmd_notify_ack(args: argparse.Namespace) -> int:
 
 # ---------- 入口 ----------
 
+# B11c: 多项目 CLI 命令
+def cmd_project_list(args: argparse.Namespace) -> int:
+    """sched project list: 列出已配置项目及配额/用量."""
+    cfg = _load_cfg()
+    projects = cfg.get("projects", {})
+    if not projects:
+        print("未配置任何项目")
+        return 0
+    with state.connect() as conn:
+        print(f"{'项目':<20} {'GPU配额':<8} {'优先级':<6} {'亲和卡':<12} {'已用/配额':<12} {'根目录'}")
+        for name, pcfg in projects.items():
+            quota = pcfg.get("gpu_quota", 0)
+            prio = pcfg.get("priority", 0)
+            aff = pcfg.get("gpu_affinity", [])
+            root = pcfg.get("root", "")
+            used = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status='running' AND project=?", (name,)
+            ).fetchone()[0]
+            quota_str = f"{used}/{quota}" if quota > 0 else f"{used}/∞"
+            print(f"{name:<20} {quota:<8} {prio:<6} {str(aff):<12} {quota_str:<12} {root}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
@@ -1633,6 +1660,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("notify-ack", help="确认通知事件 (rename .acked)")
     p.add_argument("file", help="事件文件路径 (notify-inbox 列出)")
     p.set_defaults(fn=cmd_notify_ack)
+
+    # B11c: 多项目命令
+    p = sub.add_parser("project", help="多项目管理")
+    sub_p = p.add_subparsers(dest="project_action", required=True)
+    p_list = sub_p.add_parser("list", help="列出项目及配额/用量")
+    p_list.set_defaults(fn=cmd_project_list)
 
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):

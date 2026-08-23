@@ -162,6 +162,7 @@ def init_db() -> str:
     with connect() as conn:
         conn.executescript(SCHEMA)
         migrate_gpu_jobs(conn)
+        migrate_project_columns(conn)
     return p
 
 
@@ -184,6 +185,18 @@ def migrate_gpu_jobs(conn: sqlite3.Connection) -> None:
     if "notify" not in bcols:
         conn.execute("ALTER TABLE batches ADD COLUMN notify TEXT")
 
+
+@contextmanager
+
+def migrate_project_columns(conn: sqlite3.Connection) -> None:
+    """迁移: 给 tasks/batches/jobs 表添加 project 列.
+
+    幂等: 列已存在则忽略. 旧数据 project = NULL (无项目关联, 兼容旧数据).
+    """
+    for table, col in [("tasks", "project"), ("batches", "project"), ("jobs", "project")]:
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} Text")
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
@@ -263,12 +276,13 @@ def insert_batch(
     cwd: str | None,
     env: dict | None,
     notify: Any = None,
+    project: str | None = None,
 ) -> None:
     import json
 
     conn.execute(
-        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             bid,
             name,
@@ -280,6 +294,7 @@ def insert_batch(
             json.dumps(notify) if notify is not None else None,
             "queued",
             now(),
+            project,
         ),
     )
 
@@ -291,12 +306,13 @@ def insert_task(
     version: int,
     spec: dict,
     order_idx: int,
+    project: str | None = None,
 ) -> None:
     import json
 
     conn.execute(
-        "INSERT INTO tasks (batch_id,id,version,spec,order_idx) VALUES (?,?,?,?,?)",
-        (batch_id, task_id, version, json.dumps(spec), order_idx),
+        "INSERT INTO tasks (batch_id,id,version,spec,order_idx,project) VALUES (?,?,?,?,?,?)",
+        (batch_id, task_id, version, json.dumps(spec), order_idx, project),
     )
 
 
@@ -308,12 +324,13 @@ def insert_job(
     version: int,
     fingerprint: str | None,
     stage_fingerprints: dict | None = None,
+    project: str | None = None,
 ) -> None:
     import json
 
     conn.execute(
         "INSERT INTO jobs (id,batch_id,task_id,version,status,fingerprint,"
-        "stage_fingerprints,submitted_at) VALUES (?,?,?,?,?,?,?,?)",
+        "stage_fingerprints,submitted_at,project) VALUES (?,?,?,?,?,?,?,?,?)",
         (
             job_id,
             batch_id,
@@ -323,6 +340,7 @@ def insert_job(
             fingerprint,
             json.dumps(stage_fingerprints) if stage_fingerprints else None,
             now(),
+            project,
         ),
     )
 
