@@ -86,6 +86,9 @@ class Dispatcher:
             "gpu_quota": int(proj.get("gpu_quota", 0) or 0),
             "priority": int(proj.get("priority", 0) or 0),
             "affinity": proj.get("gpu_affinity", []),
+            # B11c 补充: 硬隔离 -- true 时任务只能落在 affinity 列内的卡,
+            # 亲和卡全忙则排队等待(不外借其他卡)。防多项目混卡 OOM。
+            "affinity_hard": bool(proj.get("gpu_affinity_hard", False)),
         }
 
     def _update_project_quota_used(self, conn) -> None:
@@ -115,6 +118,11 @@ class Dispatcher:
         if not project:
             return []
         return self._get_project_config(project)["affinity"]
+
+    def _project_affinity_hard(self, project) -> bool:
+        if not project:
+            return False
+        return self._get_project_config(project)["affinity_hard"]
 
     def _mark_waiting_quota(self, conn, job_id) -> None:
         state.update_job(conn, job_id, status="waiting_quota")
@@ -1168,9 +1176,17 @@ class Dispatcher:
                     excl_vram = float(v)
                 except (TypeError, ValueError):
                     excl_vram = None
-            # B11c: prefer project affinity cards, then the rest
+            # B11c: project card selection.
+            # affinity_hard=true: 只允许 affinity 列内的卡 (硬隔离, 防跨项目混卡 OOM);
+            #   全忙 -> 返回 None 由调用方按无卡处理 (下轮重试)。
+            # 默认(软): 亲和卡优先, 不满足可借其他卡。
             affinity = self._project_affinity(project) if project else []
-            gpu_order = list(affinity) + [i for i in self.allocator.gpu_list if i not in affinity]
+            hard = self._project_affinity_hard(project) if project else False
+            valid = set(self.allocator.gpu_list)
+            if hard and affinity:
+                gpu_order = [i for i in affinity if i in valid]
+            else:
+                gpu_order = list(affinity) + [i for i in self.allocator.gpu_list if i not in affinity]
             for idx in gpu_order:
                 row = conn.execute(
                     "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
@@ -1206,9 +1222,14 @@ class Dispatcher:
         #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
         best_idx: int | None = None
         best_load = float("inf")
-        # B11c: prefer project affinity cards, then the rest
+        # B11c: shared packing honors the same hard/soft affinity semantics
         affinity_s = self._project_affinity(project) if project else []
-        gpu_order_s = list(affinity_s) + [i for i in self.allocator.gpu_list if i not in affinity_s]
+        hard_s = self._project_affinity_hard(project) if project else False
+        valid_s = set(self.allocator.gpu_list)
+        if hard_s and affinity_s:
+            gpu_order_s = [i for i in affinity_s if i in valid_s]
+        else:
+            gpu_order_s = list(affinity_s) + [i for i in self.allocator.gpu_list if i not in affinity_s]
         for idx in gpu_order_s:
             row = conn.execute(
                 "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
