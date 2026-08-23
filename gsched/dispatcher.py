@@ -975,13 +975,14 @@ class Dispatcher:
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
                 " ORDER BY j.rowid"
             ).fetchall()
-            # B11c: 项目级优先级排序 (config.projects.<name>.priority, 数值大者先派)
-            # 在 Python 层做——batches 表没有 priority 列, 且 project priority 来自
-            # config 而非 DB, SQL 无法直接引用
-            proj_prio = self._project_priority  # 局部引用, 避免循环内反复查属性
+            # B11c: 双键优先级排序——(project_priority, batch_priority) 降序,
+            # 同优先级按 rowid FIFO。project_priority 来自 config (Python 层),
+            # batch_priority 来自 batches.priority 列 (batch.json "priority" 字段)。
+            proj_prio = self._project_priority
             ready = sorted(ready, key=lambda j: (
-                -proj_prio(j["project"] or j.get("batch_project")),  # 高优先先派
-                j["rowid"],  # 同优先级按提交顺序 FIFO
+                -proj_prio(j["project"] or j.get("batch_project")),
+                -(j["priority"] if "priority" in j.keys() else 0),
+                j["rowid"],
             ))
             # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.

@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS batches (
   env         TEXT,
   notify      TEXT,
   status      TEXT NOT NULL DEFAULT 'queued',
-  created_at  TEXT NOT NULL
+  created_at  TEXT NOT NULL,
+  project     TEXT,
+  priority    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -197,6 +199,10 @@ def migrate_project_columns(conn: sqlite3.Connection) -> None:
         cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
         if col not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} Text")
+    # B11c: batches.priority 列迁移 (批次级优先级, 默认 0)
+    bcols = [r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()]
+    if "priority" not in bcols:
+        conn.execute("ALTER TABLE batches ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
@@ -277,12 +283,13 @@ def insert_batch(
     env: dict | None,
     notify: Any = None,
     project: str | None = None,
+    priority: int = 0,
 ) -> None:
     import json
 
     conn.execute(
-        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project,priority)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             bid,
             name,
@@ -295,6 +302,7 @@ def insert_batch(
             "queued",
             now(),
             project,
+            priority,
         ),
     )
 

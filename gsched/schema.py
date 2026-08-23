@@ -119,6 +119,10 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
     if project is not None and not isinstance(project, str):
         raise SchemaError("project: 必须是字符串")
 
+    batch_priority = spec.get("priority", 0)
+    if not isinstance(batch_priority, int) or isinstance(batch_priority, bool):
+        raise SchemaError("priority: 必须是整数 (批次级优先级, 数值大者先派)")
+
     return {
         "name": name,
         "mode": mode,
@@ -130,6 +134,7 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         "notify": bnotify,
         "tasks": norm_tasks,
         "project": project,
+        "priority": batch_priority,
     }
 
 
