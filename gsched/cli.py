@@ -622,15 +622,29 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
         return 0
 
+    # B11c: run 快捷提交同样强制项目归属 (无 project = 绕过隔离, 拒绝)
+    proj = getattr(args, "project", None)
+    if not proj:
+        known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "无"
+        print(
+            f"错误: 缺少 --project (B11c 项目隔离, 可选: {known})",
+            file=sys.stderr,
+        )
+        return 1
+    if proj not in cfg.get("projects", {}):
+        print(f"错误: project '{proj}' 未在 config.projects 中定义", file=sys.stderr)
+        return 1
+
     with state.connect() as conn:
         state.insert_batch(
-            conn, bid, batch_name, "mix", [], None, "{ROOT}", None
+            conn, bid, batch_name, "mix", [], None, "{ROOT}", None,
+            proj,
         )
-        state.insert_task(conn, bid, "run", 1, task_spec, 0, norm.get("project"))
+        state.insert_task(conn, bid, "run", 1, task_spec, 0, proj)
         fp, stage_fps, rev = compute_fingerprint(
             task_spec["cmd"], None, cwd_abs, None, cfg.get("venvs", {})
         )
-        state.insert_job(conn, f"{bid}-run-v1", bid, "run", 1, fp, stage_fps)
+        state.insert_job(conn, f"{bid}-run-v1", bid, "run", 1, fp, stage_fps, proj)
 
     res_txt = "cpu-only" if args.cpu_only else "gpu=1"
     print(f"已入队: {bid} ({res_txt}, duration={args.duration}min)")
@@ -1106,8 +1120,13 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
         ).fetchone()
         spec = json.loads(t["spec"])
         new_v = j["version"] + 1
+        # B11c: project 继承自原批次行
+        bproj = conn.execute(
+            "SELECT project FROM batches WHERE id=?", (batch,)
+        ).fetchone()
+        proj = bproj["project"] if bproj else None
         # 新版本任务记录 (同 spec) + 新 Job
-        state.insert_task(conn, batch, task, new_v, spec, 0, norm.get("project"))
+        state.insert_task(conn, batch, task, new_v, spec, 0, proj)
 
         from .fingerprint import compute_fingerprint
 
@@ -1116,7 +1135,8 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             spec.get("git"), {},
         )
         state.insert_job(
-            conn, f"{batch}-{task}-v{new_v}", batch, task, new_v, fp, stage_fps
+            conn, f"{batch}-{task}-v{new_v}", batch, task, new_v,
+            fp, stage_fps, proj,
         )
         # Q4: 检测下游依赖告警
         # C5 修复: name 从 DB 查 (与 cmd_cancel 同法) —— batch id 形如
@@ -1567,6 +1587,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_submit)
 
     p = sub.add_parser("run", help="一行提交单任务 (B14 L1)")
+    p.add_argument("--project", required=True,
+                   help="项目名 (B11c 隔离, 必填)")
     p.add_argument("--gpus", type=int, default=1, help="申请 GPU 数量 (R5)")
     p.add_argument("--cpus", type=int, default=None, help="CPU 配额 (记录+status 显示, B4)")
     p.add_argument("--cpu-only", action="store_true",

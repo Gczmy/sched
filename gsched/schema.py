@@ -93,10 +93,16 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         else:
             raise SchemaError('notify 必须是布尔或对象 (如 {"email_to": [...]})')
 
-    # 批次级 project 字段
+    # B11c 项目隔离 (强制): 批次必须声明所属项目, 且项目必须在 config.projects
+    # 中已定义 -- 无 project 的提交会绕过配额/亲和隔离, 直接拒绝 (用户决策 2026-08-23)
     project = spec.get("project")
-    if project is not None and not isinstance(project, str):
-        raise SchemaError("project: 必须是字符串")
+    if not isinstance(project, str) or not project.strip():
+        raise SchemaError(
+            "缺少 project 字段 (B11c 项目隔离): 必须为 config.projects 中已定义的项目名"
+        )
+    if project not in cfg.get("projects", {}):
+        known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "(无)"
+        raise SchemaError(f"project '{project}' 未在 config.projects 中定义 (可选: {known})")
 
     # 批次 cwd: 模板展开
     batch_cwd = resolve_template(spec.get("cwd", "{ROOT}"), cfg)
