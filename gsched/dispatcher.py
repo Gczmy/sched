@@ -73,6 +73,52 @@ class Dispatcher:
         # 内存态 (无跨进程语义), SIGTERM/SIGINT handler 调用 request_stop().
         self._stop_requested = False
 
+        # B11c: project config cache
+        self._projects = cfg.get("projects", {})
+        self._project_quota_used = {}
+
+    # B11c: project config / quota / priority / affinity
+    def _get_project_config(self, project):
+        if not project:
+            return {"gpu_quota": 0, "priority": 0, "affinity": []}
+        proj = self._projects.get(project, {})
+        return {
+            "gpu_quota": int(proj.get("gpu_quota", 0) or 0),
+            "priority": int(proj.get("priority", 0) or 0),
+            "affinity": proj.get("gpu_affinity", []),
+        }
+
+    def _update_project_quota_used(self, conn) -> None:
+        self._project_quota_used.clear()
+        rows = conn.execute(
+            "SELECT project, COUNT(*) FROM jobs"
+            " WHERE status='running' AND gpu IS NOT NULL AND project IS NOT NULL"
+            " GROUP BY project"
+        ).fetchall()
+        for r in rows:
+            self._project_quota_used[r["project"]] = r[1]
+
+    def _project_quota_available(self, conn, project) -> bool:
+        if not project:
+            return True
+        quota = self._get_project_config(project)["gpu_quota"]
+        if quota <= 0:
+            return True
+        return self._project_quota_used.get(project, 0) < quota
+
+    def _project_priority(self, project) -> int:
+        if not project:
+            return 0
+        return self._get_project_config(project)["priority"]
+
+    def _project_affinity(self, project):
+        if not project:
+            return []
+        return self._get_project_config(project)["affinity"]
+
+    def _mark_waiting_quota(self, conn, job_id) -> None:
+        state.update_job(conn, job_id, status="waiting_quota")
+
     def request_stop(self) -> None:
         """信号处理器入口: 只置标志 (绝不在 handler 里开 DB 连接)."""
         self._stop_requested = True
@@ -997,7 +1043,16 @@ class Dispatcher:
             ).fetchone()[0]
             gpu_full = False
             now_ts = datetime.now()
+            # B11c: refresh per-project running GPU counts
+            self._update_project_quota_used(conn)
+
             for j in ready:
+                # B11c: project quota gate -> waiting_quota
+                project = j["project"] or j.get("batch_project")
+                if not self._project_quota_available(conn, project):
+                    self._mark_waiting_quota(conn, j["id"])
+                    continue
+
                 # M2: 重试退避 —— 失败重试 (retries>0) 的 job 等 RETRY_BACKOFF_SEC
                 # 再派发, 防秒级崩溃任务同 tick 重新拉起形成紧密崩溃循环
                 # (与 _maybe_retry 日志承诺的 30s 退避一致)
@@ -1024,7 +1079,7 @@ class Dispatcher:
                     if gpu_full:
                         continue  # GPU 已满: 跳过后续 GPU 任务, 继续扫 CPU-only (防饿死)
                     # 用同一事务 assign (避免嵌套 connect 的 database is locked)
-                    gpu = self._assign_in_tx(conn, j["id"], spec)
+                    gpu = self._assign_in_tx(conn, j["id"], spec, project)
                     if gpu is None:
                         gpu_full = True
                         continue  # 无空卡: 本轮不再派 GPU 任务, 但 CPU-only 仍可派 (防饿死)
@@ -1070,7 +1125,7 @@ class Dispatcher:
             used += self._task_cpus(spec)
         return used
 
-    def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None) -> int | None:
+    def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None, project: str | None = None) -> int | None:
         """事务内 assign (定案 39 L2 共享装箱).
 
         独占任务 (gpu_share 缺省 false): free 卡 -> assigned (现状语义);
@@ -1113,7 +1168,10 @@ class Dispatcher:
                     excl_vram = float(v)
                 except (TypeError, ValueError):
                     excl_vram = None
-            for idx in self.allocator.gpu_list:
+            # B11c: prefer project affinity cards, then the rest
+            affinity = self._project_affinity(project) if project else []
+            gpu_order = list(affinity) + [i for i in self.allocator.gpu_list if i not in affinity]
+            for idx in gpu_order:
                 row = conn.execute(
                     "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
                 ).fetchone()
@@ -1123,7 +1181,7 @@ class Dispatcher:
                     if excl_vram is not None:
                         cap = self.allocator.mem_total(idx)
                         if cap > 0 and excl_vram > cap:
-                            continue  # 声明峰值超过该卡容量: 换下一张 (异构适配)
+                            continue  # declared peak exceeds card capacity
                     conn.execute(
                         "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
                         (job_id, state.now(), idx),
@@ -1148,7 +1206,10 @@ class Dispatcher:
         #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
         best_idx: int | None = None
         best_load = float("inf")
-        for idx in self.allocator.gpu_list:
+        # B11c: prefer project affinity cards, then the rest
+        affinity_s = self._project_affinity(project) if project else []
+        gpu_order_s = list(affinity_s) + [i for i in self.allocator.gpu_list if i not in affinity_s]
+        for idx in gpu_order_s:
             row = conn.execute(
                 "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
             ).fetchone()
