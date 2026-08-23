@@ -122,6 +122,10 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         if ga is not None:
             if not isinstance(ga, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in ga):
                 raise ConfigError(f"{p}: projects.{proj_name}.gpu_affinity 必须是卡号整数数组")
+        # B12-b: 项目级 colocate 开关 (可选布尔; 缺省=中立跟随全局, 与门模型)
+        col = proj_cfg.get("colocate")
+        if col is not None and not isinstance(col, bool):
+            raise ConfigError(f"{p}: projects.{proj_name}.colocate 必须是布尔 (缺省=跟随全局)")
     if "venvs" not in cfg or not isinstance(cfg["venvs"], dict):
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用

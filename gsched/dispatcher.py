@@ -668,6 +668,7 @@ class Dispatcher:
         self.cfg = new_cfg
         # 缓存字段刷新清单 (其余键均实时读 self.cfg, 换引用即生效):
         self._co_locate = bool(new_cfg.get("co_locate", False))
+        self._projects = new_cfg.get("projects", {})   # B12-b: 项目配置(含 colocate/max_jobs)
         self.venv_paths = new_cfg.get("venvs", {})
         self.idle_timeout_min = int(
             new_cfg.get("idle_timeout_min", DEFAULT_IDLE_TIMEOUT_MIN))
@@ -1414,6 +1415,14 @@ class Dispatcher:
         if gpu_share and not co_locate:
             self.log_line(f"job {job_id} gpu_share=true 但 co_locate 未开启 -> 按独占跑 + 告警")
             gpu_share = False
+        # B12-b: 项目级开关 (与门第三项): 项目 colocate=false -> 降级独占。
+        # 独占占整卡后他人本就不可 pack (S7), 天然零跨项目干扰, 无需额外隔离。
+        if gpu_share and project:
+            if (self._projects.get(project) or {}).get("colocate") is False:
+                self.log_line(
+                    f"job {job_id}: 项目 {project} 已禁用 colocate -> gpu_share 降级独占"
+                )
+                gpu_share = False
         # 装箱值 = max(声明 vram_gib, profile_cache.peak_gib) (定案 39 L1, profile 命中)
         task_vram = None
         if gpu_share:

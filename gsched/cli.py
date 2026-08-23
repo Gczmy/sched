@@ -296,6 +296,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(f"校验失败: {e}", file=sys.stderr)
         return 1
 
+    # B12-b: 项目级 colocate 禁用提示 (dry-run 与实提交都看得到)
+    _warn_colocate_disabled(norm, cfg)
+
     # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
     with state.connect() as conn:
         for dep in norm["depends_on"]:
@@ -1245,6 +1248,18 @@ def _job_progress(batch_id: str, task_id: str, version: int) -> str | None:
             total = m.group(2) or "?"
             return f"{cur}/{total}"
     return None
+
+
+def _warn_colocate_disabled(norm: dict, cfg: dict) -> None:
+    """B12-b: 项目禁用 colocate 时, 对 gpu_share 任务提交期提前告知降级."""
+    pc = cfg.get("projects", {}).get(norm.get("project") or "", {})
+    if pc.get("colocate") is False and any(
+        (t.get("resources") or {}).get("gpu_share") for t in norm.get("tasks", [])
+    ):
+        print(
+            f"⚠️ 项目 {norm['project']} 已禁用 colocate:"
+            " gpu_share 任务将按独占运行 (装箱声明被忽略)"
+        )
 
 
 def cmd_config_reload(args: argparse.Namespace) -> int:
