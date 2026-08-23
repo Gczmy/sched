@@ -213,7 +213,7 @@ def check(fake: bool = False) -> list[dict[str, str]]:
     # 无 GPU 需求时 nvidia-smi 缺失合法 (warn); 声明了 GPU 但本机无 nvidia-smi 才 fail
     from .config import parse_gpus
 
-    gpus, _ = parse_gpus(cfg)
+    gpus, _, _ = parse_gpus(cfg)
     if fake:
         add("nvidia-smi", "fake 模式跳过", "ok")
     elif shutil.which("nvidia-smi"):

@@ -28,18 +28,21 @@ def default_state_dir() -> str:
     return os.environ.get("SCHED_STATE", DEFAULT_STATE_DIR)
 
 
-def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float]]:
-    """归一化 config.gpus -> (卡号列表, 显存覆盖表 idx->GiB).
+def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float], dict[int, int]]:
+    """归一化 config.gpus -> (卡号列表, 显存覆盖表 idx->GiB, 单卡打包上限 idx->N).
 
     支持两种形态 (向后兼容):
       [0, 1, 2, 3]                       纯卡号 (显存自动探测)
       [{"idx": 0, "mem_gib": 24}, ...]  带显存覆盖 (不写 mem_gib 或缺省 -> 自动探测)
     mem_gib 语义 = 该卡总容量 (GiB), 覆盖 daemon 启动 nvidia-smi 探测值
     (手动配置异构卡容量 / 无 nvidia-smi 的环境用).
+    B12-c: 对象形态可选 max_jobs (正整数) = 该卡共享装箱任务数上限
+    (异构卡差异化密度; 缺省跟随全局 co_locate_max_jobs). 热键 —— 可热更新.
     """
     raw = cfg.get("gpus") or []
     idxs: list[int] = []
     mem: dict[int, float] = {}
+    mj: dict[int, int] = {}
     for g in raw:
         if isinstance(g, dict):
             idx = g.get("idx")
@@ -51,6 +54,11 @@ def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float]]:
                 if not isinstance(m, (int, float)) or isinstance(m, bool) or m <= 0:
                     raise ConfigError(f"gpus[{idx}].mem_gib 必须 > 0 的数字 (GiB): {g}")
                 mem[idx] = float(m)
+            mjv = g.get("max_jobs")
+            if mjv is not None:
+                if not isinstance(mjv, int) or isinstance(mjv, bool) or mjv < 1:
+                    raise ConfigError(f"gpus[{idx}].max_jobs 必须是正整数: {g}")
+                mj[idx] = mjv
         else:
             if not isinstance(g, int) or isinstance(g, bool):
                 # M17: 原消息引用只在 dict 分支赋值的 idx -> NameError
@@ -63,7 +71,7 @@ def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float]]:
         if i not in seen:
             seen.add(i)
             uniq.append(i)
-    return uniq, mem
+    return uniq, mem, mj
 
 
 def config_path() -> str:
@@ -126,6 +134,13 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         col = proj_cfg.get("colocate")
         if col is not None and not isinstance(col, bool):
             raise ConfigError(f"{p}: projects.{proj_name}.colocate 必须是布尔 (缺省=跟随全局)")
+        pmj = proj_cfg.get("max_jobs")
+        if pmj is not None and (
+            not isinstance(pmj, int) or isinstance(pmj, bool) or pmj < 1
+        ):
+            raise ConfigError(f"{p}: projects.{proj_name}.max_jobs 必须是正整数"
+                              f" (该项目任务在单卡上的打包数上限)")
+    # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,8]), 不在此重复
     if "venvs" not in cfg or not isinstance(cfg["venvs"], dict):
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用

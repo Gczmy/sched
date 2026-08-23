@@ -57,10 +57,13 @@ class Dispatcher:
         # config 未配 -> Allocator 自动探测全卡 (定案 1 第三级回退)
         from .config import parse_gpus
 
-        gpu_list, mem_overrides = parse_gpus(cfg)
+        gpu_list, mem_overrides, gpu_max_jobs = parse_gpus(cfg)
         self.allocator = Allocator(
             gpu_list=gpu_list, fake=fake, mem_overrides=mem_overrides,
         )
+        # B12-c: 每卡共享打包上限 (热键, 热更新时刷新)
+        self._gpu_max_jobs = gpu_max_jobs
+        self._cap_warned: set[str] = set()   # 已告警过"等打包上限"的 job (warn-once)
         # venv 路径映射 (指纹用)
         self.venv_paths = cfg.get("venvs", {})
         # 空转自动退出 (定案 38): 默认 360min (6h), 0 = 禁用; last_activity 内存态,
@@ -651,15 +654,15 @@ class Dispatcher:
         """加载并校验新配置, 通过冷键检查后原子换引用 + 刷新缓存字段. 幂等."""
         try:
             new_cfg = load_config(self._config_path)
-            old_gpus = parse_gpus(self.cfg)
-            new_gpus = parse_gpus(new_cfg)
+            old_gpu_list, old_mem, _ = parse_gpus(self.cfg)
+            new_gpu_list, new_mem, new_mj = parse_gpus(new_cfg)
         except Exception as e:  # ConfigError/json/OSError — 半写或非法
             self.log_line(f"⚠️ 配置热更新失败 (保留旧配置): {e}")
             return False
         cold_diff = [k for k in CONFIG_COLD_KEYS
                      if self.cfg.get(k) != new_cfg.get(k)]
-        if old_gpus != new_gpus:
-            cold_diff.append("gpus(卡集或容量覆盖)")
+        if (old_gpu_list, old_mem) != (new_gpu_list, new_mem):
+            cold_diff.append("gpus(卡集或容量覆盖)")  # max_jobs 是热键, 不参与冷键比对
         if cold_diff:
             self.log_line(
                 f"⚠️ 配置含冷键变更 {cold_diff} —— 拒绝热更新, 请重启 daemon 生效"
@@ -669,6 +672,7 @@ class Dispatcher:
         # 缓存字段刷新清单 (其余键均实时读 self.cfg, 换引用即生效):
         self._co_locate = bool(new_cfg.get("co_locate", False))
         self._projects = new_cfg.get("projects", {})   # B12-b: 项目配置(含 colocate/max_jobs)
+        self._gpu_max_jobs = new_mj                    # B12-c: 每卡打包上限 (热键)
         self.venv_paths = new_cfg.get("venvs", {})
         self.idle_timeout_min = int(
             new_cfg.get("idle_timeout_min", DEFAULT_IDLE_TIMEOUT_MIN))
@@ -1348,8 +1352,11 @@ class Dispatcher:
                     # 用同一事务 assign (避免嵌套 connect 的 database is locked)
                     gpu = self._assign_in_tx(conn, j["id"], spec, project)
                     if gpu is None:
-                        gpu_full = True
-                        continue  # 无空卡: 本轮不再派 GPU 任务, 但 CPU-only 仍可派 (防饿死)
+                        # B12-c: 项目级上限挡住的卡对其他项目仍有余量 ->
+                        # 不置 gpu_full, 继续扫后续任务 (否则他项目被误饿死)
+                        if getattr(self, "_assign_reject_scope", "all") == "all":
+                            gpu_full = True
+                        continue  # 本任务本轮无卡, 下轮再试
                 try:
                     launched = self._launch_job(conn, j, gpu)
                     # D1: 竞态放弃/skip 不占 CPU 配额 (skip 密集批次不再人为压低并发)
@@ -1478,6 +1485,7 @@ class Dispatcher:
                         (idx, job_id, task_vram, state.now()),
                     )
                     return idx
+            self._assign_reject_scope = "all"
             return None
 
         # 共享任务: 归一化负载装箱 (定案 40 Least-Loaded + 2026-08-17 方案 A).
@@ -1492,6 +1500,8 @@ class Dispatcher:
         #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
         best_idx: int | None = None
         best_load = float("inf")
+        cap_skipped = False   # B12-c: 候选卡中是否有因项目级上限被跳过
+        self._assign_reject_scope = "all"   # 默认: 无卡对所有 GPU 任务一视同仁
         # B11c: shared packing honors the same hard/soft affinity semantics
         affinity_s = self._project_affinity(project) if project else []
         hard_s = self._project_affinity_hard(project) if project else False
@@ -1528,10 +1538,28 @@ class Dispatcher:
                 used = self.allocator.vram_used(conn, idx)
                 if used + task_vram > safety * cap:
                     continue
-                if self.allocator.job_count(conn, idx) >= int(
-                    self.cfg.get("co_locate_max_jobs", 3)
-                ):
+                # B12-c: 三级打包上限. 全局/卡级是物理容量属性 -> 约束卡上
+                # 总任务数; 项目级是策略属性 -> 只数该项目在此卡的 任务
+                # (不同计数器, 不能折叠进一个 min 数). 超额只挡新 pack 不驱逐
+                # (定案 Q5: 自然排水).
+                cap_all = int(self.cfg.get("co_locate_max_jobs", 3))
+                gcap = self._gpu_max_jobs.get(idx)
+                if gcap is not None:
+                    cap_all = min(cap_all, int(gcap))
+                if self.allocator.job_count(conn, idx) >= cap_all:
+                    cap_skipped = True
                     continue
+                pmax = (self._projects.get(project or "") or {}).get("max_jobs")
+                if pmax is not None:
+                    proj_n = conn.execute(
+                        "SELECT COUNT(*) AS n FROM gpu_jobs gj"
+                        " JOIN jobs j ON j.id=gj.job_id"
+                        " WHERE gj.gpu_id=? AND j.project=?",
+                        (idx, project),
+                    ).fetchone()["n"]
+                    if proj_n >= int(pmax):
+                        cap_skipped = True
+                        continue
             else:
                 continue
             # 归一化负载 = 放入后负载率 (used+task)/cap 最小 — 回答"放哪张最均衡"
@@ -1545,7 +1573,20 @@ class Dispatcher:
                 best_load = load
                 best_idx = idx
         if best_idx is None:
+            # B12-c: 项目级上限挡住 ≠ 全卡满。scope=project 时调用方不置
+            # gpu_full, 同 tick 后续其他项目的任务仍可尝试该卡。
+            self._assign_reject_scope = "project" if cap_skipped else "all"
+            if cap_skipped and job_id not in self._cap_warned:
+                self._cap_warned.add(job_id)
+                self.log_line(
+                    f"job {job_id}: 暂无余量卡 (打包上限"
+                    f" 全局={self.cfg.get('co_locate_max_jobs', 3)}"
+                    f" 卡级={self._gpu_max_jobs or '-'}"
+                    f" 项目级={(self._projects.get(project or '') or {}).get('max_jobs', '-')}"
+                    ") —— 等待自然排水"
+                )
             return None
+        self._cap_warned.discard(job_id)
         srow = conn.execute(
             "SELECT status FROM gpus WHERE idx=?", (best_idx,)
         ).fetchone()

@@ -24,6 +24,7 @@ from .config import (
     config_path,
     default_state_dir,
     load_config,
+    parse_gpus,
     resolve_template,
 )
 from .schema import (
@@ -1578,15 +1579,25 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_list_gpus(args: argparse.Namespace) -> int:
-    """GPU 状态视图 (2026-08-17 缺口 3: 加显存列 mem_total_gib)."""
+    """GPU 状态视图 (2026-08-17 缺口 3: 加显存列; B12-c: 打包数/上限标注)."""
+    cfg = _load_cfg()
+    _, _, gpu_max_jobs = parse_gpus(cfg)
+    cap_all = int(cfg.get("co_locate_max_jobs", 3))
     with state.connect() as conn:
         rows = conn.execute("SELECT * FROM gpus ORDER BY idx").fetchall()
         for g in rows:
             q = " (QUARANTINED)" if g["quarantined"] else ""
             mem = g["mem_total_gib"]
             mem_s = f"{float(mem):.1f}GiB" if mem else "mem=?"
+            n = conn.execute(
+                "SELECT COUNT(*) FROM gpu_jobs WHERE gpu_id=?", (g["idx"],)
+            ).fetchone()[0]
+            cap = min([cap_all] + [gpu_max_jobs[g["idx"]]] if g["idx"] in gpu_max_jobs else [cap_all])
+            cap_s = f" packed={n}/{cap}"
+            if n > cap:
+                cap_s += " OVER-CAP(排水中)"
             print(
-                f"GPU{g['idx']} [{g['status']:<10}] {mem_s:>8} job={g['job_id'] or '-'}{q}"
+                f"GPU{g['idx']} [{g['status']:<10}] {mem_s:>8} job={g['job_id'] or '-'}{cap_s}{q}"
             )
     return 0
 
@@ -1775,17 +1786,23 @@ def cmd_project_list(args: argparse.Namespace) -> int:
         print("未配置任何项目")
         return 0
     with state.connect() as conn:
-        print(f"{'项目':<20} {'GPU配额':<8} {'优先级':<6} {'亲和卡':<12} {'已用/配额':<12} {'根目录'}")
+        print(f"{'项目':<16} {'GPU配额':<7} {'优先级':<6} {'colocate':<9} "
+              f"{'单卡上限':<8} {'亲和卡':<12} {'已用/配额':<10} 根目录")
         for name, pcfg in projects.items():
             quota = pcfg.get("gpu_quota", 0)
             prio = pcfg.get("priority", 0)
             aff = pcfg.get("gpu_affinity", [])
             root = pcfg.get("root", "")
+            # B12-b/c: colocate 三态与项目级打包上限可视化
+            col = pcfg.get("colocate")
+            col_s = "跟随全局" if col is None else ("on" if col else "off")
+            mjs = str(pcfg["max_jobs"]) if pcfg.get("max_jobs") else "-"
             used = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status='running' AND project=?", (name,)
             ).fetchone()[0]
             quota_str = f"{used}/{quota}" if quota > 0 else f"{used}/∞"
-            print(f"{name:<20} {quota:<8} {prio:<6} {str(aff):<12} {quota_str:<12} {root}")
+            print(f"{name:<16} {quota:<7} {prio:<6} {col_s:<9} "
+                  f"{mjs:<8} {str(aff):<12} {quota_str:<10} {root}")
     return 0
 
 
