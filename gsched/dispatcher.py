@@ -1023,20 +1023,22 @@ class Dispatcher:
         with state.connect() as conn:
             # 只派发所属批次已解锁 (active/done) 的 pending job——
             # queued 批次 (依赖未解锁) 的 job 不派发 (场景 2: 下游挂起)
+            # B11c: 显式带出 rowid 与两处 project; 排序在 Python 层做双键
             ready = conn.execute(
-                "SELECT j.*, b.project as batch_project"
+                "SELECT j.*, j.rowid AS rid, b.project AS batch_project,"
+                " b.priority AS batch_priority"
                 " FROM jobs j JOIN batches b ON j.batch_id=b.id"
                 " WHERE j.status='pending' AND b.status IN ('active','done')"
                 " ORDER BY j.rowid"
             ).fetchall()
-            # B11c: 双键优先级排序——(project_priority, batch_priority) 降序,
-            # 同优先级按 rowid FIFO。project_priority 来自 config (Python 层),
-            # batch_priority 来自 batches.priority 列 (batch.json "priority" 字段)。
+            # 双键优先级排序: (-project_priority, -batch_priority, rid)。
+            # project_priority 来自 config (Python 层); batch_priority 来自 DB 列。
+            # 注意: sqlite3.Row 无 .get(), 键必须显式存在于 SELECT 中。
             proj_prio = self._project_priority
-            ready = sorted(ready, key=lambda j: (
-                -proj_prio(j["project"] or j.get("batch_project")),
-                -(j["priority"] if "priority" in j.keys() else 0),
-                j["rowid"],
+            ready = sorted(ready, key=lambda r: (
+                -proj_prio(r["project"] or r["batch_project"]),
+                -r["batch_priority"],
+                r["rid"],
             ))
             # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.
@@ -1056,7 +1058,7 @@ class Dispatcher:
 
             for j in ready:
                 # B11c: project quota gate -> waiting_quota
-                project = j["project"] or j.get("batch_project")
+                project = j["project"] or j["batch_project"]
                 if not self._project_quota_available(conn, project):
                     self._mark_waiting_quota(conn, j["id"])
                     continue
