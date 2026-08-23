@@ -488,6 +488,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "artifacts": t["artifacts"],
                 "retry_transform": t["retry_transform"],
                 "probes": t["probes"],
+                "max_parallel": t.get("max_parallel"),
             }
             state.insert_task(
                 conn, bid, t["id"], 1, spec_json, i,
@@ -716,14 +717,35 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "SELECT id FROM batches WHERE name=?", (args.batch,)
                 ).fetchall()
             }
+        # B1: 配额排队标记 -- 项目 running GPU 任务数已达 gpu_quota 时,
+        # 该项目 pending 任务实际处于"等配额"状态, 视图层显式标注 (不落库)
+        running_gpu_by_proj: dict[str, int] = {}
+        for r in conn.execute(
+            "SELECT project, COUNT(*) AS n FROM jobs"
+            " WHERE status='running' AND gpu IS NOT NULL AND project IS NOT NULL"
+            " GROUP BY project"
+        ):
+            running_gpu_by_proj[r["project"]] = r["n"]
+
+        def _quota_wait(j) -> bool:
+            proj = j.get("project") if "project" in j.keys() else None
+            if not proj or j["status"] != "pending":
+                return False
+            pcfg = cfg.get("projects", {}).get(proj, {})
+            quota = int(pcfg.get("gpu_quota", 0) or 0)
+            return quota > 0 and running_gpu_by_proj.get(proj, 0) >= quota
+
         for j in jobs:
             if proj_batch_ids is not None and j["batch_id"] not in proj_batch_ids:
                 continue
             res = res_by_task.get((j["batch_id"], j["task_id"], j["version"]), {})
+            st = j["status"]
+            if st == "pending" and _quota_wait(j):
+                st = "pending(quota)"
             out["jobs"].append(
                 {
                     "id": j["id"], "batch": j["batch_id"], "task": j["task_id"],
-                    "status": j["status"], "gpu": j["gpu"], "version": j["version"],
+                    "status": st, "gpu": j["gpu"], "version": j["version"],
                     "resources": res,
                     "retries": j["retries"], "failure": j["failure"],
                     "started_at": j["started_at"], "finished_at": j["finished_at"],

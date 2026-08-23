@@ -1061,6 +1061,13 @@ class Dispatcher:
             ).fetchone()[0]
             gpu_full = False
             now_ts = datetime.now()
+            # B14 L4: batch 内并发上限 (sweep.max_parallel)
+            running_per_batch: dict[str, int] = {}
+            for r in conn.execute(
+                "SELECT batch_id, COUNT(*) AS n FROM jobs"
+                " WHERE status='running' GROUP BY batch_id"
+            ):
+                running_per_batch[r["batch_id"]] = r["n"]
             # B11c: refresh per-project running GPU counts
             self._update_project_quota_used(conn)
 
@@ -1085,6 +1092,10 @@ class Dispatcher:
                 resources = spec.get("resources") or {}
                 is_cpu_only = resources.get("gpu", 1) == 0
                 task_cpus = self._task_cpus(spec)
+                # B14 L4: sweep.max_parallel -- 同批 running 达上限则等下轮
+                mp = spec.get("max_parallel")
+                if mp and running_per_batch.get(j["batch_id"], 0) >= int(mp):
+                    continue
                 if cpus_total > 0 and used_cpu + task_cpus > cpus_total:
                     # CPU 配额不足: 本任务等下轮 (CPU 超卖禁止, 与 GPU 同纪律)
                     # 批内补位: continue 让后面的小任务可插队 (大任务等 GPU 释放同轮再试)
@@ -1108,6 +1119,9 @@ class Dispatcher:
                         used_cpu += task_cpus
                         if is_cpu_only:
                             cpu_only_running += 1
+                        running_per_batch[j["batch_id"]] = (
+                            running_per_batch.get(j["batch_id"], 0) + 1
+                        )
                 except Exception as e:
                     # 启动失败: 释放 GPU (如占) + 标 failed (走 retry 路径), 不中断整轮派发
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")

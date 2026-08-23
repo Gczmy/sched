@@ -114,12 +114,24 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
     if not isinstance(tasks, list) or not tasks:
         raise SchemaError("tasks 必须是至少一个任务的对象数组")
 
+    # B14 L4: sweep.matrix 同质任务矩阵展开。
+    #   sweep: {matrix: {参数名: [取值...]}, max_parallel: N}
+    #   任务 cmd/cwd/env值/artifacts路径/id 中 {参数名} 占位符按笛卡尔积逐组合
+    #   替换; id 未含占位符时自动追加 "_v1_v2" 后缀。max_parallel 由 dispatcher
+    #   按 batch 内 running 数限制并发 (存入每个任务 spec)。
+    sweep_spec = spec.get("sweep")
+    if sweep_spec is not None:
+        tasks, batch_max_parallel = _expand_sweep(tasks, sweep_spec)
+    else:
+        batch_max_parallel = None
+
     norm_tasks = []
     seen_ids: set[str] = set()
     for i, t in enumerate(tasks):
-        norm_tasks.append(
-            _validate_task(t, cfg, batch_cwd_abs, f"tasks[{i}]", seen_ids)
-        )
+        nt = _validate_task(t, cfg, batch_cwd_abs, f"tasks[{i}]", seen_ids)
+        if batch_max_parallel is not None:
+            nt["max_parallel"] = batch_max_parallel
+        norm_tasks.append(nt)
 
     project = spec.get("project")
     if project is not None and not isinstance(project, str):
@@ -314,6 +326,64 @@ def _validate_stage(s: Any, cfg: dict, t_cwd_abs: str, where: str) -> dict:
         "retry_transform": s.get("retry_transform"),
         "paths_escape": s.get("paths_escape", False),
     }
+
+
+def _expand_sweep(tasks: list[dict], sweep: Any) -> tuple[list[dict], int | None]:
+    """B14 L4: 按笛卡尔积展开矩阵组合, 返回 (展开后任务列表, max_parallel)."""
+    import copy
+    import itertools
+
+    if not isinstance(sweep, dict):
+        raise SchemaError("sweep: 必须是对象")
+    matrix = sweep.get("matrix")
+    if not isinstance(matrix, dict) or not matrix:
+        raise SchemaError('sweep.matrix: 必须是非空对象 (如 {"seed": [42, 2024]})')
+
+    keys = sorted(matrix.keys())
+    val_sets: list[list[str]] = []
+    for k in keys:
+        vs = matrix[k]
+        if not isinstance(vs, list) or not vs:
+            raise SchemaError(f"sweep.matrix.{k}: 必须是非空数组")
+        val_sets.append([str(v) for v in vs])
+
+    mp = sweep.get("max_parallel")
+    if mp is not None and (
+        not isinstance(mp, int) or isinstance(mp, bool) or mp < 1
+    ):
+        raise SchemaError("sweep.max_parallel: 必须是正整数")
+
+    def _sub(obj: Any, subs: dict[str, str]) -> Any:
+        """递归字符串替换 (cmd 数组/env 对象/artifacts 路径等任意嵌套结构)."""
+        if isinstance(obj, str):
+            for k, v in subs.items():
+                obj = obj.replace("{" + k + "}", v)
+            return obj
+        if isinstance(obj, list):
+            return [_sub(x, subs) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _sub(v, subs) for k, v in obj.items()}
+        return obj
+
+    out: list[dict] = []
+    for combo in itertools.product(*val_sets):
+        subs = dict(zip(keys, combo))
+        suffix = "_" + "_".join(combo)
+        for t in tasks:
+            tc = copy.deepcopy(t)
+            tid = str(tc.get("id", ""))
+            if "{" in tid:
+                for k, v in subs.items():
+                    tid = tid.replace("{" + k + "}", v)
+                if "{" in tid or "}" in tid:
+                    raise SchemaError(
+                        f"task id '{tid}' 含未在 sweep.matrix 中定义的占位符"
+                    )
+            else:
+                tid = tid + suffix
+            tc["id"] = tid
+            out.append(_sub(tc, subs))
+    return out, mp
 
 
 def check_dependency_cycle(depends_on: list[str], cfg: dict) -> None:
