@@ -1028,7 +1028,8 @@ class Dispatcher:
                 "SELECT j.*, j.rowid AS rid, b.project AS batch_project,"
                 " b.priority AS batch_priority"
                 " FROM jobs j JOIN batches b ON j.batch_id=b.id"
-                " WHERE j.status='pending' AND b.status IN ('active','done')"
+                " WHERE j.status IN ('pending','waiting_quota')"
+                " AND b.status IN ('active','done')"
                 " ORDER BY j.rowid"
             ).fetchall()
             # 双键优先级排序: (-project_priority, -batch_priority, rid)。
@@ -1057,10 +1058,10 @@ class Dispatcher:
             self._update_project_quota_used(conn)
 
             for j in ready:
-                # B11c: project quota gate -> waiting_quota
+                # B11c: project quota gate -- 本轮跳过, 状态保持 pending
+                # (绝不落 waiting_quota 终态化, 否则配额释放后无人再捞起)
                 project = j["project"] or j["batch_project"]
                 if not self._project_quota_available(conn, project):
-                    self._mark_waiting_quota(conn, j["id"])
                     continue
 
                 # M2: 重试退避 —— 失败重试 (retries>0) 的 job 等 RETRY_BACKOFF_SEC
