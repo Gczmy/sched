@@ -1489,12 +1489,25 @@ def cmd_discard(args: argparse.Namespace) -> int:
     if not args.yes:
         print("确认退役? 加 --yes 执行", file=sys.stderr)
         return 1
-    b = _batch_id_from_name(args.batch)
-    if not b:
+    # 支持批次名或完整 id (同名多实例需按 id 逐一退役)
+    brow = None
+    b = args.batch
+    with state.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM batches WHERE id=?", (args.batch,)
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (args.batch,),
+            ).fetchone()
+            if row is not None:
+                b = row["id"]
+        brow = row
+    if brow is None:
         print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
         return 1
     with state.connect() as conn:
-        brow = conn.execute("SELECT * FROM batches WHERE id=?", (b,)).fetchone()
         if brow is None:
             print(f"错误: 批次不存在: {b}", file=sys.stderr)
             return 1
