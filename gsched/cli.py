@@ -1352,6 +1352,90 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def _deep_merge(base: dict, patch: dict) -> None:
+    """递归深合并 patch 到 base (projects/venvs 等嵌套对象按名合并, 不整体替换)."""
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def cmd_config_get(args: argparse.Namespace) -> int:
+    """sched config get: 输出当前完整配置 (JSON)."""
+    print(json.dumps(_load_cfg(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_config_set(args: argparse.Namespace) -> int:
+    """sched config set -f <patch.json> [--yes]: 深合并补丁 -> 校验 -> 原子写 -> 热重载.
+
+    冷键 (node/state_dir/user/schema_version/gpus 卡集与容量) 变更直接拒绝 ——
+    与 daemon 侧热更新拒绝逻辑一致 (B12-a)。写入成功后自动写 config_reload
+    控制请求, daemon 下个 tick (<10s) 生效, 不受 NFS mtime 缓存延迟影响。
+    """
+    import copy as _copy
+
+    try:
+        with open(args.file, "r", encoding="utf-8") as f:
+            patch = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"错误: 读取 patch 失败: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(patch, dict) or not patch:
+        print("错误: patch 必须是非空 JSON 对象", file=sys.stderr)
+        return 1
+    if not args.yes:
+        print("确认写入配置? 加 --yes 执行", file=sys.stderr)
+        return 1
+
+    old = _load_cfg()
+    new_cfg = _copy.deepcopy(old)
+    _deep_merge(new_cfg, patch)
+
+    # 冷键拒绝 (与 dispatcher CONFIG_COLD_KEYS 同口径)
+    cold = [k for k in ("node", "state_dir", "user", "schema_version")
+            if old.get(k) != new_cfg.get(k)]
+    og, ng = parse_gpus(old), parse_gpus(new_cfg)
+    if (og[0], og[1]) != (ng[0], ng[1]):
+        cold.append("gpus(卡集或容量覆盖)")
+    if cold:
+        print(f"错误: 含冷键变更 {cold} —— 热更新拒绝, 请手动编辑并重启 daemon",
+              file=sys.stderr)
+        return 1
+
+    # 全量校验: 写临时文件走 load_config 完整管线 (含 parse_gpus/notify 等)
+    cfg_p = config_path()
+    tmp_p = cfg_p + ".tmp-set"
+    with open(tmp_p, "w", encoding="utf-8") as f:
+        json.dump(new_cfg, f, indent=2, ensure_ascii=False)
+    try:
+        load_config(tmp_p)
+    except Exception as e:
+        if os.path.exists(tmp_p):
+            os.remove(tmp_p)
+        print(f"错误: 新配置校验失败 (未写入): {e}", file=sys.stderr)
+        return 1
+    os.replace(tmp_p, cfg_p)
+
+    with state.connect() as conn:
+        state.insert_control_request(conn, "*config*", op="config_reload")
+    changed = sorted(set(_flatten_keys(patch)))
+    print(f"✅ 配置已写入并请求热重载: {', '.join(changed)}")
+    return 0
+
+
+def _flatten_keys(d: dict, prefix: str = "") -> list[str]:
+    out = []
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.extend(_flatten_keys(v, key))
+        else:
+            out.append(key)
+    return out
+
+
 def cmd_config_reload(args: argparse.Namespace) -> int:
     """sched config reload: 请求 daemon 热更新配置 (B12-a).
 
@@ -1976,6 +2060,11 @@ def main(argv: list[str] | None = None) -> int:
     sub_cfg = p.add_subparsers(dest="config_cmd", required=True)
     p_reload = sub_cfg.add_parser("reload", help="请求 daemon 热更新 config.json")
     p_reload.set_defaults(fn=cmd_config_reload)
+    sub_cfg.add_parser("get", help="输出当前完整配置 (JSON)").set_defaults(fn=cmd_config_get)
+    p_set = sub_cfg.add_parser("set", help="深合并补丁写入配置并触发热重载")
+    p_set.add_argument("-f", "--file", required=True, help="patch JSON 文件路径")
+    p_set.add_argument("--yes", action="store_true", help="确认执行")
+    p_set.set_defaults(fn=cmd_config_set)
 
     p = sub.add_parser("incidents", help="事故快照查询 (OOM/gpu_fault 现场)")
     p.add_argument("incident_id", nargs="?", type=int,
