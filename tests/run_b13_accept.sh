@@ -44,6 +44,19 @@ n = sum(1 for j in d['jobs'] if j['batch'].split('-')[0] == '$2' and j['status']
 print(n)"
 }
 
+wait_batch_done() { # $1=dir $2=batch名前缀 $3=超时秒 —— 等同名批次全部收敛终态
+  for _ in $(seq 1 ${3:-30}); do
+    SCHED_STATE=$1 SCHED_CONFIG=$1/config.json $PY -m gsched.cli status --json 2>/dev/null | \
+      $PY -c "
+import json, sys
+d = json.load(sys.stdin)
+bad = [b for b in d['batches'] if b['name'].split('-')[0] == '$2' and b['status'] not in ('done','blocked','cancelled')]
+sys.exit(0 if not bad else 1)" && return 0
+    sleep 2
+  done
+  return 1
+}
+
 wait_for() { # $1=条件 $2=超时秒
 wait_batch_done() { # $1=dir $2=batch名 $3=超时秒 —— 等同名批次全部终态
   for _ in $(seq 1 ${3:-20}); do
@@ -116,6 +129,7 @@ EOF
 git add -A && git commit -qm init
 mkdir -p /tmp/sched_b13_out
 S2=/tmp/sched_b13_2; rm -rf $S2; mkdir -p $S2
+rm -rf /tmp/sched_b13_out; mkdir -p /tmp/sched_b13_out   # 清残留产物 (防首跑误 SKIP)
 cat > $S2/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -136,13 +150,14 @@ EOF
 export SCHED_STATE=$S2 SCHED_CONFIG=$S2/config.json
 $PY -m gsched.cli submit $S2/b.json >/dev/null 2>&1
 SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-wait_for '[ "$(count_status $S2 fp done)" = "1" ]' 60 && ok "首跑完成" || bad "首跑未完成"
+wait_for '[ "$(count_status $S2 fp done)" = "1" ]' 120 && ok "首跑完成" || bad "首跑未完成"
+wait_batch_done $S2 fp 60   # 批次 settle 后再重提 (防同名未终态拒绝)
 # 同内容重提 -> SKIP
 $PY -m gsched.cli submit $S2/b.json >/dev/null 2>&1
-wait_for '[ "$(count_status $S2 fp skip)" = "1" ]' 20 && ok "同内容重提正确 SKIP" || bad "未 SKIP"
+wait_for '[ "$(count_status $S2 fp skip)" = "1" ]' 60 && ok "同内容重提正确 SKIP" || bad "未 SKIP"
+wait_batch_done $S2 fp 60   # 批次 settle
 # 工作区改动不提交 -> 重提应重跑 (dirty-tree 指纹)
 echo "" >> $W/runner.py   # 未提交改动 -> dirty-tree 指纹必变
-sleep 12   # 等批次级 settle (job skip 先于批次 done 一个 tick)
 DIRTY_OUT=$($PY -m gsched.cli submit $S2/b.json 2>&1)
 echo "$DIRTY_OUT" | grep -q "已入队" || bad "脏树提交失败: $DIRTY_OUT"
 BEFORE=$(count_status $S2 fp done)

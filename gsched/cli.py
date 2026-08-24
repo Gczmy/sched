@@ -1151,6 +1151,14 @@ def cmd_retry(args: argparse.Namespace) -> int:
             if not b:
                 print(f"错误: 批次不存在: {ref}", file=sys.stderr)
                 return 1
+            # B16: discarded 批次不可 retry (任务不会被派发, 防静默挂起)
+            bstat = conn.execute(
+                "SELECT status FROM batches WHERE id=?", (b,)
+            ).fetchone()
+            if bstat and bstat["status"] == "discarded":
+                print(f"错误: 批次已退役 (discarded), 请用新批次名重新提交",
+                      file=sys.stderr)
+                return 1
             # C4 修复: 每 task 只取最新 version —— 否则 resubmit 产生的旧版本
             # 失败终态 job 会被复活, 与新版本并发执行写相同产物路径
             targets = conn.execute(
@@ -1219,6 +1227,15 @@ def cmd_markers(args: argparse.Namespace) -> int:
 def cmd_resubmit(args: argparse.Namespace) -> int:
     """sched resubmit <batch>:<task>: 新版本 Job 排队尾 (A1 force 语义)."""
     batch, task = _resolve_task_ref(args.task)
+    # B16: discarded 批次不可 resubmit (同 retry 守卫)
+    with state.connect() as conn:
+        bstat = conn.execute(
+            "SELECT status FROM batches WHERE id=?", (batch,)
+        ).fetchone()
+        if bstat and bstat["status"] == "discarded":
+            print("错误: 批次已退役 (discarded), 请用新批次名重新提交",
+                  file=sys.stderr)
+            return 1
     with state.connect() as conn:
         j = conn.execute(
             "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1",
@@ -1375,6 +1392,68 @@ def _deep_merge(base: dict, patch: dict) -> None:
             _deep_merge(base[k], v)
         else:
             base[k] = v
+
+
+def cmd_discard(args: argparse.Namespace) -> int:
+    """sched discard <batch>: 退役被取代的 blocked 批次 (backlog#1, B16).
+
+    适用: 同名新实例已取代旧批次, 旧 blocked 实例永久滞留视图的场景.
+    行为: 仅翻转批次状态为 discarded; 任务行保持 failed/blocked 原样
+    (保留排查证据). discarded 批次不被 settle 复活、不可 retry/resubmit
+    (需用新批次名重新提交). 依赖本批次的下游将挂起 —— 与 cancel 同警告.
+    """
+    if not args.yes:
+        print("确认退役? 加 --yes 执行", file=sys.stderr)
+        return 1
+    b = _batch_id_from_name(args.batch)
+    if not b:
+        print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+        return 1
+    with state.connect() as conn:
+        brow = conn.execute("SELECT * FROM batches WHERE id=?", (b,)).fetchone()
+        if brow is None:
+            print(f"错误: 批次不存在: {b}", file=sys.stderr)
+            return 1
+        if brow["status"] not in ("blocked", "queued"):
+            print(f"错误: 仅 blocked/queued 批次可退役 (当前 {brow['status']});"
+                    " done 无需退役", file=sys.stderr)
+            return 1
+        # 仅拒真 running; queued 批次的 pending 由下方统一转 cancelled
+        running = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE batch_id=?"
+            " AND status='running'", (b,),
+        ).fetchone()[0]
+        if running:
+            print(f"错误: 批次仍有 {running} 个运行中任务,"
+                    " 请先 sched cancel", file=sys.stderr)
+            return 1
+        # queued 批次的 pending 任务一并标记 cancelled (kill_reason 留痕);
+        # blocked 批次的失败终态任务保留原状 (排查证据)
+        pend = conn.execute(
+            "SELECT id FROM jobs WHERE batch_id=? AND status='pending'", (b,),
+        ).fetchall()
+        for jr in pend:
+            state.update_job(
+                conn, jr["id"], status="cancelled", kill_reason="discarded",
+                finished_at=state.now(),
+            )
+        n = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE batch_id=?"
+            " AND status IN ('failed','blocked','timed_out','interrupted','cancelled')",
+            (b,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE batches SET status='discarded' WHERE id=?", (b,))
+        # Q4 下游依赖告警 (与 cancel 对称)
+        deps = conn.execute(
+            "SELECT name FROM batches WHERE depends_on LIKE ?",
+            (f'%"{brow["name"]}"%',),
+        ).fetchall()
+        for d in deps:
+            print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 已退役, 下游将挂起")
+    print(f"✅ 批次 {b} 已退役 (涉及 {n} 个任务, 失败终态证据保留); "
+          "重跑请用新批次名提交")
+    return 0
 
 
 def cmd_config_get(args: argparse.Namespace) -> int:
@@ -2079,6 +2158,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("diag", help="一站式失败诊断 (状态+命令+git+日志)")
     p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部非 done/skip)")
     p.set_defaults(fn=cmd_diag)
+
+    p = sub.add_parser("discard", help="退役被取代的 blocked 批次")
+    p.add_argument("batch", help="批次名或 id")
+    p.add_argument("--yes", action="store_true", help="确认执行")
+    p.set_defaults(fn=cmd_discard)
 
     p = sub.add_parser("clean", help="清除批次产物指纹 (强制后续重跑)")
     p.add_argument("batch", help="批次名或 id")
