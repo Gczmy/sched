@@ -1225,9 +1225,39 @@ def cmd_markers(args: argparse.Namespace) -> int:
 
 
 def cmd_resubmit(args: argparse.Namespace) -> int:
-    """sched resubmit <batch>:<task>: 新版本 Job 排队尾 (A1 force 语义)."""
-    batch, task = _resolve_task_ref(args.task)
-    # B16: discarded 批次不可 resubmit (同 retry 守卫)
+    """sched resubmit <batch>[:<task>] [--failed|--all] [--dry-run]: 新版本排队尾.
+
+    - <batch>:<task>      单任务新版本排队尾 (原有语义)
+    - <batch> --failed    该批全部失败终态任务 (failed/blocked/timed_out/interrupted;
+                          cancelled 属人工决策, 不含 —— 需要时用 :task 单独指定)
+    - <batch> --all       该批全部任务
+    --dry-run             只列将重跑的清单, 不写入
+
+    批次按名解析为最新实例; discarded 守卫; 完成后自动拉起 idle daemon.
+    """
+    if args.failed and args.resubmit_all:
+        print("错误: --failed 与 --all 互斥", file=sys.stderr)
+        return 1
+    ref = args.task
+    batch_level = ":" not in ref
+    mode = "all" if args.resubmit_all else ("failed" if args.failed else None)
+    if batch_level and mode is None:
+        print("错误: 批次级 resubmit 需要 --failed 或 --all"
+              " (单任务请用 <batch>:<task>)", file=sys.stderr)
+        return 1
+    if (not batch_level) and mode is not None:
+        print("错误: 单任务引用 (<batch>:<task>) 不需要 --failed/--all",
+              file=sys.stderr)
+        return 1
+
+    if batch_level:
+        batch = _batch_id_from_name(ref)
+        if not batch:
+            print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+            return 1
+    else:
+        batch, task = _resolve_task_ref(ref)
+
     with state.connect() as conn:
         bstat = conn.execute(
             "SELECT status FROM batches WHERE id=?", (batch,)
@@ -1236,52 +1266,96 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             print("错误: 批次已退役 (discarded), 请用新批次名重新提交",
                   file=sys.stderr)
             return 1
-    with state.connect() as conn:
-        j = conn.execute(
-            "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1",
-            (batch, task),
-        ).fetchone()
-        if not j:
-            print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
+        if bstat and bstat["status"] == "queued":
+            print("错误: queued 批次 (等上游依赖) 不支持 resubmit;"
+                  " 上游完成后批次会自动 active", file=sys.stderr)
             return 1
-        t = conn.execute(
-            "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
-            (batch, task, j["version"]),
-        ).fetchone()
-        spec = json.loads(t["spec"])
-        new_v = j["version"] + 1
-        # B11c: project 继承自原批次行
         bproj = conn.execute(
-            "SELECT project FROM batches WHERE id=?", (batch,)
+            "SELECT project, name FROM batches WHERE id=?", (batch,)
         ).fetchone()
         proj = bproj["project"] if bproj else None
-        # 新版本任务记录 (同 spec) + 新 Job
-        state.insert_task(conn, batch, task, new_v, spec, 0, proj)
+        bname = bproj["name"] if bproj else batch
+
+        # 收集目标任务最新版本 job 行
+        if batch_level:
+            jrows = conn.execute(
+                "SELECT j.* FROM jobs j"
+                " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+                "       WHERE batch_id=? GROUP BY task_id) t"
+                "   ON j.batch_id=? AND j.task_id=t.task_id AND j.version=t.mv"
+                " ORDER BY j.rowid",
+                (batch, batch),
+            ).fetchall()
+            if mode == "failed":
+                jrows = [j for j in jrows if j["status"] in
+                         ("failed", "blocked", "timed_out", "interrupted")]
+        else:
+            jrows = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
+                " ORDER BY version DESC LIMIT 1",
+                (batch, task),
+            ).fetchall()
+        if not jrows:
+            msg = ("无匹配任务" if mode == "failed"
+                   else f"任务不存在 {batch}:{task}")
+            print(f"错误: {msg}", file=sys.stderr)
+            return 1
+
+        if args.dry_run:
+            print(f"[dry-run] 将 resubmit {len(jrows)} 个任务 (各生成新版本排队尾):")
+            for j in jrows:
+                print(f"  {j['task_id']} [{j['status']}] v{j['version']} -> v{j['version'] + 1}")
+            return 0
 
         from .fingerprint import compute_fingerprint
 
-        fp, stage_fps, rev = compute_fingerprint(
-            spec.get("cmd"), spec.get("stages"), spec.get("cwd_abs", "."),
-            spec.get("git"), {},
-            runtime_prefix=spec.get("runtime_prefix"),
-        )
-        state.insert_job(
-            conn, f"{batch}-{task}-v{new_v}", batch, task, new_v,
-            fp, stage_fps, proj,
-        )
-        # Q4: 检测下游依赖告警
-        # C5 修复: name 从 DB 查 (与 cmd_cancel 同法) —— batch id 形如
-        # {name}-{时间戳} 且 name 可含 '-', split("-")[0] 会截错导致漏报
-        brow = state.get_batch(conn, batch)
-        bname = brow["name"] if brow else batch
+        done_labels = []
+        for j in jrows:
+            t = conn.execute(
+                "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+                (batch, j["task_id"], j["version"]),
+            ).fetchone()
+            if not t:
+                continue
+            spec = json.loads(t["spec"])
+            new_v = j["version"] + 1
+            state.insert_task(conn, batch, j["task_id"], new_v, spec, 0, proj)
+            fp, stage_fps, rev = compute_fingerprint(
+                spec.get("cmd"), spec.get("stages"), spec.get("cwd_abs", "."),
+                spec.get("git"), {},
+                runtime_prefix=spec.get("runtime_prefix"),
+            )
+            state.insert_job(
+                conn, f"{batch}-{j['task_id']}-v{new_v}", batch,
+                j["task_id"], new_v, fp, stage_fps, proj,
+            )
+            done_labels.append(f"{j['task_id']}->v{new_v}")
+
+        # Q4: 下游依赖告警 (C5: 按 name 全串匹配防截断漏报)
         deps = conn.execute(
             "SELECT name FROM batches WHERE depends_on LIKE ?", (f'%"{bname}"%',)
         ).fetchall()
         for d in deps:
             print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已更新, 请重提下游 (Q4)")
-        print(f"已 resubmit: {batch}:{task} -> v{new_v} (排队尾)")
+        # B17: 若批次因失败终态被钉在 blocked, 重提交后自动回 active
+        # (配合 dispatcher 的"最新版本"settle 口径, 否则旧失败行永久冻结新 pending)
+        if bstat and bstat["status"] == "blocked":
+            # 复用外层事务连接 —— 嵌套 connect 会 database is locked
+            conn.execute(
+                "UPDATE batches SET status='active' WHERE id=?", (batch,))
+            try:
+                mk = os.path.join(default_state_dir(), state.hostname(),
+                                  "markers", f"{bname}.blocked")
+                if os.path.isfile(mk):
+                    os.remove(mk)
+            except OSError:
+                pass
+            print("批次已回 active (旧版本失败终态不再阻塞新版本派发)")
+
+        print(f"已 resubmit {len(done_labels)} 个任务: {', '.join(done_labels)}")
+
     from . import daemon
-    print(daemon.ensure_running())  # 定案 38: resubmit 产生可派发工作, daemon 未运行自动拉起
+    print(daemon.ensure_running())  # 定案 38: 产生可派发工作, daemon 未运行自动拉起
     return 0
 
 
@@ -2187,8 +2261,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gpu", type=int, default=None, help="按 GPU 过滤")
     p.set_defaults(fn=cmd_incidents)
 
-    p = sub.add_parser("resubmit", help="重新提交 (新版本排队尾)")
-    p.add_argument("task", help="<batch>:<task>")
+    p = sub.add_parser("resubmit", help="重新提交 (新版本排队尾; 支持批次级 --failed/--all)")
+    p.add_argument("task", help="<batch>:<task> 或 <batch> (--failed/--all)")
+    p.add_argument("--failed", action="store_true",
+                   help="批次级: 重跑全部失败终态任务 (failed/blocked/timed_out/interrupted)")
+    p.add_argument("--all", dest="resubmit_all", action="store_true",
+                   help="批次级: 重跑全部任务")
+    p.add_argument("--dry-run", action="store_true", help="只列清单不写入")
     p.set_defaults(fn=cmd_resubmit)
 
     p = sub.add_parser("log", help="任务日志")

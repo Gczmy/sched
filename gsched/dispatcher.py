@@ -458,8 +458,16 @@ class Dispatcher:
                 "SELECT * FROM batches WHERE status IN ('active','blocked')"
             ).fetchall()
             for b in batches:
+                # B17: 只统计每任务最新版本 —— 旧版本的失败终态行不应永久
+                # 把批次钉在 blocked (否则 resubmit 新版本后批次无法回 active,
+                # 新 pending 全部冻结 —— SelfDistOTS 实测踩坑)。与 C4/retry
+                # 的"每 task 取最新 version"口径一致。
                 jobs = conn.execute(
-                    "SELECT status FROM jobs WHERE batch_id=?", (b["id"],)
+                    "SELECT j.status FROM jobs j"
+                    " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+                    "       WHERE batch_id=? GROUP BY task_id) t"
+                    "   ON j.batch_id=? AND j.task_id=t.task_id AND j.version=t.mv",
+                    (b["id"], b["id"]),
                 ).fetchall()
                 if not jobs:
                     continue
