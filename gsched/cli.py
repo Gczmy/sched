@@ -1648,8 +1648,93 @@ def cmd_config_reload(args: argparse.Namespace) -> int:
     return 0
 
 
+def _incident_verdicts(payload: dict) -> list[str]:
+    """启发式判读: 只列假设不下结论 (数据会撒谎, 碎片化看起来就像任务太大)."""
+    v: list[str] = []
+    mem = payload.get("memory") or {}
+    ext = mem.get("external_pids") or []
+    ext_mem = sum(e.get("mem_mib") or 0 for e in ext) / 1024.0
+    if ext and ext_mem >= 1.0:
+        pids = ", ".join(str(e.get("pid")) for e in ext[:5])
+        v.append(f"疑似调度器外进程挤占显存 (pid {pids}, ~{ext_mem:.1f} GiB)"
+                 " —— 检查同卡其他用户")
+    elif mem.get("degraded"):
+        v.append("物理查询降级: 外部进程可能存在但不可见, 建议人工 nvidia-smi 复核")
+    failed = payload.get("failed") or {}
+    dpk, fpk = failed.get("declared_vram_gib"), failed.get("profile_peak_gib")
+    if dpk and fpk and fpk > dpk * 1.3:
+        v.append(f"历史实测峰值 {fpk:.1f} GiB > 声明 {dpk:.1f} GiB"
+                 " —— 声明值偏低, 装箱按声明算会低估占用")
+    for cr in payload.get("co_runners") or []:
+        cd, cp = cr.get("declared_vram_gib"), cr.get("profile_peak_gib")
+        if cd and cp and cp > cd * 1.5 and cp - cd > 2.0:
+            v.append(f"邻居 {cr.get('task')} 实测峰值 {cp:.1f} >> 声明 {cd:.1f}"
+                     " GiB —— 疑似邻居越界挤占")
+    actual, packed = mem.get("actual_used_gib"), mem.get("packed_sum_gib")
+    if (not ext and actual is not None and packed is not None
+            and not mem.get("degraded") and abs(actual - packed) <= packed * 0.2):
+        v.append("无外部进程且物理用量≈记账值 —— 任务本身过大或碎片化")
+    tl = payload.get("timeline") or []
+    if len(tl) >= 4:
+        used = [p["used_gib"] for p in tl]
+        span = max(used) - min(used)
+        cap = mem.get("cap_gib") or 1
+        if span > cap * 0.25:
+            v.append("事发前显存快速爬升 —— 任务随训练进度增长 (activation 累积类)")
+        elif span < cap * 0.05 and max(used) < cap * 0.9:
+            v.append("事发前显存平稳 —— 更像瞬时冲击 (外部进程落入 / 瞬时峰值)")
+    return v
+
+
+def _incidents_json(args: argparse.Namespace) -> int:
+    """--json 机器可读输出 (dsh 看板契约)."""
+    with state.connect() as conn:
+        if args.incident_id:
+            row = conn.execute(
+                "SELECT * FROM incidents WHERE id=?", (args.incident_id,)
+            ).fetchone()
+            if not row:
+                print(json.dumps({"ok": False, "error": "not found"}))
+                return 1
+            try:
+                payload = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            print(json.dumps({
+                "ok": True,
+                "incident": {
+                    "id": row["id"], "ts": row["ts"], "kind": row["kind"],
+                    "gpu_idx": row["gpu_idx"], "job_id": row["job_id"],
+                    "batch_id": row["batch_id"],
+                    "payload": payload,
+                    "verdicts": _incident_verdicts(payload),
+                },
+            }, ensure_ascii=False))
+            return 0
+        q = ("SELECT id, ts, kind, gpu_idx, job_id, batch_id"
+             " FROM incidents")
+        params: list = []
+        conds = []
+        if args.job:
+            conds.append("job_id=?"); params.append(args.job)
+        if args.gpu is not None:
+            conds.append("gpu_idx=?"); params.append(args.gpu)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(args.limit)
+        rows = conn.execute(q, params).fetchall()
+    out = [{"id": r["id"], "ts": r["ts"], "kind": r["kind"],
+            "gpu_idx": r["gpu_idx"], "job_id": r["job_id"],
+            "batch_id": r["batch_id"]} for r in rows]
+    print(json.dumps({"ok": True, "incidents": out}, ensure_ascii=False))
+    return 0
+
+
 def cmd_incidents(args: argparse.Namespace) -> int:
-    """sched incidents [id] [--limit N] [--job ID] [--gpu N]: 事故快照查询 (F2)."""
+    """sched incidents [id] [--limit N] [--job ID] [--gpu N] [--json]: 事故快照查询 (F2)."""
+    if getattr(args, "json", False):
+        return _incidents_json(args)
     with state.connect() as conn:
         if args.incident_id:
             row = conn.execute(
@@ -1782,44 +1867,6 @@ def _diag_one(conn, j, cfg: dict) -> None:
         for l in tail:
             print(f"  | {l}")
     print()
-
-
-def _incident_verdicts(payload: dict) -> list[str]:
-    """启发式判读: 只列假设不下结论 (数据会撒谎, 碎片化看起来就像任务太大)."""
-    v: list[str] = []
-    mem = payload.get("memory") or {}
-    ext = mem.get("external_pids") or []
-    ext_mem = sum(e.get("mem_mib") or 0 for e in ext) / 1024.0
-    if ext and ext_mem >= 1.0:
-        pids = ", ".join(str(e.get("pid")) for e in ext[:5])
-        v.append(f"疑似调度器外进程挤占显存 (pid {pids}, ~{ext_mem:.1f} GiB)"
-                 " —— 检查同卡其他用户")
-    elif mem.get("degraded"):
-        v.append("物理查询降级: 外部进程可能存在但不可见, 建议人工 nvidia-smi 复核")
-    failed = payload.get("failed") or {}
-    dpk, fpk = failed.get("declared_vram_gib"), failed.get("profile_peak_gib")
-    if dpk and fpk and fpk > dpk * 1.3:
-        v.append(f"历史实测峰值 {fpk:.1f} GiB > 声明 {dpk:.1f} GiB"
-                 " —— 声明值偏低, 装箱按声明算会低估占用")
-    for cr in payload.get("co_runners") or []:
-        cd, cp = cr.get("declared_vram_gib"), cr.get("profile_peak_gib")
-        if cd and cp and cp > cd * 1.5 and cp - cd > 2.0:
-            v.append(f"邻居 {cr.get('task')} 实测峰值 {cp:.1f} >> 声明 {cd:.1f}"
-                     " GiB —— 疑似邻居越界挤占")
-    actual, packed = mem.get("actual_used_gib"), mem.get("packed_sum_gib")
-    if (not ext and actual is not None and packed is not None
-            and not mem.get("degraded") and abs(actual - packed) <= packed * 0.2):
-        v.append("无外部进程且物理用量≈记账值 —— 任务本身过大或碎片化")
-    tl = payload.get("timeline") or []
-    if len(tl) >= 4:
-        used = [p["used_gib"] for p in tl]
-        span = max(used) - min(used)
-        cap = mem.get("cap_gib") or 1
-        if span > cap * 0.25:
-            v.append("事发前显存快速爬升 —— 任务随训练进度增长 (activation 累积类)")
-        elif span < cap * 0.05 and max(used) < cap * 0.9:
-            v.append("事发前显存平稳 —— 更像瞬时冲击 (外部进程落入 / 瞬时峰值)")
-    return v
 
 
 def _diag_incident(inc) -> None:
@@ -2282,6 +2329,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=20, help="列表条数 (默认 20)")
     p.add_argument("--job", help="按 job id 过滤")
     p.add_argument("--gpu", type=int, default=None, help="按 GPU 过滤")
+    p.add_argument("--json", action="store_true", help="机器可读 JSON 输出 (看板契约)")
     p.set_defaults(fn=cmd_incidents)
 
     p = sub.add_parser("resubmit", help="重新提交 (新版本排队尾; 支持批次级 --failed/--all)")
