@@ -1711,6 +1711,11 @@ class Dispatcher:
         b = state.get_batch(conn, j["batch_id"])
         batch_env = json.loads(b["env"]) if b and b["env"] else {}
         task_env = {**batch_env, **dict(spec.get("env", {}))}
+        # B18: 部署级环境缺省值 (config.task_default_env) —— setdefault 语义,
+        # batch/task env 声明优先。本机用它注入 PYTHONNOUSERSITE=1 隔离
+        # ~/.local 用户站点污染 (策略在配置, 不在代码)。
+        for _dk, _dv in (self.cfg.get("task_default_env") or {}).items():
+            task_env.setdefault(str(_dk), str(_dv))
         task_env.setdefault(
             "SCHED_PROFILE_OUT", os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
         )

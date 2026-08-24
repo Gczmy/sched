@@ -141,6 +141,14 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             raise ConfigError(f"{p}: projects.{proj_name}.max_jobs 必须是正整数"
                               f" (该项目任务在单卡上的打包数上限)")
     # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,8]), 不在此重复
+    tde = cfg.get("task_default_env")
+    if tde is not None:
+        if not isinstance(tde, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in tde.items()
+        ):
+            raise ConfigError(
+                f"{p}: task_default_env 必须是 字符串->字符串 的对象"
+                " (部署级任务环境缺省值, batch/task env 可覆盖)")
     ced = cfg.get("conda_envs_dirs")
     if ced is not None:
         if not isinstance(ced, list) or not all(

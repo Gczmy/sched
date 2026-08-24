@@ -79,6 +79,7 @@
 | `projects[P].colocate / max_jobs` | 项目级共享开关 / 每卡打包密度上限（热更新）|
 | `gpus[i].max_jobs` | 异构卡每卡打包上限（热更新）|
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
+| `task_default_env` | 部署级任务环境缺省值 `{k:v}`；batch/task env 可覆盖。典型用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
 
 ⚠️ config.json 为双项目共享配置，修改须经用户确认。
 
@@ -148,6 +149,27 @@ sched log <batch>:<task> -n 50
 ### R9 查进度
 
 status 自动展示；长任务声明 `progress_regex` 更精确。
+
+### R10 新环境准备检查清单（提交前必做）
+
+```bash
+# 1. 创建环境后, 用绝对路径安装 (防 pip 解析到别的 env)
+/miniconda3/envs/new_env/bin/pip install pkg1 pkg2
+
+# 2. 模拟 daemon 执行方式验证 (无 conda activate), 并确认加载位置
+PYTHONNOUSERSITE=1 /miniconda3/envs/new_env/bin/python -c "
+import pkg1, numpy
+print('import ok')
+print('numpy from:', numpy.__file__)"
+
+# 3. 在计算节点上重复步骤 2 (共享 NFS 但解释器/LD 可能不同)
+
+# 4. 全部通过后再 sched submit; 提交时若见
+#    "检测到用户站点包" 提示, 说明 ~/.local 可能有遮蔽风险
+```
+说明：daemon 启动任务的 env 构建顺序 = 继承 → 剥离 conda 污染键 → 注入
+runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆盖。
+若部署配置了 PYTHONNOUSERSITE=1，用户站点(~/.local)自动隔离。
 
 ---
 

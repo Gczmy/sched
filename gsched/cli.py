@@ -302,6 +302,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # B12-b: 项目级 colocate 禁用提示 (dry-run 与实提交都看得到)
     _warn_colocate_disabled(norm, cfg)
 
+    # B18: 用户站点包检测提示 (配置了 PYTHONNOUSERSITE 隔离后不再打扰)
+    if not (_load_cfg().get("task_default_env") or {}).get("PYTHONNOUSERSITE"):
+        import glob as _glob
+        _hits = [d for d in _glob.glob(os.path.expanduser(
+            "~/.local/lib/python3.*/site-packages")) if os.listdir(d)]
+        if _hits:
+            print(f"ℹ️ 检测到用户站点包 ({_hits[0]} 非空)。若任务 import 到"
+                    "非预期来源的包, 可在 config 设 "
+                    'task_default_env.PYTHONNOUSERSITE="1" 隔离')
+
     # B15: 未声明运行环境的任务 -> 一次性警告
     _unwarn = [t["id"] for t in norm.get("tasks", [])
                if not t.get("runtime") and not any(
