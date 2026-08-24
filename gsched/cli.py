@@ -493,6 +493,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "retry_transform": t["retry_transform"],
                 "probes": t["probes"],
                 "max_parallel": t.get("max_parallel"),
+                # B13: 透传新增任务级字段 (漏传 = 功能静默失效, force_rerun 曾中招)
+                "_force_rerun": t.get("_force_rerun"),
+                "progress_regex": t.get("progress_regex"),
             }
             state.insert_task(
                 conn, bid, t["id"], 1, spec_json, i,
@@ -753,6 +756,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "resources": res,
                     "retries": j["retries"], "failure": j["failure"],
                     "started_at": j["started_at"], "finished_at": j["finished_at"],
+                    "progress": (j["progress"] if "progress" in j.keys() else None),
                 }
             )
         gpus = conn.execute("SELECT * FROM gpus ORDER BY idx").fetchall()
@@ -795,7 +799,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # P4: running 任务进度列 (从日志尾部 best-effort 解析 epoch/trial)
         prog = ""
         if j["status"] == "running":
-            p = _job_progress(j["batch"], j["task"], j["version"])
+            # B13-§5: progress_regex 解析结果优先, 回退 P4 启发式 (epoch/trial)
+            p = j.get("progress") or _job_progress(j["batch"], j["task"], j["version"])
             if p:
                 prog = f" {p}"
         fail = f" ({j['failure']})" if j["failure"] else ""
@@ -813,7 +818,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                     dur = f"{int((b - a).total_seconds())}s"
                 except (ValueError, TypeError):
                     pass
-            print(f"      v{j['version']}  start={t0}  end={t1}  耗时={dur}")
+            pj = j.get("progress") or _job_progress(j["batch"], j["task"], j["version"]) \
+                if j["status"] == "running" else None
+            print(f"      v{j['version']}  start={t0}  end={t1}  耗时={dur}"
+                  + (f"  进度={pj}" if pj else ""))
     print("=== GPU ===")
     for g in out["gpus"]:
         q = " QUARANTINED" if g["quarantined"] else ""
@@ -961,6 +969,31 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     - 下游依赖告警 (Q4): 上游取消后有 cancelled 终态, 依赖它的批次将永久挂起
     """
     ref = args.batch
+    # B13-§6d: 项目级批量取消 —— sched cancel --project <name> --yes
+    bulk_proj = getattr(args, "bulk_project", None) or (
+        args.project if not ref else None)
+    if not ref and bulk_proj:
+        if not args.yes:
+            print(f"确认取消项目 {bulk_proj} 的全部 active/blocked 批次? 加 --yes 执行")
+            return 1
+        with state.connect() as conn:
+            rows = conn.execute(
+                "SELECT name FROM batches WHERE project=?"
+                " AND status IN ('queued','active','blocked')",
+                (bulk_proj,),
+            ).fetchall()
+        if not rows:
+            print(f"项目 {bulk_proj} 无可取消批次")
+            return 0
+        print(f"项目 {bulk_proj}: {len(rows)} 个批次待取消")
+        rc = 0
+        for r in rows:
+            args.batch = r["name"]   # 复用按名解析路径
+            rc = cmd_cancel(args) or rc
+        return rc
+    if not ref:
+        print("用法: sched cancel <batch>[:task] 或 cancel --project <name>", file=sys.stderr)
+        return 1
     if not args.yes:
         print(f"确认取消 {ref}? 加 --yes 执行 (转发 daemon: 先写 kill_reason 再 killpg)")
         return 1
@@ -1261,6 +1294,62 @@ def _warn_colocate_disabled(norm: dict, cfg: dict) -> None:
             f"⚠️ 项目 {norm['project']} 已禁用 colocate:"
             " gpu_share 任务将按独占运行 (装箱声明被忽略)"
         )
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    """sched clean <batch>: 清除批次全部版本的产物指纹 (B13-§4c).
+
+    之后对该批次的 submit/resubmit 不再命中 SKIP, 任务强制重跑.
+    不删除产物文件本身 —— 只清"指纹匹配记录"; 需要连产物一起清理时手动删文件.
+    """
+    b = _batch_id_from_name(args.batch)
+    if not b:
+        print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+        return 1
+    if not args.yes:
+        print(f"确认清除 {b} 的全部产物指纹? 加 --yes 执行")
+        return 1
+    with state.connect() as conn:
+        # 最新版本任务声明的产物文件一并删除 —— 否则产物仍有效时,
+        # 新提交的自洽指纹照样 SKIP (B13-§4 语义修正的配套)
+        removed = []
+        trows = conn.execute(
+            "SELECT spec FROM tasks WHERE batch_id=?"
+            " AND version=(SELECT MAX(version) FROM tasks WHERE batch_id=?)",
+            (b, b),
+        ).fetchall()
+        for tr in trows:
+            try:
+                spec = json.loads(tr["spec"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            cwd = spec.get("cwd_abs") or "."
+            for a in (spec.get("artifacts") or {}).values():
+                ap = str(a.get("path", ""))
+                if not ap:
+                    continue
+                if not os.path.isabs(ap):
+                    ap = os.path.normpath(os.path.join(cwd, ap))
+                if os.path.isfile(ap):
+                    try:
+                        os.remove(ap)
+                        removed.append(ap)
+                    except OSError:
+                        pass
+        cur = conn.execute(
+            "UPDATE jobs SET fingerprint=NULL, stage_fingerprints=NULL"
+            " WHERE batch_id=?",
+            (b,),
+        )
+        n = cur.rowcount
+        conn.execute(
+            "UPDATE jobs SET status='pending' WHERE batch_id=? AND status='skip'",
+            (b,),
+        )
+    for ap in removed[:10]:
+        print(f"  已删产物: {ap}")
+    print(f"✅ 已清除 {n} 个任务的指纹并删除 {len(removed)} 个产物 ({b}); 后续将重跑")
+    return 0
 
 
 def cmd_config_reload(args: argparse.Namespace) -> int:
@@ -1863,7 +1952,10 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_markers)
 
     p = sub.add_parser("cancel", help="取消 (组级 kill)")
-    p.add_argument("batch", help="<batch> 或 <batch>:<task>")
+    p.add_argument("batch", nargs="?", default=None,
+                   help="<batch> 或 <batch>:<task> (与 --project 二选一)")
+    p.add_argument("--project", default=None,
+                   help="批量取消: 该项目全部 active/blocked 批次 (需 --yes)")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_cancel)
 
@@ -1874,6 +1966,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("diag", help="一站式失败诊断 (状态+命令+git+日志)")
     p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部非 done/skip)")
     p.set_defaults(fn=cmd_diag)
+
+    p = sub.add_parser("clean", help="清除批次产物指纹 (强制后续重跑)")
+    p.add_argument("batch", help="批次名或 id")
+    p.add_argument("--yes", action="store_true", help="确认执行")
+    p.set_defaults(fn=cmd_clean)
 
     p = sub.add_parser("config", help="配置管理 (B12-a 热更新)")
     sub_cfg = p.add_subparsers(dest="config_cmd", required=True)

@@ -59,10 +59,54 @@ class Executor:
     def __init__(
         self,
         on_progress: Callable[[str], None] | None = None,
+        sanitize_env: bool = True,
     ):
         self.on_progress = on_progress  # 第 3 层: 从日志行解析进度 (best-effort)
+        # B13-§1: conda 环境净化开关 (daemon 自身激活的 env 会经 os.environ
+        # 泄漏给子任务 —— LD_LIBRARY_PATH/CONDA_PREFIX 抢载导致跨 env import 冲突)
+        self.sanitize_env = sanitize_env
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
+
+    @staticmethod
+    def _detect_conda_env(cmd: list[str] | None, stages: list[dict] | None):
+        """从 cmd/stages 探测 conda env 解释器 (/envs/<name>/bin/python) -> env 根目录."""
+        tokens = [str(t) for t in (cmd or [])]
+        for st in stages or []:
+            tokens.extend(str(t) for t in (st.get("cmd") or []))
+        for t in tokens:
+            if "/envs/" in t:
+                head, tail = t.split("/envs/", 1)
+                seg = tail.split("/")
+                if seg and seg[0]:
+                    return os.path.join(head, "envs", seg[0])
+        return None
+
+    def _sanitize_conda_env(
+        self, merged_env: dict, cmd: list[str] | None, stages: list[dict] | None
+    ) -> None:
+        """B13-§1: 剥离父进程(daemon)的 conda 污染键, 按 VENV 路径注入等效 activate.
+
+        daemon 在某 conda env 下启动时, 其 CONDA_PREFIX/LD_LIBRARY_PATH 会经
+        dict(os.environ) 泄漏给所有子任务 —— {VENV:txl} 的 python 加载到别的
+        env 的 libstdc++/MKL 即 import 冲突。此处剥离污染键并按任务自己的
+        env 注入关键子集 (CONDA_PREFIX/bin/lib), 等效 activate 免去 source
+        conda.sh。batch.json 的 env 字段仍可最终覆盖 (合并顺序在前, 本方法
+        只在键缺失时补 PATH/LD_LIBRARY_PATH 前缀, CONDA_PREFIX 直接覆盖).
+        """
+        env_dir = self._detect_conda_env(cmd, stages)
+        for k in (
+            "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "CONDA_PROMPT_MODIFIER",
+            "CONDA_SHLVL", "CONDA_PYTHON_EXE",
+        ):
+            merged_env.pop(k, None)
+        if not env_dir:
+            return
+        merged_env["CONDA_PREFIX"] = env_dir
+        merged_env["PATH"] = env_dir + "/bin:" + merged_env.get("PATH", "")
+        lib = env_dir + "/lib"
+        ldl = merged_env.get("LD_LIBRARY_PATH", "")
+        merged_env["LD_LIBRARY_PATH"] = f"{lib}:{ldl}" if ldl else lib
 
     def launch(
         self,
@@ -94,6 +138,8 @@ class Executor:
         merged_env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
         merged_env.setdefault("PYTHONUNBUFFERED", "1")
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
+        if self.sanitize_env:
+            self._sanitize_conda_env(merged_env, cmd, stages)
 
         if stages is not None:
             # §3.4c 断点续跑: 已成功的 stage (产物已存在) 跳过, 只从失败 stage 起重跑

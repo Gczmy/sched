@@ -52,7 +52,8 @@ class Dispatcher:
         self.log = open(
             os.path.join(self.host_dir, "scheduler.log"), "a", encoding="utf-8"
         )
-        self.executor = Executor()
+        # B13-§1: 环境净化默认开 (sanitize_env: false 可关回旧行为)
+        self.executor = Executor(sanitize_env=bool(cfg.get("sanitize_env", True)))
         # gpus 归一化 (2026-08-17 缺口 1/2): 纯卡号数组或 {idx,mem_gib} 对象数组;
         # config 未配 -> Allocator 自动探测全卡 (定案 1 第三级回退)
         from .config import parse_gpus
@@ -63,7 +64,8 @@ class Dispatcher:
         )
         # B12-c: 每卡共享打包上限 (热键, 热更新时刷新)
         self._gpu_max_jobs = gpu_max_jobs
-        self._cap_warned: set[str] = set()   # 已告警过"等打包上限"的 job (warn-once)
+        self._cap_warned: set[str] = set()
+        self._last_progress_scan = 0.0   # B13-§5: 进度扫描节流   # 已告警过"等打包上限"的 job (warn-once)
         # venv 路径映射 (指纹用)
         self.venv_paths = cfg.get("venvs", {})
         # 空转自动退出 (定案 38): 默认 360min (6h), 0 = 禁用; last_activity 内存态,
@@ -151,7 +153,9 @@ class Dispatcher:
         self._stop_requested = True
 
     def log_line(self, msg: str) -> None:
-        line = f"[{state.now()}] {msg}"
+        # B13-§6c: 毫秒精度 (并发问题排查); state.now() 保持秒级 (DB 字段兼容)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        line = f"[{ts}] {msg}"
         print(line, flush=True)
         self.log.write(line + "\n")
         self.log.flush()
@@ -410,6 +414,7 @@ class Dispatcher:
         for g in _to:
             self._diag_unreleased(g)  # 事故记录 4 建议 3: 超时未释放 -> 诊断输出
         self._l3_freeze_sample()
+        self._scan_progress()   # B13-§5: 进度正则解析 (30s 节流)
         moved = self.allocator.probe_free()
         for g in moved:
             if self._gpu_ignored(g):
@@ -611,7 +616,7 @@ class Dispatcher:
                 # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
                 # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
-                if self._should_skip(spec, j):
+                if self._should_skip(conn, spec, j):
                     state.update_job(
                         conn, j["id"], status="done",
                         finished_at=state.now(),
@@ -632,6 +637,49 @@ class Dispatcher:
     # ---------- reap ----------
 
     # ---------- B12-a: 配置热更新 (colocate_finetune_hotreload_research.md §2) ----------
+
+    def _scan_progress(self) -> None:
+        """B13-§5: 对声明 progress_regex 的运行任务, 从日志尾部提取最新进度."""
+        now_t = time.time()
+        if now_t - self._last_progress_scan < 10:
+            return
+        self._last_progress_scan = now_t
+        import re as _re
+
+        with state.connect() as conn:
+            rows = conn.execute(
+                "SELECT j.id, j.batch_id, j.task_id, j.version, j.progress, t.spec"
+                " FROM jobs j JOIN tasks t"
+                "   ON t.batch_id=j.batch_id AND t.id=j.task_id AND t.version=j.version"
+                " WHERE j.status='running'"
+            ).fetchall()
+            for r in rows:
+                try:
+                    spec = json.loads(r["spec"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                rx = spec.get("progress_regex")
+                if not rx:
+                    continue
+                log_path = os.path.join(
+                    self.host_dir, "logs", r["batch_id"],
+                    f"{r['task_id']}-v{r['version']}.log",
+                )
+                try:
+                    text = read_tail(log_path, 4096)
+                except OSError:
+                    continue
+                last = None
+                try:
+                    for m in _re.finditer(str(rx), text):
+                        last = m
+                except _re.error:
+                    continue  # 非法正则: 静默跳过 (校验期已拦大部分)
+                if last is None:
+                    continue
+                val = last.group(0)[:120]
+                if r["progress"] != val:
+                    state.update_job(conn, r["id"], progress=val)
 
     def _maybe_reload_config(self) -> None:
         """每 tick stat 一次 config.json, mtime 变化则重载.
@@ -1632,15 +1680,19 @@ class Dispatcher:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
         # 产物指纹 skip 判据 (A2 + O3): 指纹有效 且 规则校验通过 -> skip
-        if self._should_skip(spec, j):
+        if self._should_skip(conn, spec, j):
             state.update_job(conn, j["id"], status="skip", finished_at=state.now())
-            self.log_line(f"job {j['id']} skip (产物指纹有效, 不执行)")
+            self.log_line(
+                f"job {j['id']} skip (产物指纹有效, 不执行)"
+                f" 匹配版本 git_rev={str(j['git_rev'] or '-')[:8]}"
+                " —— 若为改码后误 SKIP: 确认已 commit, 或 submit 加 \"force_rerun\": true"
+            )
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
 
         # 半成品清理 (§3.2): 产物存在但无效 (指纹不匹配/规则不过) -> 删除后启动
-        self._clean_stale_artifacts(spec, j)
+        self._clean_stale_artifacts(conn, spec, j)
 
         # 显存峰值回写通道 (定案 39 profile 协议, daemon 侧注入):
         #   注入 SCHED_PROFILE_OUT=<host_dir>/profiles/<job_id>.json, 训练侧写
@@ -1679,16 +1731,29 @@ class Dispatcher:
         self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
         return True
 
-    def _should_skip(self, spec: dict, j) -> bool:
-        """A2/O3: 产物指纹有效 且 规则校验通过 -> skip."""
+    def _should_skip(self, conn, spec: dict, j) -> bool:
+        """A2/O3: 产物指纹有效 且 规则校验通过 -> skip.
+
+        B13-§4: batch.json 声明 "force_rerun": true 时跳过 SKIP 判定强制重跑.
+        """
+        if spec.get("_force_rerun"):
+            return False
         artifacts = spec.get("artifacts", {})
         if not artifacts:
             return False
-        if not self._fingerprint_matches(spec, j):
+        if not self._fingerprint_matches(conn, spec, j):
             return False
         return self._check_artifacts(artifacts, spec.get("cwd_abs") or ".")
 
-    def _fingerprint_matches(self, spec: dict, j) -> bool:
+    def _fingerprint_matches(self, conn, spec: dict, j) -> bool:
+        """B13-§4 语义修正: 对照"产物生产者"的指纹, 而非本行自比.
+
+        旧实现 cur == j["fingerprint"] 是提交时/派发时两次对同一树状态采样,
+        永远自洽 —— 改码后 resubmit 照样 SKIP (SelfDistOTS 实际踩坑).
+        正确语义: 磁盘上的产物由同 task 最新终态版本 (done/skip) 生产,
+        其提交时指纹才是"产物的代码版本"; 当前态指纹与之不同 => 产物过期须重跑.
+        无前序终态版本 (首跑) 时回退自比较 (保持既有行为).
+        """
         if not j["fingerprint"]:
             return False
         try:
@@ -1698,9 +1763,21 @@ class Dispatcher:
             )
         except Exception:
             return False
-        return cur == j["fingerprint"]
+        # 产物生产者 = 同项目同任务名最近一个终态 job (跨批次实例:
+        # 每次 submit 都生成新 batch id, 同 batch 内永远没有"前序版本")
+        prev = conn.execute(
+            "SELECT j.fingerprint FROM jobs j"
+            " WHERE j.project=? AND j.task_id=?"
+            "   AND j.status IN ('done','skip') AND j.fingerprint IS NOT NULL"
+            "   AND j.id != ?"
+            " ORDER BY j.finished_at DESC, j.rowid DESC LIMIT 1",
+            (j["project"] if "project" in j.keys() else None,
+             j["task_id"], j["id"]),
+        ).fetchone()
+        ref_fp = prev["fingerprint"] if prev and prev["fingerprint"] else j["fingerprint"]
+        return cur == ref_fp
 
-    def _clean_stale_artifacts(self, spec: dict, j) -> None:
+    def _clean_stale_artifacts(self, conn, spec: dict, j) -> None:
         """§3.2 半成品: 产物存在但指纹/规则无效 -> 删除后启动."""
         from .artifacts import check_artifact
 
@@ -1710,7 +1787,7 @@ class Dispatcher:
             if p and not os.path.isabs(p):
                 p = os.path.normpath(os.path.join(cwd, p))
             if os.path.exists(p):
-                ok = self._fingerprint_matches(spec, j) and (
+                ok = self._fingerprint_matches(conn, spec, j) and (
                     check_artifact(p, a) is None
                 )
                 if not ok:

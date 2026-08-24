@@ -127,10 +127,21 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
 
     norm_tasks = []
     seen_ids: set[str] = set()
+    force_rerun = spec.get("force_rerun", False)
+    if not isinstance(force_rerun, bool):
+        raise SchemaError("force_rerun: 必须是布尔")
     for i, t in enumerate(tasks):
         nt = _validate_task(t, cfg, batch_cwd_abs, f"tasks[{i}]", seen_ids)
         if batch_max_parallel is not None:
             nt["max_parallel"] = batch_max_parallel
+        if force_rerun:
+            nt["_force_rerun"] = True   # B13-§4: 强制重跑 (跳过 SKIP 判定)
+        # B13-§5: 进度正则 (daemon 周期从日志尾部提取, status 可视化)
+        prx = t.get("progress_regex")
+        if prx is not None:
+            if not isinstance(prx, str) or not prx.strip():
+                raise SchemaError(f"tasks[{i}].progress_regex: 必须是非空字符串")
+            nt["progress_regex"] = prx
         norm_tasks.append(nt)
 
     project = spec.get("project")

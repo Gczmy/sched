@@ -31,6 +31,30 @@ def check_artifact(path: str, rule: dict[str, Any] | None) -> str | None:
                 json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             return f"JSON 解析失败: {e}"
+    # B13-§2: has_key (JSON 键存在, 支持点路径) / regex (文本匹配) —— 小结果文件
+    # 用 check:json 或 has_key 替代 min_bytes, 避免"有效但小"被误判
+    hk = rule.get("has_key")
+    if hk is not None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            return f"has_key 前置: JSON 解析失败: {e}"
+        cur: Any = data
+        for part in str(hk).split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return f"缺少键: {hk}"
+    rx = rule.get("regex")
+    if rx is not None:
+        import re as _re
+        try:
+            text = open(path, "r", encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            return f"读取失败: {e}"
+        if not _re.search(str(rx), text):
+            return f"未匹配正则: {rx}"
     return None
 
 

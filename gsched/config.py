@@ -196,12 +196,12 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
 
     # co-location (定案 39 待定项 4, 实验性默认关):
     #   co_locate: bool 全局开关; co_locate_safety 安全系数 [0.5,0.85] 默认 0.7;
-    #   co_locate_max_jobs 每卡任务数上限 [2,8] 默认 3; co_locate_freeze_pct L3 冻结阈值 (0,100) 默认 85
+    #   co_locate_max_jobs 每卡任务数上限 [2,64] 默认 3; co_locate_freeze_pct L3 冻结阈值 (0,100) 默认 85
     if cfg.get("co_locate") is not None and not isinstance(cfg["co_locate"], bool):
         raise ConfigError(f"{p}: co_locate 必须是布尔 (全局开关)")
     for k, lo, hi, dfl in (
         ("co_locate_safety", 0.5, 0.85, 0.7),
-        ("co_locate_max_jobs", 2, 8, 3),
+        ("co_locate_max_jobs", 2, 64, 3),   # B13-§3: 轻任务场景放宽; 细粒度走卡级/项目级 max_jobs
         ("co_locate_freeze_pct", 1, 100, 85),
     ):
         v = cfg.get(k)

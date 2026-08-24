@@ -59,9 +59,30 @@ def compute_fingerprint(
         # 自动探测: 非 git 目录 -> 不做代码版本指纹 (§3.2 约定)
         use_code = False
 
+    # B13-§4: dirty-tree hash —— 工作区有未提交改动时并入指纹.
+    # 只在"脏"时才入哈希: 干净树的指纹与旧版完全一致, 升级不触发全量重跑;
+    # 脏树指纹必变 -> "改了代码没 commit 就 resubmit 还 SKIP"的隐蔽陷阱消除.
+    dirty_hash = None
+    if use_code and rev is not None:
+        try:
+            # -uno: 忽略未跟踪文件 —— 任务产物/临时文件写进仓库不该使指纹变脏;
+            # 只感知已跟踪文件的修改 (真正的代码改动)
+            dout = subprocess.run(
+                ["git", "-C", cwd, "status", "--porcelain", "-uno"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if dout.returncode == 0 and dout.stdout.strip():
+                dirty_hash = hashlib.sha256(dout.stdout.encode()).hexdigest()[:16]
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+
     def fp_for(cmd_list: list[str]) -> str:
         resolved = [resolve_venv(t) for t in cmd_list]
-        payload = json.dumps({"cmd": resolved, "rev": rev if use_code else None})
+        payload = json.dumps({
+            "cmd": resolved,
+            "rev": rev if use_code else None,
+            "dirty": dirty_hash,   # None = 干净树 (与历史指纹兼容)
+        })
         return hashlib.sha256(payload.encode()).hexdigest()
 
     if stages is not None:

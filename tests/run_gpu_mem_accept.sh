@@ -67,7 +67,7 @@ PARSE_OK=$(SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json $PY -c "
 import sys; sys.path.insert(0, 'sched')
 from gsched.config import load_config, parse_gpus
 cfg = load_config()
-idxs, mem = parse_gpus(cfg)
+idxs, mem, _mj = parse_gpus(cfg)
 assert idxs == [0, 1, 2], idxs
 assert mem == {0: 24.0, 1: 16.0, 2: 16.0}, mem
 print('OK')
@@ -118,7 +118,7 @@ PARSE2=$(SCHED_STATE=$S2 SCHED_CONFIG=$S2/config.json $PY -c "
 import sys; sys.path.insert(0, 'sched')
 from gsched.config import load_config, parse_gpus
 cfg = load_config()
-idxs, mem = parse_gpus(cfg)
+idxs, mem, _mj = parse_gpus(cfg)
 assert idxs == [0, 1] and mem == {}, (idxs, mem)
 print('OK')
 ")

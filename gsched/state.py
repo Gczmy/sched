@@ -188,6 +188,7 @@ def init_db() -> str:
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
+        migrate_job_progress(conn)
     return p
 
 
@@ -226,6 +227,13 @@ def migrate_project_columns(conn: sqlite3.Connection) -> None:
     bcols = [r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()]
     if "priority" not in bcols:
         conn.execute("ALTER TABLE batches ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+
+def migrate_job_progress(conn: sqlite3.Connection) -> None:
+    """B13-§5: jobs.progress 列 (progress_regex 周期解析的最新进度串). 幂等."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "progress" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN progress TEXT")
+
 
 def migrate_incidents(conn: sqlite3.Connection) -> None:
     """OOM 事故快照表 (调研 F2): 幂等补建 (init_db 与旧库升级共用)."""
