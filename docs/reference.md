@@ -183,7 +183,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `history [batch] [--status] [--limit]` | 历史 | |
 | `log <b>:<t> [-f] [-n N]` | 任务日志 | |
 | `diag <b>[:t]` | 失败诊断（首选）| |
-| `incidents [id] [--job --gpu]` | OOM 事故快照 | |
+| `incidents [id] [--json] [--job --gpu]` | OOM 事故快照（--json 供看板/脚本）| |
 | `retry <batch>` | 解锁失败终态重跑（同 spec）| |
 | `resubmit <b>:<t>` / `<batch> [--failed\|--all] [--dry-run]` | 新版本排队尾；支持批次级批量 | discarded 批次守卫；blocked 自动回 active |
 | `cancel <b>[:t] --yes` / `cancel --project P --yes` | 取消 | 后者连带 blocked 批次的 pending |
