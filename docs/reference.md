@@ -113,13 +113,17 @@ sched resubmit <batch>:<task>            # 新版本排队尾
 batch.json 加 `"force_rerun": true` 后重新 submit；或清指纹：
 `sched clean <batch> --yes`（同时删除声明产物）。
 
-### R5 只重跑失败的任务
+### R5 重跑失败/全部任务
 
 ```bash
-sched retry <batch>          # 失败终态 -> pending 重跑（同 spec）
+sched retry <batch>                    # 解锁失败终态 -> pending 重跑（同 spec, 批次回 active）
+sched resubmit <batch> --failed        # 失败终态任务各生成新版本排队尾
+sched resubmit <batch> --all           # 全部任务重跑
+sched resubmit <batch> --failed --dry-run   # 预览将重跑的清单
+sched resubmit <batch>:<task>          # 单任务精确定位
 ```
-批量 resubmit（`--failed`/`--all`）为规划中功能，当前逐个：
-`sched resubmit <batch>:<task>`。
+选择建议：改 spec 无效想换实现用 retry（同 spec）；代码已更新想以新代码重试用
+resubmit（新指纹）。blocked 批次 resubmit 后自动回 active。
 
 ### R6 退役被取代的旧批次
 
@@ -158,7 +162,8 @@ status 自动展示；长任务声明 `progress_regex` 更精确。
 | `log <b>:<t> [-f] [-n N]` | 任务日志 | |
 | `diag <b>[:t]` | 失败诊断（首选）| |
 | `incidents [id] [--job --gpu]` | OOM 事故快照 | |
-| `retry <batch>` / `resubmit <b>:<t>` | 重跑 | discarded 批次被守卫拒绝 |
+| `retry <batch>` | 解锁失败终态重跑（同 spec）| |
+| `resubmit <b>:<t>` / `<batch> [--failed\|--all] [--dry-run]` | 新版本排队尾；支持批次级批量 | discarded 批次守卫；blocked 自动回 active |
 | `cancel <b>[:t] --yes` / `cancel --project P --yes` | 取消 | 后者连带 blocked 批次的 pending |
 | `discard <batch> --yes` | 退役 blocked/queued 批次 | 仅拒 running；证据保留 |
 | `clean <batch> --yes` | 清指纹+删产物 | 配合强制重跑 |
