@@ -136,6 +136,17 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
             nt["max_parallel"] = batch_max_parallel
         if force_rerun:
             nt["_force_rerun"] = True   # B13-§4: 强制重跑 (跳过 SKIP 判定)
+        # B15: runtime 三通道解析 (提交期即校验存在性)
+        rt = t.get("runtime")
+        if rt is not None:
+            from .config import ConfigError as _CE, resolve_runtime as _rr
+
+            try:
+                prefix = _rr(rt, cfg)
+            except _CE as e:
+                raise SchemaError(f"tasks[{i}].runtime: {e}")
+            nt["runtime"] = rt
+            nt["runtime_prefix"] = prefix
         # B13-§5: 进度正则 (daemon 周期从日志尾部提取, status 可视化)
         prx = t.get("progress_regex")
         if prx is not None:
@@ -204,12 +215,9 @@ def _validate_task(
         if not isinstance(cmd, list) or not cmd:
             raise SchemaError(f"{where}: 必须提供 cmd 数组 (或 stages 数组)")
         _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd")
-        # 解释器必须是 {VENV:...} 模板 (venv 不单设字段)
-        if not str(cmd[0]).startswith("{VENV:"):
-            raise SchemaError(
-                f"{where}.cmd[0]: 解释器必须用 {{VENV:<name>}} 模板"
-                " (I 类, venv 不单设字段)"
-            )
+        # B15: I 类规则放宽 —— cmd[0] 自由格式。环境声明走可选 runtime 字段
+        # (三通道) 或保留 {VENV:x} 语法糖；两者皆无 -> 放行, 由调用方打印警告
+        # 并在指纹中省略环境分量 (git rev 仍锚定代码版本)。定案 Q1。
         stage_specs = None
 
     # 产物路径 E4 校验
@@ -312,8 +320,7 @@ def _validate_stage(s: Any, cfg: dict, t_cwd_abs: str, where: str) -> dict:
     if not isinstance(cmd, list) or not cmd:
         raise SchemaError(f"{where}: 缺 cmd 数组")
     _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd")
-    if not str(cmd[0]).startswith("{VENV:"):
-        raise SchemaError(f"{where}.cmd[0]: 解释器必须用 {{VENV:<name>}} 模板")
+    # B15: stage 级同样放开 cmd[0] (runtime 为任务级声明, stages 继承)
 
     artifacts = s.get("artifacts", {})
     if not isinstance(artifacts, dict):

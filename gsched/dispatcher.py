@@ -1714,12 +1714,14 @@ class Dispatcher:
             env=task_env,
             gpu=gpu,
             log_path=log_path,
+            conda_env_dir=spec.get("runtime_prefix"),
         )
         git_rev = None
         try:
             _, _, git_rev = compute_fingerprint(
                 spec.get("cmd"), spec.get("stages"), cwd,
                 spec.get("git"), self.venv_paths,
+                runtime_prefix=spec.get("runtime_prefix"),
             )
         except Exception:
             pass
@@ -1760,6 +1762,7 @@ class Dispatcher:
             cur, _, _ = compute_fingerprint(
                 spec.get("cmd"), spec.get("stages"),
                 spec.get("cwd_abs") or ".", spec.get("git"), self.venv_paths,
+                runtime_prefix=spec.get("runtime_prefix"),
             )
         except Exception:
             return False

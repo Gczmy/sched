@@ -141,6 +141,12 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             raise ConfigError(f"{p}: projects.{proj_name}.max_jobs 必须是正整数"
                               f" (该项目任务在单卡上的打包数上限)")
     # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,8]), 不在此重复
+    ced = cfg.get("conda_envs_dirs")
+    if ced is not None:
+        if not isinstance(ced, list) or not all(
+            isinstance(x, str) and x.strip() for x in ced
+        ):
+            raise ConfigError(f"{p}: conda_envs_dirs 必须是非空字符串数组")
     if "venvs" not in cfg or not isinstance(cfg["venvs"], dict):
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用
@@ -264,3 +270,43 @@ def expand_path(value: str, cfg: dict[str, Any], base_cwd: str | None = None) ->
         cfg.get("default_project", "{ROOT}"), cfg
     )
     return os.path.normpath(os.path.join(base, expanded))
+
+
+def resolve_runtime(rt: Any, cfg: dict[str, Any]) -> str:
+    """B15: 解析任务级 runtime 声明 -> 环境前缀目录. 三通道恰选其一.
+
+      {"venv_alias": "k"}       查 config.venvs 注册表, 解释器路径上两级为前缀
+      {"conda_env": "timerxl"}  依次查 conda_envs_dirs 下同名目录
+      {"prefix": "/abs/path"}   直接前缀
+    """
+    import os as _os
+
+    if not isinstance(rt, dict):
+        raise ConfigError("runtime 必须是对象")
+    channels = {k: rt[k] for k in ("venv_alias", "conda_env", "prefix") if rt.get(k)}
+    if len(channels) != 1:
+        raise ConfigError(
+            "runtime 需要且仅需一个通道: venv_alias / conda_env / prefix"
+            f" (收到: {sorted(rt.keys())})"
+        )
+    if "venv_alias" in channels:
+        name = str(channels["venv_alias"])
+        py = (cfg.get("venvs") or {}).get(name)
+        if not py:
+            known = ", ".join(sorted((cfg.get("venvs") or {}).keys())) or "(无)"
+            raise ConfigError(f"runtime.venv_alias '{name}' 未在 config.venvs 中定义 (可选: {known})")
+        return _os.path.dirname(_os.path.dirname(str(py)))
+    if "conda_env" in channels:
+        name = str(channels["conda_env"])
+        dirs = list(cfg.get("conda_envs_dirs") or ["~/miniconda3/envs"])
+        for d in dirs:
+            cand = _os.path.expanduser(_os.path.join(d, name))
+            if _os.path.isdir(cand):
+                return cand
+        raise ConfigError(
+            f"runtime.conda_env '{name}' 在 conda_envs_dirs {dirs} 中未找到"
+        )
+    pref = _os.path.expanduser(str(channels["prefix"]))
+    if not _os.path.isdir(pref):
+        raise ConfigError(f"runtime.prefix 目录不存在: {pref}")
+    return pref

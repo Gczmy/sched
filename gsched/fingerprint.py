@@ -38,6 +38,7 @@ def compute_fingerprint(
     cwd: str,
     git: bool | None,
     venv_paths: dict[str, str],
+    runtime_prefix: str | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """计算任务指纹.
 
@@ -82,6 +83,7 @@ def compute_fingerprint(
             "cmd": resolved,
             "rev": rev if use_code else None,
             "dirty": dirty_hash,   # None = 干净树 (与历史指纹兼容)
+            "runtime": runtime_prefix,   # B15: 声明了才参与哈希 (环境漂移可审计)
         })
         return hashlib.sha256(payload.encode()).hexdigest()
 

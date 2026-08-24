@@ -83,8 +83,10 @@ class Executor:
         return None
 
     def _sanitize_conda_env(
-        self, merged_env: dict, cmd: list[str] | None, stages: list[dict] | None
+        self, merged_env: dict, cmd: list[str] | None, stages: list[dict] | None,
+        explicit: str | None = None,
     ) -> None:
+        """explicit = 任务 runtime 声明解析出的前缀 (B15), 优先于特征探测."""
         """B13-§1: 剥离父进程(daemon)的 conda 污染键, 按 VENV 路径注入等效 activate.
 
         daemon 在某 conda env 下启动时, 其 CONDA_PREFIX/LD_LIBRARY_PATH 会经
@@ -94,7 +96,7 @@ class Executor:
         conda.sh。batch.json 的 env 字段仍可最终覆盖 (合并顺序在前, 本方法
         只在键缺失时补 PATH/LD_LIBRARY_PATH 前缀, CONDA_PREFIX 直接覆盖).
         """
-        env_dir = self._detect_conda_env(cmd, stages)
+        env_dir = explicit or self._detect_conda_env(cmd, stages)
         for k in (
             "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "CONDA_PROMPT_MODIFIER",
             "CONDA_SHLVL", "CONDA_PYTHON_EXE",
@@ -117,6 +119,7 @@ class Executor:
         gpu: int | None,
         log_path: str,
         on_stage_start: Callable[[int], None] | None = None,
+        conda_env_dir: str | None = None,
     ) -> int:
         """启动任务. 返回 wrapper 进程 PID (pgid 锚点).
 
@@ -139,7 +142,7 @@ class Executor:
         merged_env.setdefault("PYTHONUNBUFFERED", "1")
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
         if self.sanitize_env:
-            self._sanitize_conda_env(merged_env, cmd, stages)
+            self._sanitize_conda_env(merged_env, cmd, stages, explicit=conda_env_dir)
 
         if stages is not None:
             # §3.4c 断点续跑: 已成功的 stage (产物已存在) 跳过, 只从失败 stage 起重跑

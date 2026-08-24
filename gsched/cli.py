@@ -224,7 +224,8 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
                 stages_e.append(cmd_e)
                 # 指纹 (A2): 展开 cmd + git rev + venv
                 fp, _, rev = compute_fingerprint(
-                    None, [{"cmd": cmd_e}], cwd_abs, t["git"], venv_paths
+                    None, [{"cmd": cmd_e}], cwd_abs, t["git"], venv_paths,
+                    runtime_prefix=t.get("runtime_prefix"),
                 )
                 git_rev = rev or git_rev
                 st, why = _pred_stage(cmd_e, s["artifacts"], cwd_abs)
@@ -242,7 +243,8 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
         else:
             cmd_e = _expand_cmd(t["cmd"], None, cwd_abs)
             fp, _, rev = compute_fingerprint(
-                cmd_e, None, cwd_abs, t["git"], venv_paths
+                cmd_e, None, cwd_abs, t["git"], venv_paths,
+                runtime_prefix=t.get("runtime_prefix"),
             )
             git_rev = rev or git_rev
             st, why = _pred_stage(cmd_e, t["artifacts"], cwd_abs)
@@ -299,6 +301,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     # B12-b: 项目级 colocate 禁用提示 (dry-run 与实提交都看得到)
     _warn_colocate_disabled(norm, cfg)
+
+    # B15: 未声明运行环境的任务 -> 一次性警告
+    _unwarn = [t["id"] for t in norm.get("tasks", [])
+               if not t.get("runtime") and not any(
+                   "{VENV:" in str(c) for c in (t.get("cmd") or []))
+               and not any("{VENV:" in str(c) for st in (t.get("stages") or [])
+                           for c in (st.get("cmd") or []))]
+    if _unwarn:
+        print(f"⚠️ 任务 {', '.join(_unwarn)} 未声明运行环境"
+              " ({VENV} 或 runtime 字段), 指纹仅含 git rev")
 
     # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
     with state.connect() as conn:
@@ -496,6 +508,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 # B13: 透传新增任务级字段 (漏传 = 功能静默失效, force_rerun 曾中招)
                 "_force_rerun": t.get("_force_rerun"),
                 "progress_regex": t.get("progress_regex"),
+                "runtime": t.get("runtime"),
+                "runtime_prefix": t.get("runtime_prefix"),
             }
             state.insert_task(
                 conn, bid, t["id"], 1, spec_json, i,
@@ -503,7 +517,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             # Job 指纹 (A2): 指纹用展开后的 cmd (venv 路径入指纹)
             fp, stage_fps, rev = compute_fingerprint(
-                cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {})
+                cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {}),
+                runtime_prefix=t.get("runtime_prefix"),
             )
             state.insert_job(
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
@@ -1231,6 +1246,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
         fp, stage_fps, rev = compute_fingerprint(
             spec.get("cmd"), spec.get("stages"), spec.get("cwd_abs", "."),
             spec.get("git"), {},
+            runtime_prefix=spec.get("runtime_prefix"),
         )
         state.insert_job(
             conn, f"{batch}-{task}-v{new_v}", batch, task, new_v,
@@ -1542,6 +1558,8 @@ def _diag_one(conn, j, cfg: dict) -> None:
     print(f"=== {batch}:{task} (v{j['version']}) ===")
     print(f"  status: {j['status']}  rc: {j['rc'] or '-'}  failure: {j['failure'] or '-'}")
     print(f"  retries: {j['retries']}  gpu: {j['gpu'] or '-'}")
+    if "runtime" in j.keys() and j["runtime"]:
+        print(f"  runtime: {j['runtime']}")
     w = _rev_diff_warn(conn, j)
     if w:
         print(f"  {w}")
@@ -1559,6 +1577,17 @@ def _diag_one(conn, j, cfg: dict) -> None:
             spec = {}
     for line in _diag_cmds(spec, cfg):
         print(f"  cmd: {line}")
+    # B15: 运行时声明展示
+    if spec.get("runtime"):
+        print(f"  runtime: {json.dumps(spec['runtime'], ensure_ascii=False)}"
+              f" -> {spec.get('runtime_prefix', '')}")
+    else:
+        has_venv = any("{VENV:" in str(c)
+                       for c in (spec.get("cmd") or [])) or any(
+            "{VENV:" in str(c) for st in (spec.get("stages") or [])
+            for c in (st.get("cmd") or []))
+        if not has_venv:
+            print("  runtime: 未声明")
     log_path = os.path.join(
         state.default_state_dir(), state.hostname(), "logs", batch,
         f"{task}-v{j['version']}.log",  # C1 修复: 与 dispatcher._job_log_path 同构
