@@ -45,6 +45,10 @@ class Dispatcher:
         os.makedirs(self.host_dir, exist_ok=True)
         self.pid_file = os.path.join(self.host_dir, "daemon.pid")
         self.heartbeat_file = os.path.join(self.host_dir, "daemon.heartbeat")
+        # B26: tick_ok —— heartbeat=活着, tick_ok=主循环在正常完成调度轮
+
+        self.tick_ok_file = os.path.join(self.host_dir, "daemon.tick_ok")
+
         self._prev_hb_ts: float | None = None  # acquire_lock 触心跳前采样 (D4 用)
         self._notify_threads: list[threading.Thread] = []  # 在途通知线程 (退出前 join)
         self._probe_offsets: dict[str, int] = {}  # job_id -> 日志已扫字节偏移 (P2)
@@ -234,6 +238,52 @@ class Dispatcher:
         open(self.heartbeat_file, "a").close()
         os.utime(self.heartbeat_file, None)
 
+    # B26: tick_ok = 调度主循环健康的真信号 (heartbeat 只是进程活性)
+    _touch_tick_ok_ts: float = 0.0
+    _frozen_incident_at: float = 0.0
+
+    def _touch_tick_ok(self) -> None:
+        open(self.tick_ok_file, "a").close()
+        os.utime(self.tick_ok_file, None)
+        self._touch_tick_ok_ts = time.time()
+
+    def tick_ok_age(self) -> float | None:
+        """tick_ok 文件年龄 (秒); 无文件返回 None (daemon 尚未完成过任何 tick)."""
+        try:
+            return max(0.0, time.time() - os.path.getmtime(self.tick_ok_file))
+        except OSError:
+            return None
+
+    def _check_frozen(self) -> None:
+        """tick_ok 停更超 HEARTBEAT_SEC*3 (90s) -> incident + log (10 分钟节流).
+
+        调用点: run() 主循环 sleep 片内 (1s 粒度), 不占 tick 预算.
+        """
+        try:
+            age = self.tick_ok_age()
+        except Exception:
+            return
+        if age is None or age < HEARTBEAT_SEC * 3:
+            return
+        now = time.time()
+        if now - self._frozen_incident_at < 600:
+            return
+        self._frozen_incident_at = now
+        msg = f"daemon 主循环停摆 {int(age)}s 未完成任何 tick (疑似 NFS/nvidia-smi 阻塞)"
+        self.log_line(f"B26 冻结检测: {msg}")
+        try:
+            with state.connect() as conn:
+                state.insert_incident(
+                    conn, ts=state.now(), kind="daemon_frozen",
+                    gpu_idx=None, job_id=None, batch_id=None,
+                    payload_json=json.dumps({
+                        "frozen_sec": int(age),
+                        "verdicts": ["主循环阻塞在探测/NFS; 检查 GPU 健康与 NFS 延迟"],
+                    }, ensure_ascii=False),
+                )
+        except Exception:
+            pass
+
     def _cleanup_lock(self) -> None:
         # 通知线程收尾: 退出前等在途通知发完 (超时则放弃, 记 log)
         for t in self._notify_threads:
@@ -322,6 +372,7 @@ class Dispatcher:
                 if self._idle_check():
                     break
                 self._tick()
+                self._touch_tick_ok()  # B26: tick 完成才写 —— 调度健康真信号
                 tick_failures = 0
             except KeyboardInterrupt:
                 break
@@ -343,6 +394,7 @@ class Dispatcher:
                 if self._stop_requested:
                     break
                 time.sleep(1)
+                self._check_frozen()  # B26: 不占 tick 预算的调度健康看门狗 (1s 粒度)
         self._cleanup_lock()
 
     def _idle_check(self) -> bool:

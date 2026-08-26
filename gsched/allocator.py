@@ -11,6 +11,7 @@ GPU 状态机 (注册表内维护, 唯一权威):
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 from typing import Any
 
@@ -32,6 +33,9 @@ class Allocator:
         self.mem_overrides = mem_overrides or {}  # config.gpus[{idx,mem_gib}] 手动覆盖
         self.fake = fake or bool(os.environ.get("SCHED_FAKE_GPUS"))
         self._uuid_map: dict[str, int] | None = None  # gpu_uuid->idx 缓存 (M8, 建一次)
+        # B26: GPU 健康自愈 —— nvidia-smi 连续异常计数 -> 自动熔断 (2026-08-26 幽灵卡事故)
+        self._probe_fail_streak: dict[int, int] = {}
+        self._auto_quarantine_threshold = 5  # 连续 5 次探测失败 (~50s) 即熔断
         self._mem_cache: dict[int, float] = {}  # 容量进程内缓存 (P3: 静态值, 不重复开 DB 连接)
         if self.fake:
             # 模拟 GPU 数 (0,1,2,3 语义); 支持 "idx:mem" 形式带容量 (GiB, 验收用)
@@ -97,11 +101,13 @@ class Allocator:
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=10,
                 )
+                seen: set[int] = set()
                 for line in out.stdout.splitlines():
                     parts = line.split(",")
                     if len(parts) != 2:
                         continue
                     idx, mi = int(parts[0].strip()), int(parts[1].strip())
+                    seen.add(idx)
                     if idx in self.gpu_list and idx not in self.mem_overrides:
                         gib = round(mi / 1024.0, 1)
                         conn.execute(
@@ -109,6 +115,27 @@ class Allocator:
                             (gib, idx),
                         )
                         self._mem_cache[idx] = gib
+                # B26: 幽灵卡检测 —— config 声明但 nvidia-smi 未见 = 物理缺失,
+                # 立即熔断防派发 (2026-08-26 GPU3 掉线仍显示 free 的事故)
+                for ghost in set(self.gpu_list) - seen:
+                    conn.execute(
+                        "UPDATE gpus SET quarantined=1, updated_at=? WHERE idx=? AND quarantined=0",
+                        (__import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ghost),
+                    )
+                    conn.execute(
+                        "INSERT INTO incidents (ts, kind, gpu_idx, job_id, batch_id, payload)"
+                        " VALUES (?, 'gpu_ghost', ?, NULL, NULL, ?)",
+                        (
+                            __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            ghost,
+                            json.dumps({
+                                "verdicts": [
+                                    "config.gpus 声明该卡但 nvidia-smi 未列出 —— 物理掉线/驱动异常;",
+                                    "已自动熔断禁止派发; 硬件恢复后 sched gpu-ok 解除",
+                                ],
+                            }, ensure_ascii=False),
+                        ),
+                    )
             except (subprocess.SubprocessError, ValueError, FileNotFoundError):
                 pass
 
@@ -356,9 +383,13 @@ class Allocator:
                 timeout=10,
             )
             if out.returncode != 0:
+                self._note_probe_fail(idx)
                 return None
-            return int(out.stdout.strip().splitlines()[0])
+            val = int(out.stdout.strip().splitlines()[0])
+            self._note_probe_ok(idx)
+            return val
         except (subprocess.SubprocessError, ValueError, IndexError, FileNotFoundError):
+            self._note_probe_fail(idx)
             return None
 
     # ---------- 注册表状态机 (唯一权威) ----------
@@ -543,6 +574,45 @@ class Allocator:
         flag = self._confirm_flag("release_confirm", idx)
         if os.path.exists(flag):
             os.unlink(flag)
+
+    # ── B26: GPU 健康自愈 (2026-08-26 幽灵卡事故: nvidia-smi 对掉线卡挂起) ──
+
+    def _note_probe_fail(self, idx: int) -> None:
+        """记录一次探测失败; 连续超阈值 -> 自动熔断该卡 (写 quarantined)."""
+        if self.fake:
+            return
+        try:
+            streak = self._probe_fail_streak.get(idx, 0) + 1
+            self._probe_fail_streak[idx] = streak
+            if streak < self._auto_quarantine_threshold:
+                return
+            self._probe_fail_streak[idx] = 0  # 只熔断一次; 恢复走 gpu-ok 人工通道
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE gpus SET quarantined=1, updated_at=? WHERE idx=? AND quarantined=0",
+                    (__import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"), idx),
+                )
+                conn.execute(
+                    "INSERT INTO incidents (ts, kind, gpu_idx, job_id, batch_id, payload)"
+                    " VALUES (?, 'gpu_probe_failed', ?, NULL, NULL, ?)",
+                    (
+                        __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        idx,
+                        json.dumps({
+                            "streak": self._auto_quarantine_threshold,
+                            "verdicts": ["nvidia-smi 连续异常 -> 自动隔离; 排查硬件后 sched gpu-ok 解除"],
+                        }, ensure_ascii=False),
+                    ),
+                )
+                import sys as _sys
+                print(f"[allocator] B26 GPU{idx} 连续 {self._auto_quarantine_threshold} 次探测失败 -> 自动熔断",
+                      file=_sys.stderr)
+        except Exception:
+            pass  # 自愈路径绝不反噬主循环
+
+    def _note_probe_ok(self, idx: int) -> None:
+        """采样成功 -> 清零失败计数."""
+        self._probe_fail_streak.pop(idx, None)
 
     def _reset_occupied(self, idx: int) -> None:
         """中断 unmanaged 连续计数 (采样干净/查询失败, 审查 M10)."""

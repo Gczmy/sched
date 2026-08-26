@@ -691,6 +691,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _daemon_health() -> dict[str, Any]:
+    """B26: 读取 daemon 心跳/tick_ok 文件年龄 (CLI 侧只读文件, 不开 DB)."""
+    import os as _os
+    from .config import default_state_dir as _dsd
+    host = None
+    try:
+        cfg = _load_cfg()
+        host = cfg.get("node")
+    except Exception:
+        pass
+    if not host:
+        return {}
+    base = _os.path.join(_dsd(), str(host))
+    def _age(name: str):
+        try:
+            return round(max(0.0, time.time() - _os.path.getmtime(_os.path.join(base, name))), 1)
+        except OSError:
+            return None
+    hb_age = _age("daemon.heartbeat")
+    tick_age = _age("daemon.tick_ok")
+    return {
+        "heartbeat_age_s": hb_age,
+        "tick_ok_age_s": tick_age,
+        # 冻结判定: tick_ok 超 90s 未更新 (阈值同 dispatcher._check_frozen)
+        "frozen": bool(tick_age is not None and tick_age > 90),
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """sched status [batch]: 三视图总览 + --json + --project (B11c)."""
     cfg = _load_cfg()
@@ -701,6 +729,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"错误: project 未在 config.projects 中定义: {proj_filter} (可选: {known})",
               file=sys.stderr)
         return 1
+    # B26: 调度健康可见性 —— hb=进程活性, tick_ok=主循环真的在完成调度轮
+    out["daemon_health"] = _daemon_health()
+
     with state.connect() as conn:
         batches = conn.execute(
             "SELECT * FROM batches ORDER BY created_at DESC"
