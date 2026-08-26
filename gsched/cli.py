@@ -535,6 +535,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 fp, stage_fps, norm.get("project"),
             )
 
+    # BugFix (2026-08-26, sd_repro_v3 消失事故): "已入队"/ensure_running 此前
+    # 在 with 事务块**内部** —— commit 发生在块退出时, 若 ensure_running 抛
+    # 异常 (如 NFS 读配置瞬断 -> ConfigError), 整个事务回滚但 "已入队" 已
+    # 打印, 用户以为成功实际批次消失。打印必须在提交之后。
     print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
     from . import daemon
     print(daemon.ensure_running())  # 定案 38: daemon 未运行自动拉起 (idle 退出后)
@@ -2395,6 +2399,33 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "fn", None):
         ap.print_help()
         return 1
+    # B24d (2026-08-26, sd_repro_v3 丢失事故): 写操作跨主机执行 = 静默丢数据。
+    # state.db 在 NFS 上以 WAL 模式被双主机共享 (网关 CLI 写 + 计算节点 daemon
+    # 读/写/检查点), SQLite 官方明确不支持此场景 —— 跨主机锁不可靠时, 网关提交
+    # 的事务会被 daemon 的检查点静默抹掉 (已实测 100% 复现)。写操作必须在
+    # config.node 所指的计算节点上执行; 违反则拒绝并给出明确指引。
+    _WRITE_COMMANDS = {
+        "submit", "run", "cancel", "retry", "resubmit", "discard", "clean",
+        "config", "gpu-ok", "gpu-free", "gpu-ignore", "gpu-set-mem",
+    }
+    if getattr(args, "cmd", None) in _WRITE_COMMANDS and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
+        try:
+            from .config import load_config as _lc
+            import socket as _socket
+            _node = str(_lc().get("node") or "")
+            if _node and _socket.gethostname() != _node:
+                print(
+                    f"错误: 写操作 ({args.cmd}) 必须在计算节点 {_node} 上执行,"
+                    f" 当前在登录节点 {_socket.gethostname()}。\n"
+                    "原因: state.db 经 NFS 双主机共享时 WAL 跨主机锁不可靠,"
+                    " 登录节点提交的事务会被 daemon 检查点静默抹掉。\n"
+                    f"做法: 进入计算节点会话 (screen/srun) 后再执行 sched {args.cmd}? "
+                    f"(确知风险强制继续: SCHED_ALLOW_FOREIGN_WRITE=1)",
+                    file=sys.stderr,
+                )
+                return 2
+        except Exception:
+            pass  # 配置不可读等场景交由后续正常路径报错
     # 所有命令先确保建表 (幂等; daemon 侧也建, 双保险)
     # M18: init 失败 (state 目录不可写/磁盘满/DB 损坏) 不再静默吞噬 ——
     # 打 warning 继续 (只读命令可能仍可用), 失败会在第一次 SQL 处显式报错
