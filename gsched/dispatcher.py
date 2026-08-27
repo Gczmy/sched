@@ -802,6 +802,65 @@ class Dispatcher:
             if not reqs:
                 return
             for r in reqs:
+                if r["op"] == "batch_submit":
+                    # B27: 消费提交投递 —— 从 inbox 读 spec, 计算节点本地完整入库
+                    import json as _json
+                    payload_path = r["job_id"]
+                    try:
+                        with open(payload_path, encoding="utf-8") as pf:
+                            envelope = _json.load(pf)
+                        spec = envelope.get("spec") or {}
+                        if not isinstance(spec, dict) or "name" not in spec:
+                            raise ValueError("payload 缺少合法 spec")
+                        cfg_now = self.cfg
+                        from .schema import validate_batch, SchemaError
+                        norm = validate_batch(spec, cfg_now)
+                        bid = envelope.get("bid")
+                        if not bid:
+                            from datetime import datetime as _dt
+                            bid = f"{norm['name']}-{_dt.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
+                        with state.connect() as ins:
+                            existing = ins.execute(
+                                "SELECT status FROM batches WHERE name=?", (norm["name"],)
+                            ).fetchall()
+                            if any(x["status"] not in ("done", "blocked") for x in existing):
+                                state.finish_control_request(
+                                    conn, r["id"],
+                                    f"同名批次 '{norm['name']}' 已有未终态批次 (定案 6), 未入队")
+                                self.log_line(f"batch_submit req {r['id']}: 定案 6 拒绝 ({norm['name']})")
+                                os.unlink(payload_path)
+                                continue
+                            state.insert_batch(
+                                ins, bid, norm["name"], norm["mode"], norm["depends_on"],
+                                norm["gpus"], norm["cwd"], norm["env"], norm.get("notify"),
+                                norm.get("project"), norm.get("priority", 0),
+                            )
+                            for i2, t in enumerate(norm["tasks"]):
+                                cmd_e = t.get("cmd")
+                                spec_json = {
+                                    "id": t["id"], "cmd": cmd_e, "stages": t.get("stages"),
+                                    "cwd_abs": t["cwd_abs"], "git": t["git"],
+                                    "env": t["env"], "resources": t["resources"],
+                                    "duration_min": t["duration_min"], "max_retry": t["max_retry"],
+                                    "artifacts": t["artifacts"],
+                                    "retry_transform": t.get("retry_transform"),
+                                    "probes": t.get("probes"),
+                                    "max_parallel": t.get("max_parallel"),
+                                    "_force_rerun": t.get("_force_rerun"),
+                                    "progress_regex": t.get("progress_regex"),
+                                    "runtime": t.get("runtime"),
+                                    "runtime_prefix": t.get("runtime_prefix"),
+                                }
+                                state.insert_task(ins, bid, t["id"], 1, spec_json, i2,
+                                                  norm.get("project"))
+                        state.finish_control_request(conn, r["id"], f"已入队 {bid}")
+                        self.log_line(f"batch_submit req {r['id']}: 已入队 {bid} "
+                                      f"({len(norm['tasks'])} 任务)")
+                        os.unlink(payload_path)
+                    except Exception as e:
+                        state.finish_control_request(conn, r["id"], f"失败: {e}")
+                        self.log_line(f"⚠️ batch_submit req {r['id']} 失败: {e} (payload: {payload_path})")
+                    continue
                 if r["op"] == "config_reload":
                     # B12-a: CLI `sched config reload` 的强制重载路径
                     # (mtime 未变也执行; CLI 已本地预校验过语法)

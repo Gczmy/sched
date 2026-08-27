@@ -418,6 +418,30 @@ def cmd_submit(args: argparse.Namespace) -> int:
             out.append(tok)
         return out
 
+    # B27: 单写者收编 —— 非计算节点上的 submit 转投递 inbox 文件 + 控制请求行,
+    # 由 daemon (config.node 主机) 在本地完成完整入库; 绝不在登录节点直写 state.db
+    # (NFS+WAL 双主机并发曾致批次被 daemon 检查点静默抹掉, 2026-08-26 三连事故).
+    import socket as _sock
+    if _sock.gethostname().strip() != str(cfg.get("node") or "").strip() \
+            and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
+        inbox_dir = os.path.join(os.path.expanduser(cfg.get("state_dir", "~/.sched")),
+                                 str(cfg.get("node")), "submit_inbox")
+        os.makedirs(inbox_dir, exist_ok=True)
+        payload_path = os.path.join(inbox_dir, f"submit-{bid}.json")
+        with open(payload_path, "w", encoding="utf-8") as pf:
+            json.dump({"spec": spec, "bid": bid,
+                       "project": norm.get("project"), "tasks": len(norm["tasks"])},
+                      pf, ensure_ascii=False, indent=2)
+        with state.connect() as ctrl_conn:
+            ctrl_conn.execute(
+                "INSERT INTO control_requests (job_id, op, status, created_at)"
+                " VALUES (?, 'batch_submit', 'pending', ?)",
+                (payload_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+        print(f"已投递: {bid} ({len(norm['tasks'])} 任务) -> {cfg.get('node')} (inbox)")
+        print("由 daemon 消费入队; sched verify 确认结果")
+        return 0
+
     with state.connect() as conn:
         # 同名批次未全部终态 -> 拒绝 (定案 6)
         # 决策 7A: dry-run 跳过该检查 —— 纯只读预览不产生副作用, 拦截反而
@@ -717,6 +741,26 @@ def _daemon_health() -> dict[str, Any]:
         # 冻结判定: tick_ok 超 90s 未更新 (阈值同 dispatcher._check_frozen)
         "frozen": bool(tick_age is not None and tick_age > 90),
     }
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """B27: 提交凭证 —— 确认批次已真实持久化 (防吞批假成功)."""
+    cfg = _load_cfg()
+    name = args.batch.strip()
+    with state.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, name, status, created_at, project FROM batches"
+            " WHERE id=? OR name=? ORDER BY created_at DESC LIMIT 3",
+            (name, name),
+        ).fetchall()
+    if not rows:
+        print(f"❌ 未找到批次: {name}")
+        print("   可能原因: 登录节点直提被守护检查点覆盖; 请在计算节点重提或检查 submit_inbox")
+        return 1
+    print(f"✅ 批次已持久化:")
+    for r in rows:
+        print(f"   {r['id']} [{r['status']}] {r['created_at']} project={r['project'] or '-'}")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -2275,6 +2319,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("verify", help="确认批次已持久化 (提交凭证)")
+    p.add_argument("batch", help="批次名或完整 id")
+    p.set_defaults(fn=cmd_verify)
 
     p = sub.add_parser("submit", help="提交 batch.json 批次")
     p.add_argument("batch", help="batch.json 路径")
