@@ -2483,8 +2483,10 @@ def main(argv: list[str] | None = None) -> int:
     # 读/写/检查点), SQLite 官方明确不支持此场景 —— 跨主机锁不可靠时, 网关提交
     # 的事务会被 daemon 的检查点静默抹掉 (已实测 100% 复现)。写操作必须在
     # config.node 所指的计算节点上执行; 违反则拒绝并给出明确指引。
+    # B27: submit 不在顶层守卫列表 —— 它有专属 inbox 投递通道 (cmd_submit 内),
+    # 在登录节点上会把 spec 落 inbox + 插控制请求行, 由 daemon 消费入库。
     _WRITE_COMMANDS = {
-        "submit", "run", "cancel", "retry", "resubmit", "discard", "clean",
+        "run", "cancel", "retry", "resubmit", "discard", "clean",
         "config", "gpu-ok", "gpu-free", "gpu-ignore", "gpu-set-mem",
     }
     if getattr(args, "cmd", None) in _WRITE_COMMANDS and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
