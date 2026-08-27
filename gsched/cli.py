@@ -449,7 +449,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         existing = conn.execute(
             "SELECT status FROM batches WHERE name=?", (norm["name"],)
         ).fetchall()
-        conflict = any(b["status"] not in ("done", "blocked") for b in existing)
+        conflict = any(b["status"] not in ("done", "blocked", "discarded") for b in existing)
         if conflict and not getattr(args, "dry_run", False):
             print(
                 f"错误: 同名批次 '{norm['name']}' 已有未终态批次 (定案 6),"

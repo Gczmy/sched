@@ -823,7 +823,7 @@ class Dispatcher:
                             existing = ins.execute(
                                 "SELECT status FROM batches WHERE name=?", (norm["name"],)
                             ).fetchall()
-                            if any(x["status"] not in ("done", "blocked") for x in existing):
+                            if any(x["status"] not in ("done", "blocked", "discarded") for x in existing):
                                 state.finish_control_request(
                                     conn, r["id"],
                                     f"同名批次 '{norm['name']}' 已有未终态批次 (定案 6), 未入队")
