@@ -853,6 +853,19 @@ class Dispatcher:
                                 }
                                 state.insert_task(ins, bid, t["id"], 1, spec_json, i2,
                                                   norm.get("project"))
+                            from .fingerprint import compute_fingerprint
+                            for t2 in norm["tasks"]:
+                                _cmd_e = t2.get("cmd")
+                                _stages = t2.get("stages")
+                                _fp, _sfps, _rev = compute_fingerprint(
+                                    _cmd_e, _stages, t2["cwd_abs"], t2["git"],
+                                    cfg_now.get("venvs", {}),
+                                    runtime_prefix=t2.get("runtime_prefix"),
+                                )
+                                state.insert_job(
+                                    ins, f"{bid}-{t2['id']}-v1", bid, t2["id"], 1,
+                                    _fp, _sfps, norm.get("project"),
+                                )
                         state.finish_control_request(conn, r["id"], f"已入队 {bid}")
                         self.log_line(f"batch_submit req {r['id']}: 已入队 {bid} "
                                       f"({len(norm['tasks'])} 任务)")
