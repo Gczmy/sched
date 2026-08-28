@@ -376,6 +376,30 @@ def cmd_submit(args: argparse.Namespace) -> int:
             print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
         return 0
 
+    # M9: 展开命令并计算指纹不持有 state.db 写事务, 避免 git 子进程饿死 daemon。
+    prepared_tasks = []
+    for i, t in enumerate(norm["tasks"]):
+        cmd_e = expand_cmd(t["cmd"], cfg) if t["cmd"] else None
+        stages_e = None
+        if t["stages"]:
+            stage_art: dict[int, dict] = {}
+            stages_e = []
+            for j, s in enumerate(t["stages"]):
+                stage_art[j] = s["artifacts"]
+                stages_e.append(
+                    {
+                        "cmd": expand_cmd(s["cmd"], cfg, stage_art, t["cwd_abs"]),
+                        "artifacts": s["artifacts"],
+                        "probes": s.get("probes"),
+                        "retry_transform": s.get("retry_transform"),
+                        "paths_escape": s.get("paths_escape", False),
+                    }
+                )
+        fp, stage_fps, _rev = compute_fingerprint(
+            cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {}),
+            runtime_prefix=t.get("runtime_prefix"),
+        )
+        prepared_tasks.append((i, t, cmd_e, stages_e, fp, stage_fps))
     with state.connect() as conn:
         # 同名批次未全部终态 -> 拒绝 (定案 6)
         # 决策 7A: dry-run 跳过该检查 —— 纯只读预览不产生副作用, 拦截反而
@@ -439,26 +463,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             # M13: 并发 submit 同时通过定案 6 检查 -> 撞主键, 转友好错误
             print(f"错误: 批次 id 冲突 {bid} (并发提交?), 请重试", file=sys.stderr)
             return 1
-        for i, t in enumerate(norm["tasks"]):
-            # cmd/stages 的 {VENV:}/{stageN_<key>} 展开为绝对路径 (spec 存展开后的)
-            cmd_e = expand_cmd(t["cmd"], cfg) if t["cmd"] else None
-            stages_e = None
-            if t["stages"]:
-                # N7: stage j 可引用前序 stage 0..j-1 的产物
-                stage_art: dict[int, dict] = {}
-                stages_e = []
-                for j, s in enumerate(t["stages"]):
-                    stage_art[j] = s["artifacts"]
-                    stages_e.append(
-                        {
-                            "cmd": expand_cmd(s["cmd"], cfg, stage_art, t["cwd_abs"]),
-                            "artifacts": s["artifacts"],
-                            "probes": s.get("probes"),
-                            "retry_transform": s.get("retry_transform"),
-                            "paths_escape": s.get("paths_escape", False),
-                        }
-                    )
-            # 任务级 spec 存规范化后的 (含 cwd_abs, 供 executor 直接用)
+        for i, t, cmd_e, stages_e, fp, stage_fps in prepared_tasks:
+            # 任务级 spec 已在事务外展开 (M9); 事务内只写规范化结果。
             spec_json = {
                 "id": t["id"],
                 "cmd": cmd_e,
@@ -482,11 +488,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
             state.insert_task(
                 conn, bid, t["id"], 1, spec_json, i,
                 norm.get("project"),
-            )
-            # Job 指纹 (A2): 指纹用展开后的 cmd (venv 路径入指纹)
-            fp, stage_fps, rev = compute_fingerprint(
-                cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {}),
-                runtime_prefix=t.get("runtime_prefix"),
             )
             state.insert_job(
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
