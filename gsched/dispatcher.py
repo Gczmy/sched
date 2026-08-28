@@ -1826,7 +1826,7 @@ class Dispatcher:
                         (idx, job_id, task_vram, state.now()),
                     )
                     return idx
-            self._assign_reject_scope = "all"
+            self._assign_reject_scope = "project" if hard and affinity else "all"
             return None
 
         # 共享任务: 归一化负载装箱 (定案 40 Least-Loaded + 2026-08-17 方案 A).
