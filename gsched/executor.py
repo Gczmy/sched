@@ -146,6 +146,12 @@ class Executor:
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
         rc_dir = merged_env.get("SCHED_RC_DIR")
         rc_prefix = merged_env.get("SCHED_RC_PREFIX")
+        launch_marker = merged_env.get("SCHED_LAUNCH_MARKER")
+        launch_script = ""
+        if launch_marker:
+            launch_script = (
+                f"umask 077; printf '%s\\n' \"$$\" > {shlex.quote(str(launch_marker))}; "
+            )
         if self.sanitize_env:
             self._sanitize_conda_env(merged_env, cmd, stages, explicit=conda_env_dir)
 
@@ -180,13 +186,18 @@ class Executor:
                     parts.append(f"echo [sched] stage{i} 产物已存在, 跳过")
                     continue
                 parts.append(" ".join(shlex.quote(str(t)) for t in s["cmd"]))
-            wrapper_cmd = ["/bin/bash", "--noprofile", "--norc", "-c", " && ".join(parts) + rc_script]
+            wrapper_cmd = [
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                launch_script + " && ".join(parts) + rc_script,
+            ]
+        elif rc_script or launch_script:
+            command = launch_script + " ".join(shlex.quote(str(t)) for t in (cmd or []))
+            wrapper_cmd = ["/bin/bash", "--noprofile", "--norc", "-c", command + rc_script]
         else:
-            if rc_script:
-                command = " ".join(shlex.quote(str(t)) for t in (cmd or []))
-                wrapper_cmd = ["/bin/bash", "--noprofile", "--norc", "-c", command + rc_script]
-            else:
-                wrapper_cmd = [str(t) for t in (cmd or [])]
+            wrapper_cmd = [str(t) for t in (cmd or [])]
 
         try:
             proc = subprocess.Popen(
@@ -198,10 +209,24 @@ class Executor:
                 start_new_session=True,  # 新进程组, pgid = proc.pid
             )
         except Exception:
-            log_f.close()  # Popen 失败 (cwd/cmd 非法等): 关闭句柄防 daemon 长驻 fd 泄漏
+            try:
+                log_f.close()  # Popen 失败 (cwd/cmd 非法等)
+            except Exception:
+                pass
             raise
-        log_f.close()
-        self._procs[proc.pid] = proc
+        try:
+            log_f.close()
+            self._procs[proc.pid] = proc
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+            raise
         return proc.pid
 
     def poll_rc(self, pgid: int) -> int | None:
@@ -230,6 +255,12 @@ class Executor:
             # 回滚 -> probe 已写入的 blocked/done 终态丢失 -> 任务被误判 failed
             # 并 retry (日志门控失效, 平台无关的结构性脆弱点)。
             pass
+        finally:
+            # SIGKILL is terminal for our local Popen bookkeeping. If the DB
+            # write that follows launch fails, no running-row can reap this
+            # handle later, so retaining it leaks the executor registry.
+            if sig == signal.SIGKILL:
+                self._procs.pop(pgid, None)
 
     def alive(self, pgid: int) -> bool:
         try:

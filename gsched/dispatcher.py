@@ -60,6 +60,7 @@ class Dispatcher:
         )
         # B13-§1: 环境净化默认开 (sanitize_env: false 可关回旧行为)
         self.executor = Executor(sanitize_env=bool(cfg.get("sanitize_env", True)))
+        self._launch_inflight: dict[str, int] = {}
         # gpus 归一化 (2026-08-17 缺口 1/2): 纯卡号数组或 {idx,mem_gib} 对象数组;
         # config 未配 -> Allocator 自动探测全卡 (定案 1 第三级回退)
         from .config import parse_gpus
@@ -339,6 +340,7 @@ class Dispatcher:
                             finished_at=state.now(),
                         )
                         self._drop_job_rc(j)
+                        self._drop_launch_marker(j)
                         # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
                         # (assigned -> releasing), 否则 cancelled 任务残留 assigned
                         # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
@@ -367,6 +369,7 @@ class Dispatcher:
             f"dispatcher 启动 (pid={os.getpid()}, fake={self.fake}, gpus={self.allocator.gpu_list})"
         )
         # 接管: running 任务 pgid 存活则继续等 (A3/3.2b)
+        self._recover_launch_markers()
         self._adopt_running()
 
         tick_failures = 0
@@ -688,13 +691,56 @@ class Dispatcher:
     def _job_rc_prefix(self, job) -> str:
         return hashlib.sha256(str(job["id"]).encode("utf-8")).hexdigest()[:24]
 
-    def _job_rc_path(self, job) -> str | None:
-        pgid = job["pgid"]
+    def _job_rc_path(self, job, pgid: int | None = None) -> str | None:
+        pgid = job["pgid"] if pgid is None else pgid
         if not pgid:
             return None
         return os.path.join(
             self.host_dir, "rc", f"{self._job_rc_prefix(job)}-{pgid}.rc"
         )
+    def _launch_marker_path(self, job) -> str:
+        return os.path.join(
+            self.host_dir, "launch", f"{self._job_rc_prefix(job)}.launch"
+        )
+
+    def _drop_launch_marker(self, job) -> None:
+        try:
+            os.unlink(self._launch_marker_path(job))
+        except OSError:
+            pass
+
+    def _recover_launch_markers(self) -> None:
+        marker_dir = os.path.join(self.host_dir, "launch")
+        try:
+            names = [name for name in os.listdir(marker_dir) if name.endswith(".launch")]
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        with state.connect() as conn:
+            rows = conn.execute("SELECT id, status, pgid FROM jobs").fetchall()
+            by_prefix = {self._job_rc_prefix(row): row for row in rows}
+            for name in names:
+                path = os.path.join(marker_dir, name)
+                try:
+                    with open(path, encoding="utf-8") as marker:
+                        pgid = int(marker.read().strip())
+                except (OSError, ValueError):
+                    self._drop_rc_path(path)
+                    continue
+                row = by_prefix.get(name[:-len(".launch")])
+                if (
+                    row
+                    and row["status"] == "running"
+                    and row["pgid"] == pgid
+                    and self.executor.alive(pgid)
+                ):
+                    continue
+                try:
+                    self.executor.kill_pgid(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
+                self._drop_rc_path(path)
 
     def _read_job_rc(self, job) -> int | None:
         path = self._job_rc_path(job)
@@ -1250,6 +1296,7 @@ class Dispatcher:
 
     def _handle_job_done(self, conn, j, rc: int | None = None) -> None:
         """reap 顺序 (N2): 先读 kill_reason 定终态; 无 reason 按 rc + 日志分类."""
+        self._drop_launch_marker(j)
         reason = j["kill_reason"]
         if rc is None:
             rc = j["rc"]
@@ -1641,6 +1688,25 @@ class Dispatcher:
 
     # ---------- 派发 ----------
 
+    @contextmanager
+    def _dispatch_connection(self):
+        self._launch_inflight = {}
+        try:
+            with state.connect() as conn:
+                yield conn
+        except BaseException:
+            for job_id, pgid in list(self._launch_inflight.items()):
+                try:
+                    self.executor.kill_pgid(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
+                self._drop_rc_path(
+                    self._job_rc_path({"id": job_id, "pgid": pgid})
+                )
+                self._drop_launch_marker({"id": job_id})
+            raise
+        finally:
+            self._launch_inflight.clear()
     def _dispatch_ready_jobs(self) -> None:
         with state.connect() as conn:
             # 只派发所属批次已解锁 (active/done) 的 pending job——
@@ -2057,6 +2123,10 @@ class Dispatcher:
         os.makedirs(rc_dir, exist_ok=True)
         task_env["SCHED_RC_DIR"] = rc_dir
         task_env["SCHED_RC_PREFIX"] = self._job_rc_prefix(j)
+        launch_marker = self._launch_marker_path(j)
+        os.makedirs(os.path.dirname(launch_marker), exist_ok=True)
+        self._drop_launch_marker(j)
+        task_env["SCHED_LAUNCH_MARKER"] = launch_marker
         os.makedirs(os.path.dirname(task_env["SCHED_PROFILE_OUT"]), exist_ok=True)
         pgid = self.executor.launch(
             cmd=spec.get("cmd"),
@@ -2076,12 +2146,41 @@ class Dispatcher:
             )
         except Exception:
             pass
-        state.update_job(
-            conn, j["id"], gpu=gpu, pgid=pgid,
-            git_rev=git_rev, kill_reason=None,
-        )
+        try:
+            state.update_job(
+                conn, j["id"], gpu=gpu, pgid=pgid,
+                git_rev=git_rev, kill_reason=None,
+            )
+        except Exception:
+            self.log_line(
+                f"LAUNCH 回写失败: job {j['id']} pgid={pgid} -> SIGKILL 防止孤儿进程"
+            )
+            try:
+                self.executor.kill_pgid(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+            self._drop_rc_path(self._job_rc_path(j, pgid))
+            self._drop_launch_marker(j)
+            if isinstance(inflight, dict):
+                inflight.pop(j["id"], None)
+            raise
         tag = f"cpu" if gpu is None else f"gpu={gpu}"
-        self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
+        try:
+            self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
+        except Exception:
+            try:
+                self.executor.kill_pgid(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                state.update_job(conn, j["id"], gpu=None, pgid=None)
+            except Exception:
+                pass
+            self._drop_rc_path(self._job_rc_path(j, pgid))
+            self._drop_launch_marker(j)
+            if isinstance(inflight, dict):
+                inflight.pop(j["id"], None)
+            raise
         return True
 
     def _should_skip(self, conn, spec: dict, j) -> bool:
