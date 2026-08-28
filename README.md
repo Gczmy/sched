@@ -106,7 +106,7 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU-only ta
 ```jsonc
 {
   "name": "my_batch",                       // batch name (a timestamp is appended automatically)
-  "mode": "mix",                            // mix | gpu | cpu
+  "mode": "mix",                            // 目前唯一实现的批次模式
   "priority": 5,                            // batch priority within its project (optional)
   "cwd": "{ROOT}",                          // working dir; supports {ROOT}/{VENV:key} templates
   "env": {"NN_NO_CUDNN": "1"},              // batch-level env vars (optional)

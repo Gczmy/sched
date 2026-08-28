@@ -106,7 +106,7 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU 任务
 ```jsonc
 {
   "name": "my_batch",                       // 批次名 (id 自动追加时间戳)
-  "mode": "mix",                            // mix | gpu | cpu
+  "mode": "mix",                            // 当前唯一实现的批次模式
   "priority": 5,                            // 项目内批次优先级 (可选)
   "cwd": "{ROOT}",                          // 工作目录, 支持 {ROOT}/{VENV:key} 模板
   "env": {"NN_NO_CUDNN": "1"},              // 批次级环境变量 (可选)

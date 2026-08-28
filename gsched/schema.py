@@ -58,8 +58,8 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         raise SchemaError("缺少 name (批次名, 依赖按 name 引用)")
 
     mode = spec.get("mode", "mix")
-    if mode not in ("mix", "strict"):
-        raise SchemaError(f"mode 必须是 mix|strict, 实际 {mode}")
+    if mode != "mix":
+        raise SchemaError(f"mode 目前仅支持 mix (实际 {mode})")
 
     depends_on = spec.get("depends_on", [])
     if not isinstance(depends_on, list) or not all(

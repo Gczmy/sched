@@ -38,7 +38,7 @@
 |---|---|---|---|
 | `name` | str | ✅ | 批次名（id 自动追加时间戳）|
 | `project` | str | ✅ | 项目名，必须在 config.projects 注册 |
-| `mode` | str | ✗ | mix(缺省) \| gpu \| cpu |
+| `mode` | str | ✗ | `mix`（缺省；当前唯一实现的批次模式）|
 | `priority` | int | ✗ | 项目内派发优先级，大者先 |
 | `cwd` | str | ✗ | 缺省 `{ROOT}`；支持 `{VENV:key}` 模板 |
 | `env` | obj | ✗ | 环境变量映射（最终覆盖，优先级高于自动注入）|
