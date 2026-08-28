@@ -2065,7 +2065,8 @@ def cmd_gpu_set_mem(args: argparse.Namespace) -> int:
     """sched gpu-set-mem <idx> <gib>: 运行时覆盖该卡容量 (GiB).
 
     config.gpus[{idx,mem_gib}] 是启动时覆盖 (daemon 重启后探测覆盖); 本命令
-    立即生效, 适合临时改容量 (如共享装箱余量调整) 不重启 daemon.
+    只更新 state.db/list-gpus, 运行中 daemon 的 allocator 缓存不变;
+    重启探测会覆盖该临时值. 如需调度生效请改 config.gpus 后重启 daemon.
     """
     if args.gib <= 0:
         print(f"错误: mem_gib 必须 > 0 (got {args.gib})", file=sys.stderr)
@@ -2078,7 +2079,7 @@ def cmd_gpu_set_mem(args: argparse.Namespace) -> int:
         conn.execute(
             "UPDATE gpus SET mem_total_gib=? WHERE idx=?", (float(args.gib), args.idx)
         )
-        print(f"GPU{args.idx} 容量已设为 {float(args.gib):.1f} GiB (下次 daemon 重启探测会覆盖, 如需持久化改 config.gpus)")
+        print(f"GPU{args.idx} 容量已写入 state.db/list-gpus: {float(args.gib):.1f} GiB (仅临时记录; 重启探测会覆盖, 调度生效请改 config.gpus)")
     return 0
 
 

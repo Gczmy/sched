@@ -5,7 +5,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 # 背景: 三个缺口
 #   1. 显存手动覆盖: config.gpus 对象形态 {idx, mem_gib} (daemon 启动覆盖探测值)
-#      + `sched gpu-set-mem <idx> <gib>` (运行时立即覆盖, 不重启 daemon)
+#      + `sched gpu-set-mem <idx> <gib>` 写入 state.db, 运行中 daemon 重启后读取
 #   2. 自动探测全卡: config 未配 gpus -> Allocator 自动 nvidia-smi -L (定案 1
 #      第三级回退, 之前文档写了但代码没实现)
 #   3. list-gpus 显示显存: mem_total_gib 列展示 (之前只有状态/job/quarantine)
@@ -13,7 +13,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # 覆盖场景:
 #   1. 对象形态 gpus 解析: {idx,mem_gib} -> gpu_list + mem_overrides
 #   2. fake daemon 启动: 对象形态容量生效 (probe_capacity 用 override)
-#   3. gpu-set-mem 运行时覆盖立即生效 + 校验非法值
+#   3. gpu-set-mem 写入 state.db (Allocator 缓存需重启 daemon)
 #   4. list-gpus 显示显存列
 #   5. 兼容: 纯卡号数组 gpus 仍可用 (向后兼容)
 #   6. 自动探测: config 无 gpus + fake 模式 -> fake 语义 (探测不适用, 验证不崩)
@@ -87,9 +87,13 @@ M0=$(mem_of $S1 0); M1=$(mem_of $S1 1); M2=$(mem_of $S1 2)
   || bad "override 容量未生效 (got GPU0=$M0 GPU1=$M1 GPU2=$M2)"
 # 场景 3: gpu-set-mem 运行时覆盖
 echo "--- 场景 3: gpu-set-mem 运行时覆盖 + 非法值拒绝 ---"
-$PY -m gsched.cli gpu-set-mem 0 20 >/dev/null 2>&1
-[ "$(mem_of $S1 0)" = "20.0" ] && ok "gpu-set-mem 0 20 立即生效" \
-  || bad "gpu-set-mem 未生效 (got $(mem_of $S1 0))"
+MEM_OUT=$($PY -m gsched.cli gpu-set-mem 0 20 2>&1)
+[ "$(mem_of $S1 0)" = "20.0" ] && ok "gpu-set-mem 0 20 写入 state.db" \
+  || bad "gpu-set-mem 未写入 state.db (got $(mem_of $S1 0))"
+case "$MEM_OUT" in
+  *"重启探测会覆盖"*"config.gpus"*) ok "gpu-set-mem 提示临时值与持久化方式" ;;
+  *) bad "gpu-set-mem 未说明重启覆盖/config 持久化: $MEM_OUT" ;;
+esac
 if $PY -m gsched.cli gpu-set-mem 0 -5 >/dev/null 2>&1; then
   bad "gpu-set-mem 负数应拒绝"
 else
@@ -101,6 +105,14 @@ LIST_OUT=$($PY -m gsched.cli list-gpus 2>/dev/null)
 echo "$LIST_OUT" | grep -q "20.0GiB" && ok "list-gpus 显示显存列 (GPU0 20.0GiB)" \
   || bad "list-gpus 缺显存列 (输出: $LIST_OUT)"
 echo "$LIST_OUT" | grep -q "GPU0" && ok "list-gpus 卡号正常" || bad "list-gpus 卡号异常"
+stop_daemon $S1
+
+# 重启探测重新采用 config.gpus 的容量覆盖，临时 state.db 值不持久。
+export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
+SCHED_FAKE_GPUS="0,1,2" $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
+sleep 2
+[ "$(mem_of $S1 0)" = "24.0" ] && ok "daemon 重启覆盖 gpu-set-mem 临时值" \
+  || bad "daemon 重启未覆盖临时容量 (got $(mem_of $S1 0))"
 stop_daemon $S1
 
 # ---------- 场景 5: 纯卡号数组向后兼容 ----------
