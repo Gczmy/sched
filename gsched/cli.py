@@ -655,7 +655,7 @@ def _daemon_health() -> dict[str, Any]:
     from .config import default_state_dir as _dsd
     try:
         cfg = _load_cfg()
-    except Exception:
+    except (Exception, SystemExit):
         cfg = {}
     host = cfg.get("node")
     if not host:
@@ -1106,7 +1106,18 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # 转发后确认: daemon 处理是异步的 (POLL_SEC=10s tick), 等几秒让下一轮
     # tick 完成 alive 预检 + killpg; 不阻塞等待终态 (reap 下一轮才收敛).
     if n > 0:
-        print("(daemon 将在下轮 tick 执行 kill, 可用 sched status 复查)")
+        if targets:
+            health = _daemon_health()
+            heartbeat_age = health.get("heartbeat_age_s")
+            tick_age = health.get("tick_ok_age_s")
+            if heartbeat_age is None or heartbeat_age > 60:
+                print("⚠️ daemon 未运行或心跳已过期；取消请求已写入队列，暂不会执行")
+            elif tick_age is None or health.get("frozen"):
+                print("⚠️ daemon 心跳存在但调度 tick 未确认；请检查 daemon.log 后再复查")
+            else:
+                print("(daemon 将在下轮 tick 执行 kill, 可用 sched status 复查)")
+        else:
+            print("(排队任务已直接取消, 可用 sched status 复查)")
     return 0
 
 
