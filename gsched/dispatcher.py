@@ -528,6 +528,19 @@ class Dispatcher:
                 if not jobs:
                     continue
                 statuses = [j["status"] for j in jobs]
+                stale_live = conn.execute(
+                    "SELECT 1 FROM jobs j"
+                    " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+                    "       WHERE batch_id=? GROUP BY task_id) t"
+                    "   ON j.batch_id=? AND j.task_id=t.task_id"
+                    " WHERE j.version < t.mv"
+                    "   AND j.status IN ('running','pending','waiting_quota','waiting_dep')"
+                    " LIMIT 1",
+                    (b["id"], b["id"]),
+                ).fetchone()
+                if stale_live and all(s in ("done", "skip") for s in statuses):
+                    # 老版本仍可能在跑: 最新版本虽成功, 批次不可提前收敛。
+                    continue
                 if all(s in ("done", "skip") for s in statuses):
                     conn.execute(
                         "UPDATE batches SET status='done' WHERE id=?", (b["id"],)
@@ -1556,9 +1569,25 @@ class Dispatcher:
         if not b:
             return False
         jobs = conn.execute(
-            "SELECT status FROM jobs WHERE batch_id=?", (b["id"],)
+            "SELECT j.status FROM jobs j"
+            " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+            "       WHERE batch_id=? GROUP BY task_id) latest"
+            "   ON j.batch_id=? AND j.task_id=latest.task_id AND j.version=latest.mv",
+            (b["id"], b["id"]),
         ).fetchall()
         if not jobs:
+            return False
+        stale_live = conn.execute(
+            "SELECT 1 FROM jobs j"
+            " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+            "       WHERE batch_id=? GROUP BY task_id) latest"
+            "   ON j.batch_id=? AND j.task_id=latest.task_id"
+            " WHERE j.version < latest.mv"
+            "   AND j.status IN ('running','pending','waiting_quota','waiting_dep')"
+            " LIMIT 1",
+            (b["id"], b["id"]),
+        ).fetchone()
+        if stale_live:
             return False
         return all(j["status"] in ("done", "skip") for j in jobs)
 
