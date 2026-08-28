@@ -130,6 +130,15 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         if ga is not None:
             if not isinstance(ga, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in ga):
                 raise ConfigError(f"{p}: projects.{proj_name}.gpu_affinity 必须是卡号整数数组")
+        hard_affinity = proj_cfg.get("gpu_affinity_hard", False)
+        if not isinstance(hard_affinity, bool):
+            raise ConfigError(
+                f"{p}: projects.{proj_name}.gpu_affinity_hard 必须是布尔"
+            )
+        if hard_affinity and not ga:
+            raise ConfigError(
+                f"{p}: projects.{proj_name}.gpu_affinity_hard=true 必须同时声明非空 gpu_affinity"
+            )
         # B12-b: 项目级 colocate 开关 (可选布尔; 缺省=中立跟随全局, 与门模型)
         col = proj_cfg.get("colocate")
         if col is not None and not isinstance(col, bool):
