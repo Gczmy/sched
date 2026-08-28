@@ -212,7 +212,6 @@ def migrate_gpu_jobs(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE batches ADD COLUMN notify TEXT")
 
 
-@contextmanager
 
 def migrate_project_columns(conn: sqlite3.Connection) -> None:
     """迁移: 给 tasks/batches/jobs 表添加 project 列.
