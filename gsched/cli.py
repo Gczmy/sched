@@ -1323,6 +1323,27 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                    else f"任务不存在 {batch}:{task}")
             print(f"错误: {msg}", file=sys.stderr)
             return 1
+        target_tasks = {j["task_id"] for j in jrows}
+        active_targets = [
+            j for j in conn.execute(
+                "SELECT task_id, status, version FROM jobs"
+                " WHERE batch_id=?"
+                "   AND status IN ('running','pending','waiting_quota','waiting_dep')",
+                (batch,),
+            ).fetchall()
+            if j["task_id"] in target_tasks
+        ]
+        if active_targets:
+            labels = ", ".join(
+                f"{j['task_id']}[{j['status']}]v{j['version']}"
+                for j in active_targets
+            )
+            print(
+                f"错误: 禁止 resubmit 仍在运行/排队的任务: {labels}；"
+                "先等待所有版本终态后再提交",
+                file=sys.stderr,
+            )
+            return 1
 
         if args.dry_run:
             print(f"[dry-run] 将 resubmit {len(jrows)} 个任务 (各生成新版本排队尾):")
