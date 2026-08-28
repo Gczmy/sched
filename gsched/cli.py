@@ -126,7 +126,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             elif ch == "3":
                 cmd_path = input("  command 脚本路径: ").strip()
                 if cmd_path:
-                    cfg["notify"]["command"] = {"cmd": cmd_path}
+                    cfg["notify"]["command"] = [cmd_path]
         print(f"  通知已配置: {list(cfg['notify'].keys())}")
     else:
         print("  通知未启用 (后续可用 sched config-edit 手动添加 notify 段)")
