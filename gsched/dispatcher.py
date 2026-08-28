@@ -902,7 +902,14 @@ class Dispatcher:
             reqs = state.pending_control_requests(conn)
             if not reqs:
                 return
+            seen_cancel_jobs: set[str] = set()
             for r in reqs:
+                if r["op"] == "cancel":
+                    if r["job_id"] in seen_cancel_jobs:
+                        state.finish_control_request(conn, r["id"], "同轮重复取消, 已跳过")
+                        self.log_line(f"cancel req {r['id']}: job {r['job_id']} 同轮重复, 跳过")
+                        continue
+                    seen_cancel_jobs.add(r["job_id"])
                 if r["op"] == "batch_submit":
                     # B27: 消费提交投递 —— 从 inbox 读 spec, 计算节点本地完整入库
                     import json as _json
