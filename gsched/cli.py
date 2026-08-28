@@ -1016,7 +1016,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             return 1
         with state.connect() as conn:
             rows = conn.execute(
-                "SELECT name FROM batches WHERE project=?"
+                "SELECT id, name FROM batches WHERE project=?"
                 " AND status IN ('queued','active','blocked')",
                 (bulk_proj,),
             ).fetchall()
@@ -1026,7 +1026,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         print(f"项目 {bulk_proj}: {len(rows)} 个批次待取消")
         rc = 0
         for r in rows:
-            args.batch = r["name"]   # 复用按名解析路径
+            args.batch = r["id"]   # 以批次 id 精确定位同名实例
             rc = cmd_cancel(args) or rc
         return rc
     if not ref:
@@ -1062,7 +1062,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 (b, t),
             ).fetchall()
         else:
-            b = _batch_id_from_name(ref)
+            row = conn.execute("SELECT id FROM batches WHERE id=?", (ref,)).fetchone()
+            b = row["id"] if row else _batch_id_from_name(ref)
             if not b:
                 print(f"错误: 批次不存在: {ref}", file=sys.stderr)
                 return 1
