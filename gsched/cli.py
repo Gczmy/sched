@@ -624,7 +624,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     with state.connect() as conn:
         state.insert_batch(
             conn, bid, batch_name, "mix", [], None, "{ROOT}", None,
-            proj,
+            project=proj,
         )
         state.insert_task(conn, bid, "run", 1, task_spec, 0, proj)
         fp, stage_fps, rev = compute_fingerprint(
