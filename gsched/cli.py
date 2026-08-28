@@ -1478,8 +1478,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
         # 新提交的自洽指纹照样 SKIP (B13-§4 语义修正的配套)
         removed = []
         trows = conn.execute(
-            "SELECT spec FROM tasks WHERE batch_id=?"
-            " AND version=(SELECT MAX(version) FROM tasks WHERE batch_id=?)",
+            "SELECT t.spec FROM tasks t"
+            " JOIN (SELECT id, MAX(version) AS mv FROM tasks"
+            "       WHERE batch_id=? GROUP BY id) latest"
+            "   ON t.batch_id=? AND t.id=latest.id AND t.version=latest.mv",
             (b, b),
         ).fetchall()
         for tr in trows:
