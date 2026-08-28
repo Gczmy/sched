@@ -33,6 +33,7 @@ from .schema import (
     parse_shell_cmd,
     validate_batch,
 )
+from .templates import expand_cmd
 
 
 def _load_cfg():
@@ -150,45 +151,6 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
     from .artifacts import check_artifact
     from .fingerprint import compute_fingerprint
 
-    def _expand_venv(tok: str) -> str:
-        if isinstance(tok, str) and tok.startswith("{VENV:") and tok.endswith("}"):
-            name = tok[len("{VENV:"):-1]
-            p = cfg.get("venvs", {}).get(name)
-            if not p:
-                raise SchemaError(f"venv 未定义: {name}")
-            return p
-        return tok
-
-    def _expand_root(tok: str) -> str:
-        """cmd 里的 {ROOT} 模板展开为项目根目录绝对路径."""
-        if isinstance(tok, str) and "{ROOT}" in tok:
-            return resolve_template(tok, cfg)
-        return tok
-
-    def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
-                    cwd_abs: str | None = None) -> list[str]:
-        out = []
-        for tok in cmd_list:
-            tok = _expand_venv(tok)
-            tok = _expand_root(tok)
-            if isinstance(tok, str) and tok.startswith("{stage") and tok.endswith("}"):
-                inner = tok[1:-1]
-                parts = inner.split("_", 1)
-                if len(parts) == 2 and parts[0].startswith("stage") and parts[0][5:].isdigit():
-                    si = int(parts[0][5:])
-                    key = parts[1]
-                    arts = (stage_artifacts or {}).get(si)
-                    if arts is None:
-                        raise SchemaError(f"{tok}: 引用不存在的 stage {si} (N7)")
-                    a = arts.get(key)
-                    if not a or not a.get("path"):
-                        raise SchemaError(f"{tok}: stage{si} 未声明产物 key '{key}' (N7)")
-                    p = a["path"]
-                    if not os.path.isabs(p) and cwd_abs:
-                        p = os.path.normpath(os.path.join(cwd_abs, p))
-                    tok = p
-            out.append(tok)
-        return out
 
     def _pred_stage(cmd_e: list[str], arts: dict, cwd_abs: str) -> tuple[str, str]:
         """单 stage 预测: (skip/run, 原因). 产物路径相对 cwd 解析."""
@@ -220,7 +182,7 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
             stage_preds = []
             for j, s in enumerate(t["stages"]):
                 stage_art[j] = s["artifacts"]
-                cmd_e = _expand_cmd(s["cmd"], stage_art, cwd_abs)
+                cmd_e = expand_cmd(s["cmd"], cfg, stage_art, cwd_abs)
                 stages_e.append(cmd_e)
                 # 指纹 (A2): 展开 cmd + git rev + venv
                 fp, _, rev = compute_fingerprint(
@@ -241,7 +203,7 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
                 "skip": all(p["skip"] for p in stage_preds),
             })
         else:
-            cmd_e = _expand_cmd(t["cmd"], None, cwd_abs)
+            cmd_e = expand_cmd(t["cmd"], cfg, None, cwd_abs)
             fp, _, rev = compute_fingerprint(
                 cmd_e, None, cwd_abs, t["git"], venv_paths,
                 runtime_prefix=t.get("runtime_prefix"),
@@ -375,48 +337,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     from .fingerprint import compute_fingerprint
 
-    def _expand_venv(tok: str) -> str:
-        """cmd 里的 {VENV:name} 模板展开为绝对解释器路径 (executor 直接用)."""
-        if isinstance(tok, str) and tok.startswith("{VENV:") and tok.endswith("}"):
-            name = tok[len("{VENV:"):-1]
-            p = cfg.get("venvs", {}).get(name)
-            if not p:
-                raise SchemaError(f"venv 未定义: {name}")
-            return p
-        return tok
-
-    def _expand_root(tok: str) -> str:
-        """cmd 里的 {ROOT} 模板展开为项目根目录绝对路径."""
-        if isinstance(tok, str) and "{ROOT}" in tok:
-            return resolve_template(tok, cfg)
-        return tok
-
-    def _expand_cmd(cmd_list: list[str], stage_artifacts: dict[int, dict] | None = None,
-                    cwd_abs: str | None = None) -> list[str]:
-        """cmd 模板展开: {VENV:name} + {ROOT} + {stageN_<key>} (N7, 前序 stage 产物路径)."""
-        out = []
-        for tok in cmd_list:
-            tok = _expand_venv(tok)
-            tok = _expand_root(tok)
-            if isinstance(tok, str) and tok.startswith("{stage") and tok.endswith("}"):
-                # {stage0_ckpt} -> stage0 的 artifacts["ckpt"].path
-                inner = tok[1:-1]  # stage0_ckpt
-                parts = inner.split("_", 1)
-                if len(parts) == 2 and parts[0].startswith("stage") and parts[0][5:].isdigit():
-                    si = int(parts[0][5:])
-                    key = parts[1]
-                    arts = (stage_artifacts or {}).get(si)
-                    if arts is None:
-                        raise SchemaError(f"{tok}: 引用不存在的 stage {si} (N7)")
-                    a = arts.get(key)
-                    if not a or not a.get("path"):
-                        raise SchemaError(f"{tok}: stage{si} 未声明产物 key '{key}' (N7)")
-                    p = a["path"]
-                    if not os.path.isabs(p) and cwd_abs:
-                        p = os.path.normpath(os.path.join(cwd_abs, p))
-                    tok = p
-            out.append(tok)
-        return out
 
     # B27: 单写者收编 —— 非计算节点上的 submit 转投递 inbox 文件 + 控制请求行,
     # 由 daemon (config.node 主机) 在本地完成完整入库; 绝不在登录节点直写 state.db
@@ -507,7 +427,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             return 1
         for i, t in enumerate(norm["tasks"]):
             # cmd/stages 的 {VENV:}/{stageN_<key>} 展开为绝对路径 (spec 存展开后的)
-            cmd_e = _expand_cmd(t["cmd"]) if t["cmd"] else None
+            cmd_e = expand_cmd(t["cmd"], cfg) if t["cmd"] else None
             stages_e = None
             if t["stages"]:
                 # N7: stage j 可引用前序 stage 0..j-1 的产物
@@ -517,7 +437,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     stage_art[j] = s["artifacts"]
                     stages_e.append(
                         {
-                            "cmd": _expand_cmd(s["cmd"], stage_art, t["cwd_abs"]),
+                            "cmd": expand_cmd(s["cmd"], cfg, stage_art, t["cwd_abs"]),
                             "artifacts": s["artifacts"],
                             "probes": s.get("probes"),
                             "retry_transform": s.get("retry_transform"),

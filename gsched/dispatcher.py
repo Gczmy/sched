@@ -22,6 +22,7 @@ from .allocator import Allocator
 from .executor import Executor, pid_cmdline_matches, read_tail
 from .fingerprint import compute_fingerprint
 from .config import config_path, load_config, parse_gpus, resolve_template
+from .templates import expand_cmd
 
 POLL_SEC = 10
 HEARTBEAT_SEC = 30
@@ -836,9 +837,26 @@ class Dispatcher:
                                 norm.get("project"), norm.get("priority", 0),
                             )
                             for i2, t in enumerate(norm["tasks"]):
-                                cmd_e = t.get("cmd")
+                                cmd_e = expand_cmd(t["cmd"], cfg_now) if t["cmd"] else None
+                                stages_e = None
+                                if t["stages"]:
+                                    stage_art: dict[int, dict] = {}
+                                    stages_e = []
+                                    for stage_idx, stage in enumerate(t["stages"]):
+                                        stage_art[stage_idx] = stage["artifacts"]
+                                        stages_e.append(
+                                            {
+                                                "cmd": expand_cmd(
+                                                    stage["cmd"], cfg_now, stage_art, t["cwd_abs"]
+                                                ),
+                                                "artifacts": stage["artifacts"],
+                                                "probes": stage.get("probes"),
+                                                "retry_transform": stage.get("retry_transform"),
+                                                "paths_escape": stage.get("paths_escape", False),
+                                            }
+                                        )
                                 spec_json = {
-                                    "id": t["id"], "cmd": cmd_e, "stages": t.get("stages"),
+                                    "id": t["id"], "cmd": cmd_e, "stages": stages_e,
                                     "cwd_abs": t["cwd_abs"], "git": t["git"],
                                     "env": t["env"], "resources": t["resources"],
                                     "duration_min": t["duration_min"], "max_retry": t["max_retry"],
@@ -851,20 +869,19 @@ class Dispatcher:
                                     "runtime": t.get("runtime"),
                                     "runtime_prefix": t.get("runtime_prefix"),
                                 }
-                                state.insert_task(ins, bid, t["id"], 1, spec_json, i2,
-                                                  norm.get("project"))
-                            from .fingerprint import compute_fingerprint
-                            for t2 in norm["tasks"]:
-                                _cmd_e = t2.get("cmd")
-                                _stages = t2.get("stages")
+                                state.insert_task(
+                                    ins, bid, t["id"], 1, spec_json, i2,
+                                    norm.get("project")
+                                )
+                                from .fingerprint import compute_fingerprint
                                 _fp, _sfps, _rev = compute_fingerprint(
-                                    _cmd_e, _stages, t2["cwd_abs"], t2["git"],
+                                    cmd_e, stages_e, t["cwd_abs"], t["git"],
                                     cfg_now.get("venvs", {}),
-                                    runtime_prefix=t2.get("runtime_prefix"),
+                                    runtime_prefix=t.get("runtime_prefix"),
                                 )
                                 state.insert_job(
-                                    ins, f"{bid}-{t2['id']}-v1", bid, t2["id"], 1,
-                                    _fp, _sfps, norm.get("project"),
+                                    ins, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
+                                    _fp, _sfps, norm.get("project")
                                 )
                         state.finish_control_request(conn, r["id"], f"已入队 {bid}")
                         self.log_line(f"batch_submit req {r['id']}: 已入队 {bid} "
