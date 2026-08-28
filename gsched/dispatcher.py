@@ -459,6 +459,7 @@ class Dispatcher:
 
     def _tick(self) -> None:
         self._maybe_reload_config()  # B12-a: 配置热更新 (mtime 变化时)
+        self._drain_submit_inbox()  # C2: 单写者 inbox 文件补插请求行
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
         self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
@@ -674,6 +675,13 @@ class Dispatcher:
                 if j["pgid"] and self.executor.alive(j["pgid"]):
                     self.log_line(f"A3: 接管 running job {j['id']} (pgid={j['pgid']})")
                     continue
+                rc = self._read_job_rc(j)
+                if rc is not None:
+                    self.log_line(f"A3: job {j['id']} pgid 已死, 读取持久退出码 rc={rc}")
+                    state.update_job(conn, j["id"], rc=rc)
+                    self._handle_job_done(conn, j, rc)
+                    self._drop_job_rc(j)
+                    continue
                 # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
                 # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
@@ -786,6 +794,43 @@ class Dispatcher:
         self.idle_timeout_min = int(
             new_cfg.get("idle_timeout_min", DEFAULT_IDLE_TIMEOUT_MIN))
         return True
+
+    def _drain_submit_inbox(self) -> None:
+        """C2: 将网关投递的 payload 文件收编为本地 pending 请求行.
+
+        网关与 daemon 共享 NFS 时禁止网关写 state.db; payload 文件是跨主机
+        唯一投递通道。daemon 是 control_requests 的唯一写者, 因此每轮先以
+        job_id=payload path 全状态去重, 再本地插入 pending 行交给统一消费者。
+        """
+        state_dir = os.path.expanduser(self.cfg.get("state_dir", "~/.sched"))
+        node = str(self.cfg.get("node") or state.hostname())
+        inbox_dir = os.path.join(state_dir, node, "submit_inbox")
+        if not os.path.isdir(inbox_dir):
+            return
+        payloads = sorted(
+            os.path.join(inbox_dir, name)
+            for name in os.listdir(inbox_dir)
+            if name.startswith("submit-") and name.endswith(".json")
+        )
+        if not payloads:
+            return
+        with state.connect() as conn:
+            known = {
+                row["job_id"]
+                for row in conn.execute(
+                    "SELECT job_id FROM control_requests WHERE op='batch_submit'"
+                ).fetchall()
+            }
+            for payload_path in payloads:
+                if payload_path in known:
+                    continue
+                conn.execute(
+                    "INSERT INTO control_requests (job_id, op, status, created_at)"
+                    " VALUES (?, 'batch_submit', 'pending', ?)",
+                    (payload_path, state.now()),
+                )
+                known.add(payload_path)
+                self.log_line(f"submit_inbox 收编: {payload_path}")
 
     def _process_control_requests(self) -> None:
         """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.

@@ -14,6 +14,7 @@ import shlex
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -338,28 +339,32 @@ def cmd_submit(args: argparse.Namespace) -> int:
     from .fingerprint import compute_fingerprint
 
 
-    # B27: 单写者收编 —— 非计算节点上的 submit 转投递 inbox 文件 + 控制请求行,
-    # 由 daemon (config.node 主机) 在本地完成完整入库; 绝不在登录节点直写 state.db
-    # (NFS+WAL 双主机并发曾致批次被 daemon 检查点静默抹掉, 2026-08-26 三连事故).
+    # B27/C2: 网关 submit 只投递 inbox 文件; control_requests 由计算节点
+    # daemon 每轮扫描后本地写入, 避免 NFS+WAL 跨主机双写。
     import socket as _sock
     if _sock.gethostname().strip() != str(cfg.get("node") or "").strip() \
             and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
         inbox_dir = os.path.join(os.path.expanduser(cfg.get("state_dir", "~/.sched")),
                                  str(cfg.get("node")), "submit_inbox")
         os.makedirs(inbox_dir, exist_ok=True)
-        payload_path = os.path.join(inbox_dir, f"submit-{bid}.json")
-        with open(payload_path, "w", encoding="utf-8") as pf:
-            json.dump({"spec": spec, "bid": bid,
-                       "project": norm.get("project"), "tasks": len(norm["tasks"])},
-                      pf, ensure_ascii=False, indent=2)
-        with state.connect() as ctrl_conn:
-            ctrl_conn.execute(
-                "INSERT INTO control_requests (job_id, op, status, created_at)"
-                " VALUES (?, 'batch_submit', 'pending', ?)",
-                (payload_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
+        payload_path = os.path.join(
+            inbox_dir, f"submit-{uuid.uuid4().hex}.json"
+        )
+        tmp_path = payload_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as pf:
+                json.dump({"spec": spec, "bid": bid,
+                           "project": norm.get("project"), "tasks": len(norm["tasks"])},
+                          pf, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, payload_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         print(f"已投递: {bid} ({len(norm['tasks'])} 任务) -> {cfg.get('node')} (inbox)")
-        print("由 daemon 消费入队; sched verify 确认结果")
+        print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
         return 0
 
     with state.connect() as conn:
