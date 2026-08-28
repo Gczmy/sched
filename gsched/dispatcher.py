@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import signal
 import subprocess
@@ -332,6 +333,7 @@ class Dispatcher:
                             conn, j["id"], status="cancelled", kill_reason="cancelled",
                             finished_at=state.now(),
                         )
+                        self._drop_job_rc(j)
                         # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
                         # (assigned -> releasing), 否则 cancelled 任务残留 assigned
                         # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
@@ -662,10 +664,43 @@ class Dispatcher:
                         self._requeue_for_retry(conn, j)
         except (OSError, ValueError):
             pass
+    def _job_rc_prefix(self, job) -> str:
+        return hashlib.sha256(str(job["id"]).encode("utf-8")).hexdigest()[:24]
 
-    # ---------- 接管 (A3) ----------
+    def _job_rc_path(self, job) -> str | None:
+        pgid = job["pgid"]
+        if not pgid:
+            return None
+        return os.path.join(
+            self.host_dir, "rc", f"{self._job_rc_prefix(job)}-{pgid}.rc"
+        )
+
+    def _read_job_rc(self, job) -> int | None:
+        path = self._job_rc_path(job)
+        if path is None:
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().strip()
+            if not text or not text.lstrip("-").isdigit():
+                return None
+            return int(text)
+        except (OSError, ValueError):
+            return None
+
+    def _drop_rc_path(self, path: str | None) -> None:
+        if path is None:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _drop_job_rc(self, job) -> None:
+        self._drop_rc_path(self._job_rc_path(job))
 
     def _adopt_running(self) -> None:
+        drop_paths: list[str] = []
         with state.connect() as conn:
             # P1: SQL 层过滤 running
             rows = conn.execute(
@@ -677,10 +712,12 @@ class Dispatcher:
                     continue
                 rc = self._read_job_rc(j)
                 if rc is not None:
+                    rc_path = self._job_rc_path(j)
                     self.log_line(f"A3: job {j['id']} pgid 已死, 读取持久退出码 rc={rc}")
                     state.update_job(conn, j["id"], rc=rc)
                     self._handle_job_done(conn, j, rc)
-                    self._drop_job_rc(j)
+                    if rc_path is not None:
+                        drop_paths.append(rc_path)
                     continue
                 # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
                 # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
@@ -702,8 +739,8 @@ class Dispatcher:
                 # 不再直接堵批次; 重试满 -> blocked 语义与正常运行路径一致
                 if state.get_job(conn, j["id"])["status"] == "failed":
                     self._maybe_retry(conn, j)
-
-    # ---------- reap ----------
+        for path in drop_paths:
+            self._drop_rc_path(path)
 
     # ---------- B12-a: 配置热更新 (colocate_finetune_hotreload_research.md §2) ----------
 
@@ -807,9 +844,14 @@ class Dispatcher:
         inbox_dir = os.path.join(state_dir, node, "submit_inbox")
         if not os.path.isdir(inbox_dir):
             return
+        try:
+            names = os.listdir(inbox_dir)
+        except OSError as e:
+            self.log_line(f"submit_inbox 扫描失败 (保留下轮重试): {e}")
+            return
         payloads = sorted(
             os.path.join(inbox_dir, name)
-            for name in os.listdir(inbox_dir)
+            for name in names
             if name.startswith("submit-") and name.endswith(".json")
         )
         if not payloads:
@@ -1034,6 +1076,7 @@ class Dispatcher:
           pgid 仍存活 -> 逐轮 SIGKILL, 与 cancel 的升级语义对齐 (防进程忽略
           SIGTERM 占卡直至 releasing 超时)
         """
+        drop_paths: list[str] = []
         with state.connect() as conn:
             # P1: SQL 层过滤, 不再每 tick 全表扫描历史 job
             running = conn.execute(
@@ -1071,7 +1114,10 @@ class Dispatcher:
                         conn, j["id"], status="blocked", failure="probe",
                         kill_reason="probe", finished_at=state.now(),
                     )
+                    rc_path = self._job_rc_path(j)
                     self._release_gpu_for_job(conn, j)
+                    if rc_path is not None:
+                        drop_paths.append(rc_path)
                     continue
                 if ready_pat and ready_pat in text:
                     self.log_line(
@@ -1090,7 +1136,10 @@ class Dispatcher:
                         self._drop_profile(j)  # 失败路径: 只删临时不 upsert (同 rc!=0)
                     else:
                         self._consume_profile(conn, j, spec)
+                    rc_path = self._job_rc_path(j)
                     self._release_gpu_for_job(conn, j)
+                    if rc_path is not None:
+                        drop_paths.append(rc_path)
             # L3: SIGKILL 升级 —— probe kill 已触发但进程忽略 SIGTERM 仍存活
             # (终态 done/blocked 的 job 不会再进上面的 running 循环, 在此补杀)
             # P1: SQL 层过滤, 不扫全表
@@ -1112,19 +1161,31 @@ class Dispatcher:
             live = {j["id"] for j in running}
             for jid in [k for k in self._probe_offsets if k not in live]:
                 del self._probe_offsets[jid]
+        for path in drop_paths:
+            self._drop_rc_path(path)
 
     def _reap_finished_jobs(self) -> None:
+        drop_paths: list[str] = []
         with state.connect() as conn:
             # P1: SQL 层过滤 running, 不再每 tick 全表扫描历史 job
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
+                known_proc = self.executor.has_process(j["pgid"])
                 rc = self.executor.poll_rc(j["pgid"])
                 if rc is None:
                     continue  # 仍在运行
+                rc_path = self._job_rc_path(j)
+                marker_rc = None if known_proc else self._read_job_rc(j)
+                if marker_rc is not None:
+                    rc = marker_rc
                 state.update_job(conn, j["id"], rc=rc)
                 self._handle_job_done(conn, j, rc)
+                if rc_path is not None:
+                    drop_paths.append(rc_path)
+        for path in drop_paths:
+            self._drop_rc_path(path)
 
     def _handle_job_done(self, conn, j, rc: int | None = None) -> None:
         """reap 顺序 (N2): 先读 kill_reason 定终态; 无 reason 按 rc + 日志分类."""
@@ -1868,6 +1929,8 @@ class Dispatcher:
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
+        # H2: retry/previous daemon attempts may leave a stale marker for this job id.
+        self._drop_job_rc(j)
         spec = json.loads(self._get_task_spec(conn, j) or "{}")
         cwd = spec.get("cwd_abs") or resolve_template(self.cfg.get("default_project", "{ROOT}"), self.cfg)
         log_path = self._job_log_path(j)
@@ -1884,7 +1947,6 @@ class Dispatcher:
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
-
         # 半成品清理 (§3.2): 产物存在但无效 (指纹不匹配/规则不过) -> 删除后启动
         self._clean_stale_artifacts(conn, spec, j)
 
@@ -1905,6 +1967,10 @@ class Dispatcher:
         task_env.setdefault(
             "SCHED_PROFILE_OUT", os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
         )
+        rc_dir = os.path.join(self.host_dir, "rc")
+        os.makedirs(rc_dir, exist_ok=True)
+        task_env["SCHED_RC_DIR"] = rc_dir
+        task_env["SCHED_RC_PREFIX"] = self._job_rc_prefix(j)
         os.makedirs(os.path.dirname(task_env["SCHED_PROFILE_OUT"]), exist_ok=True)
         pgid = self.executor.launch(
             cmd=spec.get("cmd"),

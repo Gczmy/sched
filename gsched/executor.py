@@ -68,6 +68,9 @@ class Executor:
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
 
+    def has_process(self, pgid: int) -> bool:
+        """Whether this executor still owns the Popen handle for a process group."""
+        return pgid in self._procs
     @staticmethod
     def _detect_conda_env(cmd: list[str] | None, stages: list[dict] | None):
         """从 cmd/stages 探测 conda env 解释器 (/envs/<name>/bin/python) -> env 根目录."""
@@ -141,9 +144,20 @@ class Executor:
         merged_env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
         merged_env.setdefault("PYTHONUNBUFFERED", "1")
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
+        rc_dir = merged_env.get("SCHED_RC_DIR")
+        rc_prefix = merged_env.get("SCHED_RC_PREFIX")
         if self.sanitize_env:
             self._sanitize_conda_env(merged_env, cmd, stages, explicit=conda_env_dir)
 
+        rc_script = ""
+        if rc_dir and rc_prefix:
+            rc_script = (
+                "; __sched_rc=$?; __sched_rc_path=\"$SCHED_RC_DIR/"
+                "$SCHED_RC_PREFIX-$$.rc\"; __sched_rc_tmp=\"${__sched_rc_path}.tmp.$$\"; "
+                "printf '%s\\n' \"$__sched_rc\" > \"$__sched_rc_tmp\" && "
+                "/bin/mv -f \"$__sched_rc_tmp\" \"$__sched_rc_path\"; "
+                "exit \"$__sched_rc\""
+            )
         if stages is not None:
             # §3.4c 断点续跑: 已成功的 stage (产物已存在) 跳过, 只从失败 stage 起重跑
             # M9 修复: 产物相对路径必须拼任务 cwd —— 否则相对 daemon 进程 cwd 判定,
@@ -166,9 +180,13 @@ class Executor:
                     parts.append(f"echo [sched] stage{i} 产物已存在, 跳过")
                     continue
                 parts.append(" ".join(shlex.quote(str(t)) for t in s["cmd"]))
-            wrapper_cmd = ["bash", "-lc", " && ".join(parts)]
+            wrapper_cmd = ["/bin/bash", "--noprofile", "--norc", "-c", " && ".join(parts) + rc_script]
         else:
-            wrapper_cmd = [str(t) for t in (cmd or [])]
+            if rc_script:
+                command = " ".join(shlex.quote(str(t)) for t in (cmd or []))
+                wrapper_cmd = ["/bin/bash", "--noprofile", "--norc", "-c", command + rc_script]
+            else:
+                wrapper_cmd = [str(t) for t in (cmd or [])]
 
         try:
             proc = subprocess.Popen(
