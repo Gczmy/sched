@@ -151,8 +151,6 @@ class Dispatcher:
             return False
         return self._get_project_config(project)["affinity_hard"]
 
-    def _mark_waiting_quota(self, conn, job_id) -> None:
-        state.update_job(conn, job_id, status="waiting_quota")
 
     def request_stop(self) -> None:
         """信号处理器入口: 只置标志 (绝不在 handler 里开 DB 连接)."""
