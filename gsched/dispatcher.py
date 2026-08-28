@@ -461,6 +461,8 @@ class Dispatcher:
         self._maybe_reload_config()  # B12-a: 配置热更新 (mtime 变化时)
         self._drain_submit_inbox()  # C2: 单写者 inbox 文件补插请求行
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
+        self._prune_control_requests()  # L11: 有界保留已完成控制请求
+        self._prune_notify_threads()  # L11: 清理已结束通知线程引用
         self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
         self._reap_finished_jobs()
@@ -588,6 +590,7 @@ class Dispatcher:
         - 调用方传入的 b 是 UPDATE 前的 Row 快照 —— 必须重读 (同 H1 教训)
         - 发送在 daemon 线程, 退出时 _cleanup_lock join 等发完 (定案 38 交互)
         """
+        self._prune_notify_threads()
         try:
             b = state.get_batch(conn, b["id"])  # 重读: 拿到刚写入的终态
             bnf = json.loads(b["notify"]) if b["notify"] else None
@@ -884,6 +887,35 @@ class Dispatcher:
                 )
                 known.add(payload_path)
                 self.log_line(f"submit_inbox 收编: {payload_path}")
+
+    def _prune_control_requests(self) -> None:
+        """L11: 删除过期/超上限的 done 控制请求, 保留 pending 请求."""
+        cutoff = datetime.fromtimestamp(
+            datetime.now().timestamp() - 30 * 86400
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        with state.connect() as conn:
+            conn.execute(
+                "DELETE FROM control_requests"
+                " WHERE status='done' AND processed_at IS NOT NULL AND processed_at < ?",
+                (cutoff,),
+            )
+            keep_min = conn.execute(
+                "SELECT MIN(id) FROM ("
+                " SELECT id FROM control_requests WHERE status='done'"
+                " ORDER BY id DESC LIMIT 1000"
+                ")"
+            ).fetchone()[0]
+            if keep_min is not None:
+                conn.execute(
+                    "DELETE FROM control_requests WHERE status='done' AND id < ?",
+                    (keep_min,),
+                )
+
+    def _prune_notify_threads(self) -> None:
+        """L11: 通知线程只保留仍在执行的引用."""
+        self._notify_threads[:] = [
+            thread for thread in self._notify_threads if thread.is_alive()
+        ]
 
     def _process_control_requests(self) -> None:
         """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.
