@@ -2457,7 +2457,15 @@ def main(argv: list[str] | None = None) -> int:
         "run", "cancel", "retry", "resubmit", "discard", "clean",
         "config", "gpu-ok", "gpu-free", "gpu-ignore", "gpu-set-mem",
     }
-    if getattr(args, "cmd", None) in _WRITE_COMMANDS and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
+    is_read_only_config = (
+        getattr(args, "cmd", None) == "config"
+        and getattr(args, "config_cmd", None) == "get"
+    )
+    if (
+        getattr(args, "cmd", None) in _WRITE_COMMANDS
+        and not is_read_only_config
+        and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE")
+    ):
         try:
             from .config import load_config as _lc
             import socket as _socket
