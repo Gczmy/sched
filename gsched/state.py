@@ -273,16 +273,22 @@ def prune_incidents(conn: sqlite3.Connection, max_rows: int = 200,
         - ttl_days * 86400
     )
     cutoff_str = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute(
-        "DELETE FROM incidents WHERE ts < ?", (cutoff_str,)
-    )
-    # 条数裁剪: 保留最新 max_rows 条, 但跳过 blocked 引用的行
+    # TTL 与条数裁剪使用同一 blocked 豁免: 未完成诊断所需的事故证据不删。
     blocked_ids = {
         r["id"]
         for r in conn.execute(
             "SELECT DISTINCT id FROM jobs WHERE status='blocked'"
         ).fetchall()
     }
+    if blocked_ids:
+        placeholders = ",".join("?" * len(blocked_ids))
+        conn.execute(
+            f"DELETE FROM incidents WHERE ts < ?"
+            f" AND (job_id IS NULL OR job_id NOT IN ({placeholders}))",
+            (cutoff_str, *blocked_ids),
+        )
+    else:
+        conn.execute("DELETE FROM incidents WHERE ts < ?", (cutoff_str,))
     keep_min = conn.execute(
         "SELECT MIN(id) FROM (SELECT id FROM incidents ORDER BY id DESC LIMIT ?)",
         (max_rows,),

@@ -209,6 +209,28 @@ PRUNE_OUT=$(SCHED_STATE=$S4 $PY $S4/unit_prune.py)
 [ "$PRUNE_OUT" = "7:5:2" ] && ok "裁剪到 5 条且 blocked 引用全保留 ($PRUNE_OUT)" \
   || bad "裁剪结果异常: $PRUNE_OUT (期望 7:5:2)"
 
+echo "--- 场景 5: TTL 删除也保留 blocked 证据 ---"
+S5=/tmp/sched_inc5; rm -rf $S5; mkdir -p $S5
+mk_config $S5
+cat > $S5/unit_ttl.py << 'UNITPY'
+from gsched import state
+state.init_db()
+with state.connect() as conn:
+    conn.execute(
+        "INSERT INTO jobs (id,batch_id,task_id,version,status,pgid)"
+        " VALUES ('blocked-job','bb','tb',1,'blocked',111)"
+    )
+    state.insert_incident(conn, "2020-01-01 00:00:00", "oom", 0, "blocked-job", "bb", "{}")
+    state.insert_incident(conn, "2020-01-01 00:00:01", "oom", 0, None, "bb", "{}")
+    n_del = state.prune_incidents(conn, max_rows=200, ttl_days=1)
+    remain = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+    kept = conn.execute("SELECT COUNT(*) FROM incidents WHERE job_id='blocked-job'").fetchone()[0]
+print(f"{n_del}:{remain}:{kept}")
+UNITPY
+TTL_OUT=$(SCHED_STATE=$S5 $PY $S5/unit_ttl.py)
+[ "$TTL_OUT" = "0:1:1" ] && ok "TTL 裁剪保留 blocked 事故证据 ($TTL_OUT)" \
+  || bad "TTL 裁剪错误: $TTL_OUT (期望 0:1:1; return 值仅统计条数裁剪)"
+
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
 [ $FAIL -eq 0 ] || exit 1
