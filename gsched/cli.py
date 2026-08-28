@@ -1257,6 +1257,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
 
     批次按名解析为最新实例; discarded 守卫; 完成后自动拉起 idle daemon.
     """
+    cfg = _load_cfg()
     if args.failed and args.resubmit_all:
         print("错误: --failed 与 --all 互斥", file=sys.stderr)
         return 1
@@ -1344,7 +1345,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             state.insert_task(conn, batch, j["task_id"], new_v, spec, 0, proj)
             fp, stage_fps, rev = compute_fingerprint(
                 spec.get("cmd"), spec.get("stages"), spec.get("cwd_abs", "."),
-                spec.get("git"), {},
+                spec.get("git"), cfg.get("venvs", {}),
                 runtime_prefix=spec.get("runtime_prefix"),
             )
             state.insert_job(
