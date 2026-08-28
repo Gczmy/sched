@@ -485,7 +485,7 @@ class Allocator:
                         )
                         freed.append(idx)
                 else:
-                    self._reset_confirm(idx)  # 中间不干净: 中断连续计数
+                    self._reset_release_confirm(idx)  # 中间不干净: 中断连续计数
                     if elapsed > RELEASE_TIMEOUT_SEC:
                         conn.execute(
                             "UPDATE gpus SET status='unmanaged', job_id=NULL, updated_at=? WHERE idx=?",
@@ -575,11 +575,31 @@ class Allocator:
         open(flag, "w").close()
         return False
 
-    def _reset_confirm(self, idx: int) -> None:
+    def _reset_release_confirm(self, idx: int) -> None:
         """中断连续计数 (采样到进程)."""
         if self.fake:
             return
         flag = self._confirm_flag("release_confirm", idx)
+        if os.path.exists(flag):
+            os.unlink(flag)
+
+    def _confirm_unmanaged(self, idx: int) -> bool:
+        """unmanaged 卡连续 2 次干净采样确认."""
+        if self.fake:
+            return True
+        flag = self._confirm_flag("unmanaged_confirm", idx)
+        os.makedirs(os.path.dirname(flag), exist_ok=True)
+        if os.path.exists(flag):
+            os.unlink(flag)
+            return True
+        open(flag, "w").close()
+        return False
+
+    def _reset_unmanaged_confirm(self, idx: int) -> None:
+        """中断 unmanaged 连续干净采样计数."""
+        if self.fake:
+            return
+        flag = self._confirm_flag("unmanaged_confirm", idx)
         if os.path.exists(flag):
             os.unlink(flag)
 
@@ -665,10 +685,10 @@ class Allocator:
                 # occ=None (nvidia-smi 故障) -> fail-closed 保持 unmanaged
                 occ = self._card_any_occupied(idx, by_card)
                 if occ is None or occ:
-                    self._reset_confirm(idx)
+                    self._reset_unmanaged_confirm(idx)
                     continue
                 # 与 settle_releasing 同确认 (M7): 连续 2 次采样才回 free (防抖动)
-                if self._confirm_release(idx):
+                if self._confirm_unmanaged(idx):
                     conn.execute(
                         "UPDATE gpus SET status='free', job_id=NULL, updated_at=? WHERE idx=?",
                         (now(), idx),
