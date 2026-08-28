@@ -174,6 +174,13 @@ class Dispatcher:
         if os.path.isdir(self.lock_dir):
             pid = self._read_pid()
             if pid and self._pid_exists(pid) and not self._heartbeat_fresh():
+                # L16: NFS mtime 可能在首次读取后刚刷新; 二次确认避免
+                # 把仍健康的 daemon 当成 stalled 并误杀。
+                if self._heartbeat_fresh():
+                    self.log_line(
+                        f"F4: 心跳二次读取已恢复新鲜, 保留 daemon pid={pid}"
+                    )
+                    return False
                 # M4: kill 前身份校验 —— pid 文件残留 + PID 复用时凭数字发
                 # 信号会误杀无关进程; cmdline 不含 gsched 则只清锁不杀
                 if not pid_cmdline_matches(pid, "gsched"):
