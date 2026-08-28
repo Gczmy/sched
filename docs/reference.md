@@ -63,7 +63,6 @@
 | `resources.vram_gib` | num | 共卡必填 | 峰值显存声明（GiB）；独占时用于容量校验 |
 | `resources.profile_key` | str | ✗ | 历史实测峰值键，装箱取 max(声明, 实测) |
 | `resources.cpus` | int | ✗ | CPU 核数声明 |
-| `resources.oom_retries` | int | ✗ | OOM 专属重试预算（独立于 max_retry）|
 | `runtime` | obj | ✗ | 环境声明（cmd[0] 非 {VENV} 时建议声明）：`{conda_env:"名"}` ∥ `{venv_alias:"名"}` ∥ `{prefix:"路径"}` 三选一；参与指纹 |
 | `progress_regex` | str | ✗ | 从日志尾部提取进度，status 展示 |
 | `artifacts` | obj | ✗ | `{key:{path,rule}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`regex:"模式"`；命中→SKIP |
