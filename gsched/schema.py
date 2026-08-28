@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 from typing import Any
 
 from .config import ConfigError, expand_path, resolve_template
 
 SUDO_TOKENS = {"sudo", "su", "runuser"}
+MAX_NESTED_SHELL_STATES = 1024
+SHELL_TOKENS = {"sh", "bash", "dash", "zsh", "ksh", "fish"}
 
 
 class SchemaError(Exception):
@@ -23,17 +26,283 @@ def _require_type(v: Any, t: type, field: str, where: str) -> None:
     if not isinstance(v, t):
         raise SchemaError(f"{where}.{field}: 期望 {t.__name__}, 实际 {type(v).__name__}")
 
+SHELL_WRAPPERS = {"env", "command", "nohup", "eval", "builtin"}
 
-def _check_sudo_tokens(tokens: list[str], where: str) -> None:
-    """H1: cmd 数组/sched run 的 shell token 含 sudo/su/runuser 直接拒绝."""
-    for tok in tokens:
-        if tok in SUDO_TOKENS:
+
+def _shell_command_arg(tokens: list[str], idx: int) -> str | None:
+    next_idx = idx + 1
+    if next_idx < len(tokens) and tokens[next_idx] in ("--", "-", "+"):
+        next_idx += 1
+    return tokens[next_idx] if next_idx < len(tokens) else None
+
+
+def _wrapper_command_tokens(tokens: list[str], idx: int) -> list[str]:
+    """Return argv after a command wrapper's own options/assignments."""
+    base = os.path.basename(tokens[idx])
+    tail = tokens[idx + 1:]
+    pos = 0
+    while pos < len(tail):
+        token = tail[pos]
+        if base == "env":
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                pos += 1
+                continue
+            if token == "--":
+                return tail[pos + 1:]
+            if token in ("-S", "--split-string") or token.startswith(("--split-string=", "-S")):
+                raise SchemaError("env -S/--split-string 无法安全解析, 拒绝命令")
+            if token in ("-u", "--unset", "-C", "--chdir"):
+                pos += 2
+                continue
+            if token.startswith(("--unset=", "--chdir=")):
+                pos += 1
+                continue
+            if token.startswith("-"):
+                pos += 1
+                continue
+            return tail[pos:]
+        if token == "--":
+            return tail[pos + 1:]
+        if token in ("-a", "--argv0"):
+            pos += 2
+            continue
+        if token.startswith("-"):
+            pos += 1
+            continue
+        return tail[pos:]
+    return []
+
+
+def _launcher_shell_payloads(tokens: list[str], launcher_idx: int) -> tuple[bool, list[str]]:
+    base = os.path.basename(tokens[launcher_idx])
+    candidates: list[int] = []
+    if base == "find":
+        for idx in range(launcher_idx + 1, len(tokens)):
+            if tokens[idx] not in ("-exec", "-execdir"):
+                continue
+            for candidate in range(idx + 1, len(tokens)):
+                if tokens[candidate] == ";":
+                    break
+                if os.path.basename(tokens[candidate]) in SHELL_TOKENS:
+                    candidates.append(candidate)
+    elif base in {"xargs", "busybox"}:
+        candidates = [
+            idx for idx in range(launcher_idx + 1, len(tokens))
+            if os.path.basename(tokens[idx]) in SHELL_TOKENS
+        ]
+    payloads: list[str] = []
+    for shell_idx in candidates:
+        payloads.extend(_nested_shell_commands(tokens, shell_idx))
+    return bool(candidates), payloads
+
+def _launcher_argument_tokens(tokens: list[str], launcher_idx: int) -> list[str]:
+    base = os.path.basename(tokens[launcher_idx])
+    if base != "find":
+        return tokens[launcher_idx + 1:]
+    arguments: list[str] = []
+    for idx in range(launcher_idx + 1, len(tokens)):
+        if tokens[idx] not in ("-exec", "-execdir"):
+            continue
+        for candidate in range(idx + 1, len(tokens)):
+            if tokens[candidate] == ";":
+                break
+            arguments.append(tokens[candidate])
+    return arguments
+
+
+def _cluster_command_index(flags: str, *, fish: bool = False) -> int:
+    for pos, char in enumerate(flags):
+        if char in ("o", "O"):
+            return -1
+        if char == "C" and fish:
+            return pos
+        if char == "c":
+            return pos
+    return -1
+
+
+def _nested_shell_commands(tokens: list[str], shell_idx: int) -> list[str]:
+    """Return every possible shell command-string payload."""
+    commands: list[str] = []
+    shell_name = os.path.basename(tokens[shell_idx])
+    for idx in range(shell_idx + 1, len(tokens)):
+        option = tokens[idx]
+        if shell_name == "fish":
+            if option in ("--command", "--init-command", "--init-cmd", "-C", "-c", "+c"):
+                command = _shell_command_arg(tokens, idx)
+                if command is not None:
+                    commands.append(command)
+                continue
+            if option.startswith(("--command=", "--init-command=", "--init-cmd=", "-C=", "-c=", "+c=")):
+                commands.append(option.partition("=")[2])
+                continue
+            if option.startswith(("-", "+")):
+                flags = option[1:]
+                c_index = _cluster_command_index(flags, fish=True)
+                if c_index >= 0:
+                    attached = flags[c_index + 1:]
+                    if attached:
+                        commands.append(attached)
+                    else:
+                        command = _shell_command_arg(tokens, idx)
+                        if command is not None:
+                            commands.append(command)
+                    continue
+            continue
+        if option == "--command":
+            command = _shell_command_arg(tokens, idx)
+            if command is not None:
+                commands.append(command)
+            break
+        if option.startswith("--command="):
+            commands.append(option.partition("=")[2])
+            break
+        if option in ("-c", "+c"):
+            command = _shell_command_arg(tokens, idx)
+            if command is not None:
+                commands.append(command)
+            break
+        if option.startswith("-c=") or option.startswith("+c="):
+            commands.append(option[3:])
+            break
+        if option.startswith(("-", "+")):
+            flags = option[1:]
+            c_index = _cluster_command_index(flags)
+            if c_index < 0:
+                continue
+            attached = flags[c_index + 1:]
+            if attached:
+                commands.append(attached)
+            command = _shell_command_arg(tokens, idx)
+            if command is not None:
+                commands.append(command)
+            break
+    return commands
+
+
+def _ends_shell_separator(tok: str) -> bool:
+    return bool(re.search(r"[;|&]$", tok))
+
+
+def _token_has_sudo(tok: str) -> bool:
+    """Recognize helpers in shell-command substitution and punctuation."""
+    return bool(
+        re.search(
+            r"(?:^|[;|&`()<>{}=])(?:[^\s;|&`()<>{}]+/)?"
+            r"(?:sudo|su|runuser)(?=$|[\s;|&`()<>{}$])",
+            tok,
+        )
+    )
+def _check_sudo_tokens(
+    tokens: list[str],
+    where: str,
+    cfg: dict[str, Any] | None = None,
+    shell_payload: bool = False,
+) -> None:
+    """Reject privilege helpers and inspect nested shell payloads."""
+    pending = [(tokens, where, shell_payload)]
+    seen: set[tuple[bool, tuple[str, ...]]] = set()
+    while pending:
+        current, current_where, is_shell_payload = pending.pop()
+        expanded: list[str] = []
+        for token in current:
+            if cfg is None or not isinstance(token, str):
+                expanded.append(token)
+                continue
+            try:
+                expanded.append(resolve_template(token, cfg))
+            except ConfigError as e:
+                raise SchemaError(str(e)) from e
+        current_key = (is_shell_payload, tuple(expanded))
+        if current_key in seen:
+            continue
+        if len(seen) >= MAX_NESTED_SHELL_STATES:
             raise SchemaError(
-                f"{where}: 含特权命令 '{tok}' —— 框架无 sudo 硬约束 (H1),"
-                " 请重新设计为无 sudo 方案"
+                f"{where}: nested shell/template expansion exceeds "
+                f"{MAX_NESTED_SHELL_STATES} states"
+            )
+        seen.add(current_key)
+        command_position = True
+        for idx, tok in enumerate(expanded):
+            base = os.path.basename(tok)
+            if is_shell_payload and re.search(r"[$`]", tok):
+                if command_position or re.search(r"(?i)(?:sudo|runuser|\bsu\b)", tok):
+                    raise SchemaError(
+                        f"{current_where}: 动态命令展开被拒绝 ('{tok}') —— "
+                        "无法安全确认特权命令"
+                    )
+            if command_position and base == "eval":
+                raise SchemaError(
+                    f"{current_where}: eval 动态执行被拒绝 —— 无法安全检查特权命令"
+                )
+            if (
+                (command_position and base in SUDO_TOKENS)
+                or (is_shell_payload and _token_has_sudo(tok))
+            ):
+                raise SchemaError(
+                    f"{current_where}: 含特权命令 '{tok}' —— 框架无 sudo 硬约束 (H1),"
+                    " 请重新设计为无 sudo 方案"
+                )
+            if command_position and base == "exec":
+                raise SchemaError(
+                    f"{current_where}: exec 会绕过退出码封装, 拒绝命令"
+                )
+            if command_position and base in {"find", "xargs", "busybox"}:
+                for launcher_arg in _launcher_argument_tokens(expanded, idx):
+                    if (
+                        os.path.basename(launcher_arg) in SUDO_TOKENS
+                        or _token_has_sudo(launcher_arg)
+                    ):
+                        raise SchemaError(
+                            f"{current_where}: 命令启动器包含特权命令 '{launcher_arg}'"
+                        )
+                shell_found, launcher_payloads = _launcher_shell_payloads(expanded, idx)
+                if shell_found and not launcher_payloads:
+                    raise SchemaError(
+                        f"{current_where}: 命令启动器中的 shell 缺少可检查命令"
+                    )
+                for command in launcher_payloads:
+                    try:
+                        nested = shlex.split(command)
+                    except ValueError as e:
+                        raise SchemaError(
+                            f"{current_where}: launcher shell 解析失败: {e}"
+                        ) from e
+                    pending.append((nested, f"{current_where} command launcher", True))
+            if command_position and base in SHELL_WRAPPERS:
+                nested = _wrapper_command_tokens(expanded, idx)
+                if nested:
+                    pending.append((nested, f"{current_where} command wrapper", is_shell_payload))
+            if is_shell_payload and command_position and base in {"source", "."}:
+                raise SchemaError(
+                    f"{current_where}: source 动态脚本执行被拒绝"
+                )
+            if command_position and base in SHELL_TOKENS:
+                nested_commands = _nested_shell_commands(expanded, idx)
+                if is_shell_payload and not nested_commands:
+                    raise SchemaError(
+                        f"{current_where}: 未提供可检查的嵌套 shell 命令"
+                    )
+                for command in nested_commands:
+                    try:
+                        nested = shlex.split(command)
+                    except ValueError as e:
+                        raise SchemaError(
+                            f"{current_where}: nested shell 解析失败: {e}"
+                        ) from e
+                    pending.append((nested, f"{current_where} nested shell", True))
+            if command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+                continue
+            command_position = (
+                _ends_shell_separator(tok) if is_shell_payload else False
             )
 
 
+def check_sudo_tokens(
+    tokens: list[str], where: str, cfg: dict[str, Any] | None = None
+) -> None:
+    """Public wrapper for validating commands after template expansion."""
+    _check_sudo_tokens(tokens, where, cfg)
 def _check_path_in_cwd(path: str, cwd_abs: str, where: str) -> None:
     """E4: 产物/日志路径必须 realpath 归一化后在任务 cwd 内."""
     real = os.path.realpath(path)
@@ -219,7 +488,7 @@ def _validate_task(
         cmd = t.get("cmd")
         if not isinstance(cmd, list) or not cmd:
             raise SchemaError(f"{where}: 必须提供 cmd 数组 (或 stages 数组)")
-        _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd")
+        _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd", cfg)
         # B15: I 类规则放宽 —— cmd[0] 自由格式。环境声明走可选 runtime 字段
         # (三通道) 或保留 {VENV:x} 语法糖；两者皆无 -> 放行, 由调用方打印警告
         # 并在指纹中省略环境分量 (git rev 仍锚定代码版本)。定案 Q1。
@@ -324,7 +593,7 @@ def _validate_stage(s: Any, cfg: dict, t_cwd_abs: str, where: str) -> dict:
     cmd = s.get("cmd")
     if not isinstance(cmd, list) or not cmd:
         raise SchemaError(f"{where}: 缺 cmd 数组")
-    _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd")
+    _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd", cfg)
     # B15: stage 级同样放开 cmd[0] (runtime 为任务级声明, stages 继承)
 
     artifacts = s.get("artifacts", {})
@@ -424,5 +693,5 @@ def parse_shell_cmd(shell_str: str, where: str) -> list[str]:
         tokens = shlex.split(shell_str)
     except ValueError as e:
         raise SchemaError(f"{where}: shell 字符串解析失败: {e}") from e
-    _check_sudo_tokens(tokens, where)
+    _check_sudo_tokens(tokens, where, shell_payload=True)
     return tokens

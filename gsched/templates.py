@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 from .config import resolve_template
-from .schema import SchemaError
+from .schema import SchemaError, check_sudo_tokens
 
 
 def _expand_venv(token: str, cfg: dict) -> str:
@@ -54,4 +54,5 @@ def expand_cmd(
                     path = os.path.normpath(os.path.join(cwd_abs, path))
                 token = path
         out.append(token)
+    check_sudo_tokens([str(token) for token in out], "expanded command")
     return out

@@ -379,16 +379,25 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # M9: 展开命令并计算指纹不持有 state.db 写事务, 避免 git 子进程饿死 daemon。
     prepared_tasks = []
     for i, t in enumerate(norm["tasks"]):
-        cmd_e = expand_cmd(t["cmd"], cfg) if t["cmd"] else None
+        try:
+            cmd_e = expand_cmd(t["cmd"], cfg) if t["cmd"] else None
+        except SchemaError as e:
+            print(f"校验失败: {e}", file=sys.stderr)
+            return 1
         stages_e = None
         if t["stages"]:
             stage_art: dict[int, dict] = {}
             stages_e = []
             for j, s in enumerate(t["stages"]):
                 stage_art[j] = s["artifacts"]
+                try:
+                    stage_cmd = expand_cmd(s["cmd"], cfg, stage_art, t["cwd_abs"])
+                except SchemaError as e:
+                    print(f"校验失败: {e}", file=sys.stderr)
+                    return 1
                 stages_e.append(
                     {
-                        "cmd": expand_cmd(s["cmd"], cfg, stage_art, t["cwd_abs"]),
+                        "cmd": stage_cmd,
                         "artifacts": s["artifacts"],
                         "probes": s.get("probes"),
                         "retry_transform": s.get("retry_transform"),
