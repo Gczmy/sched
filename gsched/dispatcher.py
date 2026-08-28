@@ -1117,10 +1117,14 @@ class Dispatcher:
                     size = os.path.getsize(log_path)
                     if size < off:
                         off = 0
-                    longest = max(len(fail_pat or ""), len(ready_pat or ""))
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    longest = max(
+                        len((fail_pat or "").encode("utf-8")),
+                        len((ready_pat or "").encode("utf-8")),
+                    )
+                    with open(log_path, "rb") as f:
                         f.seek(max(0, off - longest))
-                        text = f.read()
+                        text = f.read().decode("utf-8", "replace")
+                    text = text.replace("\r\n", "\n").replace("\r", "\n")
                     self._probe_offsets[j["id"]] = size
                 except OSError:
                     continue  # 日志未就绪, 下轮再查
