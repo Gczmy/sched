@@ -364,7 +364,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 pass
             raise
         print(f"已投递: {bid} ({len(norm['tasks'])} 任务) -> {cfg.get('node')} (inbox)")
-        print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
+        health = _daemon_health()
+        heartbeat_age = health.get("heartbeat_age_s")
+        tick_age = health.get("tick_ok_age_s")
+        if heartbeat_age is None or heartbeat_age > 60:
+            print("⚠️ daemon 未运行或心跳已过期；payload 已落 inbox，恢复 daemon 后才会消费")
+            print("请先恢复 daemon，再用 sched verify 确认批次入队")
+        elif tick_age is None or health.get("frozen"):
+            print("⚠️ daemon 心跳存在但调度 tick 未确认完成；请检查 daemon.log 后再用 sched verify")
+        else:
+            print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
         return 0
 
     with state.connect() as conn:
@@ -644,12 +653,11 @@ def _daemon_health() -> dict[str, Any]:
     """B26: 读取 daemon 心跳/tick_ok 文件年龄 (CLI 侧只读文件, 不开 DB)."""
     import os as _os
     from .config import default_state_dir as _dsd
-    host = None
     try:
         cfg = _load_cfg()
-        host = cfg.get("node")
     except Exception:
-        pass
+        cfg = {}
+    host = cfg.get("node")
     if not host:
         return {}
     base = _os.path.join(_dsd(), str(host))
