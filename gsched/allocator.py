@@ -101,6 +101,14 @@ class Allocator:
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=10,
                 )
+                if out.returncode != 0 or not (out.stdout or "").strip():
+                    import sys as _sys
+                    print(
+                        f"[allocator] H3 nvidia-smi 容量探测失败 (rc={out.returncode}),"
+                        " 保留现有显存/隔离状态, 跳过幽灵卡判定",
+                        file=_sys.stderr,
+                    )
+                    return
                 seen: set[int] = set()
                 for line in out.stdout.splitlines():
                     parts = line.split(",")
