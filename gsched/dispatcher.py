@@ -1839,12 +1839,15 @@ class Dispatcher:
         #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
         best_idx: int | None = None
         best_load = float("inf")
+        preferred_idx: int | None = None
+        preferred_load = float("inf")
         cap_skipped = False   # B12-c: 候选卡中是否有因项目级上限被跳过
         self._assign_reject_scope = "all"   # 默认: 无卡对所有 GPU 任务一视同仁
         # B11c: shared packing honors the same hard/soft affinity semantics
         affinity_s = self._project_affinity(project) if project else []
         hard_s = self._project_affinity_hard(project) if project else False
         valid_s = set(self.allocator.gpu_list)
+        affinity_set = set(affinity_s)
         if hard_s and affinity_s:
             gpu_order_s = [i for i in affinity_s if i in valid_s]
         else:
@@ -1908,9 +1911,15 @@ class Dispatcher:
                 load = (used + task_vram) / cap
             else:
                 load = 0.0  # free 且容量未知: 第一个任务总能放 (现状语义)
-            if load < best_load:
+            if idx in affinity_set:
+                if load < preferred_load:
+                    preferred_load = load
+                    preferred_idx = idx
+            elif load < best_load:
                 best_load = load
                 best_idx = idx
+        if preferred_idx is not None:
+            best_idx = preferred_idx
         if best_idx is None:
             # B12-c: 项目级上限挡住 ≠ 全卡满。scope=project 时调用方不置
             # gpu_full, 同 tick 后续其他项目的任务仍可尝试该卡。
