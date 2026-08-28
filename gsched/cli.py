@@ -2282,7 +2282,9 @@ def cmd_project_list(args: argparse.Namespace) -> int:
             col_s = "跟随全局" if col is None else ("on" if col else "off")
             mjs = str(pcfg["max_jobs"]) if pcfg.get("max_jobs") else "-"
             used = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status='running' AND project=?", (name,)
+                "SELECT COUNT(*) FROM jobs"
+                " WHERE status='running' AND gpu IS NOT NULL AND project=?",
+                (name,),
             ).fetchone()[0]
             quota_str = f"{used}/{quota}" if quota > 0 else f"{used}/∞"
             print(f"{name:<16} {quota:<7} {prio:<6} {col_s:<9} "

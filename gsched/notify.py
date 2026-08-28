@@ -212,7 +212,10 @@ def send(event: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
         if ncfg.get(name) is not None:
             results.append(f"SKIP: {name} 渠道预留未实现 (设计 §4)")
     for name, fn in CHANNELS.items():
-        if ncfg.get(name) is None:  # 空 dict {} = 启用默认参数, 必须显式判 None
+        channel_cfg = ncfg.get(name)
+        if channel_cfg is None:
+            continue
+        if isinstance(channel_cfg, dict) and channel_cfg.get("enabled") is False:
             continue
         try:
             results.append(f"ok: {fn(event, ncfg)}")
