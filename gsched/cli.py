@@ -2306,7 +2306,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cpus", type=int, default=None, help="CPU 配额 (记录+status 显示, B4)")
     p.add_argument("--cpu-only", action="store_true",
                    help="CPU-only 任务 (resources.gpu=0, 不占 GPU 槽位)")
-    p.add_argument("--duration", type=int, default=None, help="预计时长(分钟), 超时=2x")
+    p.add_argument("--duration", type=int, default=None, help="预计时长(分钟), 超过该时长即终止")
     p.add_argument("--cwd", default=None, help="工作目录 (默认 {ROOT})")
     p.add_argument("--out", default=None, help="产物路径 (声明后 done 需产物存在)")
     p.add_argument("--venv", default=None, help="venv 语义名 (默认 config 第一个)")
