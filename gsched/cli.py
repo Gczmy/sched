@@ -50,6 +50,12 @@ def _load_cfg():
     except ConfigError as e:
         print(f"错误: {e}", file=sys.stderr)
         sys.exit(1)
+def _ensure_running_after_write() -> str:
+    from . import daemon
+
+    with state.submission_lock():
+        return daemon.ensure_running()
+
 
 
 def _batch_id_from_name(name: str) -> str | None:
@@ -555,8 +561,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # 异常 (如 NFS 读配置瞬断 -> ConfigError), 整个事务回滚但 "已入队" 已
     # 打印, 用户以为成功实际批次消失。打印必须在提交之后。
     print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
-    from . import daemon
-    print(daemon.ensure_running())  # 定案 38: daemon 未运行自动拉起 (idle 退出后)
+    print(_ensure_running_after_write())
     return 0
 
 
@@ -701,8 +706,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     res_txt = "cpu-only" if args.cpu_only else "gpu=1"
     print(f"已入队: {bid} ({res_txt}, duration={args.duration}min)")
     print(f"  status/cancel 用批次名: {batch_name}")
-    from . import daemon
-    print(daemon.ensure_running())  # 定案 38: daemon 未运行自动拉起 (idle 退出后)
+    print(_ensure_running_after_write())
     return 0
 
 
@@ -1278,8 +1282,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
             print(f"已解锁重跑: {j['id']}")
             n += 1
         print(f"({n} 个任务)")
-    from . import daemon
-    print(daemon.ensure_running())  # 定案 38: retry 产生可派发工作, daemon 未运行自动拉起
+    print(_ensure_running_after_write())
     return 0
 
 
@@ -1467,8 +1470,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
 
         print(f"已 resubmit {len(done_labels)} 个任务: {', '.join(done_labels)}")
 
-    from . import daemon
-    print(daemon.ensure_running())  # 定案 38: 产生可派发工作, daemon 未运行自动拉起
+    print(_ensure_running_after_write())
     return 0
 
 

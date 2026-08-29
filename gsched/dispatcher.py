@@ -361,7 +361,10 @@ class Dispatcher:
 
     def stop(self) -> None:
         with state.submission_lock():
-            state.mark_idle_shutdown()
+            try:
+                state.mark_idle_shutdown()
+            except OSError:
+                pass
             self._stop_locked()
 
     def _stop_locked(self) -> None:

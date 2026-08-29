@@ -369,8 +369,7 @@ def _check_sudo_tokens(
                 and (tok in SHELL_CONTROL_WORDS or tok == "!")
             )
             if effective_command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
-                if is_shell_payload and control_pending:
-                    continue
+                continue
             command_position = (
                 _ends_shell_separator(tok) if is_shell_payload else False
             )

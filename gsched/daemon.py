@@ -73,12 +73,17 @@ def is_running() -> bool:
 
 
 def ensure_running() -> str:
-    """定案 38: 所有"会产生可派发工作"的命令 (submit/run/retry/resubmit) 共享的
-    再启动通道——daemon 未运行 (含 idle 自动退出后) 自动拉起.
-
-    fake 由 SCHED_FAKE_GPUS 环境变量驱动 (验收/测试场景), 与 daemon start --fake 一致.
-    start 本身幂等: 已在运行则跳过.
-    """
+    """Restart the daemon when work was submitted during idle shutdown."""
+    if state.idle_shutdown_pending():
+        for _ in range(100):
+            if not is_running():
+                break
+            time.sleep(0.1)
+        state.clear_idle_shutdown()
+        return start(
+            fake=bool(os.environ.get("SCHED_FAKE_GPUS")),
+            force=True,
+        )
     if is_running():
         return "daemon 已在运行"
     return start(fake=bool(os.environ.get("SCHED_FAKE_GPUS")))
@@ -95,8 +100,8 @@ def status_str() -> str:
 
 # ---------- start ----------
 
-def start(fake: bool = False) -> str:
-    if is_running():
+def start(fake: bool = False, force: bool = False) -> str:
+    if not force and is_running():
         return f"daemon 已在运行 ({status_str()})"
     # 前置检查 (M0)
     issues = check(fake=fake)
