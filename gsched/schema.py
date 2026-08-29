@@ -199,16 +199,23 @@ def _token_has_sudo(tok: str) -> bool:
 
 def _reject_shell_source(command: str, where: str) -> None:
     text = str(command)
+    source_token = (
+        r"(?:(?<![\w.])source(?!\w)"
+        r"|(?<![\w.])\.(?=$|[\s;|&`(){}<>]))"
+    )
     if re.search(
-        r"(?:^|[;\n|&(){}])\s*(?:source|\.)\b",
+        rf"(?:^|[;\n|&(){{}}])\s*{source_token}",
         text,
     ):
         raise SchemaError(f"{where}: source 动态脚本执行被拒绝")
-    if re.search(r"(?:\$\(|`)[^`)]*\b(?:source|\.)\b", text):
+    if re.search(
+        rf"(?:\$\(|`)[^`)]*{source_token}",
+        text,
+    ):
         raise SchemaError(f"{where}: source 命令替换被拒绝")
     if re.search(
-        r"\b(?:if|then|else|elif|!|command|builtin|time|coproc)\s+"
-        r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:source|\.)\b",
+        rf"\b(?:if|then|else|elif|!|command|builtin|time|coproc)\s+"
+        rf"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*{source_token}",
         text,
     ):
         raise SchemaError(f"{where}: source 控制前缀被拒绝")

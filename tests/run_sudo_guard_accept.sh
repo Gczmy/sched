@@ -82,6 +82,9 @@ rejected(["perl", "-E", "system \"sudo id\""])
 rejected(["node", "-p", "require(\"child_process\").exec(\"sudo id\")"])
 rejected(["node", "-pe", "require(\"child_process\").exec(\"sudo id\")"])
 rejected(["bash", "-c", "echo $(source priv.sh)"])
+rejected(["bash", "-c", "echo $(A=1 source${IFS}/tmp/payload)"])
+rejected(["bash", "-c", "echo `A=1 source${IFS}/tmp/payload`"])
+rejected(["bash", "-c", "echo $(A=1 source* /tmp/payload)"])
 try:
     parse_shell_cmd("bash -lc 'runuser -u root id'", "sched run")
 except SchemaError:
@@ -116,6 +119,7 @@ accepted(["echo", "bash", "-c", "sudo id"])
 accepted(["bash", "-c", "echo", "--command", "sudo id"])
 accepted(["echo", "source"])
 accepted(["echo", "."])
+accepted(["python3", "-c", "open('out.txt').write('ok')"])
 validate_batch(
     {**base, "tasks": [{"id": "loop", "cmd": ["bash", "-c", "{ROOT}"]}]},
     loop_cfg,
