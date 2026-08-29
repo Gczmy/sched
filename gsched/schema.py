@@ -27,6 +27,13 @@ def _require_type(v: Any, t: type, field: str, where: str) -> None:
         raise SchemaError(f"{where}.{field}: 期望 {t.__name__}, 实际 {type(v).__name__}")
 
 SHELL_WRAPPERS = {"env", "command", "nohup", "eval", "builtin"}
+COMMAND_LAUNCHERS = {
+    "find", "xargs", "busybox", "nice", "timeout", "setsid",
+    "stdbuf", "chrt", "taskset", "command", "nohup", "time", "!",
+}
+SCRIPT_INTERPRETERS = {
+    "python", "python3", "perl", "ruby", "node", "nodejs", "php", "lua",
+}
 
 
 def _shell_command_arg(tokens: list[str], idx: int) -> str | None:
@@ -85,7 +92,7 @@ def _launcher_shell_payloads(tokens: list[str], launcher_idx: int) -> tuple[bool
                     break
                 if os.path.basename(tokens[candidate]) in SHELL_TOKENS:
                     candidates.append(candidate)
-    elif base in {"xargs", "busybox"}:
+    elif base in COMMAND_LAUNCHERS - {"find"}:
         candidates = [
             idx for idx in range(launcher_idx + 1, len(tokens))
             if os.path.basename(tokens[idx]) in SHELL_TOKENS
@@ -185,14 +192,9 @@ def _ends_shell_separator(tok: str) -> bool:
 
 
 def _token_has_sudo(tok: str) -> bool:
-    """Recognize helpers in shell-command substitution and punctuation."""
-    return bool(
-        re.search(
-            r"(?:^|[;|&`()<>{}=])(?:[^\s;|&`()<>{}]+/)?"
-            r"(?:sudo|su|runuser)(?=$|[\s;|&`()<>{}$])",
-            tok,
-        )
-    )
+    """Recognize privilege helpers embedded in shell punctuation/code."""
+    candidates = re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", str(tok))
+    return any(os.path.basename(candidate).lower() in SUDO_TOKENS for candidate in candidates)
 def _check_sudo_tokens(
     tokens: list[str],
     where: str,
@@ -247,7 +249,23 @@ def _check_sudo_tokens(
                 raise SchemaError(
                     f"{current_where}: exec 会绕过退出码封装, 拒绝命令"
                 )
-            if command_position and base in {"find", "xargs", "busybox"}:
+            if command_position and base in SCRIPT_INTERPRETERS:
+                for option_idx in range(idx + 1, len(expanded)):
+                    option = expanded[option_idx]
+                    script = None
+                    if option in ("-c", "--command", "-e", "--eval", "-r"):
+                        script = _shell_command_arg(expanded, option_idx)
+                    elif option.startswith(("--command=", "--eval=")):
+                        script = option.partition("=")[2]
+                    elif len(option) > 2 and option[:2] in ("-c", "-e", "-r"):
+                        script = option[2:]
+                    if script is None:
+                        continue
+                    pending.append(
+                        ([script], f"{current_where} interpreter payload", True)
+                    )
+                    break
+            if command_position and base in COMMAND_LAUNCHERS:
                 for launcher_arg in _launcher_argument_tokens(expanded, idx):
                     if (
                         os.path.basename(launcher_arg) in SUDO_TOKENS
@@ -273,13 +291,13 @@ def _check_sudo_tokens(
                 nested = _wrapper_command_tokens(expanded, idx)
                 if nested:
                     pending.append((nested, f"{current_where} command wrapper", is_shell_payload))
-            if is_shell_payload and command_position and base in {"source", "."}:
+            if base in {"source", "."}:
                 raise SchemaError(
                     f"{current_where}: source 动态脚本执行被拒绝"
                 )
             if command_position and base in SHELL_TOKENS:
                 nested_commands = _nested_shell_commands(expanded, idx)
-                if is_shell_payload and not nested_commands:
+                if not nested_commands:
                     raise SchemaError(
                         f"{current_where}: 未提供可检查的嵌套 shell 命令"
                     )

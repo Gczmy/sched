@@ -72,6 +72,10 @@ rejected(["xargs", "sh", "-c", "sudo id"])
 rejected(["busybox", "sh", "-c", "sudo id"])
 rejected(["bash", "-Oexpand_aliases", "-c", "alias x=sudo; x id"])
 rejected(["bash", "-c", "builtin eval \"$x\""])
+rejected(["nice", "-n", "10", "/usr/bin/sudo", "id"])
+rejected(["timeout", "5", "/usr/bin/sudo", "id"])
+rejected(["command", "-p", "/usr/bin/sudo", "id"])
+rejected(["nohup", "--", "/usr/bin/sudo", "id"])
 try:
     parse_shell_cmd("bash -lc 'runuser -u root id'", "sched run")
 except SchemaError:

@@ -336,6 +336,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # 撞主键抛裸 IntegrityError; 毫秒 + IntegrityError 兜底友好报错
     bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
     foreign_write = _is_foreign_host(cfg) and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE")
+    if foreign_write:
+        bid = f"{bid}-{uuid.uuid4().hex[:12]}"
     dry_run = bool(getattr(args, "dry_run", False))
 
     # B27/C2: 网关 submit 只投递 inbox 文件; control_requests 由计算节点
@@ -399,12 +401,24 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
         # 依赖环检测 (§3.4e B3): 按 name 拓扑 DFS (当前批次 + 已存在批次全图)
         def _dep_graph() -> dict[str, list[str]]:
-            """name -> depends_on name 列表 (含当前批次)."""
+            """name -> latest batch's depends_on names (including current batch)."""
             g: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
+            latest: dict[str, tuple[str, int, list[str]]] = {}
             with state.connect() as conn:
-                rows = conn.execute("SELECT name, depends_on FROM batches").fetchall()
-                for r in rows:
-                    g.setdefault(r["name"], json.loads(r["depends_on"] or "[]"))
+                rows = conn.execute(
+                    "SELECT rowid, name, depends_on, created_at FROM batches"
+                ).fetchall()
+                for row in rows:
+                    key = (row["created_at"] or "", row["rowid"])
+                    current = latest.get(row["name"])
+                    if current is None or key > current[:2]:
+                        latest[row["name"]] = (
+                            key[0],
+                            key[1],
+                            json.loads(row["depends_on"] or "[]"),
+                        )
+            for name, (_created_at, _rowid, depends_on) in latest.items():
+                g.setdefault(name, depends_on)
             return g
 
         g = _dep_graph()

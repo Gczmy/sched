@@ -48,7 +48,7 @@ with open(rc_path, encoding="utf-8") as f:
 
 # Simulate a daemon restart: Popen is gone, but the adopted job's rc marker is 0.
 with open(launch_marker, encoding="utf-8") as f:
-    assert f.read().strip() == str(pid)
+    assert f.read().split()[0] == str(pid)
 batch_id = "adopt-rc-batch"
 job_id = "adopt-rc-batch-t1-v1"
 spec = {

@@ -149,8 +149,14 @@ class Executor:
         launch_marker = merged_env.get("SCHED_LAUNCH_MARKER")
         launch_script = ""
         if launch_marker:
+            marker_path = shlex.quote(str(launch_marker))
+            marker_tmp = shlex.quote(f"{launch_marker}.tmp")
             launch_script = (
-                f"umask 077; printf '%s\\n' \"$$\" > {shlex.quote(str(launch_marker))}; "
+                f"umask 077; launch_tmp={marker_tmp}.$$; "
+                f"if [ -r /proc/$$/stat ] && "
+                f"/usr/bin/awk '{{print $1 \" \" $22}}' /proc/$$/stat > \"$launch_tmp\"; "
+                f"then :; else printf '%s\\n' \"$$\" > \"$launch_tmp\"; fi && "
+                f"/bin/mv -f \"$launch_tmp\" {marker_path} && "
             )
         if self.sanitize_env:
             self._sanitize_conda_env(merged_env, cmd, stages, explicit=conda_env_dir)

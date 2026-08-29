@@ -50,9 +50,15 @@ def _validate_inbox_dependencies(conn, norm: dict) -> None:
             raise SchemaError(f"depends_on 引用的批次不存在: '{dep}' (O1)")
 
     graph: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
-    rows = conn.execute("SELECT name, depends_on FROM batches").fetchall()
+    latest: dict[str, tuple[str, int, list[str]]] = {}
+    rows = conn.execute("SELECT rowid, name, depends_on, created_at FROM batches").fetchall()
     for row in rows:
-        graph.setdefault(row["name"], json.loads(row["depends_on"] or "[]"))
+        key = (row["created_at"] or "", row["rowid"])
+        current = latest.get(row["name"])
+        if current is None or key > current[:2]:
+            latest[row["name"]] = (key[0], key[1], json.loads(row["depends_on"] or "[]"))
+    for name, (_created_at, _rowid, depends_on) in latest.items():
+        graph.setdefault(name, depends_on)
     visited: set[str] = set()
     stack: list[str] = []
 
@@ -768,6 +774,14 @@ class Dispatcher:
             os.unlink(self._launch_marker_path(job))
         except OSError:
             pass
+    def _proc_start_time(self, pgid: int) -> str | None:
+        try:
+            with open(f"/proc/{pgid}/stat", encoding="utf-8") as proc_stat:
+                fields = proc_stat.read().rsplit(")", 1)[1].split()
+            return fields[19] if len(fields) > 19 else None
+        except (OSError, IndexError):
+            return None
+
 
     def _recover_launch_markers(self) -> None:
         marker_dir = os.path.join(self.host_dir, "launch")
@@ -778,29 +792,60 @@ class Dispatcher:
         except OSError:
             return
         with state.connect() as conn:
-            rows = conn.execute("SELECT id, status, pgid FROM jobs").fetchall()
+            rows = conn.execute("SELECT * FROM jobs").fetchall()
             by_prefix = {self._job_rc_prefix(row): row for row in rows}
             for name in names:
                 path = os.path.join(marker_dir, name)
                 try:
                     with open(path, encoding="utf-8") as marker:
-                        pgid = int(marker.read().strip())
-                except (OSError, ValueError):
+                        fields = marker.read().split()
+                    pgid = int(fields[0])
+                    marker_start = fields[1] if len(fields) > 1 else None
+                except (OSError, ValueError, IndexError):
+                    self._drop_rc_path(path)
+                    continue
+                if pgid <= 0 or pgid > 2**31 - 1:
                     self._drop_rc_path(path)
                     continue
                 row = by_prefix.get(name[:-len(".launch")])
-                if (
-                    row
-                    and row["status"] == "running"
-                    and row["pgid"] == pgid
-                    and self.executor.alive(pgid)
-                ):
+                if row is None:
+                    self._drop_rc_path(path)
+                    continue
+                same_process = row["status"] == "running" and row["pgid"] == pgid
+                process_start = self._proc_start_time(pgid) if marker_start else None
+                if marker_start and process_start and marker_start != process_start:
+                    if same_process:
+                        state.update_job(
+                            conn,
+                            row["id"],
+                            status="failed",
+                            failure="launch_identity",
+                            pgid=None,
+                            finished_at=state.now(),
+                        )
+                        self._release_gpu_for_job(conn, row)
+                        self._maybe_retry(conn, row)
+                    self._drop_rc_path(path)
+                    continue
+                if same_process:
+                    try:
+                        if self.executor.alive(pgid):
+                            continue
+                    except (OSError, OverflowError):
+                        pass
+                elif row["status"] == "running" and row["pgid"] is not None:
+                    self._drop_rc_path(path)
                     continue
                 try:
                     self.executor.kill_pgid(pgid, signal.SIGKILL)
                 except Exception:
                     pass
-                self._drop_rc_path(path)
+                try:
+                    still_alive = self.executor.alive(pgid)
+                except (OSError, OverflowError):
+                    still_alive = True
+                if not still_alive:
+                    self._drop_rc_path(path)
 
     def _read_job_rc(self, job) -> int | None:
         path = self._job_rc_path(job)
@@ -992,20 +1037,26 @@ class Dispatcher:
             return
         with state.connect() as conn:
             known = {
-                row["job_id"]
+                row["job_id"]: row["status"]
                 for row in conn.execute(
-                    "SELECT job_id FROM control_requests WHERE op='batch_submit'"
+                    "SELECT job_id, status FROM control_requests WHERE op='batch_submit'"
                 ).fetchall()
             }
             for payload_path in payloads:
-                if payload_path in known:
+                status = known.get(payload_path)
+                if status:
+                    if status == "done":
+                        try:
+                            os.unlink(payload_path)
+                        except OSError:
+                            pass
                     continue
                 conn.execute(
                     "INSERT INTO control_requests (job_id, op, status, created_at)"
                     " VALUES (?, 'batch_submit', 'pending', ?)",
                     (payload_path, state.now()),
                 )
-                known.add(payload_path)
+                known[payload_path] = "pending"
                 self.log_line(f"submit_inbox 收编: {payload_path}")
 
     def _prune_control_requests(self) -> None:
@@ -1368,6 +1419,7 @@ class Dispatcher:
                         f"probe fail_on_log 命中: job {j['id']} ({fail_pat!r}) -> kill + blocked"
                     )
                     self.executor.kill_pgid(j["pgid"])
+                    self._drop_launch_marker(j)
                     # probe 命中视为确定失败: 不 retry, 直接 blocked (等人工)
                     state.update_job(
                         conn, j["id"], status="blocked", failure="probe",
@@ -1383,6 +1435,7 @@ class Dispatcher:
                         f"probe ready_on_log 命中: job {j['id']} ({ready_pat!r}) -> kill + done"
                     )
                     self.executor.kill_pgid(j["pgid"])
+                    self._drop_launch_marker(j)
                     state.update_job(
                         conn, j["id"], status="done", kill_reason="probe",
                         finished_at=state.now(),
@@ -1781,6 +1834,7 @@ class Dispatcher:
         H3 修复: 回队前必须释放 GPU 占用 (assigned -> releasing + 删 gpu_jobs
         行), 否则节点重启后卡仍 assigned 给已死 job, GPU 永久泄漏.
         """
+        self._drop_launch_marker(j)
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
         state.update_job(
@@ -1852,10 +1906,15 @@ class Dispatcher:
                     self.executor.kill_pgid(pgid, signal.SIGKILL)
                 except Exception:
                     pass
-                self._drop_rc_path(
-                    self._job_rc_path({"id": job_id, "pgid": pgid})
-                )
-                self._drop_launch_marker({"id": job_id})
+                try:
+                    still_alive = self.executor.alive(pgid)
+                except (OSError, OverflowError):
+                    still_alive = True
+                if not still_alive:
+                    self._drop_rc_path(
+                        self._job_rc_path({"id": job_id, "pgid": pgid})
+                    )
+                    self._drop_launch_marker({"id": job_id})
             raise
         finally:
             self._launch_inflight.clear()
@@ -2292,6 +2351,20 @@ class Dispatcher:
         inflight = getattr(self, "_launch_inflight", None)
         if isinstance(inflight, dict):
             inflight[j["id"]] = pgid
+        def abort_launch() -> None:
+            try:
+                self.executor.kill_pgid(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                still_alive = self.executor.alive(pgid)
+            except (OSError, OverflowError):
+                still_alive = True
+            if not still_alive:
+                self._drop_rc_path(self._job_rc_path(j, pgid))
+                self._drop_launch_marker(j)
+            if isinstance(inflight, dict):
+                inflight.pop(j["id"], None)
         git_rev = None
         try:
             _, _, git_rev = compute_fingerprint(
@@ -2313,31 +2386,17 @@ class Dispatcher:
                 )
             except Exception:
                 pass
-            try:
-                self.executor.kill_pgid(pgid, signal.SIGKILL)
-            except Exception:
-                pass
-            self._drop_rc_path(self._job_rc_path(j, pgid))
-            self._drop_launch_marker(j)
-            if isinstance(inflight, dict):
-                inflight.pop(j["id"], None)
+            abort_launch()
             raise
         tag = f"cpu" if gpu is None else f"gpu={gpu}"
         try:
             self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
         except Exception:
             try:
-                self.executor.kill_pgid(pgid, signal.SIGKILL)
-            except Exception:
-                pass
-            try:
                 state.update_job(conn, j["id"], gpu=None, pgid=None)
             except Exception:
                 pass
-            self._drop_rc_path(self._job_rc_path(j, pgid))
-            self._drop_launch_marker(j)
-            if isinstance(inflight, dict):
-                inflight.pop(j["id"], None)
+            abort_launch()
             raise
         return True
 
