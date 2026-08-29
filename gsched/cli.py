@@ -1280,10 +1280,19 @@ def cmd_retry(args: argparse.Namespace) -> int:
             w = _rev_diff_warn(conn, j)
             if w:
                 print(w)
+            probe_pending = j["kill_reason"] == "probe" and j["pgid"] is not None
             state.update_job(
-                conn, j["id"], status="pending", retries=0, kill_reason=None,
-                pgid=None, gpu=None, rc=None, failure=None,
-                started_at=None, finished_at=None,  # 清陈旧时间戳, pending 期间不显示旧耗时
+                conn,
+                j["id"],
+                status="pending",
+                retries=0,
+                kill_reason="probe" if probe_pending else None,
+                pgid=j["pgid"] if probe_pending else None,
+                gpu=None,
+                rc=None,
+                failure=None,
+                started_at=None,
+                finished_at=None,  # 清陈旧时间戳, pending 期间不显示旧耗时
             )
             print(f"已解锁重跑: {j['id']}")
             n += 1
@@ -1414,6 +1423,16 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             ).fetchall()
             if j["task_id"] in target_tasks
         ]
+        probe_targets = [
+            j for j in jrows if j["kill_reason"] == "probe" and j["pgid"] is not None
+        ]
+        if probe_targets:
+            labels = ", ".join(f"{j['task_id']}v{j['version']}" for j in probe_targets)
+            print(
+                f"错误: probe 终止尚未确认完成: {labels}; 请等待 daemon 完成 SIGKILL 升级",
+                file=sys.stderr,
+            )
+            return 1
         if active_targets:
             labels = ", ".join(
                 f"{j['task_id']}[{j['status']}]v{j['version']}"
