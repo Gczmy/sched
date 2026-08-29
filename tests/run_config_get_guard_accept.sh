@@ -15,5 +15,6 @@ import os, subprocess, sys
 result = subprocess.run([sys.executable, "-m", "gsched.cli", "config", "get"], text=True, capture_output=True)
 assert result.returncode == 0, result.stderr + result.stdout
 assert '"node": "compute-node"' in result.stdout, result.stdout
+assert not os.path.exists(os.path.join(os.environ["SCHED_STATE"], "compute-node", "state.db"))
 print("L4 config get bypasses foreign write guard")
 PY

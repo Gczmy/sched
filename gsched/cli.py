@@ -2553,7 +2553,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
     # Gateway submit is file-only; foreign dry-run is also DB-free.
-    if not foreign_submit:
+    if not foreign_submit and not is_read_only_config:
         try:
             state.init_db()
         except Exception as e:
