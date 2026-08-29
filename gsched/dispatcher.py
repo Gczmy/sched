@@ -894,6 +894,7 @@ class Dispatcher:
                     except (OSError, OverflowError):
                         pass
                 elif row["status"] == "running" and row["pgid"] is not None:
+                    self._drop_rc_path(self._job_rc_path(row, pgid))
                     self._drop_rc_path(path)
                     continue
                 try:
@@ -905,6 +906,8 @@ class Dispatcher:
                 except (OSError, OverflowError):
                     still_alive = True
                 if not still_alive:
+                    if not same_process:
+                        self._drop_rc_path(self._job_rc_path(row, pgid))
                     self._drop_rc_path(path)
 
     def _read_job_rc(self, job) -> int | None:

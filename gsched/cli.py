@@ -1273,6 +1273,18 @@ def cmd_retry(args: argparse.Namespace) -> int:
         if not targets:
             print(f"无失败终态任务: {ref}")
             return 0
+        blocked_markers = [
+            j for j in targets
+            if j["kill_reason"] != "probe"
+            and os.path.isfile(state.launch_marker_path(j["id"]))
+        ]
+        if blocked_markers:
+            labels = ", ".join(j["id"] for j in blocked_markers)
+            print(
+                f"错误: 任务 {labels} 仍有未确认的进程组，请等待 daemon 完成清理后再 retry",
+                file=sys.stderr,
+            )
+            return 1
         n = 0
         for j in targets:
             if j["status"] not in ("blocked", "cancelled", "timed_out", "failed"):
@@ -1280,18 +1292,8 @@ def cmd_retry(args: argparse.Namespace) -> int:
             w = _rev_diff_warn(conn, j)
             if w:
                 print(w)
-            marker_present = os.path.isfile(state.launch_marker_path(j["id"]))
-            if marker_present and j["kill_reason"] != "probe":
-                print(
-                    f"错误: 任务 {j['id']} 仍有未确认的进程组，"
-                    "请等待 daemon 完成清理后再 retry",
-                    file=sys.stderr,
-                )
-                return 1
             termination_pending = (
-                marker_present
-                and j["kill_reason"] == "probe"
-                and j["pgid"] is not None
+                j["kill_reason"] == "probe" and j["pgid"] is not None
             )
             state.update_job(
                 conn,
