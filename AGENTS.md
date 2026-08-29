@@ -3,6 +3,7 @@
 ## LLM agent 操作契约（L0）
 
 本目录的调度器保持"无意识"：不含任何 agent 逻辑，只提供标准接口。**agent 操作调度器的唯一正确方式是 `sched` CLI**（入口 `gsched.cli:main`，零依赖纯标准库）。
+- 配套项目为 `/Users/zzc/quant_trade/dsh-node-sched`，与 `sched` 配合使用。
 
 ### 铁律
 
