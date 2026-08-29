@@ -73,17 +73,16 @@ def is_running() -> bool:
 
 
 def ensure_running() -> str:
-    """Restart the daemon when work was submitted during idle shutdown."""
+    """Restart the daemon when work was submitted during a coordinated shutdown."""
     if state.idle_shutdown_pending():
-        for _ in range(100):
+        for _ in range(700):
             if not is_running():
                 break
             time.sleep(0.1)
+        if is_running():
+            return "daemon 正在退出未完成, 请稍后重试 (任务已保留)"
         state.clear_idle_shutdown()
-        return start(
-            fake=bool(os.environ.get("SCHED_FAKE_GPUS")),
-            force=True,
-        )
+        return start(fake=bool(os.environ.get("SCHED_FAKE_GPUS")))
     if is_running():
         return "daemon 已在运行"
     return start(fake=bool(os.environ.get("SCHED_FAKE_GPUS")))
