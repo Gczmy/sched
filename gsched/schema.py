@@ -189,7 +189,7 @@ def _nested_shell_commands(tokens: list[str], shell_idx: int) -> list[str]:
 
 
 def _ends_shell_separator(tok: str) -> bool:
-    return bool(re.search(r"[;|&]$", tok))
+    return bool(re.search(r"[;|&({\n]$", tok))
 
 
 def _token_has_sudo(tok: str) -> bool:
@@ -226,6 +226,7 @@ def _check_sudo_tokens(
             )
         seen.add(current_key)
         command_position = True
+        control_pending = False
         for idx, tok in enumerate(expanded):
             base = os.path.basename(tok)
             if is_shell_payload and re.search(r"[$`]", tok):
@@ -259,11 +260,18 @@ def _check_sudo_tokens(
                         payload_options += ("-E", "--execute")
                     if base in {"node", "nodejs"}:
                         payload_options += ("-p", "--print")
+                    if base == "php":
+                        payload_options += (
+                            "-R", "--process-code", "-B", "--process-begin",
+                            "-E", "--process-end",
+                        )
                     if option in payload_options:
                         script = _shell_command_arg(expanded, option_idx)
-                    elif option.startswith(("--command=", "--eval=", "--execute=", "--print=")):
+                    elif option.startswith(("--command=", "--eval=", "--execute=", "--print=", "--process-code=", "--process-begin=", "--process-end=")):
                         script = option.partition("=")[2]
-                    elif len(option) > 2 and option[:2] in ("-c", "-e", "-r", "-E", "-p"):
+                    elif base in {"node", "nodejs"} and option.startswith("-p") and len(option) > 2:
+                        script = _shell_command_arg(expanded, option_idx)
+                    elif len(option) > 2 and option[:2] in ("-c", "-e", "-r", "-E", "-p", "-R", "-B"):
                         script = option[2:]
                     if script is None:
                         continue
@@ -298,10 +306,7 @@ def _check_sudo_tokens(
                     pending.append((nested, f"{current_where} command wrapper", is_shell_payload))
             if (
                 command_position
-                or (
-                    is_shell_payload
-                    and any(token in SHELL_CONTROL_WORDS for token in expanded[:idx])
-                )
+                or (is_shell_payload and control_pending)
             ) and base in {"source", "."}:
                 raise SchemaError(
                     f"{current_where}: source 动态脚本执行被拒绝"
@@ -320,6 +325,9 @@ def _check_sudo_tokens(
                             f"{current_where}: nested shell 解析失败: {e}"
                         ) from e
                     pending.append((nested, f"{current_where} nested shell", True))
+            control_pending = bool(
+                is_shell_payload and command_position and tok in SHELL_CONTROL_WORDS
+            )
             if command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
                 continue
             command_position = (

@@ -293,9 +293,6 @@ class Executor:
         return kill_sent
 
     def alive(self, pgid: int) -> bool:
-        proc = self._procs.get(pgid)
-        if proc is not None and proc.poll() is not None:
-            self._procs.pop(pgid, None)
         try:
             os.killpg(pgid, 0)
             return True

@@ -79,6 +79,7 @@ rejected(["nohup", "--", "/usr/bin/sudo", "id"])
 rejected(["perl", "-e", "print 1;", "-e", "system \"sudo id\""])
 rejected(["perl", "-E", "system \"sudo id\""])
 rejected(["node", "-p", "require(\"child_process\").exec(\"sudo id\")"])
+rejected(["node", "-pe", "require(\"child_process\").exec(\"sudo id\")"])
 try:
     parse_shell_cmd("bash -lc 'runuser -u root id'", "sched run")
 except SchemaError:
