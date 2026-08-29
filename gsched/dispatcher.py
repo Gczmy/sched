@@ -390,7 +390,14 @@ class Dispatcher:
                             finished_at=state.now(),
                         )
                         self._drop_job_rc(j)
-                        self._drop_launch_marker(j)
+                        if not j["pgid"]:
+                            self._drop_launch_marker(j)
+                        else:
+                            try:
+                                if not self.executor.alive(j["pgid"]):
+                                    self._drop_launch_marker(j)
+                            except (OSError, OverflowError):
+                                pass
                         # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
                         # (assigned -> releasing), 否则 cancelled 任务残留 assigned
                         # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
