@@ -37,6 +37,13 @@ from .schema import (
 from .templates import expand_cmd
 
 
+def _is_foreign_host(cfg: dict) -> bool:
+    import socket
+
+    node = str(cfg.get("node") or "").strip()
+    return bool(node) and socket.gethostname().strip() != node
+
+
 def _load_cfg():
     try:
         return load_config()
@@ -141,7 +148,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _dry_run_preview(norm: dict, cfg: dict) -> dict:
+def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
     """§G4 A 类 dry-run: 纯只读预览 (不写 state).
 
     返回 {"tasks": [{id, cmd_flat, stage_preds, skip, reason}],
@@ -224,17 +231,20 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
 
     # 2) 依赖就绪预览 (O1): depends_on name -> 最新批次 id + 状态
     dep_status: dict[str, str] = {}
-    with state.connect() as conn:
-        for dep in norm["depends_on"]:
-            row = conn.execute(
-                "SELECT id, status FROM batches WHERE name=?"
-                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                (dep,),
-            ).fetchone()
-            if row:
-                dep_status[dep] = row["status"]
-            else:
-                dep_status[dep] = "NOT_FOUND"
+    if use_state:
+        with state.connect() as conn:
+            for dep in norm["depends_on"]:
+                row = conn.execute(
+                    "SELECT id, status FROM batches WHERE name=?"
+                    " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (dep,),
+                ).fetchone()
+                if row:
+                    dep_status[dep] = row["status"]
+                else:
+                    dep_status[dep] = "NOT_FOUND"
+    else:
+        dep_status = {dep: "UNAVAILABLE" for dep in norm["depends_on"]}
 
     return {
         "tasks": preview_tasks,
@@ -243,6 +253,41 @@ def _dry_run_preview(norm: dict, cfg: dict) -> dict:
         "n_skip": n_skip,
         "n_run": n_run,
     }
+
+
+def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, conflict: bool) -> None:
+    print(f"=== dry-run: {norm['name']} ({len(norm['tasks'])} 任务, mode={norm['mode']}) ===")
+    if conflict:
+        print("  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
+    if prev["dep_status"]:
+        print("--- 依赖就绪 ---")
+        for dep, st in prev["dep_status"].items():
+            mark = "✅" if st == "done" else ("⚠️" if st in ("active", "queued") else "❌")
+            note = {
+                "done": "上游已终态, 本批提交后可直接派发",
+                "blocked": "上游 blocked, 本批将挂起 waiting_dep",
+                "active": "上游运行中, 本批将挂起等解锁",
+                "queued": "上游排队中, 本批将挂起等解锁",
+                "NOT_FOUND": "上游不存在 (O1 已拒绝, 这里仅为展示)",
+                "UNAVAILABLE": "当前节点无法读取状态, 实际提交由 daemon 重新解析",
+            }.get(st, st)
+            print(f"  {mark} {dep}: {st} — {note}")
+    print("--- 任务预览 ---")
+    for pt in prev["tasks"]:
+        tag = "SKIP" if pt["skip"] else "RUN "
+        print(f"  [{tag}] {pt['id']}")
+        for sp in pt["stages"]:
+            st = "SKIP" if sp["skip"] else "RUN "
+            print(f"      stage{sp['stage']} [{st}] {sp['reason']}")
+        flat = pt["cmd_flat"]
+        shown = flat[:120] + ("..." if len(flat) > 120 else "")
+        print(f"      cmd: {shown}")
+    print("--- 汇总 ---")
+    print(f"  将跑 {prev['n_run']} / 将 skip {prev['n_skip']} / 共 {len(norm['tasks'])} 任务")
+    if prev["git_rev"]:
+        print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
+    if args.json:
+        print(json.dumps(prev, ensure_ascii=False, indent=2))
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -258,7 +303,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     try:
         norm = validate_batch(spec, cfg)
         check_dependency_cycle(norm["depends_on"], cfg)
-    except SchemaError as e:
+    except (SchemaError, ConfigError) as e:
         print(f"校验失败: {e}", file=sys.stderr)
         return 1
 
@@ -285,77 +330,39 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(f"⚠️ 任务 {', '.join(_unwarn)} 未声明运行环境"
               " ({VENV} 或 runtime 字段), 指纹仅含 git rev")
 
-    # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
-    with state.connect() as conn:
-        for dep in norm["depends_on"]:
-            row = conn.execute(
-                "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                (dep,),
-            ).fetchone()
-            if not row:
-                print(f"错误: depends_on 引用的批次不存在: '{dep}' (O1)", file=sys.stderr)
-                return 1
-
-    # 依赖环检测 (§3.4e B3): 按 name 拓扑 DFS (当前批次 + 已存在批次全图)
-    def _dep_graph() -> dict[str, list[str]]:
-        """name -> depends_on name 列表 (含当前批次)."""
-        g: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
-        with state.connect() as conn:
-            rows = conn.execute("SELECT name, depends_on FROM batches").fetchall()
-            for r in rows:
-                g.setdefault(r["name"], json.loads(r["depends_on"] or "[]"))
-        return g
-
-    g = _dep_graph()
-    visited: set[str] = set()
-    stack: list[str] = []
-
-    def _has_cycle(name: str) -> bool:
-        if name in stack:
-            cycle = " -> ".join(stack[stack.index(name):] + [name])
-            raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
-        if name in visited:
-            return False
-        visited.add(name)
-        stack.append(name)
-        for d in g.get(name, []):
-            if _has_cycle(d):
-                return True
-        stack.pop()
-        return False
-
-    try:
-        _has_cycle(norm["name"])
-    except SchemaError as e:
-        print(f"校验失败: {e}", file=sys.stderr)
-        return 1
-
     from datetime import datetime
 
     # M13: 批次 id 到毫秒 (与 cmd_run 一致) —— 秒级精度下同秒重提/并发 submit
     # 撞主键抛裸 IntegrityError; 毫秒 + IntegrityError 兜底友好报错
     bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-    from .fingerprint import compute_fingerprint
-
+    foreign_write = _is_foreign_host(cfg) and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE")
+    dry_run = bool(getattr(args, "dry_run", False))
 
     # B27/C2: 网关 submit 只投递 inbox 文件; control_requests 由计算节点
-    # daemon 每轮扫描后本地写入, 避免 NFS+WAL 跨主机双写。
-    import socket as _sock
-    if _sock.gethostname().strip() != str(cfg.get("node") or "").strip() \
-            and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
-        inbox_dir = os.path.join(os.path.expanduser(cfg.get("state_dir", "~/.sched")),
-                                 str(cfg.get("node")), "submit_inbox")
-        os.makedirs(inbox_dir, exist_ok=True)
-        payload_path = os.path.join(
-            inbox_dir, f"submit-{uuid.uuid4().hex}.json"
+    # daemon 每轮扫描后本地写入, 避免 NFS+WAL 跨主机双写。该分支必须
+    # 位于所有 state.connect() 之前。
+    if foreign_write and not dry_run:
+        inbox_dir = os.path.join(
+            default_state_dir(),
+            str(cfg.get("node")),
+            "submit_inbox",
         )
+        os.makedirs(inbox_dir, exist_ok=True)
+        payload_path = os.path.join(inbox_dir, f"submit-{uuid.uuid4().hex}.json")
         tmp_path = payload_path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as pf:
-                json.dump({"spec": spec, "bid": bid,
-                           "project": norm.get("project"), "tasks": len(norm["tasks"])},
-                          pf, ensure_ascii=False, indent=2)
+                json.dump(
+                    {
+                        "spec": spec,
+                        "bid": bid,
+                        "project": norm.get("project"),
+                        "tasks": len(norm["tasks"]),
+                    },
+                    pf,
+                    ensure_ascii=False,
+                    indent=2,
+                )
             os.replace(tmp_path, payload_path)
         except Exception:
             try:
@@ -376,12 +383,60 @@ def cmd_submit(args: argparse.Namespace) -> int:
             print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
         return 0
 
-    # M9: 展开命令并计算指纹不持有 state.db 写事务, 避免 git 子进程饿死 daemon。
+    # 登录节点 dry-run 不能创建/迁移/写入 state.db。依赖状态降级为
+    # UNAVAILABLE，实际提交时由 daemon 在同一数据库事务内重新解析。
+    if not (foreign_write and dry_run):
+        # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
+        with state.connect() as conn:
+            for dep in norm["depends_on"]:
+                row = conn.execute(
+                    "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (dep,),
+                ).fetchone()
+                if not row:
+                    print(f"错误: depends_on 引用的批次不存在: '{dep}' (O1)", file=sys.stderr)
+                    return 1
+
+        # 依赖环检测 (§3.4e B3): 按 name 拓扑 DFS (当前批次 + 已存在批次全图)
+        def _dep_graph() -> dict[str, list[str]]:
+            """name -> depends_on name 列表 (含当前批次)."""
+            g: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
+            with state.connect() as conn:
+                rows = conn.execute("SELECT name, depends_on FROM batches").fetchall()
+                for r in rows:
+                    g.setdefault(r["name"], json.loads(r["depends_on"] or "[]"))
+            return g
+
+        g = _dep_graph()
+        visited: set[str] = set()
+        stack: list[str] = []
+
+        def _has_cycle(name: str) -> bool:
+            if name in stack:
+                cycle = " -> ".join(stack[stack.index(name):] + [name])
+                raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
+            if name in visited:
+                return False
+            visited.add(name)
+            stack.append(name)
+            for d in g.get(name, []):
+                if _has_cycle(d):
+                    return True
+            stack.pop()
+            return False
+
+        try:
+            _has_cycle(norm["name"])
+        except SchemaError as e:
+            print(f"校验失败: {e}", file=sys.stderr)
+            return 1
+
+    from .fingerprint import compute_fingerprint
     prepared_tasks = []
     for i, t in enumerate(norm["tasks"]):
         try:
             cmd_e = expand_cmd(t["cmd"], cfg) if t["cmd"] else None
-        except SchemaError as e:
+        except (SchemaError, ConfigError) as e:
             print(f"校验失败: {e}", file=sys.stderr)
             return 1
         stages_e = None
@@ -392,7 +447,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 stage_art[j] = s["artifacts"]
                 try:
                     stage_cmd = expand_cmd(s["cmd"], cfg, stage_art, t["cwd_abs"])
-                except SchemaError as e:
+                except (SchemaError, ConfigError) as e:
                     print(f"校验失败: {e}", file=sys.stderr)
                     return 1
                 stages_e.append(
@@ -409,6 +464,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
             runtime_prefix=t.get("runtime_prefix"),
         )
         prepared_tasks.append((i, t, cmd_e, stages_e, fp, stage_fps))
+    if foreign_write and dry_run:
+        prev = _dry_run_preview(norm, cfg, use_state=False)
+        _print_dry_run_preview(norm, args, prev, conflict=False)
+        return 0
+
     with state.connect() as conn:
         # 同名批次未全部终态 -> 拒绝 (定案 6)
         # 决策 7A: dry-run 跳过该检查 —— 纯只读预览不产生副作用, 拦截反而
@@ -416,8 +476,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
         existing = conn.execute(
             "SELECT status FROM batches WHERE name=?", (norm["name"],)
         ).fetchall()
-        conflict = any(b["status"] not in ("done", "blocked", "discarded") for b in existing)
-        if conflict and not getattr(args, "dry_run", False):
+        conflict = any(
+            b["status"] not in ("done", "blocked", "discarded")
+            for b in existing
+        )
+        if conflict and not dry_run:
             print(
                 f"错误: 同名批次 '{norm['name']}' 已有未终态批次 (定案 6),"
                 " 请改名或用 sched resubmit",
@@ -425,43 +488,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             return 1
 
-        if getattr(args, "dry_run", False):
-            # §G4 A 类: 纯只读预览, 不 insert
+        if dry_run:
             prev = _dry_run_preview(norm, cfg)
-            print(f"=== dry-run: {norm['name']} ({len(norm['tasks'])} 任务, mode={norm['mode']}) ===")
-            if conflict:
-                print(f"  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
-            if prev["dep_status"]:
-                print("--- 依赖就绪 ---")
-                for dep, st in prev["dep_status"].items():
-                    mark = "✅" if st == "done" else ("⚠️" if st in ("active", "queued") else "❌")
-                    note = {
-                        "done": "上游已终态, 本批提交后可直接派发",
-                        "blocked": "上游 blocked, 本批将挂起 waiting_dep",
-                        "active": "上游运行中, 本批将挂起等解锁",
-                        "queued": "上游排队中, 本批将挂起等解锁",
-                        "NOT_FOUND": "上游不存在 (O1 已拒绝, 这里仅为展示)",
-                    }.get(st, st)
-                    print(f"  {mark} {dep}: {st} — {note}")
-            print("--- 任务预览 ---")
-            for pt in prev["tasks"]:
-                tag = "SKIP" if pt["skip"] else "RUN "
-                print(f"  [{tag}] {pt['id']}")
-                for sp in pt["stages"]:
-                    st = "SKIP" if sp["skip"] else "RUN "
-                    print(f"      stage{sp['stage']} [{st}] {sp['reason']}")
-                flat = pt["cmd_flat"]
-                shown = flat[:120] + ("..." if len(flat) > 120 else "")
-                print(f"      cmd: {shown}")
-            print("--- 汇总 ---")
-            print(f"  将跑 {prev['n_run']} / 将 skip {prev['n_skip']} / 共 {len(norm['tasks'])} 任务")
-            if prev["git_rev"]:
-                print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
-            if args.json:
-                # 只输出 JSON (对齐 status --json 惯例, 供脚本直接解析)
-                print(json.dumps(prev, ensure_ascii=False, indent=2))
+            _print_dry_run_preview(norm, args, prev, conflict)
             return 0
-
         try:
             state.insert_batch(
                 conn, bid, norm["name"], norm["mode"], norm["depends_on"],
@@ -2497,13 +2527,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         except Exception:
             pass  # 配置不可读等场景交由后续正常路径报错
-    # 所有命令先确保建表 (幂等; daemon 侧也建, 双保险)
-    # M18: init 失败 (state 目录不可写/磁盘满/DB 损坏) 不再静默吞噬 ——
-    # 打 warning 继续 (只读命令可能仍可用), 失败会在第一次 SQL 处显式报错
-    try:
-        state.init_db()
-    except Exception as e:
-        print(f"警告: state DB 初始化失败 ({e}), 后续命令可能报错", file=sys.stderr)
+    foreign_submit = False
+    if getattr(args, "cmd", None) == "submit" and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
+        try:
+            foreign_submit = _is_foreign_host(load_config())
+        except Exception:
+            pass
+    # Gateway submit is file-only; foreign dry-run is also DB-free.
+    if not foreign_submit:
+        try:
+            state.init_db()
+        except Exception as e:
+            print(f"警告: state DB 初始化失败 ({e}), 后续命令可能报错", file=sys.stderr)
     try:
         return args.fn(args)
     except KeyboardInterrupt:

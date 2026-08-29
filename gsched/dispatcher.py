@@ -8,9 +8,11 @@
 """
 
 from __future__ import annotations
+from contextlib import contextmanager
 
 import json
 import hashlib
+import sqlite3
 import os
 import signal
 import subprocess
@@ -22,7 +24,8 @@ from . import notify, state
 from .allocator import Allocator
 from .executor import Executor, pid_cmdline_matches, read_tail
 from .fingerprint import compute_fingerprint
-from .config import config_path, load_config, parse_gpus, resolve_template
+from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template
+from .schema import SchemaError, validate_batch
 from .templates import expand_cmd
 
 POLL_SEC = 10
@@ -34,6 +37,38 @@ DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载�
 DEFAULT_MAX_CPU_JOBS = 2  # cpus_total 未配置时回退: CPU-only 并发上限 (定案 7 旧语义)
 DEFAULT_IDLE_TIMEOUT_MIN = 360  # 空转自动退出 (定案 38): 默认 6h, 0 = 禁用
 # B12-a: 配置冷键 —— 变更拒绝热更新, 必须重启 daemon (调研 §2.3).
+
+
+def _validate_inbox_dependencies(conn, norm: dict) -> None:
+    """Recheck dependency existence and cycles on the daemon's DB connection."""
+    for dep in norm["depends_on"]:
+        row = conn.execute(
+            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (dep,),
+        ).fetchone()
+        if not row:
+            raise SchemaError(f"depends_on 引用的批次不存在: '{dep}' (O1)")
+
+    graph: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
+    rows = conn.execute("SELECT name, depends_on FROM batches").fetchall()
+    for row in rows:
+        graph.setdefault(row["name"], json.loads(row["depends_on"] or "[]"))
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def visit(name: str) -> None:
+        if name in stack:
+            cycle = " -> ".join(stack[stack.index(name):] + [name])
+            raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
+        if name in visited:
+            return
+        visited.add(name)
+        stack.append(name)
+        for dep in graph.get(name, []):
+            visit(dep)
+        stack.pop()
+
+    visit(norm["name"])
 # gpus 卡集/容量另经 parse_gpus 结构比对, 不在本列表.
 CONFIG_COLD_KEYS = ("node", "state_dir", "user", "schema_version")
 
@@ -381,6 +416,11 @@ class Dispatcher:
                     self.stop()
                     break
                 if self._idle_check():
+                    # Drain once more at the shutdown boundary. A gateway
+                    # payload may have arrived during the preceding sleep.
+                    self._drain_submit_inbox()
+                    if self._submit_inbox_pending():
+                        continue
                     break
                 self._tick()
                 self._touch_tick_ok()  # B26: tick 完成才写 —— 调度健康真信号
@@ -408,6 +448,22 @@ class Dispatcher:
                 self._check_frozen()  # B26: 不占 tick 预算的调度健康看门狗 (1s 粒度)
         self._cleanup_lock()
 
+    def _submit_inbox_pending(self) -> bool:
+        state_dir = default_state_dir()
+        node = str(self.cfg.get("node") or state.hostname())
+        inbox_dir = os.path.join(state_dir, node, "submit_inbox")
+        try:
+            return any(
+                name.startswith("submit-") and name.endswith(".json")
+                for name in os.listdir(inbox_dir)
+            )
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # Failure to inspect an existing inbox must not let idle shutdown
+            # strand a payload; the next tick will retry the scan.
+            return True
+
     def _idle_check(self) -> bool:
         """定案 38: 连续 idle 超时优雅退出.
 
@@ -421,8 +477,12 @@ class Dispatcher:
             n = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','running','waiting_dep')"
             ).fetchone()[0]
+            pending_control = conn.execute(
+                "SELECT COUNT(*) FROM control_requests WHERE status='pending'"
+            ).fetchone()[0]
         now = time.time()
-        if n > 0:
+        inbox_pending = self._submit_inbox_pending()
+        if n > 0 or pending_control > 0 or inbox_pending:
             self.last_activity = now
             return False
         if now - self.last_activity >= self.idle_timeout_min * 60:
@@ -786,6 +846,13 @@ class Dispatcher:
                     if rc_path is not None:
                         drop_paths.append(rc_path)
                     continue
+                if j["kill_reason"] in ("cancelled", "timed_out"):
+                    rc_path = self._job_rc_path(j)
+                    state.update_job(conn, j["id"], rc=137)
+                    self._handle_job_done(conn, j, 137)
+                    if rc_path is not None:
+                        drop_paths.append(rc_path)
+                    continue
                 # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
                 # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
                 spec = json.loads(self._get_task_spec(conn, j) or "{}")
@@ -906,7 +973,7 @@ class Dispatcher:
         唯一投递通道。daemon 是 control_requests 的唯一写者, 因此每轮先以
         job_id=payload path 全状态去重, 再本地插入 pending 行交给统一消费者。
         """
-        state_dir = os.path.expanduser(self.cfg.get("state_dir", "~/.sched"))
+        state_dir = default_state_dir()
         node = str(self.cfg.get("node") or state.hostname())
         inbox_dir = os.path.join(state_dir, node, "submit_inbox")
         if not os.path.isdir(inbox_dir):
@@ -994,92 +1061,177 @@ class Dispatcher:
                         continue
                     seen_cancel_jobs.add(r["job_id"])
                 if r["op"] == "batch_submit":
-                    # B27: 消费提交投递 —— 从 inbox 读 spec, 计算节点本地完整入库
-                    import json as _json
+                    # Release any earlier request's write transaction before
+                    # doing file validation, git probes, and fingerprinting.
+                    conn.commit()
+                    # B27: consume the file-only submit inbox on the daemon's
+                    # single state connection. Validate and fingerprint before
+                    # opening a write savepoint so git/NFS work never holds a
+                    # SQLite writer lock.
                     payload_path = r["job_id"]
+                    savepoint = f"batch_submit_{int(r['id'])}"
+                    savepoint_active = False
+
+                    def rollback_savepoint() -> None:
+                        nonlocal savepoint_active
+                        if not savepoint_active:
+                            return
+                        try:
+                            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        finally:
+                            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                            savepoint_active = False
+
+                    def safe_log(message: str) -> None:
+                        try:
+                            self.log_line(message)
+                        except Exception:
+                            pass
+
+                    def discard_payload() -> None:
+                        try:
+                            os.unlink(payload_path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError as error:
+                            safe_log(
+                                f"⚠️ batch_submit req {r['id']} payload cleanup failed: {error}"
+                            )
+
                     try:
                         with open(payload_path, encoding="utf-8") as pf:
-                            envelope = _json.load(pf)
+                            envelope = json.load(pf)
+                        if not isinstance(envelope, dict):
+                            raise ValueError("payload 顶层必须是对象")
                         spec = envelope.get("spec") or {}
                         if not isinstance(spec, dict) or "name" not in spec:
                             raise ValueError("payload 缺少合法 spec")
                         cfg_now = self.cfg
-                        from .schema import validate_batch, SchemaError
                         norm = validate_batch(spec, cfg_now)
+                        _validate_inbox_dependencies(conn, norm)
                         bid = envelope.get("bid")
-                        if not bid:
-                            from datetime import datetime as _dt
-                            bid = f"{norm['name']}-{_dt.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-                        with state.connect() as ins:
-                            existing = ins.execute(
-                                "SELECT status FROM batches WHERE name=?", (norm["name"],)
-                            ).fetchall()
-                            if any(x["status"] not in ("done", "blocked", "discarded") for x in existing):
-                                state.finish_control_request(
-                                    conn, r["id"],
-                                    f"同名批次 '{norm['name']}' 已有未终态批次 (定案 6), 未入队")
-                                self.log_line(f"batch_submit req {r['id']}: 定案 6 拒绝 ({norm['name']})")
-                                os.unlink(payload_path)
-                                continue
-                            state.insert_batch(
-                                ins, bid, norm["name"], norm["mode"], norm["depends_on"],
-                                norm["gpus"], norm["cwd"], norm["env"], norm.get("notify"),
-                                norm.get("project"), norm.get("priority", 0),
+                        if not isinstance(bid, str) or not bid:
+                            bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
+
+                        existing_bid = conn.execute(
+                            "SELECT name FROM batches WHERE id=?", (bid,)
+                        ).fetchone()
+                        if existing_bid:
+                            if existing_bid["name"] != norm["name"]:
+                                raise SchemaError(f"批次 id 已存在且名称不同: '{bid}'")
+                            state.finish_control_request(
+                                conn, r["id"], f"已入队 {bid} (重复投递, 已存在)"
                             )
-                            for i2, t in enumerate(norm["tasks"]):
-                                cmd_e = expand_cmd(t["cmd"], cfg_now) if t["cmd"] else None
-                                stages_e = None
-                                if t["stages"]:
-                                    stage_art: dict[int, dict] = {}
-                                    stages_e = []
-                                    for stage_idx, stage in enumerate(t["stages"]):
-                                        stage_art[stage_idx] = stage["artifacts"]
-                                        stages_e.append(
-                                            {
-                                                "cmd": expand_cmd(
-                                                    stage["cmd"], cfg_now, stage_art, t["cwd_abs"]
-                                                ),
-                                                "artifacts": stage["artifacts"],
-                                                "probes": stage.get("probes"),
-                                                "retry_transform": stage.get("retry_transform"),
-                                                "paths_escape": stage.get("paths_escape", False),
-                                            }
-                                        )
-                                spec_json = {
-                                    "id": t["id"], "cmd": cmd_e, "stages": stages_e,
-                                    "cwd_abs": t["cwd_abs"], "git": t["git"],
-                                    "env": t["env"], "resources": t["resources"],
-                                    "duration_min": t["duration_min"], "max_retry": t["max_retry"],
-                                    "artifacts": t["artifacts"],
-                                    "retry_transform": t.get("retry_transform"),
-                                    "probes": t.get("probes"),
-                                    "max_parallel": t.get("max_parallel"),
-                                    "_force_rerun": t.get("_force_rerun"),
-                                    "progress_regex": t.get("progress_regex"),
-                                    "runtime": t.get("runtime"),
-                                    "runtime_prefix": t.get("runtime_prefix"),
-                                }
-                                state.insert_task(
-                                    ins, bid, t["id"], 1, spec_json, i2,
-                                    norm.get("project")
-                                )
-                                from .fingerprint import compute_fingerprint
-                                _fp, _sfps, _rev = compute_fingerprint(
-                                    cmd_e, stages_e, t["cwd_abs"], t["git"],
-                                    cfg_now.get("venvs", {}),
-                                    runtime_prefix=t.get("runtime_prefix"),
-                                )
-                                state.insert_job(
-                                    ins, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
-                                    _fp, _sfps, norm.get("project")
-                                )
+                            discard_payload()
+                            safe_log(f"batch_submit req {r['id']}: 重复投递 {bid}, 已跳过")
+                            continue
+
+                        prepared_tasks = []
+                        for i2, t in enumerate(norm["tasks"]):
+                            cmd_e = expand_cmd(t["cmd"], cfg_now) if t["cmd"] else None
+                            stages_e = None
+                            if t["stages"]:
+                                stage_art: dict[int, dict] = {}
+                                stages_e = []
+                                for stage_idx, stage in enumerate(t["stages"]):
+                                    stage_art[stage_idx] = stage["artifacts"]
+                                    stages_e.append(
+                                        {
+                                            "cmd": expand_cmd(
+                                                stage["cmd"], cfg_now, stage_art, t["cwd_abs"]
+                                            ),
+                                            "artifacts": stage["artifacts"],
+                                            "probes": stage.get("probes"),
+                                            "retry_transform": stage.get("retry_transform"),
+                                            "paths_escape": stage.get("paths_escape", False),
+                                        }
+                                    )
+                            fp, stage_fps, _rev = compute_fingerprint(
+                                cmd_e,
+                                stages_e,
+                                t["cwd_abs"],
+                                t["git"],
+                                cfg_now.get("venvs", {}),
+                                runtime_prefix=t.get("runtime_prefix"),
+                            )
+                            prepared_tasks.append((i2, t, cmd_e, stages_e, fp, stage_fps))
+
+                        conn.execute(f"SAVEPOINT {savepoint}")
+                        savepoint_active = True
+                        existing = conn.execute(
+                            "SELECT status FROM batches WHERE name=?", (norm["name"],)
+                        ).fetchall()
+                        if any(
+                            x["status"] not in ("done", "blocked", "discarded")
+                            for x in existing
+                        ):
+                            raise SchemaError(
+                                f"同名批次 '{norm['name']}' 已有未终态批次 (定案 6), 未入队"
+                            )
+                        state.insert_batch(
+                            conn,
+                            bid,
+                            norm["name"],
+                            norm["mode"],
+                            norm["depends_on"],
+                            norm["gpus"],
+                            norm["cwd"],
+                            norm["env"],
+                            norm.get("notify"),
+                            norm.get("project"),
+                            norm.get("priority", 0),
+                        )
+                        for i2, t, cmd_e, stages_e, fp, stage_fps in prepared_tasks:
+                            spec_json = {
+                                "id": t["id"],
+                                "cmd": cmd_e,
+                                "stages": stages_e,
+                                "cwd_abs": t["cwd_abs"],
+                                "git": t["git"],
+                                "env": t["env"],
+                                "resources": t["resources"],
+                                "duration_min": t["duration_min"],
+                                "max_retry": t["max_retry"],
+                                "artifacts": t["artifacts"],
+                                "retry_transform": t.get("retry_transform"),
+                                "probes": t.get("probes"),
+                                "max_parallel": t.get("max_parallel"),
+                                "_force_rerun": t.get("_force_rerun"),
+                                "progress_regex": t.get("progress_regex"),
+                                "runtime": t.get("runtime"),
+                                "runtime_prefix": t.get("runtime_prefix"),
+                            }
+                            state.insert_task(
+                                conn, bid, t["id"], 1, spec_json, i2, norm.get("project")
+                            )
+                            state.insert_job(
+                                conn,
+                                f"{bid}-{t['id']}-v1",
+                                bid,
+                                t["id"],
+                                1,
+                                fp,
+                                stage_fps,
+                                norm.get("project"),
+                            )
                         state.finish_control_request(conn, r["id"], f"已入队 {bid}")
-                        self.log_line(f"batch_submit req {r['id']}: 已入队 {bid} "
-                                      f"({len(norm['tasks'])} 任务)")
-                        os.unlink(payload_path)
-                    except Exception as e:
-                        state.finish_control_request(conn, r["id"], f"失败: {e}")
-                        self.log_line(f"⚠️ batch_submit req {r['id']} 失败: {e} (payload: {payload_path})")
+                        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        savepoint_active = False
+                        discard_payload()
+                        safe_log(
+                            f"batch_submit req {r['id']}: 已入队 {bid} "
+                            f"({len(norm['tasks'])} 任务)"
+                        )
+                    except (SchemaError, ConfigError, ValueError, TypeError, KeyError, FileNotFoundError, sqlite3.IntegrityError) as error:
+                        rollback_savepoint()
+                        state.finish_control_request(conn, r["id"], f"失败: {error}")
+                        discard_payload()
+                        safe_log(f"⚠️ batch_submit req {r['id']} 拒绝: {error}")
+                    except Exception as error:
+                        rollback_savepoint()
+                        safe_log(
+                            f"⚠️ batch_submit req {r['id']} 暂未完成，将重试: {error}"
+                        )
                     continue
                 if r["op"] == "config_reload":
                     # B12-a: CLI `sched config reload` 的强制重载路径
@@ -1708,7 +1860,7 @@ class Dispatcher:
         finally:
             self._launch_inflight.clear()
     def _dispatch_ready_jobs(self) -> None:
-        with state.connect() as conn:
+        with self._dispatch_connection() as conn:
             # 只派发所属批次已解锁 (active/done) 的 pending job——
             # queued 批次 (依赖未解锁) 的 job 不派发 (场景 2: 下游挂起)
             # B11c: 显式带出 rowid 与两处 project; 排序在 Python 层做双键
@@ -2137,6 +2289,9 @@ class Dispatcher:
             log_path=log_path,
             conda_env_dir=spec.get("runtime_prefix"),
         )
+        inflight = getattr(self, "_launch_inflight", None)
+        if isinstance(inflight, dict):
+            inflight[j["id"]] = pgid
         git_rev = None
         try:
             _, _, git_rev = compute_fingerprint(
@@ -2152,9 +2307,12 @@ class Dispatcher:
                 git_rev=git_rev, kill_reason=None,
             )
         except Exception:
-            self.log_line(
-                f"LAUNCH 回写失败: job {j['id']} pgid={pgid} -> SIGKILL 防止孤儿进程"
-            )
+            try:
+                self.log_line(
+                    f"LAUNCH 回写失败: job {j['id']} pgid={pgid} -> SIGKILL 防止孤儿进程"
+                )
+            except Exception:
+                pass
             try:
                 self.executor.kill_pgid(pgid, signal.SIGKILL)
             except Exception:

@@ -40,7 +40,7 @@ batch_spec = {
 }
 
 # 模拟: 外部节点投递 (写 inbox 文件 + 插 control_requests)
-inbox = os.path.join(os.environ["SCHED_STATE"], "localhost", "submit_inbox")
+inbox = os.path.join(os.environ["SCHED_STATE"], st.hostname(), "submit_inbox")
 os.makedirs(inbox, exist_ok=True)
 payload = os.path.join(inbox, "submit-inbox_smoke-TEST.json")
 json.dump({"spec": batch_spec, "bid": "inbox_smoke-TEST0001"}, open(payload, "w"))
@@ -85,6 +85,67 @@ if os.path.exists(payload):
     print("⚠️ inbox payload 未清理 (非致命)")
 else:
     print("✅ S4 inbox payload 已清理")
+
+def queue_payload(name, depends_on, bid):
+    path = os.path.join(inbox, f"submit-{name}.json")
+    spec = {**batch_spec, "name": name, "depends_on": depends_on}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"spec": spec, "bid": bid}, f)
+    with st.connect() as c:
+        c.execute(
+            "INSERT INTO control_requests (job_id, op, status, created_at) "
+            "VALUES (?, 'batch_submit', 'pending', datetime('now'))",
+            (path,),
+        )
+    return path
+
+bad_dep = queue_payload("missing_dep", ["not_created"], "missing-dep-1")
+cycle = queue_payload("cycle_dep", ["cycle_dep"], "cycle-dep-1")
+Dispatcher._process_control_requests(d)
+check = sqlite3.connect(db)
+assert check.execute("SELECT 1 FROM batches WHERE name='missing_dep'").fetchone() is None
+assert check.execute("SELECT 1 FROM batches WHERE name='cycle_dep'").fetchone() is None
+for bad_path in (bad_dep, cycle):
+    assert not os.path.exists(bad_path), bad_path
+    assert check.execute(
+        "SELECT status FROM control_requests WHERE job_id=?", (bad_path,)
+    ).fetchone()[0] == "done"
+print("✅ S5 daemon rejects missing/cyclic inbox dependencies")
+malformed = os.path.join(inbox, "submit-malformed.json")
+with open(malformed, "w", encoding="utf-8") as f:
+    json.dump([], f)
+with st.connect() as c:
+    c.execute(
+        "INSERT INTO control_requests (job_id, op, status, created_at) "
+        "VALUES (?, 'batch_submit', 'pending', datetime('now'))",
+        (malformed,),
+    )
+Dispatcher._process_control_requests(d)
+assert check.execute(
+    "SELECT status FROM control_requests WHERE job_id=?", (malformed,)
+).fetchone()[0] == "done"
+assert not os.path.exists(malformed)
+print("✅ S5b daemon rejects malformed inbox envelope")
+
+transient = queue_payload("transient_submit", [], "transient-submit-1")
+original_insert_batch = st2.insert_batch
+failed_once = [False]
+def fail_once(*args, **kwargs):
+    if not failed_once[0]:
+        failed_once[0] = True
+        raise sqlite3.OperationalError("simulated busy")
+    return original_insert_batch(*args, **kwargs)
+st2.insert_batch = fail_once
+Dispatcher._process_control_requests(d)
+st2.insert_batch = original_insert_batch
+assert check.execute(
+    "SELECT status FROM control_requests WHERE job_id=?", (transient,)
+).fetchone()[0] == "pending"
+assert os.path.exists(transient)
+Dispatcher._process_control_requests(d)
+assert check.execute("SELECT status FROM batches WHERE name='transient_submit'").fetchone()
+assert not os.path.exists(transient)
+print("✅ S6 transient inbox failure remains pending and retries")
 sys.exit(0)
 RPEOF
 

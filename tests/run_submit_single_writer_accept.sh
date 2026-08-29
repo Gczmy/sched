@@ -28,11 +28,15 @@ cat > "$BATCH" <<'EOF'
   "tasks": [{"id": "t1", "cmd": ["echo", "ok"]}]
 }
 EOF
+python3 -m gsched.cli submit "$BATCH" --dry-run >"$SCHED_STATE/dry-run.out"
+test ! -e "$SCHED_STATE/compute-node/state.db"
+test ! -e "$SCHED_STATE/compute-node/submit_inbox/submit-"*
 python3 -m gsched.cli submit "$BATCH"
+test ! -e "$SCHED_STATE/compute-node/state.db"
 python3 - <<'PY'
 import glob, json, os, sqlite3, sys
-sys.path.insert(0, ".")
 from gsched import state
+state.init_db()
 conn = sqlite3.connect(state.db_path())
 count = conn.execute("SELECT COUNT(*) FROM control_requests").fetchone()[0]
 assert count == 0, f"gateway wrote {count} control_requests rows"
