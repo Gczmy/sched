@@ -884,6 +884,7 @@ class Dispatcher:
                         )
                         self._release_gpu_for_job(conn, row)
                         self._maybe_retry(conn, row)
+                    self._drop_rc_path(self._job_rc_path(row, pgid))
                     self._drop_rc_path(path)
                     continue
                 if same_process:
