@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS control_requests (
 
 class StateError(Exception):
     pass
+class SubmissionBlocked(StateError):
+    pass
 
 
 def hostname() -> str:
@@ -202,6 +204,31 @@ def submission_lock() -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+def submission_shutdown_active() -> bool:
+    """True only while a daemon with a fresh heartbeat is stopping."""
+    if not idle_shutdown_pending():
+        return False
+    import time
+
+    heartbeat = os.path.join(default_state_dir(), hostname(), "daemon.heartbeat")
+    try:
+        fresh = time.time() - os.path.getmtime(heartbeat) <= 60
+    except OSError:
+        fresh = False
+    if not fresh:
+        clear_idle_shutdown()
+    return fresh
+
+
+@contextmanager
+def submission_connect() -> Iterator[sqlite3.Connection]:
+    """Open a submission transaction while holding the idle-shutdown lease."""
+    with submission_lock():
+        if submission_shutdown_active():
+            raise SubmissionBlocked("daemon 正在退出, 请稍后重试")
+        with connect() as conn:
+            yield conn
 
 
 def idle_shutdown_pending() -> bool:

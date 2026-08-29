@@ -156,6 +156,11 @@ def stop() -> str:
         _cleanup()
         return (f"daemon pid={pid} 的 cmdline 不含 gsched (PID 复用?), "
                 "已放弃 kill 只清理状态文件")
+    with state.submission_lock():
+        try:
+            state.mark_idle_shutdown()
+        except OSError:
+            pass
     os.kill(pid, 15)  # SIGTERM -> dispatcher.stop()
     for _ in range(20):
         time.sleep(0.5)

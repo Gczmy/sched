@@ -155,7 +155,7 @@ class Executor:
             launch_script = (
                 f"(umask 077; launch_tmp={marker_tmp}.$$; "
                 f"if [ -r /proc/$$/stat ] && "
-                f"/usr/bin/awk '{{print $1 \" \" $22}}' /proc/$$/stat > \"$launch_tmp\"; "
+                f"/usr/bin/awk '{{print $1 \" proc:\" $22}}' /proc/$$/stat > \"$launch_tmp\"; "
                 f"then :; else printf '%s\\n' \"$$\" > \"$launch_tmp\"; fi && "
                 f"/bin/mv -f \"$launch_tmp\" {marker_path}) && "
             )
@@ -230,15 +230,26 @@ class Executor:
                     with open(f"/proc/{proc.pid}/stat", encoding="utf-8") as proc_stat:
                         fields = proc_stat.read().rsplit(")", 1)[1].split()
                     if len(fields) > 19:
-                        marker_value += f" {fields[19]}"
+                        marker_value += f" proc:{fields[19]}"
                 except (OSError, IndexError):
                     try:
-                        with open(marker_path, encoding="utf-8") as existing:
-                            existing_fields = existing.read().split()
-                        if len(existing_fields) >= 2 and existing_fields[0] == str(proc.pid):
-                            marker_value = " ".join(existing_fields[:2])
-                    except (OSError, IndexError):
-                        pass
+                        ps = subprocess.run(
+                            ["ps", "-p", str(proc.pid), "-o", "lstart="],
+                            capture_output=True,
+                            text=True,
+                            timeout=1,
+                        )
+                        start_text = ps.stdout.strip()
+                        if ps.returncode == 0 and start_text:
+                            marker_value += f" ps:{start_text}"
+                    except (OSError, subprocess.SubprocessError):
+                        try:
+                            with open(marker_path, encoding="utf-8") as existing:
+                                existing_fields = existing.read().split()
+                            if len(existing_fields) >= 2 and existing_fields[0] == str(proc.pid):
+                                marker_value = " ".join(existing_fields[:])
+                        except (OSError, IndexError):
+                            pass
                 marker_tmp = f"{marker_path}.parent.{proc.pid}.tmp"
                 with open(marker_tmp, "w", encoding="utf-8") as marker:
                     marker.write(marker_value + "\n")
@@ -246,6 +257,10 @@ class Executor:
             log_f.close()
             self._procs[proc.pid] = proc
         except Exception:
+            try:
+                log_f.close()
+            except Exception:
+                pass
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):

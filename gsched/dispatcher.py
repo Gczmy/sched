@@ -785,16 +785,26 @@ class Dispatcher:
         try:
             with open(f"/proc/{pgid}/stat", encoding="utf-8") as proc_stat:
                 fields = proc_stat.read().rsplit(")", 1)[1].split()
-            return fields[19] if len(fields) > 19 else None
+            return f"proc:{fields[19]}" if len(fields) > 19 else None
         except (OSError, IndexError):
-            return None
+            try:
+                ps = subprocess.run(
+                    ["ps", "-p", str(pgid), "-o", "lstart="],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                start = ps.stdout.strip()
+                return f"ps:{start}" if ps.returncode == 0 and start else None
+            except (OSError, subprocess.SubprocessError):
+                return None
     def _launch_marker_alive(self, job) -> bool:
         marker_path = self._launch_marker_path(job)
         try:
             with open(marker_path, encoding="utf-8") as marker:
                 fields = marker.read().split()
             pgid = int(fields[0])
-            marker_start = fields[1] if len(fields) > 1 else None
+            marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
         except FileNotFoundError:
             return False
         except OSError:
@@ -834,7 +844,7 @@ class Dispatcher:
                     with open(path, encoding="utf-8") as marker:
                         fields = marker.read().split()
                     pgid = int(fields[0])
-                    marker_start = fields[1] if len(fields) > 1 else None
+                    marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
                 except FileNotFoundError:
                     continue
                 except OSError:

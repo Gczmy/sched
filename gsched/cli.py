@@ -351,7 +351,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # 位于所有 state.connect() 之前。
     if foreign_write and not dry_run:
         with state.submission_lock():
-            if state.idle_shutdown_pending():
+            if state.submission_shutdown_active():
                 print(
                     "错误: daemon 正在退出，未投递 payload；请先恢复 daemon 后重试",
                     file=sys.stderr,
@@ -492,7 +492,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         _print_dry_run_preview(norm, args, prev, conflict=False)
         return 0
 
-    with state.connect() as conn:
+    db_context = state.connect() if dry_run else state.submission_connect()
+    with db_context as conn:
         # 同名批次未全部终态 -> 拒绝 (定案 6)
         # 决策 7A: dry-run 跳过该检查 —— 纯只读预览不产生副作用, 拦截反而
         # 挡住"现有批次终态后要提交什么"的预览场景; 预览中降级为提示
@@ -692,15 +693,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"错误: project '{proj}' 未在 config.projects 中定义", file=sys.stderr)
         return 1
 
-    with state.connect() as conn:
+    fp, stage_fps, rev = compute_fingerprint(
+        task_spec["cmd"], None, cwd_abs, None, cfg.get("venvs", {})
+    )
+    with state.submission_connect() as conn:
         state.insert_batch(
             conn, bid, batch_name, "mix", [], None, "{ROOT}", None,
             project=proj,
         )
         state.insert_task(conn, bid, "run", 1, task_spec, 0, proj)
-        fp, stage_fps, rev = compute_fingerprint(
-            task_spec["cmd"], None, cwd_abs, None, cfg.get("venvs", {})
-        )
         state.insert_job(conn, f"{bid}-run-v1", bid, "run", 1, fp, stage_fps, proj)
 
     res_txt = "cpu-only" if args.cpu_only else "gpu=1"
@@ -1231,7 +1232,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     - P3: git_rev 与当前仓库不一致 -> 警告 (retry 复用旧 spec)
     """
     ref = args.task
-    with state.connect() as conn:
+    with state.submission_connect() as conn:
         if ":" in ref:
             batch, task = _resolve_task_ref(ref)
             targets = conn.execute(
@@ -1353,7 +1354,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     else:
         batch, task = _resolve_task_ref(ref)
 
-    with state.connect() as conn:
+    with state.submission_connect() as conn:
         bstat = conn.execute(
             "SELECT status FROM batches WHERE id=?", (batch,)
         ).fetchone()
@@ -2560,6 +2561,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"警告: state DB 初始化失败 ({e}), 后续命令可能报错", file=sys.stderr)
     try:
         return args.fn(args)
+    except state.SubmissionBlocked as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         return 130
 
