@@ -781,14 +781,21 @@ class Dispatcher:
         except (OSError, IndexError):
             return None
     def _launch_marker_alive(self, job) -> bool:
+        marker_path = self._launch_marker_path(job)
         try:
-            with open(self._launch_marker_path(job), encoding="utf-8") as marker:
+            with open(marker_path, encoding="utf-8") as marker:
                 fields = marker.read().split()
             pgid = int(fields[0])
             marker_start = fields[1] if len(fields) > 1 else None
-        except (OSError, ValueError, IndexError):
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        except (ValueError, IndexError):
+            self._drop_launch_marker(job)
             return False
         if pgid <= 0 or pgid > 2**31 - 1:
+            self._drop_launch_marker(job)
             return False
         if marker_start:
             process_start = self._proc_start_time(pgid)

@@ -225,33 +225,44 @@ def _check_sudo_tokens(
                 f"{MAX_NESTED_SHELL_STATES} states"
             )
         seen.add(current_key)
+        if is_shell_payload and re.search(
+            r"(?:^|[;\n|&`(){}])\s*(?:source|\.)"
+            r"(?=$|[\s;|&`(){}])",
+            " ".join(str(token) for token in expanded),
+        ):
+            raise SchemaError(
+                f"{current_where}: source 动态脚本执行被拒绝"
+            )
         command_position = True
         control_pending = False
         for idx, tok in enumerate(expanded):
             base = os.path.basename(tok)
+            effective_command_position = (
+                command_position or (is_shell_payload and control_pending)
+            )
             if is_shell_payload and re.search(r"[$`]", tok):
-                if command_position or re.search(r"(?i)(?:sudo|runuser|\bsu\b)", tok):
+                if effective_command_position or re.search(r"(?i)(?:sudo|runuser|\bsu\b)", tok):
                     raise SchemaError(
                         f"{current_where}: 动态命令展开被拒绝 ('{tok}') —— "
                         "无法安全确认特权命令"
                     )
-            if command_position and base == "eval":
+            if effective_command_position and base == "eval":
                 raise SchemaError(
                     f"{current_where}: eval 动态执行被拒绝 —— 无法安全检查特权命令"
                 )
             if (
-                (command_position and base in SUDO_TOKENS)
+                (effective_command_position and base in SUDO_TOKENS)
                 or (is_shell_payload and _token_has_sudo(tok))
             ):
                 raise SchemaError(
                     f"{current_where}: 含特权命令 '{tok}' —— 框架无 sudo 硬约束 (H1),"
                     " 请重新设计为无 sudo 方案"
                 )
-            if command_position and base == "exec":
+            if effective_command_position and base == "exec":
                 raise SchemaError(
                     f"{current_where}: exec 会绕过退出码封装, 拒绝命令"
                 )
-            if command_position and base in SCRIPT_INTERPRETERS:
+            if effective_command_position and base in SCRIPT_INTERPRETERS:
                 for option_idx in range(idx + 1, len(expanded)):
                     option = expanded[option_idx]
                     script = None
@@ -269,6 +280,8 @@ def _check_sudo_tokens(
                         script = _shell_command_arg(expanded, option_idx)
                     elif option.startswith(("--command=", "--eval=", "--execute=", "--print=", "--process-code=", "--process-begin=", "--process-end=")):
                         script = option.partition("=")[2]
+                    elif base in {"node", "nodejs"} and option.startswith("-p="):
+                        script = option.partition("=")[2]
                     elif base in {"node", "nodejs"} and option.startswith("-p") and len(option) > 2:
                         script = _shell_command_arg(expanded, option_idx)
                     elif len(option) > 2 and option[:2] in ("-c", "-e", "-r", "-E", "-p", "-R", "-B"):
@@ -278,10 +291,11 @@ def _check_sudo_tokens(
                     pending.append(
                         ([script], f"{current_where} interpreter payload", True)
                     )
-            if command_position and base in COMMAND_LAUNCHERS:
+            if effective_command_position and base in COMMAND_LAUNCHERS:
                 for launcher_arg in _launcher_argument_tokens(expanded, idx):
                     if (
                         os.path.basename(launcher_arg) in SUDO_TOKENS
+                        or os.path.basename(launcher_arg) in {"source", ".", "eval", "exec"}
                         or _token_has_sudo(launcher_arg)
                     ):
                         raise SchemaError(
@@ -300,18 +314,23 @@ def _check_sudo_tokens(
                             f"{current_where}: launcher shell 解析失败: {e}"
                         ) from e
                     pending.append((nested, f"{current_where} command launcher", True))
-            if command_position and base in SHELL_WRAPPERS:
+            if effective_command_position and base in SHELL_WRAPPERS:
                 nested = _wrapper_command_tokens(expanded, idx)
                 if nested:
                     pending.append((nested, f"{current_where} command wrapper", is_shell_payload))
             if (
-                command_position
-                or (is_shell_payload and control_pending)
+                effective_command_position
+                or (
+                    is_shell_payload
+                    and (control_pending or any(
+                        token in SHELL_CONTROL_WORDS for token in expanded[:idx]
+                    ))
+                )
             ) and base in {"source", "."}:
                 raise SchemaError(
                     f"{current_where}: source 动态脚本执行被拒绝"
                 )
-            if command_position and base in SHELL_TOKENS:
+            if effective_command_position and base in SHELL_TOKENS:
                 nested_commands = _nested_shell_commands(expanded, idx)
                 if not nested_commands:
                     raise SchemaError(
@@ -326,9 +345,11 @@ def _check_sudo_tokens(
                         ) from e
                     pending.append((nested, f"{current_where} nested shell", True))
             control_pending = bool(
-                is_shell_payload and command_position and tok in SHELL_CONTROL_WORDS
+                is_shell_payload
+                and (effective_command_position or control_pending)
+                and (tok in SHELL_CONTROL_WORDS or tok == "!")
             )
-            if command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            if effective_command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
                 continue
             command_position = (
                 _ends_shell_separator(tok) if is_shell_payload else False

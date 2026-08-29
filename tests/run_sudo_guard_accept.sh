@@ -80,6 +80,7 @@ rejected(["perl", "-e", "print 1;", "-e", "system \"sudo id\""])
 rejected(["perl", "-E", "system \"sudo id\""])
 rejected(["node", "-p", "require(\"child_process\").exec(\"sudo id\")"])
 rejected(["node", "-pe", "require(\"child_process\").exec(\"sudo id\")"])
+rejected(["bash", "-c", "echo $(source priv.sh)"])
 try:
     parse_shell_cmd("bash -lc 'runuser -u root id'", "sched run")
 except SchemaError:

@@ -66,6 +66,7 @@ class Executor:
         # 泄漏给子任务 —— LD_LIBRARY_PATH/CONDA_PREFIX 抢载导致跨 env import 冲突)
         self.sanitize_env = sanitize_env
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
+        self._dead_pgroups: set[int] = set()
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
 
     def has_process(self, pgid: int) -> bool:
@@ -220,6 +221,7 @@ class Executor:
             except Exception:
                 pass
             raise
+        self._dead_pgroups.discard(proc.pid)
         try:
             if launch_marker:
                 marker_path = str(launch_marker)
@@ -230,7 +232,13 @@ class Executor:
                     if len(fields) > 19:
                         marker_value += f" {fields[19]}"
                 except (OSError, IndexError):
-                    pass
+                    try:
+                        with open(marker_path, encoding="utf-8") as existing:
+                            existing_fields = existing.read().split()
+                        if len(existing_fields) >= 2 and existing_fields[0] == str(proc.pid):
+                            marker_value = " ".join(existing_fields[:2])
+                    except (OSError, IndexError):
+                        pass
                 marker_tmp = f"{marker_path}.parent.{proc.pid}.tmp"
                 with open(marker_tmp, "w", encoding="utf-8") as marker:
                     marker.write(marker_value + "\n")
@@ -274,6 +282,7 @@ class Executor:
             # EPERM even though poll() proves the wrapper has exited.
             proc = self._procs.get(pgid)
             if sig == signal.SIGKILL and proc is not None and proc.poll() is not None:
+                self._dead_pgroups.add(pgid)
                 kill_sent = True
             else:
                 # No proof of death: retain bookkeeping so callers can retry.
@@ -291,8 +300,9 @@ class Executor:
                         pass
                 self._procs.pop(pgid, None)
         return kill_sent
-
     def alive(self, pgid: int) -> bool:
+        if pgid in self._dead_pgroups:
+            return False
         try:
             os.killpg(pgid, 0)
             return True
