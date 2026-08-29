@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -184,6 +185,11 @@ def db_path() -> str:
 
 def submission_inbox_dir() -> str:
     return os.path.join(default_state_dir(), hostname(), "submit_inbox")
+
+
+def launch_marker_path(job_id: str) -> str:
+    prefix = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:24]
+    return os.path.join(default_state_dir(), hostname(), "launch", f"{prefix}.launch")
 
 
 def submission_shutdown_marker() -> str:

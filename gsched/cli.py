@@ -1280,14 +1280,26 @@ def cmd_retry(args: argparse.Namespace) -> int:
             w = _rev_diff_warn(conn, j)
             if w:
                 print(w)
-            probe_pending = j["kill_reason"] == "probe" and j["pgid"] is not None
+            marker_present = os.path.isfile(state.launch_marker_path(j["id"]))
+            if marker_present and j["kill_reason"] != "probe":
+                print(
+                    f"错误: 任务 {j['id']} 仍有未确认的进程组，"
+                    "请等待 daemon 完成清理后再 retry",
+                    file=sys.stderr,
+                )
+                return 1
+            termination_pending = (
+                marker_present
+                and j["kill_reason"] == "probe"
+                and j["pgid"] is not None
+            )
             state.update_job(
                 conn,
                 j["id"],
                 status="pending",
                 retries=0,
-                kill_reason="probe" if probe_pending else None,
-                pgid=j["pgid"] if probe_pending else None,
+                kill_reason=j["kill_reason"] if termination_pending else None,
+                pgid=j["pgid"] if termination_pending else None,
                 gpu=None,
                 rc=None,
                 failure=None,
@@ -1423,13 +1435,13 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             ).fetchall()
             if j["task_id"] in target_tasks
         ]
-        probe_targets = [
-            j for j in jrows if j["kill_reason"] == "probe" and j["pgid"] is not None
+        marker_targets = [
+            j for j in jrows if os.path.isfile(state.launch_marker_path(j["id"]))
         ]
-        if probe_targets:
-            labels = ", ".join(f"{j['task_id']}v{j['version']}" for j in probe_targets)
+        if marker_targets:
+            labels = ", ".join(f"{j['task_id']}v{j['version']}" for j in marker_targets)
             print(
-                f"错误: probe 终止尚未确认完成: {labels}; 请等待 daemon 完成 SIGKILL 升级",
+                f"错误: 进程组终止尚未确认完成: {labels}; 请等待 daemon 完成清理",
                 file=sys.stderr,
             )
             return 1
