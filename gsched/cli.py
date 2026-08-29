@@ -1101,7 +1101,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     if not args.yes:
         print(f"确认取消 {ref}? 加 --yes 执行 (转发 daemon: 先写 kill_reason 再 killpg)")
         return 1
-    with state.connect() as conn:
+    with state.submission_connect() as conn:
         if ":" in ref:
             # R1: <batch_name>:<task> — batch 段是 name, 解析为最新 id
             b_name, t = _parse_task_ref(ref)
