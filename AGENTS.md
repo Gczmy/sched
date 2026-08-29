@@ -10,6 +10,15 @@
 - **脚本/agent 解析输出一律用 `--json`**（`status --json`、`submit --dry-run --json`），不要解析人类可读文本。
 - 破坏性命令需要 `--yes`（`cancel`、`gpu-free`）；缺 `--yes` 返回码 1 是"未确认"，不是执行失败。
 - daemon 生命周期（`sched daemon start/stop`）必须在**计算节点**执行；查询类命令在登录节点可直接用（共享 state，定案 43/44）。
+### 网关纪律
+
+- 任何 SSH 操作前，必须先询问用户当前是校外还是校内环境；校内使用 `HPDC`，校外使用 `HPDC_outside`。
+- 网关禁止运行任何计算任务；测试、训练、批处理和 smoke test 必须在计算节点执行。网关仅用于查询、提交任务及必要的调度控制。
+- daemon 统一运行在 `84016.ambior1` 上。
+- 如需重启 daemon，严格按以下步骤执行：
+  1. 根据网络环境执行 `ssh HPDC`（校内）或 `ssh HPDC_outside`（校外）。
+  2. 执行 `screen -d -r 84016.ambior1`。
+  3. 重启 daemon。
 
 ### 子命令速查
 
