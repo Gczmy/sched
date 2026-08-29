@@ -783,11 +783,18 @@ class Dispatcher:
     def _launch_marker_alive(self, job) -> bool:
         try:
             with open(self._launch_marker_path(job), encoding="utf-8") as marker:
-                pgid = int(marker.read().split()[0])
+                fields = marker.read().split()
+            pgid = int(fields[0])
+            marker_start = fields[1] if len(fields) > 1 else None
         except (OSError, ValueError, IndexError):
             return False
         if pgid <= 0 or pgid > 2**31 - 1:
             return False
+        if marker_start:
+            process_start = self._proc_start_time(pgid)
+            if process_start and process_start != marker_start:
+                self._drop_launch_marker(job)
+                return False
         try:
             return bool(self.executor.alive(pgid))
         except (OSError, OverflowError):

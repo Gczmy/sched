@@ -270,12 +270,14 @@ class Executor:
         except ProcessLookupError:
             pass
         except PermissionError:
-            # W-5: macOS 上僵尸进程组 killpg 抛 EPERM (而非 ESRCH)。与 alive()
-            # 决策 6A 口径一致: 无可杀目标/无权探测 = no-op 成功。若不捕获,
-            # 异常冒出 -> dispatcher._check_probes 的 state.connect() 事务整体
-            # 回滚 -> probe 已写入的 blocked/done 终态丢失 -> 任务被误判 failed
-            # 并 retry (日志门控失效, 平台无关的结构性脆弱点)。
-            kill_sent = False
+            # A local Popen may already be a zombie on Darwin: killpg reports
+            # EPERM even though poll() proves the wrapper has exited.
+            proc = self._procs.get(pgid)
+            if sig == signal.SIGKILL and proc is not None and proc.poll() is not None:
+                kill_sent = True
+            else:
+                # No proof of death: retain bookkeeping so callers can retry.
+                kill_sent = False
         finally:
             # SIGKILL is terminal for a successfully signalled local Popen.
             # Wait for the group leader before dropping its handle so a
@@ -291,6 +293,9 @@ class Executor:
         return kill_sent
 
     def alive(self, pgid: int) -> bool:
+        proc = self._procs.get(pgid)
+        if proc is not None and proc.poll() is not None:
+            self._procs.pop(pgid, None)
         try:
             os.killpg(pgid, 0)
             return True

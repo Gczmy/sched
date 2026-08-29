@@ -34,6 +34,7 @@ COMMAND_LAUNCHERS = {
 SCRIPT_INTERPRETERS = {
     "python", "python3", "perl", "ruby", "node", "nodejs", "php", "lua",
 }
+SHELL_CONTROL_WORDS = {"if", "then", "else", "elif", "while", "until", "for", "do", "case"}
 
 
 def _shell_command_arg(tokens: list[str], idx: int) -> str | None:
@@ -253,11 +254,16 @@ def _check_sudo_tokens(
                 for option_idx in range(idx + 1, len(expanded)):
                     option = expanded[option_idx]
                     script = None
-                    if option in ("-c", "--command", "-e", "--eval", "-r"):
+                    payload_options = ("-c", "--command", "-e", "--eval", "-r")
+                    if base == "perl":
+                        payload_options += ("-E", "--execute")
+                    if base in {"node", "nodejs"}:
+                        payload_options += ("-p", "--print")
+                    if option in payload_options:
                         script = _shell_command_arg(expanded, option_idx)
-                    elif option.startswith(("--command=", "--eval=")):
+                    elif option.startswith(("--command=", "--eval=", "--execute=", "--print=")):
                         script = option.partition("=")[2]
-                    elif len(option) > 2 and option[:2] in ("-c", "-e", "-r"):
+                    elif len(option) > 2 and option[:2] in ("-c", "-e", "-r", "-E", "-p"):
                         script = option[2:]
                     if script is None:
                         continue
@@ -290,7 +296,13 @@ def _check_sudo_tokens(
                 nested = _wrapper_command_tokens(expanded, idx)
                 if nested:
                     pending.append((nested, f"{current_where} command wrapper", is_shell_payload))
-            if (command_position or is_shell_payload) and base in {"source", "."}:
+            if (
+                command_position
+                or (
+                    is_shell_payload
+                    and any(token in SHELL_CONTROL_WORDS for token in expanded[:idx])
+                )
+            ) and base in {"source", "."}:
                 raise SchemaError(
                     f"{current_where}: source 动态脚本执行被拒绝"
                 )
