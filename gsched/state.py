@@ -214,8 +214,10 @@ def submission_shutdown_active() -> bool:
     heartbeat = os.path.join(default_state_dir(), hostname(), "daemon.heartbeat")
     try:
         fresh = time.time() - os.path.getmtime(heartbeat) <= 60
-    except OSError:
+    except FileNotFoundError:
         fresh = False
+    except OSError:
+        return True
     if not fresh:
         clear_idle_shutdown()
     return fresh

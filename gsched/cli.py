@@ -50,11 +50,12 @@ def _load_cfg():
     except ConfigError as e:
         print(f"错误: {e}", file=sys.stderr)
         sys.exit(1)
-def _ensure_running_after_write() -> str:
+def _ensure_running_locked() -> str:
     from . import daemon
 
-    with state.submission_lock():
-        return daemon.ensure_running()
+    return daemon.ensure_running()
+
+
 
 
 
@@ -556,13 +557,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
                 fp, stage_fps, norm.get("project"),
             )
+        conn.commit()
+        wake_result = _ensure_running_locked()
 
     # BugFix (2026-08-26, sd_repro_v3 消失事故): "已入队"/ensure_running 此前
     # 在 with 事务块**内部** —— commit 发生在块退出时, 若 ensure_running 抛
     # 异常 (如 NFS 读配置瞬断 -> ConfigError), 整个事务回滚但 "已入队" 已
     # 打印, 用户以为成功实际批次消失。打印必须在提交之后。
     print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
-    print(_ensure_running_after_write())
+    print(wake_result)
     return 0
 
 
@@ -703,11 +706,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         state.insert_task(conn, bid, "run", 1, task_spec, 0, proj)
         state.insert_job(conn, f"{bid}-run-v1", bid, "run", 1, fp, stage_fps, proj)
+        conn.commit()
+        wake_result = _ensure_running_locked()
 
     res_txt = "cpu-only" if args.cpu_only else "gpu=1"
     print(f"已入队: {bid} ({res_txt}, duration={args.duration}min)")
     print(f"  status/cancel 用批次名: {batch_name}")
-    print(_ensure_running_after_write())
+    print(wake_result)
     return 0
 
 
@@ -1283,7 +1288,9 @@ def cmd_retry(args: argparse.Namespace) -> int:
             print(f"已解锁重跑: {j['id']}")
             n += 1
         print(f"({n} 个任务)")
-    print(_ensure_running_after_write())
+        conn.commit()
+        wake_result = _ensure_running_locked()
+    print(wake_result)
     return 0
 
 
@@ -1354,7 +1361,8 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     else:
         batch, task = _resolve_task_ref(ref)
 
-    with state.submission_connect() as conn:
+    db_context = state.connect() if args.dry_run else state.submission_connect()
+    with db_context as conn:
         bstat = conn.execute(
             "SELECT status FROM batches WHERE id=?", (batch,)
         ).fetchone()
@@ -1470,8 +1478,10 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             print("批次已回 active (旧版本失败终态不再阻塞新版本派发)")
 
         print(f"已 resubmit {len(done_labels)} 个任务: {', '.join(done_labels)}")
+        conn.commit()
+        wake_result = _ensure_running_locked()
 
-    print(_ensure_running_after_write())
+    print(wake_result)
     return 0
 
 
