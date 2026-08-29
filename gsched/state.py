@@ -213,6 +213,9 @@ def _launch_process_start(pgid: int) -> str | None:
 
 def launch_marker_active(job_id: str) -> bool:
     path = launch_marker_path(job_id)
+    import socket
+    if socket.gethostname().strip() != hostname().strip():
+        return os.path.exists(path)
     try:
         with open(path, encoding="utf-8") as marker:
             fields = marker.read().split()
@@ -228,9 +231,6 @@ def launch_marker_active(job_id: str) -> bool:
         except OSError:
             pass
         return False
-    import socket
-    if socket.gethostname().strip() != hostname().strip():
-        return True
     if pgid <= 0 or pgid > 2**31 - 1:
         try:
             os.unlink(path)
