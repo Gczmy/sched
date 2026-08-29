@@ -228,6 +228,9 @@ def launch_marker_active(job_id: str) -> bool:
         except OSError:
             pass
         return False
+    import socket
+    if socket.gethostname().strip() != hostname().strip():
+        return True
     if pgid <= 0 or pgid > 2**31 - 1:
         try:
             os.unlink(path)
