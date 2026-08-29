@@ -191,6 +191,29 @@ def launch_marker_path(job_id: str) -> str:
     prefix = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:24]
     return os.path.join(default_state_dir(), hostname(), "launch", f"{prefix}.launch")
 
+def launch_marker_active(job_id: str) -> bool:
+    path = launch_marker_path(job_id)
+    try:
+        with open(path, encoding="utf-8") as marker:
+            pgid = int(marker.read().split()[0])
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, IndexError):
+        return True
+    if pgid <= 0 or pgid > 2**31 - 1:
+        return True
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    except PermissionError:
+        return True
+
 
 def submission_shutdown_marker() -> str:
     return os.path.join(submission_inbox_dir(), ".daemon-stopping")

@@ -1276,7 +1276,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         blocked_markers = [
             j for j in targets
             if j["kill_reason"] != "probe"
-            and os.path.isfile(state.launch_marker_path(j["id"]))
+            and state.launch_marker_active(j["id"])
         ]
         if blocked_markers:
             labels = ", ".join(j["id"] for j in blocked_markers)
@@ -1438,7 +1438,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             if j["task_id"] in target_tasks
         ]
         marker_targets = [
-            j for j in jrows if os.path.isfile(state.launch_marker_path(j["id"]))
+            j for j in jrows if state.launch_marker_active(j["id"])
         ]
         if marker_targets:
             labels = ", ".join(f"{j['task_id']}v{j['version']}" for j in marker_targets)
