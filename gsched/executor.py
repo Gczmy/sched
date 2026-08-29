@@ -153,11 +153,11 @@ class Executor:
             marker_path = shlex.quote(str(launch_marker))
             marker_tmp = shlex.quote(f"{launch_marker}.tmp")
             launch_script = (
-                f"umask 077; launch_tmp={marker_tmp}.$$; "
+                f"(umask 077; launch_tmp={marker_tmp}.$$; "
                 f"if [ -r /proc/$$/stat ] && "
                 f"/usr/bin/awk '{{print $1 \" \" $22}}' /proc/$$/stat > \"$launch_tmp\"; "
                 f"then :; else printf '%s\\n' \"$$\" > \"$launch_tmp\"; fi && "
-                f"/bin/mv -f \"$launch_tmp\" {marker_path} && "
+                f"/bin/mv -f \"$launch_tmp\" {marker_path}) && "
             )
         if self.sanitize_env:
             self._sanitize_conda_env(merged_env, cmd, stages, explicit=conda_env_dir)
@@ -264,9 +264,22 @@ class Executor:
             # daemon 重启后接管: 无 proc 对象, 用 killpg 存活判断
             return None if self.alive(pgid) else 137
         rc = proc.poll()
-        if rc is not None:
+        if rc is None:
+            return None
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
             self._procs.pop(pgid, None)
-        return rc
+            return rc
+        except PermissionError:
+            if len(self._dead_pgroups) >= 1024:
+                self._dead_pgroups.clear()
+            self._dead_pgroups.add(pgid)
+            self._procs.pop(pgid, None)
+            return rc
+        except OSError:
+            return None
+        return None
 
     # ---------- 组级 kill ----------
 
@@ -282,6 +295,8 @@ class Executor:
             # EPERM even though poll() proves the wrapper has exited.
             proc = self._procs.get(pgid)
             if sig == signal.SIGKILL and proc is not None and proc.poll() is not None:
+                if len(self._dead_pgroups) >= 1024:
+                    self._dead_pgroups.clear()
                 self._dead_pgroups.add(pgid)
                 kill_sent = True
             else:

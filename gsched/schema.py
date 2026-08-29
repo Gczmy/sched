@@ -34,7 +34,7 @@ COMMAND_LAUNCHERS = {
 SCRIPT_INTERPRETERS = {
     "python", "python3", "perl", "ruby", "node", "nodejs", "php", "lua",
 }
-SHELL_CONTROL_WORDS = {"if", "then", "else", "elif", "while", "until", "for", "do", "case"}
+SHELL_CONTROL_WORDS = {"if", "then", "else", "elif", "while", "until", "for", "do", "case", "coproc"}
 
 
 def _shell_command_arg(tokens: list[str], idx: int) -> str | None:
@@ -196,6 +196,22 @@ def _token_has_sudo(tok: str) -> bool:
     """Recognize privilege helpers embedded in shell punctuation/code."""
     candidates = re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", str(tok))
     return any(os.path.basename(candidate).lower() in SUDO_TOKENS for candidate in candidates)
+
+def _reject_shell_source(command: str, where: str) -> None:
+    text = str(command)
+    if re.search(
+        r"(?:^|[;\n|&(){}])\s*(?:source|\.)\b",
+        text,
+    ):
+        raise SchemaError(f"{where}: source 动态脚本执行被拒绝")
+    if re.search(r"(?:\$\(|`)[^`)]*\b(?:source|\.)\b", text):
+        raise SchemaError(f"{where}: source 命令替换被拒绝")
+    if re.search(
+        r"\b(?:if|then|else|elif|!|command|builtin|time|coproc)\s+"
+        r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:source|\.)\b",
+        text,
+    ):
+        raise SchemaError(f"{where}: source 控制前缀被拒绝")
 def _check_sudo_tokens(
     tokens: list[str],
     where: str,
@@ -288,6 +304,7 @@ def _check_sudo_tokens(
                         script = option[2:]
                     if script is None:
                         continue
+                    _reject_shell_source(script, current_where)
                     pending.append(
                         ([script], f"{current_where} interpreter payload", True)
                     )
@@ -307,6 +324,7 @@ def _check_sudo_tokens(
                         f"{current_where}: 命令启动器中的 shell 缺少可检查命令"
                     )
                 for command in launcher_payloads:
+                    _reject_shell_source(command, current_where)
                     try:
                         nested = shlex.split(command)
                     except ValueError as e:
@@ -337,6 +355,7 @@ def _check_sudo_tokens(
                         f"{current_where}: 未提供可检查的嵌套 shell 命令"
                     )
                 for command in nested_commands:
+                    _reject_shell_source(command, current_where)
                     try:
                         nested = shlex.split(command)
                     except ValueError as e:
@@ -350,7 +369,8 @@ def _check_sudo_tokens(
                 and (tok in SHELL_CONTROL_WORDS or tok == "!")
             )
             if effective_command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
-                continue
+                if is_shell_payload and control_pending:
+                    continue
             command_position = (
                 _ends_shell_separator(tok) if is_shell_payload else False
             )

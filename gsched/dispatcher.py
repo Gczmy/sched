@@ -360,6 +360,11 @@ class Dispatcher:
                 pass
 
     def stop(self) -> None:
+        with state.submission_lock():
+            state.mark_idle_shutdown()
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         """daemon stop: 未完成任务标 cancelled 收尾 (N11).
 
         审查 B1: 主循环 tick 边界调用 (任何 connect() 块之外), 不再由信号
@@ -735,9 +740,9 @@ class Dispatcher:
         hb_ts = getattr(self, "_prev_hb_ts", None)
         if hb_ts is None:
             return
-        with open("/proc/uptime") as f:
-            uptime = float(f.read().split()[0])
         try:
+            with open("/proc/uptime") as f:
+                uptime = float(f.read().split()[0])
             boot_ts = time.time() - uptime
             if boot_ts > hb_ts:
                 self.log_line("D4: 检测到节点重启, running 任务标 interrupted (不计 retries)")
@@ -827,7 +832,11 @@ class Dispatcher:
                         fields = marker.read().split()
                     pgid = int(fields[0])
                     marker_start = fields[1] if len(fields) > 1 else None
-                except (OSError, ValueError, IndexError):
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                except (ValueError, IndexError):
                     self._drop_rc_path(path)
                     continue
                 if pgid <= 0 or pgid > 2**31 - 1:
