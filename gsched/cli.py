@@ -344,34 +344,37 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # daemon 每轮扫描后本地写入, 避免 NFS+WAL 跨主机双写。该分支必须
     # 位于所有 state.connect() 之前。
     if foreign_write and not dry_run:
-        inbox_dir = os.path.join(
-            default_state_dir(),
-            str(cfg.get("node")),
-            "submit_inbox",
-        )
-        os.makedirs(inbox_dir, exist_ok=True)
-        payload_path = os.path.join(inbox_dir, f"submit-{uuid.uuid4().hex}.json")
-        tmp_path = payload_path + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as pf:
-                json.dump(
-                    {
-                        "spec": spec,
-                        "bid": bid,
-                        "project": norm.get("project"),
-                        "tasks": len(norm["tasks"]),
-                    },
-                    pf,
-                    ensure_ascii=False,
-                    indent=2,
+        with state.submission_lock():
+            if state.idle_shutdown_pending():
+                print(
+                    "错误: daemon 正在退出，未投递 payload；请先恢复 daemon 后重试",
+                    file=sys.stderr,
                 )
-            os.replace(tmp_path, payload_path)
-        except Exception:
+                return 2
+            inbox_dir = state.submission_inbox_dir()
+            os.makedirs(inbox_dir, exist_ok=True)
+            payload_path = os.path.join(inbox_dir, f"submit-{uuid.uuid4().hex}.json")
+            tmp_path = payload_path + ".tmp"
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                with open(tmp_path, "w", encoding="utf-8") as pf:
+                    json.dump(
+                        {
+                            "spec": spec,
+                            "bid": bid,
+                            "project": norm.get("project"),
+                            "tasks": len(norm["tasks"]),
+                        },
+                        pf,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                os.replace(tmp_path, payload_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         print(f"已投递: {bid} ({len(norm['tasks'])} 任务) -> {cfg.get('node')} (inbox)")
         health = _daemon_health()
         heartbeat_age = health.get("heartbeat_age_s")

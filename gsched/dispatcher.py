@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import json
 import hashlib
 import sqlite3
+import stat
 import os
 import signal
 import subprocess
@@ -399,6 +400,7 @@ class Dispatcher:
     # ---------- 主循环 ----------
 
     def run(self, once: bool = False) -> None:
+        state.clear_idle_shutdown()
         # GPU 表初始化 (配置集 -> free; 幂等)
         with state.connect() as conn:
             state.init_gpus(conn, self.allocator.gpu_list)
@@ -422,11 +424,6 @@ class Dispatcher:
                     self.stop()
                     break
                 if self._idle_check():
-                    # Drain once more at the shutdown boundary. A gateway
-                    # payload may have arrived during the preceding sleep.
-                    self._drain_submit_inbox()
-                    if self._submit_inbox_pending():
-                        continue
                     break
                 self._tick()
                 self._touch_tick_ok()  # B26: tick 完成才写 —— 调度健康真信号
@@ -479,24 +476,26 @@ class Dispatcher:
         """
         if self.idle_timeout_min <= 0:
             return False  # 0 = 禁用
-        with state.connect() as conn:
-            n = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','running','waiting_dep')"
-            ).fetchone()[0]
-            pending_control = conn.execute(
-                "SELECT COUNT(*) FROM control_requests WHERE status='pending'"
-            ).fetchone()[0]
-        now = time.time()
-        inbox_pending = self._submit_inbox_pending()
-        if n > 0 or pending_control > 0 or inbox_pending:
-            self.last_activity = now
+        with state.submission_lock():
+            with state.connect() as conn:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','running','waiting_dep')"
+                ).fetchone()[0]
+                pending_control = conn.execute(
+                    "SELECT COUNT(*) FROM control_requests WHERE status='pending'"
+                ).fetchone()[0]
+            now = time.time()
+            inbox_pending = self._submit_inbox_pending()
+            if n > 0 or pending_control > 0 or inbox_pending:
+                self.last_activity = now
+                return False
+            if now - self.last_activity >= self.idle_timeout_min * 60:
+                state.mark_idle_shutdown()
+                self.log_line(
+                    f"连续 {self.idle_timeout_min}min 无任务 (idle_timeout_min), 自动退出"
+                )
+                return True
             return False
-        if now - self.last_activity >= self.idle_timeout_min * 60:
-            self.log_line(
-                f"连续 {self.idle_timeout_min}min 无任务 (idle_timeout_min), 自动退出"
-            )
-            return True
-        return False
 
     def _l3_freeze_sample(self) -> None:
         """L3 运行时保护 (定案 39): 每 60s 采样 assigned 卡显存, > freeze_pct 冻结.
@@ -781,6 +780,19 @@ class Dispatcher:
             return fields[19] if len(fields) > 19 else None
         except (OSError, IndexError):
             return None
+    def _launch_marker_alive(self, job) -> bool:
+        try:
+            with open(self._launch_marker_path(job), encoding="utf-8") as marker:
+                pgid = int(marker.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pgid <= 0 or pgid > 2**31 - 1:
+            return False
+        try:
+            return bool(self.executor.alive(pgid))
+        except (OSError, OverflowError):
+            return True
+
 
 
     def _recover_launch_markers(self) -> None:
@@ -1028,11 +1040,23 @@ class Dispatcher:
         except OSError as e:
             self.log_line(f"submit_inbox 扫描失败 (保留下轮重试): {e}")
             return
-        payloads = sorted(
-            os.path.join(inbox_dir, name)
-            for name in names
-            if name.startswith("submit-") and name.endswith(".json")
-        )
+        payloads = []
+        for name in names:
+            if not name.startswith("submit-") or not name.endswith(".json"):
+                continue
+            path = os.path.join(inbox_dir, name)
+            try:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    self.log_line(f"submit_inbox 拒绝非普通文件: {path}")
+                    os.unlink(path)
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                self.log_line(f"submit_inbox 文件检查失败 (保留下轮重试): {error}")
+                continue
+            payloads.append(path)
+        payloads.sort()
         if not payloads:
             return
         with state.connect() as conn:
@@ -1148,10 +1172,21 @@ class Dispatcher:
                             safe_log(
                                 f"⚠️ batch_submit req {r['id']} payload cleanup failed: {error}"
                             )
-
                     try:
-                        with open(payload_path, encoding="utf-8") as pf:
-                            envelope = json.load(pf)
+                        payload_fd = None
+                        try:
+                            payload_fd = os.open(
+                                payload_path,
+                                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            if not stat.S_ISREG(os.fstat(payload_fd).st_mode):
+                                raise ValueError("payload 必须是普通文件")
+                            with os.fdopen(payload_fd, "r", encoding="utf-8") as pf:
+                                payload_fd = None
+                                envelope = json.load(pf)
+                        finally:
+                            if payload_fd is not None:
+                                os.close(payload_fd)
                         if not isinstance(envelope, dict):
                             raise ValueError("payload 顶层必须是对象")
                         spec = envelope.get("spec") or {}
@@ -1419,7 +1454,6 @@ class Dispatcher:
                         f"probe fail_on_log 命中: job {j['id']} ({fail_pat!r}) -> kill + blocked"
                     )
                     self.executor.kill_pgid(j["pgid"])
-                    self._drop_launch_marker(j)
                     # probe 命中视为确定失败: 不 retry, 直接 blocked (等人工)
                     state.update_job(
                         conn, j["id"], status="blocked", failure="probe",
@@ -1435,7 +1469,6 @@ class Dispatcher:
                         f"probe ready_on_log 命中: job {j['id']} ({ready_pat!r}) -> kill + done"
                     )
                     self.executor.kill_pgid(j["pgid"])
-                    self._drop_launch_marker(j)
                     state.update_job(
                         conn, j["id"], status="done", kill_reason="probe",
                         finished_at=state.now(),
@@ -1469,6 +1502,7 @@ class Dispatcher:
                     # H4 修复: 确认死亡后清 pgid, 解除对历史终态 job 的永久
                     # 探测 —— 否则 OS 复用该 pgid 后每轮 SIGKILL 无关进程组
                     state.update_job(conn, j["id"], pgid=None)
+                    self._drop_launch_marker(j)
             # P2: 清理已不在 running 的 job 的偏移记录, 防内存随历史膨胀
             live = {j["id"] for j in running}
             for jid in [k for k in self._probe_offsets if k not in live]:
@@ -1971,6 +2005,10 @@ class Dispatcher:
             self._update_project_quota_used(conn)
 
             for j in ready:
+                if self._launch_marker_alive(j):
+                    # A previous launch survived transaction rollback; keep its
+                    # marker and wait for recovery instead of double-starting.
+                    continue
                 # B11c: project quota gate -- 本轮跳过, 状态保持 pending
                 # (绝不落 waiting_quota 终态化, 否则配额释放后无人再捞起)
                 project = j["project"] or j["batch_project"]

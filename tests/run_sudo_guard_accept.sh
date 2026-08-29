@@ -108,6 +108,8 @@ accepted(["grep", "/usr/bin/sudo"])
 accepted(["echo", "foo;sudo"])
 accepted(["echo", "bash", "-c", "sudo id"])
 accepted(["bash", "-c", "echo", "--command", "sudo id"])
+accepted(["echo", "source"])
+accepted(["echo", "."])
 validate_batch(
     {**base, "tasks": [{"id": "loop", "cmd": ["bash", "-c", "{ROOT}"]}]},
     loop_cfg,

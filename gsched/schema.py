@@ -291,7 +291,7 @@ def _check_sudo_tokens(
                 nested = _wrapper_command_tokens(expanded, idx)
                 if nested:
                     pending.append((nested, f"{current_where} command wrapper", is_shell_payload))
-            if base in {"source", "."}:
+            if (command_position or is_shell_payload) and base in {"source", "."}:
                 raise SchemaError(
                     f"{current_where}: source 动态脚本执行被拒绝"
                 )

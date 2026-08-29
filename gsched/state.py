@@ -179,6 +179,51 @@ def db_path() -> str:
     return os.path.join(default_state_dir(), hostname(), "state.db")
 
 
+
+def submission_inbox_dir() -> str:
+    return os.path.join(default_state_dir(), hostname(), "submit_inbox")
+
+
+def submission_shutdown_marker() -> str:
+    return os.path.join(submission_inbox_dir(), ".daemon-stopping")
+
+
+@contextmanager
+def submission_lock() -> Iterator[None]:
+    """Serialize gateway inbox/DB submissions with daemon idle shutdown."""
+    import fcntl
+
+    inbox_dir = submission_inbox_dir()
+    os.makedirs(inbox_dir, exist_ok=True, mode=0o700)
+    lock_path = os.path.join(inbox_dir, ".submit.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def idle_shutdown_pending() -> bool:
+    return os.path.exists(submission_shutdown_marker())
+
+
+def mark_idle_shutdown() -> None:
+    inbox_dir = submission_inbox_dir()
+    os.makedirs(inbox_dir, exist_ok=True, mode=0o700)
+    marker = submission_shutdown_marker()
+    tmp = marker + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()}\n")
+    os.replace(tmp, marker)
+
+
+def clear_idle_shutdown() -> None:
+    try:
+        os.unlink(submission_shutdown_marker())
+    except OSError:
+        pass
+
 def init_db() -> str:
     """建目录 + 建表 + 迁移, 返回 db 路径. 幂等."""
     p = db_path()

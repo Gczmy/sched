@@ -221,6 +221,20 @@ class Executor:
                 pass
             raise
         try:
+            if launch_marker:
+                marker_path = str(launch_marker)
+                marker_value = str(proc.pid)
+                try:
+                    with open(f"/proc/{proc.pid}/stat", encoding="utf-8") as proc_stat:
+                        fields = proc_stat.read().rsplit(")", 1)[1].split()
+                    if len(fields) > 19:
+                        marker_value += f" {fields[19]}"
+                except (OSError, IndexError):
+                    pass
+                marker_tmp = f"{marker_path}.parent.{proc.pid}.tmp"
+                with open(marker_tmp, "w", encoding="utf-8") as marker:
+                    marker.write(marker_value + "\n")
+                os.replace(marker_tmp, marker_path)
             log_f.close()
             self._procs[proc.pid] = proc
         except Exception:
@@ -248,8 +262,9 @@ class Executor:
 
     # ---------- 组级 kill ----------
 
-    def kill_pgid(self, pgid: int, sig: int = signal.SIGTERM) -> None:
+    def kill_pgid(self, pgid: int, sig: int = signal.SIGTERM) -> bool:
         """组级杀 (进程组全灭). pgid 即 wrapper PID (start_new_session 锚点)."""
+        kill_sent = True
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
@@ -260,13 +275,20 @@ class Executor:
             # 异常冒出 -> dispatcher._check_probes 的 state.connect() 事务整体
             # 回滚 -> probe 已写入的 blocked/done 终态丢失 -> 任务被误判 failed
             # 并 retry (日志门控失效, 平台无关的结构性脆弱点)。
-            pass
+            kill_sent = False
         finally:
-            # SIGKILL is terminal for our local Popen bookkeeping. If the DB
-            # write that follows launch fails, no running-row can reap this
-            # handle later, so retaining it leaks the executor registry.
-            if sig == signal.SIGKILL:
+            # SIGKILL is terminal for a successfully signalled local Popen.
+            # Wait for the group leader before dropping its handle so a
+            # rollback cannot retain an unreaped zombie forever.
+            if sig == signal.SIGKILL and kill_sent:
+                proc = self._procs.get(pgid)
+                if proc is not None:
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
                 self._procs.pop(pgid, None)
+        return kill_sent
 
     def alive(self, pgid: int) -> bool:
         try:
