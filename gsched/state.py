@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import hashlib
 import sqlite3
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -190,18 +191,59 @@ def submission_inbox_dir() -> str:
 def launch_marker_path(job_id: str) -> str:
     prefix = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:24]
     return os.path.join(default_state_dir(), hostname(), "launch", f"{prefix}.launch")
+def _launch_process_start(pgid: int) -> str | None:
+    try:
+        with open(f"/proc/{pgid}/stat", encoding="utf-8") as proc_stat:
+            fields = proc_stat.read().rsplit(")", 1)[1].split()
+        return f"proc:{fields[19]}" if len(fields) > 19 else None
+    except (OSError, IndexError):
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pgid), "-o", "lstart="],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            start = result.stdout.strip()
+            return f"ps:{start}" if result.returncode == 0 and start else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+
 
 def launch_marker_active(job_id: str) -> bool:
     path = launch_marker_path(job_id)
     try:
         with open(path, encoding="utf-8") as marker:
-            pgid = int(marker.read().split()[0])
+            fields = marker.read().split()
+        pgid = int(fields[0])
+        marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
     except FileNotFoundError:
         return False
-    except (OSError, ValueError, IndexError):
+    except OSError:
         return True
+    except (ValueError, IndexError):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
     if pgid <= 0 or pgid > 2**31 - 1:
-        return True
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    if marker_start and marker_start.isdigit():
+        marker_start = f"proc:{marker_start}"
+    if marker_start:
+        process_start = _launch_process_start(pgid)
+        if process_start and process_start != marker_start:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return False
     try:
         os.killpg(pgid, 0)
         return True
