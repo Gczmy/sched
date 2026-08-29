@@ -232,23 +232,26 @@ class Executor:
                     if len(fields) > 19:
                         marker_value += f" proc:{fields[19]}"
                 except (OSError, IndexError):
+                    existing_fields = []
                     try:
-                        ps = subprocess.run(
-                            ["ps", "-p", str(proc.pid), "-o", "lstart="],
-                            capture_output=True,
-                            text=True,
-                            timeout=1,
-                        )
-                        start_text = ps.stdout.strip()
-                        if ps.returncode == 0 and start_text:
-                            marker_value += f" ps:{start_text}"
-                    except (OSError, subprocess.SubprocessError):
+                        with open(marker_path, encoding="utf-8") as existing:
+                            existing_fields = existing.read().split()
+                    except (OSError, IndexError):
+                        pass
+                    if len(existing_fields) >= 2 and existing_fields[0] == str(proc.pid):
+                        marker_value = " ".join(existing_fields[:])
+                    else:
                         try:
-                            with open(marker_path, encoding="utf-8") as existing:
-                                existing_fields = existing.read().split()
-                            if len(existing_fields) >= 2 and existing_fields[0] == str(proc.pid):
-                                marker_value = " ".join(existing_fields[:])
-                        except (OSError, IndexError):
+                            ps = subprocess.run(
+                                ["ps", "-p", str(proc.pid), "-o", "lstart="],
+                                capture_output=True,
+                                text=True,
+                                timeout=1,
+                            )
+                            start_text = ps.stdout.strip()
+                            if ps.returncode == 0 and start_text:
+                                marker_value += f" ps:{start_text}"
+                        except (OSError, subprocess.SubprocessError):
                             pass
                 marker_tmp = f"{marker_path}.parent.{proc.pid}.tmp"
                 with open(marker_tmp, "w", encoding="utf-8") as marker:

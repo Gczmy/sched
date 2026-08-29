@@ -805,6 +805,8 @@ class Dispatcher:
                 fields = marker.read().split()
             pgid = int(fields[0])
             marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
+            if marker_start and marker_start.isdigit():
+                marker_start = f"proc:{marker_start}"
         except FileNotFoundError:
             return False
         except OSError:
@@ -845,6 +847,8 @@ class Dispatcher:
                         fields = marker.read().split()
                     pgid = int(fields[0])
                     marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
+                    if marker_start and marker_start.isdigit():
+                        marker_start = f"proc:{marker_start}"
                 except FileNotFoundError:
                     continue
                 except OSError:

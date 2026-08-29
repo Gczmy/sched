@@ -52,7 +52,7 @@ def _wrapper_command_tokens(tokens: list[str], idx: int) -> list[str]:
     while pos < len(tail):
         token = tail[pos]
         if base == "env":
-            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]+\])?\+?=", token):
                 pos += 1
                 continue
             if token == "--":
@@ -368,7 +368,7 @@ def _check_sudo_tokens(
                 and (effective_command_position or control_pending)
                 and (tok in SHELL_CONTROL_WORDS or tok == "!")
             )
-            if effective_command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            if effective_command_position and re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]+\])?\+?=", tok):
                 continue
             command_position = (
                 _ends_shell_separator(tok) if is_shell_payload else False
