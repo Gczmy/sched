@@ -76,6 +76,7 @@ rejected(["nice", "-n", "10", "/usr/bin/sudo", "id"])
 rejected(["timeout", "5", "/usr/bin/sudo", "id"])
 rejected(["command", "-p", "/usr/bin/sudo", "id"])
 rejected(["nohup", "--", "/usr/bin/sudo", "id"])
+rejected(["perl", "-e", "print 1;", "-e", "system \"sudo id\""])
 try:
     parse_shell_cmd("bash -lc 'runuser -u root id'", "sched run")
 except SchemaError:

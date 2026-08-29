@@ -264,7 +264,6 @@ def _check_sudo_tokens(
                     pending.append(
                         ([script], f"{current_where} interpreter payload", True)
                     )
-                    break
             if command_position and base in COMMAND_LAUNCHERS:
                 for launcher_arg in _launcher_argument_tokens(expanded, idx):
                     if (
