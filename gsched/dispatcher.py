@@ -1163,6 +1163,7 @@ class Dispatcher:
           3. killpg SIGTERM; 下一轮仍存活 -> SIGKILL 升级 (绝不静默, 修复建议 2)
         GPU 释放交给 reap (_handle_job_done cancelled 分支), 与正常路径一致.
         """
+        cleanup_payloads: list[str] = []
         with state.connect() as conn:
             reqs = state.pending_control_requests(conn)
             if not reqs:
@@ -1204,14 +1205,8 @@ class Dispatcher:
                             pass
 
                     def discard_payload() -> None:
-                        try:
-                            os.unlink(payload_path)
-                        except FileNotFoundError:
-                            pass
-                        except OSError as error:
-                            safe_log(
-                                f"⚠️ batch_submit req {r['id']} payload cleanup failed: {error}"
-                            )
+                        if payload_path not in cleanup_payloads:
+                            cleanup_payloads.append(payload_path)
                     try:
                         payload_fd = None
                         try:
@@ -1398,6 +1393,11 @@ class Dispatcher:
                 self.log_line(f"cancel req {r['id']}: job {j['id']} killpg SIGTERM (pgid={pgid})")
                 # 请求本轮不 finish: 下轮 tick 复查, 仍存活则 SIGKILL 升级
 
+        for payload_path in cleanup_payloads:
+            try:
+                os.unlink(payload_path)
+            except OSError as error:
+                self.log_line(f"⚠️ submit payload cleanup failed (保留下轮重试): {error}")
     def _check_timeouts(self) -> None:
         """H6 任务级超时看门狗: running 超 duration_min (schema 已校验) -> timed_out.
 
