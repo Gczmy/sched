@@ -2,7 +2,9 @@
 # L10: clean must select the latest version independently for each task.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-clean-versions"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
@@ -23,7 +25,8 @@ def spec(path):
     return {
         "id": "t", "cmd": ["echo", "ok"], "stages": None, "cwd_abs": "/tmp",
         "git": False, "env": {}, "resources": {"gpu": 0}, "duration_min": None,
-        "max_retry": 0, "artifacts": {"out": {"path": path}},
+        "max_retry": 0, "paths_escape": True,
+        "artifacts": {"out": {"path": path}},
         "retry_transform": None, "probes": None,
     }
 t1_old = os.path.join(out_dir, "t1-old.txt")

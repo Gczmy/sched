@@ -2,11 +2,13 @@
 # B26: GPU 健康自愈验收 —— 探测失败计数/幽灵卡检测/自动熔断
 set -u
 cd "$(dirname "$0")/.."
+source tests/acceptance_cleanup.sh
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 
-export SCHED_STATE="$(mktemp -d)"
+sched_accept_make_root SCHED_STATE "sched-gpu-selfheal"
+export SCHED_STATE
 export SCHED_ALLOW_FOREIGN_WRITE=1
 
 NODE="$(uname -n)"

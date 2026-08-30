@@ -9,11 +9,15 @@ from __future__ import annotations
 import os
 import hashlib
 import sqlite3
-import subprocess
+import shutil
+import stat
+import tempfile
+import secrets
 from contextlib import contextmanager
-from datetime import datetime
+from contextvars import ContextVar
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .config import default_state_dir
 
@@ -30,7 +34,8 @@ CREATE TABLE IF NOT EXISTS batches (
   status      TEXT NOT NULL DEFAULT 'queued',
   created_at  TEXT NOT NULL,
   project     TEXT,
-  priority    INTEGER NOT NULL DEFAULT 0
+  priority    INTEGER NOT NULL DEFAULT 0,
+  revision    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -68,7 +73,8 @@ CREATE TABLE IF NOT EXISTS gpus (
   quarantined INTEGER NOT NULL DEFAULT 0,
   ignore_until TEXT,
   updated_at TEXT,
-  mem_total_gib REAL
+  mem_total_gib REAL,
+  revision INTEGER NOT NULL DEFAULT 0
 );
 
 -- gpu_jobs 关联表 (co-location 多归属, §3.2e A2): gpu_id <-> job_id 多对一.
@@ -116,6 +122,18 @@ CREATE TABLE IF NOT EXISTS control_requests (
   processed_at TEXT,
   result      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS operation_requests (
+  request_id  TEXT PRIMARY KEY,
+  argv        TEXT NOT NULL,
+  status      TEXT NOT NULL,  -- started / done
+  code        INTEGER,
+  stdout      TEXT,
+  stderr      TEXT,
+  output_compacted INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL,
+  finished_at TEXT
+);
 """
 
 
@@ -123,6 +141,179 @@ class StateError(Exception):
     pass
 class SubmissionBlocked(StateError):
     pass
+
+def ensure_private_directory(path: str) -> str:
+    """Create/repair a scheduler directory as 0700 without accepting symlinks."""
+    absolute = os.path.normpath(os.path.abspath(path))
+    os.makedirs(absolute, mode=0o700, exist_ok=True)
+    state_root = os.path.normpath(os.path.abspath(default_state_dir()))
+    try:
+        inside_state = os.path.commonpath((state_root, absolute)) == state_root
+    except ValueError:
+        inside_state = False
+    targets = [absolute]
+    if inside_state:
+        relative = os.path.relpath(absolute, state_root)
+        targets = [state_root]
+        if relative != ".":
+            current = state_root
+            for component in relative.split(os.sep):
+                current = os.path.join(current, component)
+                targets.append(current)
+    for target in targets:
+        entry = os.lstat(target)
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise StateError(f"state directory is not a real directory: {target}")
+        os.chmod(target, 0o700)
+    return absolute
+
+
+def ensure_private_file(path: str) -> str:
+    """Create/repair a regular scheduler file as 0600 without following links."""
+    ensure_private_directory(os.path.dirname(path) or ".")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(path, flags, 0o600)
+    try:
+        entry = os.fstat(fd)
+        if not stat.S_ISREG(entry.st_mode):
+            raise StateError(f"state file is not regular: {path}")
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return path
+
+
+def open_private_text(
+    path: str,
+    mode: str,
+    *,
+    encoding: str = "utf-8",
+):
+    """Open a scheduler text file with O_NOFOLLOW and an exact 0600 mode."""
+    modes = {
+        "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        "a+": os.O_RDWR | os.O_CREAT | os.O_APPEND,
+        "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        "x": os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+    }
+    if mode not in modes:
+        raise ValueError(f"unsupported private file mode: {mode}")
+    ensure_private_directory(os.path.dirname(path) or ".")
+    flags = (
+        modes[mode]
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(path, flags, 0o600)
+    try:
+        entry = os.fstat(fd)
+        if not stat.S_ISREG(entry.st_mode):
+            raise StateError(f"state file is not regular: {path}")
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, mode, encoding=encoding)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def touch_private_file(path: str) -> None:
+    ensure_private_file(path)
+    fd = os.open(
+        path,
+        os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.utime(fd)
+    finally:
+        os.close(fd)
+
+_read_only = False
+
+
+class _CommitNeutralConnection:
+    """Delegate SQLite work while reserving transaction control to the caller."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.raw = connection
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw, name)
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+_bound_connection: ContextVar[_CommitNeutralConnection | None] = ContextVar(
+    "sched_bound_connection",
+    default=None,
+)
+_bound_after_commit: ContextVar[list[Callable[[], None]] | None] = ContextVar(
+    "sched_bound_after_commit",
+    default=None,
+)
+_submission_lock_depth: ContextVar[int] = ContextVar(
+    "sched_submission_lock_depth",
+    default=0,
+)
+
+
+@contextmanager
+def bind_connection(
+    conn: sqlite3.Connection,
+) -> Iterator[list[Callable[[], None]]]:
+    """Reuse one writer transaction and collect effects for its outer commit."""
+    existing = _bound_connection.get()
+    if existing is not None and existing.raw is not conn:
+        raise StateError("cannot replace an active bound state transaction")
+    callbacks = _bound_after_commit.get()
+    owns_callbacks = callbacks is None
+    if callbacks is None:
+        callbacks = []
+    bound = existing or _CommitNeutralConnection(conn)
+    connection_token = _bound_connection.set(bound)
+    callbacks_token = _bound_after_commit.set(callbacks)
+    try:
+        yield callbacks
+    except Exception:
+        if owns_callbacks:
+            callbacks.clear()
+        raise
+    finally:
+        _bound_after_commit.reset(callbacks_token)
+        _bound_connection.reset(connection_token)
+
+
+def defer_after_commit(callback: Callable[[], None]) -> bool:
+    """Queue an external effect when a durable request owns the transaction."""
+    callbacks = _bound_after_commit.get()
+    if callbacks is None:
+        return False
+    callbacks.append(callback)
+    return True
+
+
+
+def set_read_only(enabled: bool) -> None:
+    """Select read-only SQLite connections for the current CLI invocation."""
+    global _read_only
+    _read_only = bool(enabled)
+
+
+def read_only() -> bool:
+    return _read_only
 
 
 def hostname() -> str:
@@ -179,74 +370,118 @@ def hostname() -> str:
     return result
 
 
-def db_path() -> str:
-    return os.path.join(default_state_dir(), hostname(), "state.db")
+def host_dir() -> str:
+    """Return the configured host directory without permitting root escape."""
+    root = os.path.normpath(os.path.abspath(default_state_dir()))
+    host = hostname()
+    if (
+        not host
+        or host in (".", "..")
+        or "/" in host
+        or "\\" in host
+        or "\x00" in host
+    ):
+        raise StateError("node must be a safe single path component")
+    candidate = os.path.join(root, host)
+    root_real = os.path.realpath(root)
+    try:
+        contained = os.path.commonpath(
+            (root_real, os.path.realpath(candidate))
+        ) == root_real
+    except ValueError:
+        contained = False
+    if not contained:
+        raise StateError(f"node state path escapes state_dir: {host}")
+    return candidate
 
+
+def db_path() -> str:
+    return os.path.join(host_dir(), "state.db")
 
 
 def submission_inbox_dir() -> str:
-    return os.path.join(default_state_dir(), hostname(), "submit_inbox")
+    return os.path.join(host_dir(), "submit_inbox")
 
 
 def launch_marker_path(job_id: str) -> str:
     prefix = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:24]
-    return os.path.join(default_state_dir(), hostname(), "launch", f"{prefix}.launch")
-def _launch_process_start(pgid: int) -> str | None:
-    try:
-        with open(f"/proc/{pgid}/stat", encoding="utf-8") as proc_stat:
-            fields = proc_stat.read().rsplit(")", 1)[1].split()
-        return f"proc:{fields[19]}" if len(fields) > 19 else None
-    except (OSError, IndexError):
-        try:
-            result = subprocess.run(
-                ["ps", "-p", str(pgid), "-o", "lstart="],
-                capture_output=True,
-                text=True,
-                timeout=1,
-            )
-            start = result.stdout.strip()
-            return f"ps:{start}" if result.returncode == 0 and start else None
-        except (OSError, subprocess.SubprocessError):
-            return None
+    return os.path.join(host_dir(), "launch", f"{prefix}.launch")
 
+
+def _launch_process_start(pgid: int) -> str | None:
+    from .executor import process_start_token
+
+    return process_start_token(pgid)
 
 
 def launch_marker_active(job_id: str) -> bool:
+    """Conservatively report whether a strong launch identity may be active."""
     path = launch_marker_path(job_id)
     import socket
+
     if socket.gethostname().strip() != hostname().strip():
-        return os.path.exists(path)
+        try:
+            os.lstat(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
-        with open(path, encoding="utf-8") as marker:
-            fields = marker.read().split()
-        pgid = int(fields[0])
-        marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
+        fd = os.open(path, flags)
     except FileNotFoundError:
         return False
     except OSError:
         return True
-    except (ValueError, IndexError):
+    try:
+        marker_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(marker_stat.st_mode)
+            or marker_stat.st_uid != os.getuid()
+            or marker_stat.st_nlink != 1
+            or marker_stat.st_size > 4096
+        ):
+            return True
+        payload = os.read(fd, 4097)
+        if len(payload) > 4096:
+            return True
+        try:
+            fields = payload.decode("utf-8").split()
+        except UnicodeDecodeError:
+            return True
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+    if len(fields) != 2:
+        return True
+    try:
+        pgid = int(fields[0])
+    except (TypeError, ValueError):
+        return True
+    from .executor import _is_strong_start_token
+
+    marker_start = fields[1]
+    if (
+        pgid <= 0
+        or pgid > 2**31 - 1
+        or not _is_strong_start_token(marker_start)
+    ):
+        return True
+    process_start = _launch_process_start(pgid)
+    if process_start is None:
+        return True
+    if process_start != marker_start:
         try:
             os.unlink(path)
         except OSError:
             pass
         return False
-    if pgid <= 0 or pgid > 2**31 - 1:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        return False
-    if marker_start and marker_start.isdigit():
-        marker_start = f"proc:{marker_start}"
-    if marker_start:
-        process_start = _launch_process_start(pgid)
-        if process_start and process_start != marker_start:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            return False
     try:
         os.killpg(pgid, 0)
         return True
@@ -256,7 +491,7 @@ def launch_marker_active(job_id: str) -> bool:
         except OSError:
             pass
         return False
-    except PermissionError:
+    except (PermissionError, OSError):
         return True
 
 
@@ -266,17 +501,28 @@ def submission_shutdown_marker() -> str:
 
 @contextmanager
 def submission_lock() -> Iterator[None]:
-    """Serialize gateway inbox/DB submissions with daemon idle shutdown."""
-    import fcntl
-
-    inbox_dir = submission_inbox_dir()
-    os.makedirs(inbox_dir, exist_ok=True, mode=0o700)
-    lock_path = os.path.join(inbox_dir, ".submit.lock")
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    """Serialize submissions with one re-entrant process-local lock order."""
+    depth = _submission_lock_depth.get()
+    if depth:
+        token = _submission_lock_depth.set(depth + 1)
         try:
             yield
         finally:
+            _submission_lock_depth.reset(token)
+        return
+
+    import fcntl
+
+    inbox_dir = submission_inbox_dir()
+    ensure_private_directory(inbox_dir)
+    lock_path = os.path.join(inbox_dir, ".submit.lock")
+    with open_private_text(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        token = _submission_lock_depth.set(1)
+        try:
+            yield
+        finally:
+            _submission_lock_depth.reset(token)
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 def submission_shutdown_active() -> bool:
@@ -311,33 +557,78 @@ def idle_shutdown_pending() -> bool:
     return os.path.exists(submission_shutdown_marker())
 
 
-def mark_idle_shutdown() -> None:
-    inbox_dir = submission_inbox_dir()
-    os.makedirs(inbox_dir, exist_ok=True, mode=0o700)
-    marker = submission_shutdown_marker()
-    tmp = marker + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(f"{os.getpid()}\n")
-    os.replace(tmp, marker)
+def mark_idle_shutdown() -> str:
+    """Atomically publish a caller-owned shutdown marker and return its token."""
+    with submission_lock():
+        inbox_dir = submission_inbox_dir()
+        ensure_private_directory(inbox_dir)
+        marker = submission_shutdown_marker()
+        token = secrets.token_hex(24)
+        tmp = f"{marker}.{token}.tmp"
+        with open_private_text(tmp, "x") as f:
+            f.write(f"{token}\n{os.getpid()}\n")
+        os.replace(tmp, marker)
+        return token
 
 
-def clear_idle_shutdown() -> None:
-    try:
-        os.unlink(submission_shutdown_marker())
-    except OSError:
-        pass
+def clear_idle_shutdown(token: str | None = None) -> bool:
+    """Clear the marker, optionally only when it is still owned by *token*."""
+    with submission_lock():
+        marker = submission_shutdown_marker()
+        if token is not None:
+            try:
+                with open(marker, encoding="utf-8") as stream:
+                    current_token = stream.readline().strip()
+            except OSError:
+                return False
+            if not secrets.compare_digest(current_token, token):
+                return False
+        try:
+            os.unlink(marker)
+        except OSError:
+            return False
+        return True
+
+
+def _execute_sql_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a migration script statement-by-statement without implicit commits."""
+    pending: list[str] = []
+    for line in script.splitlines(keepends=True):
+        pending.append(line)
+        statement = "".join(pending)
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            pending.clear()
+    if any(part.strip() for part in pending):
+        raise StateError("incomplete SQL migration statement")
+
 
 def init_db() -> str:
     """建目录 + 建表 + 迁移, 返回 db 路径. 幂等."""
+    if _read_only:
+        raise StateError("read-only state mode cannot initialize or migrate the database")
     p = db_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
+    if _bound_connection.get() is not None:
+        return p
+    ensure_private_directory(os.path.dirname(p))
     with connect() as conn:
-        conn.executescript(SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
         migrate_job_progress(conn)
+        migrate_operation_requests(conn)
+        migrate_revisions(conn)
+        migrate_legacy_job_statuses(conn)
     return p
+
+
+def migrate_legacy_job_statuses(conn: sqlite3.Connection) -> None:
+    """Normalize pre-pending waiting states in the initialization transaction."""
+    conn.execute(
+        "UPDATE jobs SET status='pending'"
+        " WHERE status IN ('waiting_quota','waiting_dep')"
+    )
 
 
 def migrate_gpu_jobs(conn: sqlite3.Connection) -> None:
@@ -380,6 +671,140 @@ def migrate_job_progress(conn: sqlite3.Connection) -> None:
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
     if "progress" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN progress TEXT")
+
+
+def migrate_operation_requests(conn: sqlite3.Connection) -> None:
+    """Add durable-output tombstone metadata to databases created pre-ledger."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(operation_requests)").fetchall()
+    }
+    if "output_compacted" not in columns:
+        conn.execute(
+            "ALTER TABLE operation_requests"
+            " ADD COLUMN output_compacted INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def migrate_revisions(conn: sqlite3.Connection) -> None:
+    """Install monotonic ABA revisions after upgrading legacy table columns."""
+    for table in ("batches", "gpus"):
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "revision" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table}"
+                " ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
+    _execute_sql_statements(
+        conn,
+        """
+        CREATE TRIGGER IF NOT EXISTS revision_batch_status
+        AFTER UPDATE OF status ON batches
+        WHEN OLD.status IS NOT NEW.status
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS revision_task_insert
+        AFTER INSERT ON tasks
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=NEW.batch_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_task_delete
+        AFTER DELETE ON tasks
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=OLD.batch_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_task_membership
+        AFTER UPDATE OF batch_id, id, version ON tasks
+        WHEN OLD.batch_id IS NOT NEW.batch_id
+          OR OLD.id IS NOT NEW.id
+          OR OLD.version IS NOT NEW.version
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=OLD.batch_id;
+          UPDATE batches SET revision=revision+1
+            WHERE id=NEW.batch_id AND NEW.batch_id IS NOT OLD.batch_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS revision_job_insert
+        AFTER INSERT ON jobs
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=NEW.batch_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_job_delete
+        AFTER DELETE ON jobs
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=OLD.batch_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_job_state
+        AFTER UPDATE OF status, batch_id, task_id, version ON jobs
+        WHEN OLD.status IS NOT NEW.status
+          OR OLD.batch_id IS NOT NEW.batch_id
+          OR OLD.task_id IS NOT NEW.task_id
+          OR OLD.version IS NOT NEW.version
+        BEGIN
+          UPDATE batches SET revision=revision+1 WHERE id=OLD.batch_id;
+          UPDATE batches SET revision=revision+1
+            WHERE id=NEW.batch_id AND NEW.batch_id IS NOT OLD.batch_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS revision_gpu_state
+        AFTER UPDATE OF status, job_id, quarantined ON gpus
+        WHEN OLD.status IS NOT NEW.status
+          OR OLD.job_id IS NOT NEW.job_id
+          OR OLD.quarantined IS NOT NEW.quarantined
+        BEGIN
+          UPDATE gpus SET revision=revision+1 WHERE idx=NEW.idx;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_gpu_job_insert
+        AFTER INSERT ON gpu_jobs
+        BEGIN
+          UPDATE gpus SET revision=revision+1 WHERE idx=NEW.gpu_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_gpu_job_delete
+        AFTER DELETE ON gpu_jobs
+        BEGIN
+          UPDATE gpus SET revision=revision+1 WHERE idx=OLD.gpu_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS revision_gpu_job_update
+        AFTER UPDATE OF gpu_id, job_id, vram_gib ON gpu_jobs
+        WHEN OLD.gpu_id IS NOT NEW.gpu_id
+          OR OLD.job_id IS NOT NEW.job_id
+          OR OLD.vram_gib IS NOT NEW.vram_gib
+        BEGIN
+          UPDATE gpus SET revision=revision+1 WHERE idx=OLD.gpu_id;
+          UPDATE gpus SET revision=revision+1
+            WHERE idx=NEW.gpu_id AND NEW.gpu_id IS NOT OLD.gpu_id;
+        END;
+        """
+    )
+
+
+def compact_operation_outputs(
+    conn: sqlite3.Connection,
+    *,
+    keep_recent: int = 1000,
+    ttl_days: int = 7,
+) -> int:
+    """Replace old completed output with tombstones while retaining bindings."""
+    cutoff = (datetime.now() - timedelta(days=max(0, ttl_days))).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    cursor = conn.execute(
+        "UPDATE operation_requests"
+        " SET stdout=NULL, stderr=NULL, output_compacted=1"
+        " WHERE status='done' AND output_compacted=0"
+        " AND (finished_at<? OR request_id IN ("
+        "   SELECT request_id FROM operation_requests"
+        "   WHERE status='done' ORDER BY finished_at DESC, rowid DESC"
+        "   LIMIT -1 OFFSET ?"
+        " ))",
+        (cutoff, max(0, keep_recent)),
+    )
+    return cursor.rowcount
 
 
 def migrate_incidents(conn: sqlite3.Connection) -> None:
@@ -463,15 +888,90 @@ def latest_incident_for_job(conn: sqlite3.Connection, job_id: str):
     ).fetchone()
 
 
+def _snapshot_signature(path: str) -> tuple:
+    """Stat the database and WAL without opening SQLite shared-memory state."""
+    signature = []
+    for candidate in (path, path + "-wal"):
+        try:
+            stat = os.stat(candidate)
+        except FileNotFoundError:
+            signature.append(None)
+        else:
+            signature.append(
+                (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
+    return tuple(signature)
+
+
+@contextmanager
+def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
+    """Yield a stable private copy without opening SQLite state on the source."""
+    snapshot_dir = tempfile.mkdtemp(prefix="sched-state-ro-")
+    snapshot_db = os.path.join(snapshot_dir, os.path.basename(path))
+    snapshot_wal = snapshot_db + "-wal"
+    try:
+        for _ in range(4):
+            before = _snapshot_signature(path)
+            if before[0] is None:
+                raise StateError(f"state database does not exist: {path}")
+            try:
+                shutil.copyfile(path, snapshot_db)
+            except FileNotFoundError:
+                continue
+            if before[1] is None:
+                try:
+                    os.unlink(snapshot_wal)
+                except FileNotFoundError:
+                    pass
+            else:
+                try:
+                    shutil.copyfile(path + "-wal", snapshot_wal)
+                except FileNotFoundError:
+                    continue
+            if before == _snapshot_signature(path):
+                yield snapshot_db, before[1] is None
+                return
+        raise StateError("state database changed while creating read-only snapshot")
+    finally:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
-    """WAL + busy_timeout 连接. 事务由调用方 with 管理 (自动 commit/rollback)."""
+    """Open the state database in invocation-selected read or writer mode."""
+    bound = _bound_connection.get()
+    if bound is not None:
+        yield bound
+        return
     p = db_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
+    if _read_only:
+        with _read_only_database(p) as (read_path, immutable):
+            uri = Path(read_path).absolute().as_uri() + "?mode=ro"
+            if immutable:
+                uri += "&immutable=1"
+            conn = sqlite3.connect(uri, timeout=5.0, uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
+        return
+
+    ensure_private_directory(os.path.dirname(p))
+    ensure_private_file(p)
     conn = sqlite3.connect(p, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    for sidecar in (p + "-wal", p + "-shm"):
+        if os.path.exists(sidecar):
+            ensure_private_file(sidecar)
     try:
         yield conn
         conn.commit()
@@ -480,6 +980,9 @@ def connect() -> Iterator[sqlite3.Connection]:
         raise
     finally:
         conn.close()
+        for sidecar in (p + "-wal", p + "-shm"):
+            if os.path.exists(sidecar):
+                ensure_private_file(sidecar)
 
 
 def now() -> str:

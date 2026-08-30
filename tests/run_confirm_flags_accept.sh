@@ -2,7 +2,9 @@
 # L12: releasing and unmanaged confirmation counters must not share a flag.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-confirm-flags"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {

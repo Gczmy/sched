@@ -17,6 +17,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -28,7 +29,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() {
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -41,7 +41,7 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     print(-1); raise SystemExit
-n = sum(1 for j in d['jobs'] if j['batch'].split('-')[0] == '$2' and j['status'] == '$3')
+n = sum(1 for j in d['jobs'] if j['batch_name'] == '$2' and j['status'] == '$3')
 print(n)"
 }
 
@@ -51,7 +51,7 @@ wait_batch_done() { # $1=dir $2=batch名前缀 $3=超时秒 —— 等同名批�
       $PY -c "
 import json, sys
 d = json.load(sys.stdin)
-bad = [b for b in d['batches'] if b['name'].split('-')[0] == '$2' and b['status'] not in ('done','blocked','cancelled')]
+bad = [b for b in d['batches'] if b['batch_name'] == '$2' and b['status'] not in ('done','blocked','cancelled')]
 sys.exit(0 if not bad else 1)" && return 0
     sleep 2
   done
@@ -65,7 +65,7 @@ wait_batch_done() { # $1=dir $2=batch名 $3=超时秒 —— 等同名批次全�
       $PY -c "
 import json, sys
 d = json.load(sys.stdin)
-bad = [b for b in d['batches'] if b['name'].split('-')[0] == '$2' and b['status'] not in ('done','blocked','cancelled')]
+bad = [b for b in d['batches'] if b['batch_name'] == '$2' and b['status'] not in ('done','blocked','cancelled')]
 sys.exit(0 if not bad else 1)" && return 0
     sleep 1
   done
@@ -83,7 +83,7 @@ echo "=== B13 SelfDistOTS 改进批次验收 ==="
 
 # ---------- S1: 环境净化 ----------
 echo "--- S1: conda 环境净化 + VENV 注入 ---"
-S=/tmp/sched_b13_1; rm -rf $S; mkdir -p $S
+sched_accept_make_root S "sched-b13-env"
 mkdir -p $S/envs/myenv/bin
 cat > $S/envs/myenv/bin/pyprobe << 'EOF'
 #!/bin/bash
@@ -121,16 +121,15 @@ stop_daemon $S
 
 # ---------- S2/S3/S4: 指纹三件套 ----------
 echo "--- S2-S4: dirty-tree 指纹 / force_rerun / clean ---"
-W=/tmp/sched_b13_repo; rm -rf $W; mkdir -p $W
+sched_accept_make_root W "sched-b13-repo"
 cd "$W"
 git init -q . && git config user.email t@t && git config user.name t
-cat > runner.py << 'EOF'
-open("/tmp/sched_b13_out/res.json", "w").write('{"result": 1}')
+sched_accept_make_root OUT "sched-b13-out"
+cat > runner.py << EOF
+open("$OUT/res.json", "w").write('{"result": 1}')
 EOF
 git add -A && git commit -qm init
-mkdir -p /tmp/sched_b13_out
-S2=/tmp/sched_b13_2; rm -rf $S2; mkdir -p $S2
-rm -rf /tmp/sched_b13_out; mkdir -p /tmp/sched_b13_out   # 清残留产物 (防首跑误 SKIP)
+sched_accept_make_root S2 "sched-b13-fingerprint"
 cat > $S2/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -144,7 +143,7 @@ cat > $S2/b.json << EOF
   "name": "fp", "project": "default", "mode": "mix",
   "tasks": [{
     "id": "t1", "cmd": ["{VENV:k}", "runner.py"], "duration_min": 1,
-    "artifacts": {"r": {"path": "/tmp/sched_b13_out/res.json"}}, "paths_escape": true
+    "artifacts": {"r": {"path": "$OUT/res.json"}}, "paths_escape": true
   }]
 }
 EOF
@@ -174,11 +173,11 @@ spec["name"] = "fpf"
 spec["force_rerun"] = True
 json.dump(spec, open("$S2/bf.json", "w"), indent=2)
 PYEOF
-rm -f /tmp/sched_b13_out/res.json
+rm -f "$OUT/res.json"
 $PY -m gsched.cli submit $S2/bf.json >/dev/null 2>&1
 wait_for '[ "$(count_status $S2 fpf done)" = "1" ]' 30 \
   && ok "force_rerun: 干净树也强制重跑" || bad "force_rerun 未生效"
-[ -f /tmp/sched_b13_out/res.json ] && ok "产物已重新生成" || bad "产物缺失"
+[ -f "$OUT/res.json" ] && ok "产物已重新生成" || bad "产物缺失"
 
 # ---------- S4: sched clean ----------
 echo "--- S4: sched clean 清指纹+删产物 ---"
@@ -189,7 +188,7 @@ wait_for '[ "$(count_status $S2 fp skip)" -ge 1 ]' 45 \
 wait_batch_done $S2 fp 30
 CLEANOUT=$($PY -m gsched.cli clean fp --yes 2>&1)
 echo "$CLEANOUT" | grep -q "已清除" || bad "clean 异常: $CLEANOUT"
-[ -f /tmp/sched_b13_out/res.json ] && bad "产物未被 clean 删除" || ok "clean 已删除产物文件"
+[ -f "$OUT/res.json" ] && bad "产物未被 clean 删除" || ok "clean 已删除产物文件"
 $PY -m gsched.cli submit $S2/b.json >/dev/null 2>&1
 BEFORE=$(count_status $S2 fp done)
 wait_for '[ "$(count_status $S2 fp done)" = '"$((BEFORE+1))"' ]' 40 \
@@ -201,9 +200,9 @@ python3 - << PYEOF
 import json
 base = json.load(open("$S2/b.json"))
 base["tasks"][0]["cmd"] = ["{VENV:k}", "-c",
-    "import json; open('/tmp/sched_b13_out/hk.json','w').write(json.dumps({'avg_mse': 0.1}))"]
+    "import json; open('$OUT/hk.json','w').write(json.dumps({'avg_mse': 0.1}))"]
 base["tasks"][0]["artifacts"] = {
-    "hk": {"path": "/tmp/sched_b13_out/hk.json", "has_key": "avg_mse"}}
+    "hk": {"path": "$OUT/hk.json", "has_key": "avg_mse"}}
 base["tasks"][0]["paths_escape"] = True
 base["name"] = "hkok"
 json.dump(base, open("$S2/hkok.json", "w"), indent=2)
@@ -218,9 +217,11 @@ HBOUT=$($PY -m gsched.cli submit $S2/hkbad.json 2>&1)
 echo "$HBOUT" | grep -q "已入队" || bad "hkbad 提交失败: $HBOUT"
 wait_for '[ "$(count_status $S2 hkbad blocked)" -ge 1 ]' 120 && ok "has_key 缺失 -> blocked" || bad "缺键未被拦截"
 
+stop_daemon $S2
+
 # ---------- S6: progress_regex ----------
 echo "--- S6: progress_regex 进度入库与展示 ---"
-S6=/tmp/sched_b13_6; rm -rf $S6; mkdir -p $S6
+sched_accept_make_root S6 "sched-b13-progress"
 cat > $S6/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -267,7 +268,7 @@ stop_daemon $S6
 
 # ---------- S7: cancel --project 批量取消 ----------
 echo "--- S7: cancel --project 批量取消 ---"
-S7=/tmp/sched_b13_7; rm -rf $S7; mkdir -p $S7
+sched_accept_make_root S7 "sched-b13-cancel"
 cat > $S7/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",

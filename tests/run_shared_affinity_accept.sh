@@ -2,7 +2,9 @@
 # M5: shared packing must prefer a project's soft-affinity cards before load balance.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-shared-affinity"
+export SCHED_STATE
 export SCHED_FAKE_GPUS="0:24,1:24"
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF

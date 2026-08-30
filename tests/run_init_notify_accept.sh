@@ -2,7 +2,9 @@
 # M6: cmd_init must emit the command channel in schema-compatible form.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-init-notify"
+export SCHED_STATE
 python3 - <<'PY'
 import builtins, json, os, tempfile, sys
 sys.path.insert(0, ".")

@@ -14,6 +14,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -28,13 +29,13 @@ try: d=json.load(sys.stdin)
 except Exception: print(-1); raise SystemExit
 n=0
 for j in d['jobs']:
-    if j['batch'].split('-')[0]=='$2' and j['status']=='$3': n+=1
+    if j['batch_name']=='$2' and j['status']=='$3': n+=1
 print(n)
 "
 }
 wait_for(){ for _ in $(seq 1 ${2:-40}); do eval "$1" && return 0; sleep 2; done; return 1; }
 
-S=/tmp/sched_discard; rm -rf $S; mkdir -p $S /tmp/sched_dc_out
+sched_accept_make_root S "sched-discard"
 cat > $S/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -116,7 +117,6 @@ echo "$DOUT2" | grep -q "已退役" && ok "queued 挂起批次可退役 (pending
 
 stop_daemon() {
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
 }
 stop_daemon
 

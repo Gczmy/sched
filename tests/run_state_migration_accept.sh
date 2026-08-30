@@ -2,7 +2,9 @@
 # L1: migrate_project_columns must execute as a normal migration function.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-state-migration"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {

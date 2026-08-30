@@ -2,7 +2,9 @@
 # M1: resubmit fingerprints must resolve the configured VENV aliases.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-resubmit-venv"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {

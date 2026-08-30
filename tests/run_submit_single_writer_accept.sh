@@ -2,7 +2,9 @@
 # C2: gateway submission must use the file-only inbox channel; no NFS DB write.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-submit-writer"
+export SCHED_STATE
 unset SCHED_ALLOW_FOREIGN_WRITE || true
 cat > "$SCHED_STATE/config.json" <<'EOF'
 {

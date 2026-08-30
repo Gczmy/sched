@@ -18,13 +18,13 @@ ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PASS=0; FAIL=0
+source tests/acceptance_cleanup.sh
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 
 stop_daemon() {
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -34,7 +34,7 @@ count_status() { # $1=dir $2=batch $3=status
     $PY -c "
 import json, sys
 d = json.load(sys.stdin)
-n = sum(1 for j in d['jobs'] if j['batch'].split('-')[0] == '$2' and j['status'] == '$3')
+n = sum(1 for j in d['jobs'] if j['batch_name'] == '$2' and j['status'] == '$3')
 print(n)"
 }
 
@@ -74,7 +74,7 @@ echo "=== B12-c 三级打包上限验收 ==="
 
 # ---------- S1: 全局上限 ----------
 echo "--- S1: 全局 co_locate_max_jobs=1 -> 串行 ---"
-S1=/tmp/sched_caps_1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-caps-global"
 cat > $S1/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -99,7 +99,7 @@ stop_daemon $S1
 
 # ---------- S2: 卡级上限 (对象形态 max_jobs) ----------
 echo "--- S2: 卡级 max_jobs=2 -> 并发 2, 第 3 个排队 ---"
-S2=/tmp/sched_caps_2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-caps-gpu"
 cat > $S2/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -124,7 +124,7 @@ stop_daemon $S2
 
 # ---------- S3: 项目级上限 + 跨项目隔离 ----------
 echo "--- S3: 项目级 max_jobs=1, 跨项目不受影响 ---"
-S3=/tmp/sched_caps_3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-caps-project"
 cat > $S3/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -166,7 +166,7 @@ stop_daemon $S3
 
 # ---------- S4: 自然排水 (热更新调低上限, 不驱逐) ----------
 echo "--- S4: 热更新调低上限 -> 已 pack 不驱逐 ---"
-S4=/tmp/sched_caps_4; rm -rf $S4; mkdir -p $S4
+sched_accept_make_root S4 "sched-caps-hotreload"
 cat > $S4/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",

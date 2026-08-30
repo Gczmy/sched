@@ -23,6 +23,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
@@ -34,7 +35,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -53,7 +53,7 @@ echo "=== GPU 显存配置/探测验收 ==="
 
 # ---------- 场景 1: 对象形态 gpus 解析 ----------
 echo "--- 场景 1: config.gpus 对象形态 {idx,mem_gib} 解析 ---"
-S1=/tmp/sched_acc_gm1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-gpu-mem-1"
 cat > $S1/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -117,7 +117,7 @@ stop_daemon $S1
 
 # ---------- 场景 5: 纯卡号数组向后兼容 ----------
 echo "--- 场景 5: 纯卡号数组 gpus 向后兼容 ---"
-S2=/tmp/sched_acc_gm2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-gpu-mem-2"
 cat > $S2/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -146,7 +146,7 @@ stop_daemon $S2
 
 # ---------- 场景 6: config 无 gpus -> 自动探测 (fake 下不崩) ----------
 echo "--- 场景 6: config 无 gpus -> fake 自动探测语义 (不崩, 用 fake 列表) ---"
-S3=/tmp/sched_acc_gm3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-gpu-mem-3"
 cat > $S3/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",

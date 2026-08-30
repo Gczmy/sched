@@ -17,6 +17,7 @@ PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
+source tests/acceptance_cleanup.sh
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
@@ -28,16 +29,18 @@ count_st(){ # $1=dir $2=batch $3=status
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print(-1); raise SystemExit
-print(sum(1 for j in d['jobs'] if j['batch'].split('-')[0]=='$2' and j['status']=='$3'))"
+print(sum(1 for j in d['jobs'] if j['batch_name']=='$2' and j['status']=='$3'))"
 }
 wait_for(){ for _ in $(seq 1 ${2:-40}); do eval "$1" && return 0; sleep 2; done; return 1; }
 
-S=/tmp/sched_rt; rm -rf $S; mkdir -p $S /tmp/fake_conda/envs/timerxl2
+sched_accept_make_root S "sched-runtime"
+sched_accept_make_root CONDA_ROOT "sched-runtime-conda"
+mkdir -p "$CONDA_ROOT/envs/timerxl2"
 cat > $S/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
   "state_dir": "$S", "gpus": [0],
-  "conda_envs_dirs": ["/tmp/fake_conda/envs"],
+  "conda_envs_dirs": ["$CONDA_ROOT/envs"],
   "projects": {"default": {"root": "$ROOT", "git": false}},
   "default_project": "default", "venvs": {"k": "$PY"}
 }
@@ -99,7 +102,6 @@ DONE2=$(count_st $S rt_va done)
 stop_daemon() {
   export SCHED_STATE=$S SCHED_CONFIG=$S/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
 }
 stop_daemon
 

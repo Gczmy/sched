@@ -18,6 +18,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
+source tests/acceptance_cleanup.sh
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 HOST=testnode   # 定案 43 (P6): hostname() 读 config node 字段, 测试 config 统一 node=testnode
@@ -54,7 +55,6 @@ c.commit(); c.close()
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -74,7 +74,7 @@ echo "=== unmanaged 自动恢复验收 (fake-gpu) ==="
 
 # ---------- 场景 1: 正常批次 done 后 GPU 回 free (不误伤) ----------
 echo "--- 场景 1: 正常路径 GPU 回 free ---"
-S1=/tmp/sched_acc_u1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-unmanaged-1"
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
@@ -100,7 +100,7 @@ stop_daemon $S1
 
 # ---------- 场景 2: 手动置 unmanaged -> 自动回 free (核心) ----------
 echo "--- 场景 2: unmanaged 卡自动恢复 ---"
-S2=/tmp/sched_acc_u2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-unmanaged-2"
 mk_config $S2
 cat > $S2/batch.json << EOF
 {
@@ -133,9 +133,10 @@ else
     bad "场景2: unmanaged 未自动恢复 (实际: $(gpu_status $S2))"
   fi
 fi
-stop_daemon $S2# ---------- 场景 3: 恢复后新批次正常派发完成 ----------
+stop_daemon $S2
+# ---------- 场景 3: 恢复后新批次正常派发完成 ----------
 echo "--- 场景 3: unmanaged 恢复后新批次可派发 ---"
-S3=/tmp/sched_acc_u3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-unmanaged-3"
 mk_config $S3
 cat > $S3/batch.json << EOF
 {
@@ -161,7 +162,7 @@ stop_daemon $S3
 
 # ---------- 场景 5: blocked 批次 retry 后自动回 active (定案 37) ----------
 echo "--- 场景 5: blocked 批次 retry 后自动回 active ---"
-S5=/tmp/sched_acc_u5; rm -rf $S5; mkdir -p $S5
+sched_accept_make_root S5 "sched-unmanaged-5"
 mk_config $S5
 cat > $S5/batch.json << EOF
 {
@@ -213,7 +214,7 @@ daemon_alive() { # $1=state_dir -> 1 alive / 0 dead
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -c "from gsched import daemon; import sys; sys.exit(0 if daemon.is_running() else 1)" 2>/dev/null && echo 1 || echo 0
 }
-S6=/tmp/sched_acc_u6; rm -rf $S6; mkdir -p $S6
+sched_accept_make_root S6 "sched-unmanaged-6"
 cat > $S6/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -280,7 +281,7 @@ stop_daemon $S6
 
 # ---------- 场景 4: daemon stop 收尾不残留 assigned 卡 (N11 修复) ----------
 echo "--- 场景 4: daemon stop 后 GPU 释放不残留 ---"
-S4=/tmp/sched_acc_u4; rm -rf $S4; mkdir -p $S4
+sched_accept_make_root S4 "sched-unmanaged-4"
 mk_config $S4
 cat > $S4/batch.json << EOF
 {
@@ -320,7 +321,7 @@ stop_daemon $S4
 # ---------- 场景 7: gpu_jobs 迁移 + 独占生命周期 (§3.2e A2/B, 定案 39) ----------
 echo "--- 场景 7: gpu_jobs 迁移 + 独占模式零行为变化 ---"
 # 7a 迁移验证: 独立目录, 手工造旧库 (gpus.job_id 非空, 无 gpu_jobs 表)
-S7=/tmp/sched_acc_u7a; rm -rf $S7; mkdir -p $S7
+sched_accept_make_root S7 "sched-unmanaged-migration"
 SCHED_STATE=$S7 $PY - <<EOF
 import os, sqlite3, sys
 sys.path.insert(0, '$ROOT/sched')
@@ -352,7 +353,7 @@ print('MIGRATE_OK')
 EOF
 if [ $? -eq 0 ]; then ok "场景7a: gpus.job_id 存量行迁移到 gpu_jobs (每卡 1 行)"; else bad "场景7a: 迁移失败"; fi
 # 7b 独占生命周期: 干净目录, 正常批次 -> assigned 有 gpu_jobs 行 -> 完成后行清空 + 回 free
-S7B=/tmp/sched_acc_u7b; rm -rf $S7B; mkdir -p $S7B
+sched_accept_make_root S7B "sched-unmanaged-exclusive"
 mk_config $S7B
 cat > $S7B/batch.json << EOF
 {
@@ -386,7 +387,7 @@ stop_daemon $S7B
 
 # ---------- 场景 8: profile 消费 (定案 39, daemon 侧) ----------
 echo "--- 场景 8: SCHED_PROFILE_OUT 注入 + upsert + 删临时 ---"
-S8=/tmp/sched_acc_u8; rm -rf $S8; mkdir -p $S8
+sched_accept_make_root S8 "sched-unmanaged-profile"
 mk_config $S8
 # 任务: 训练侧模拟 - 写 SCHED_PROFILE_OUT 指向的文件 (peak_gib), 声明 profile_key
 cat > $S8/batch.json << EOF
@@ -404,9 +405,11 @@ U8=0
 for _ in $(seq 1 30); do
   R=$($PY -c "
 import sqlite3
+from gsched.dispatcher import _profile_cache_key
 db='$S8/$HOST/state.db'
 c=sqlite3.connect(db)
-r=c.execute(\"SELECT peak_gib, git_rev FROM profile_cache WHERE profile_key='raft/b158/bs4096'\").fetchone()
+key=_profile_cache_key('default', 'raft/b158/bs4096')
+r=c.execute(\"SELECT peak_gib, git_rev FROM profile_cache WHERE profile_key=?\", (key,)).fetchone()
 c.close()
 print(r[0] if r else 'NONE')" 2>/dev/null)
   [ "$R" != "NONE" ] && { U8=1; PEAK=$R; break; }
@@ -427,7 +430,7 @@ stop_daemon $S8
 
 # ---------- 场景 8c: 失败任务只删不 upsert ----------
 echo "--- 场景 8c: 失败任务 profile 不入库 ---"
-S8C=/tmp/sched_acc_u8c; rm -rf $S8C; mkdir -p $S8C
+sched_accept_make_root S8C "sched-unmanaged-profile-fail"
 mk_config $S8C
 cat > $S8C/batch.json << EOF
 {
@@ -444,9 +447,11 @@ U8C=0
 for _ in $(seq 1 30); do
   R=$($PY -c "
 import sqlite3
+from gsched.dispatcher import _profile_cache_key
 db='$S8C/$HOST/state.db'
 c=sqlite3.connect(db)
-r=c.execute(\"SELECT COUNT(*) FROM profile_cache WHERE profile_key='raft/b158/bs4096_fail'\").fetchone()[0]
+key=_profile_cache_key('default', 'raft/b158/bs4096_fail')
+r=c.execute(\"SELECT COUNT(*) FROM profile_cache WHERE profile_key=?\", (key,)).fetchone()[0]
 c.close()
 print(r)" 2>/dev/null)
   [ "$R" = "0" ] && [ "$(gpu_status $S8C)" = "free" ] && { U8C=1; break; }
@@ -459,18 +464,18 @@ else
 fi
 stop_daemon $S8C
 
-# ---------- 场景 9: M8 releasing 判据 (compute-apps pid 归属对照, §3.2e C) ----------
-echo "--- 场景 9: M8 pid 归属判据 (残留框架进程等 / 外部进程判净) ---"
-S9=/tmp/sched_acc_u9; rm -rf $S9; mkdir -p $S9
+# ---------- 场景 9: H08 releasing 安全判据 (任意 compute pid 均按占用处理) ----------
+echo "--- 场景 9: H08 compute pid 占用判据 (框架残留 / 外部进程均 fail-closed) ---"
+sched_accept_make_root S9 "sched-unmanaged-external"
 SCHED_STATE=$S9 SCHED_FAKE_GPUS=0 $PY - <<'EOF'
 import os, sys
 import gsched.state as st
 st.init_db()
 with st.connect() as conn:
     st.init_gpus(conn, [0])
-    # 造一个已知 job (pgid=111): M8 归属对照用.
-    # 注意: _known_job_pgids 只认 running + 近 10min 终态 (决策 3A 变体),
-    # 故 finished_at 必须是当前时间, 否则 pgid 不在已知集合 -> 误判外部
+    # 造一个已知 job (pgid=111), 验证已知 sched 残留进程仍按占用处理.
+    # _known_job_pgids 只认 running + 近 10min 终态,
+    # 故 finished_at 必须是当前时间, 以保留已知残留进程覆盖.
     conn.execute("INSERT INTO jobs (id,batch_id,task_id,version,status,pgid,submitted_at,finished_at) "
                  "VALUES ('known','b','t',1,'done',111,"
                  " datetime('now','localtime'), datetime('now','localtime'))")
@@ -488,18 +493,18 @@ def gpu_status():
     with st.connect() as conn:
         return conn.execute("SELECT status FROM gpus WHERE idx=0").fetchone()['status']
 
-# 9a: 残留框架进程 (pid 111 的 pgid 属已知 job pgid=111) -> 卡不转 free
+# 9a: 已知 sched 残留进程 (pid 111 的 pgid 属已知 job pgid=111) -> 占用, 不转 free
 set_releasing()
 os.environ['SCHED_FAKE_COMPUTE_APPS'] = '0:111'
-assert al._card_has_compute(0) is True, al._card_has_compute(0)  # 残留框架进程
+assert al._card_has_compute(0) is True, al._card_has_compute(0)  # 已知 sched 残留进程占用
 assert al.settle_releasing() == ([], [])
 assert gpu_status() == 'releasing', gpu_status()
 print('9a OK')
-# 9b: 外部进程 (pid 999 不属于任何已知 job) -> 判干净 -> free
+# 9b: 外部/非 sched 进程直接隔离为 unmanaged，绝不进入可派发 free 窗口
 os.environ['SCHED_FAKE_COMPUTE_APPS'] = '0:999'
-assert al._card_has_compute(0) is False, al._card_has_compute(0)  # 外部进程
-assert al.settle_releasing() == ([0], [])
-assert gpu_status() == 'free', gpu_status()
+assert al._card_has_compute(0) is True, al._card_has_compute(0)  # 外部 compute 进程占用
+assert al.settle_releasing() == ([], [])
+assert gpu_status() == 'unmanaged', gpu_status()
 print('9b OK')
 # 9c: 无进程 -> free (常规路径不受影响)
 set_releasing()
@@ -508,9 +513,9 @@ assert al._card_has_compute(0) is False
 assert al.settle_releasing() == ([0], [])
 assert gpu_status() == 'free', gpu_status()
 print('9c OK')
-print('M8_OK')
+print('H08_OK')
 EOF
-if [ $? -eq 0 ]; then ok "场景9: M8 pid 归属判据 (残留框架进程等 / 外部进程判净 / 无进程即 free)"; else bad "场景9: M8 判据失败"; fi
+if [ $? -eq 0 ]; then ok "场景9: H08 占用判据 (框架残留 / 外部进程均占用 / 无进程即 free)"; else bad "场景9: H08 判据失败"; fi
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="

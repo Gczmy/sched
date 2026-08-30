@@ -2,7 +2,9 @@
 # M9: submit must compute git fingerprints before opening the write transaction.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-submit-fingerprint"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {

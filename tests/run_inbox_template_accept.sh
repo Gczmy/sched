@@ -2,7 +2,9 @@
 # C1: inbox consumer must expand the same command templates as direct submit.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-inbox-template"
+export SCHED_STATE
 export SCHED_ALLOW_FOREIGN_WRITE=1
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" << EOF
@@ -24,7 +26,7 @@ spec = {
     "schema_version": 1,
     "name": "inbox_template",
     "project": "p",
-    "cwd": "/tmp",
+    "cwd": os.environ["SCHED_STATE"],
     "tasks": [{
         "id": "t1",
         "stages": [
@@ -52,7 +54,7 @@ assert row, "task was not inserted"
 task = json.loads(row["spec"])
 assert task["stages"][0]["cmd"][0] == "/opt/venvs/k/bin/python", task
 assert task["stages"][1]["cmd"][0] == "/opt/venvs/k/bin/python", task
-assert task["stages"][1]["cmd"][1] == os.path.realpath("/tmp/out/model.bin"), task
+assert task["stages"][1]["cmd"][1] == os.path.realpath(os.path.join(os.environ["SCHED_STATE"], "out", "model.bin")), task
 job = conn.execute("SELECT fingerprint FROM jobs WHERE id='inbox-template-TEST0001-t1-v1'").fetchone()
 assert job and job["fingerprint"], "fingerprint missing"
 req = conn.execute("SELECT status FROM control_requests WHERE job_id=?", (payload,)).fetchone()

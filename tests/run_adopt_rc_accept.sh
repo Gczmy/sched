@@ -2,7 +2,9 @@
 # H2: a daemon restart must preserve a completed job's real exit code.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-adopt-rc"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
@@ -15,7 +17,7 @@ python3 - <<'PY'
 import json, os, sqlite3, sys, time
 sys.path.insert(0, ".")
 from gsched import state
-from gsched.executor import Executor
+from gsched.executor import Executor, _is_strong_start_token
 state.init_db()
 
 # The launch wrapper must leave a durable rc marker before its process group exits.
@@ -48,7 +50,10 @@ with open(rc_path, encoding="utf-8") as f:
 
 # Simulate a daemon restart: Popen is gone, but the adopted job's rc marker is 0.
 with open(launch_marker, encoding="utf-8") as f:
-    assert f.read().split()[0] == str(pid)
+    launch_identity = f.read().split()
+assert launch_identity[0] == str(pid)
+assert len(launch_identity) >= 2
+assert _is_strong_start_token(launch_identity[1]), launch_identity
 batch_id = "adopt-rc-batch"
 job_id = "adopt-rc-batch-t1-v1"
 spec = {
@@ -138,13 +143,17 @@ d2.venv_paths = {}
 d2.executor = LaunchExecutor()
 d2.log_line = lambda _msg: None
 d2._get_task_spec = lambda _conn, _job: json.dumps(stale_spec)
-d2._should_skip = lambda _conn, _spec, _job: False
-d2._clean_stale_artifacts = lambda _conn, _spec, _job: None
+d2._should_skip = lambda _conn, _spec, _job, current_fingerprint: False
+d2._clean_stale_artifacts = lambda _conn, _spec, _job, current_fingerprint, stage_fingerprints: None
 d2._job_log_path = lambda _job: os.path.join(d.host_dir, "logs", f"{stale_job}.log")
 with state.connect() as conn:
     assert Dispatcher._launch_job(d2, conn, stale_row, None)
 assert d2._read_job_rc({"id": stale_job, "pgid": 515151}) is None
 assert os.path.exists(old_marker)
+Dispatcher._adopt_running(d)
+with state.connect() as conn:
+    settled_stale = state.get_job(conn, stale_job)
+assert settled_stale["status"] == "failed", settled_stale["status"]
 print("H2 retry process group gets a distinct exit marker")
 assert row == ("done", 0), row
 print("H2 adopted completed job uses durable rc=0 and becomes done")

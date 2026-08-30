@@ -17,6 +17,7 @@ PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
+source tests/acceptance_cleanup.sh
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
@@ -32,7 +33,6 @@ wait_log() { # $1=log $2=pattern $3=超时秒 -> 0 命中
 stop_daemon() {
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -51,7 +51,7 @@ EOF
 
 echo "=== B12-a 配置热更新验收 (fake-gpu) ==="
 
-S=/tmp/sched_hotrl; rm -rf $S; mkdir -p $S
+sched_accept_make_root S "sched-hotreload"
 mk_config $S testnode
 export SCHED_STATE=$S SCHED_CONFIG=$S/config.json
 SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
@@ -139,6 +139,7 @@ else
   ok "非法配置在 CLI 本地被拒 (未发请求)"
 fi
 
+mk_config $S testnode
 stop_daemon $S
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="

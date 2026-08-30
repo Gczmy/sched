@@ -2,7 +2,9 @@
 # L7: a hard-affinity exclusive miss must not block unrelated projects this tick.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-exclusive-scope"
+export SCHED_STATE
 export SCHED_FAKE_GPUS="0:24,1:24"
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF

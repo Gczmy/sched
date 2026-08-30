@@ -18,6 +18,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
+source tests/acceptance_cleanup.sh
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
@@ -28,7 +29,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -43,7 +43,7 @@ d = json.load(sys.stdin)
 bn = '$bn'; want = '$want'
 n = 0
 for j in d['jobs']:
-    if j['batch'].split('-')[0] == bn and j['status'] == want:
+    if j['batch_name'] == bn and j['status'] == want:
         n += 1
 print(n)
 "
@@ -74,7 +74,7 @@ echo "=== probes 日志门控验收 (fake-gpu) ==="
 
 # ---------- 场景 1: fail_on_log 命中 -> blocked (不 retry) ----------
 echo "--- 场景 1: fail_on_log 命中 -> blocked ---"
-S1=/tmp/sched_prb1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-probes-1"
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
@@ -108,7 +108,7 @@ stop_daemon $S1
 
 # ---------- 场景 2: ready_on_log 命中 + 产物存在 -> done ----------
 echo "--- 场景 2: ready_on_log 命中 + 产物存在 -> done ---"
-S2=/tmp/sched_prb2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-probes-2"
 mk_config $S2
 cat > $S2/batch.json << EOF
 {
@@ -134,7 +134,7 @@ stop_daemon $S2
 
 # ---------- 场景 3: ready_on_log 命中但产物缺失 -> 降级 failed ----------
 echo "--- 场景 3: ready_on_log 命中但产物缺失 -> failed ---"
-S3=/tmp/sched_prb3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-probes-3"
 mk_config $S3
 cat > $S3/batch.json << EOF
 {
@@ -159,7 +159,7 @@ stop_daemon $S3
 
 # ---------- 场景 4: 无 probes 任务不受扰 (正常退出码路径) ----------
 echo "--- 场景 4: 无 probes 任务正常 done ---"
-S4=/tmp/sched_prb4; rm -rf $S4; mkdir -p $S4
+sched_accept_make_root S4 "sched-probes-4"
 mk_config $S4
 cat > $S4/batch.json << EOF
 {
@@ -186,7 +186,7 @@ stop_daemon $S4
 # 任务忽略 SIGTERM: probe kill 发 SIGTERM 无效 -> daemon 逐轮 SIGKILL 升级
 # -> 进程真实死亡 (不与 cancel 脱节, 防占卡直至 releasing 超时)
 echo "--- 场景 5: probe SIGKILL 升级 (进程忽略 SIGTERM) ---"
-S5=/tmp/sched_prb5; rm -rf $S5; mkdir -p $S5
+sched_accept_make_root S5 "sched-probes-5"
 mk_config $S5
 cat > $S5/batch.json << EOF
 {

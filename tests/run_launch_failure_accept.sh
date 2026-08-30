@@ -1,8 +1,11 @@
 #!/bin/bash
-# L17: a DB write failure after Popen must kill the just-launched process group.
+# L17: a DB write failure after Popen must kill the just-launched process group
+# while retaining the committed running/pgid=NULL recovery claim.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-launch-failure"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
@@ -36,18 +39,33 @@ d.host_dir = os.path.join(os.environ["SCHED_STATE"], state.hostname())
 d.venv_paths = {}
 d.log_line = lambda _msg: None
 d._get_task_spec = lambda _conn, _job: json.dumps(spec)
-d._should_skip = lambda _conn, _spec, _job: False
-d._clean_stale_artifacts = lambda _conn, _spec, _job: None
+d._should_skip = lambda _conn, _spec, _job, current_fingerprint: False
+d._clean_stale_artifacts = lambda _conn, _spec, _job, current_fingerprint, stage_fingerprints: None
 d._job_log_path = lambda _job: os.path.join(d.host_dir, "logs", "launch.log")
 killed = []
 class Exec:
-    def launch(self, **_kwargs): return 515151
-    def kill_pgid(self, pgid, sig): killed.append((pgid, sig))
-    def alive(self, _pgid): return False
+    def __init__(self):
+        self.running = False
+    def launch(self, **_kwargs):
+        marker = d._launch_marker_path(job)
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as stream:
+            stream.write("515151 proc:1\n")
+        self.running = True
+        return 515151
+    def kill_pgid(self, pgid, sig):
+        killed.append((pgid, sig))
+        self.running = False
+        return True
+    def alive(self, _pgid):
+        return self.running
 d.executor = Exec()
+d._proc_start_time = lambda _pgid: "proc:1"
 original_update = state.update_job
-def fail_update(*_args, **_kwargs):
-    raise RuntimeError("simulated DB write failure")
+def fail_update(conn, job_id, **fields):
+    if fields.get("pgid") == 515151:
+        raise RuntimeError("simulated post-launch DB write failure")
+    return original_update(conn, job_id, **fields)
 state.update_job = fail_update
 try:
     try:
@@ -57,18 +75,17 @@ try:
         pass
 finally:
     state.update_job = original_update
-assert killed and killed[0][0] == 515151, killed
+assert killed and killed[0] == (515151, signal.SIGKILL), killed
 with state.connect() as conn:
-    row = conn.execute("SELECT status, pgid FROM jobs WHERE id='launch-failure-t1-v1'").fetchone()
+    row = conn.execute(
+        "SELECT status, pgid FROM jobs WHERE id='launch-failure-t1-v1'"
+    ).fetchone()
 marker = d._launch_marker_path({"id": "launch-failure-t1-v1"})
-os.makedirs(os.path.dirname(marker), exist_ok=True)
-with open(marker, "w", encoding="utf-8") as f:
-    f.write("515151\n")
-d._recover_launch_markers()
 assert not os.path.exists(marker), marker
-assert row[0] == "pending" and row[1] is None, row
+assert row[0] == "running" and row[1] is None, row
 e = Executor.__new__(Executor)
 e._procs = {515151: object()}
+e._dead_pgroups = set()
 original_killpg = executor_mod.os.killpg
 def missing_kill(*_args):
     raise ProcessLookupError()
@@ -78,5 +95,5 @@ try:
 finally:
     executor_mod.os.killpg = original_killpg
 assert not e._procs, e._procs
-print("L17 launch DB failure kills orphan process group and rolls back state")
+print("L17 launch DB failure kills orphan process group and retains durable recovery claim")
 PY

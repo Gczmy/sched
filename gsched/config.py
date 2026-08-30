@@ -14,6 +14,8 @@ from typing import Any
 # 默认 state 目录 (与文档 §6 决策 3 一致)
 DEFAULT_STATE_DIR = os.path.expanduser("~/.sched")
 
+_runtime_state_dir: str | None = None
+
 # 模板变量: 解析目标见 resolve_template
 TEMPLATE_PREFIX = "{"
 TEMPLATE_SUFFIX = "}"
@@ -24,8 +26,12 @@ class ConfigError(Exception):
 
 
 def default_state_dir() -> str:
-    """state 目录: SCHED_STATE 环境变量 > 默认 ~/.sched."""
-    return os.environ.get("SCHED_STATE", DEFAULT_STATE_DIR)
+    """Return the normalized runtime data root."""
+    if "SCHED_STATE" in os.environ:
+        root = os.environ["SCHED_STATE"]
+    else:
+        root = _runtime_state_dir or DEFAULT_STATE_DIR
+    return os.path.normpath(os.path.abspath(os.path.expanduser(root)))
 
 
 def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float], dict[int, int]]:
@@ -75,15 +81,18 @@ def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float], dict[i
 
 
 def config_path() -> str:
-    """config.json 路径: SCHED_CONFIG 覆盖 > {STATE}/config.json."""
+    """Bootstrap config path, independent of the installed runtime data root."""
     if os.environ.get("SCHED_CONFIG"):
         return os.environ["SCHED_CONFIG"]
-    return os.path.join(default_state_dir(), "config.json")
+    bootstrap_root = os.environ.get("SCHED_STATE", DEFAULT_STATE_DIR)
+    return os.path.join(os.path.expanduser(bootstrap_root), "config.json")
 
 
-def load_config(path: str | None = None) -> dict[str, Any]:
-    """加载并校验 config.json. 缺失/非法报 ConfigError."""
-    p = path or config_path()
+def load_config(
+    path: str | None = None, *, apply_runtime_state: bool = True
+) -> dict[str, Any]:
+    """Load and validate config, optionally installing its runtime state root."""
+    p = os.path.normpath(os.path.abspath(os.path.expanduser(path or config_path())))
     if not os.path.isfile(p):
         raise ConfigError(
             f"config.json 不存在: {p}\n"
@@ -96,6 +105,16 @@ def load_config(path: str | None = None) -> dict[str, Any]:
         raise ConfigError(f"config.json 解析失败: {e}") from e
 
     _validate(cfg, p)
+    global _runtime_state_dir
+    if apply_runtime_state and "SCHED_STATE" not in os.environ:
+        configured_root = cfg.get("state_dir")
+        if configured_root:
+            configured_root = os.path.expanduser(str(configured_root))
+            if not os.path.isabs(configured_root):
+                configured_root = os.path.join(os.path.dirname(p), configured_root)
+            _runtime_state_dir = os.path.normpath(os.path.abspath(configured_root))
+        else:
+            _runtime_state_dir = None
     return cfg
 
 
@@ -107,8 +126,24 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         raise ConfigError(f"{p}: 缺少 user (运行身份账户名)")
     if not cfg.get("node"):
         raise ConfigError(f"{p}: 缺少 node (daemon 所在计算节点名)")
+    node = cfg["node"]
+    if (
+        not isinstance(node, str)
+        or not node.strip()
+        or node != node.strip()
+        or node in (".", "..")
+        or "/" in node
+        or "\\" in node
+        or "\x00" in node
+    ):
+        raise ConfigError(f"{p}: node 必须是安全的单一路径组件")
     if "projects" not in cfg or not isinstance(cfg["projects"], dict):
         raise ConfigError(f"{p}: 缺少 projects (多项目 root 映射)")
+    state_dir = cfg.get("state_dir")
+    if state_dir is not None and (
+        not isinstance(state_dir, str) or not state_dir.strip()
+    ):
+        raise ConfigError(f"{p}: state_dir 必须是非空字符串")
 
     # B11c: projects schema validation (multi-project quota/priority/affinity)
     for proj_name, proj_cfg in cfg["projects"].items():

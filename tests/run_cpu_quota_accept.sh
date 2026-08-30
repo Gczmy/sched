@@ -17,6 +17,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
@@ -39,11 +40,9 @@ wait_done() { # $1=state_dir $2=batch_name  -> 轮询批次终态 (最多 30s)
   local st=$1 bn=$2
   export SCHED_STATE=$st SCHED_CONFIG=$st/config.json
   for _ in $(seq 1 30); do
-    if $PY -m gsched.cli status --json 2>/dev/null | grep -q "\"$bn\""; then
-      if $PY -m gsched.cli status --json 2>/dev/null | \
-         grep -A2 "\"name\": \"$bn\"" | grep -q '"status": "done"'; then
-        return 0
-      fi
+    if $PY -m gsched.cli status --json 2>/dev/null | \
+       $PY -c 'import json,sys; name=sys.argv[1]; raise SystemExit(0 if any(b.get("name") == name and b.get("status") == "done" for b in json.load(sys.stdin).get("batches", [])) else 1)' "$bn"; then
+      return 0
     fi
     sleep 1
   done
@@ -53,7 +52,6 @@ wait_done() { # $1=state_dir $2=batch_name  -> 轮询批次终态 (最多 30s)
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -61,7 +59,7 @@ echo "=== CPU 配额制调度验收 (fake-gpu) ==="
 
 # ---------- 场景 1: GPU 满 + 排后的 CPU-only 不饿死 ----------
 echo "--- 场景 1: 单卡 GPU 满, CPU-only 不被 break 饿死 ---"
-S1=/tmp/sched_acc_s1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-cpu-quota-1"
 cat > $S1/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -100,7 +98,7 @@ stop_daemon $S1
 
 # ---------- 场景 2: cpus_total 未配置回退 max_cpu_jobs ----------
 echo "--- 场景 2: 无 cpus_total -> max_cpu_jobs=2 回退 ---"
-S2=/tmp/sched_acc_s2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-cpu-quota-2"
 cat > $S2/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -135,7 +133,7 @@ stop_daemon $S2
 
 # ---------- 场景 3: 配额制双约束 (cpus_total=8, gpu_job_cpus=4) ----------
 echo "--- 场景 3: cpus_total=8/gpu_job_cpus=4, 3 GPU + 2 CPU ---"
-S3=/tmp/sched_acc_s3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-cpu-quota-3"
 cat > $S3/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -180,5 +178,4 @@ stop_daemon $S3
 # ---------- 汇总 ----------
 echo
 echo "=== 结果: $PASS 通过 / $FAIL 失败 ==="
-rm -rf /tmp/sched_acc_s1 /tmp/sched_acc_s2 /tmp/sched_acc_s3
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

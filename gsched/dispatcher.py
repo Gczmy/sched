@@ -10,11 +10,15 @@
 from __future__ import annotations
 from contextlib import contextmanager
 
+import fcntl
 import json
 import hashlib
 import sqlite3
+import math
 import stat
 import os
+import secrets
+import socket
 import signal
 import subprocess
 import threading
@@ -22,8 +26,21 @@ import time
 from datetime import datetime
 
 from . import notify, state
+from .artifacts import (
+    bounded_regex_last_match,
+    check_artifacts,
+    check_declared_artifacts,
+    unlink_artifact,
+)
 from .allocator import Allocator
-from .executor import Executor, pid_cmdline_matches, read_tail
+from .executor import (
+    Executor,
+    _is_strong_start_token,
+    pid_cmdline_matches,
+    process_start_token,
+    read_tail,
+    stage_checkpoint_valid,
+)
 from .fingerprint import compute_fingerprint
 from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template
 from .schema import SchemaError, validate_batch
@@ -37,6 +54,82 @@ RETRY_BACKOFF_SEC = 30  # 失败重试退避 (M2): 防秒级崩溃任务紧密�
 DEFAULT_GPU_JOB_CPUS = 8  # GPU 任务默认 CPU 占用 (NN 训练数据加载也要 CPU, config gpu_job_cpus 可覆盖)
 DEFAULT_MAX_CPU_JOBS = 2  # cpus_total 未配置时回退: CPU-only 并发上限 (定案 7 旧语义)
 DEFAULT_IDLE_TIMEOUT_MIN = 360  # 空转自动退出 (定案 38): 默认 6h, 0 = 禁用
+LOCK_STARTUP_GRACE_SEC = 2 * HEARTBEAT_SEC
+INBOX_MAX_BYTES = 1024 * 1024
+INBOX_MAX_DEPTH = 64
+INBOX_MAX_NODES = 100_000
+JOB_STOP_TERM_GRACE_SEC = 5.0
+JOB_STOP_KILL_GRACE_SEC = 5.0
+JOB_STOP_POLL_SEC = 0.1
+PROBE_READ_MAX_BYTES = 1024 * 1024
+PROFILE_MAX_BYTES = 64 * 1024
+PROFILE_MAX_PEAK_GIB = 1024.0
+RC_MAX_BYTES = 32
+
+_SIGNAL_SENT = "sent"
+_SIGNAL_DEAD = "dead_or_mismatch"
+_SIGNAL_UNKNOWN = "unknown_or_error"
+
+
+def _load_bounded_submit_json(fd: int) -> object:
+    """Read and structurally bound one already-open submit payload."""
+    payload_stat = os.fstat(fd)
+    if not stat.S_ISREG(payload_stat.st_mode):
+        raise ValueError("payload 必须是普通文件")
+    if payload_stat.st_size > INBOX_MAX_BYTES:
+        raise ValueError(
+            f"payload 过大 ({payload_stat.st_size} > {INBOX_MAX_BYTES} bytes)"
+        )
+    chunks: list[bytes] = []
+    remaining = INBOX_MAX_BYTES + 1
+    while remaining:
+        chunk = os.read(fd, min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    if len(payload) > INBOX_MAX_BYTES:
+        raise ValueError(f"payload 过大 (> {INBOX_MAX_BYTES} bytes)")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"payload 不是 UTF-8: {error}") from error
+    except RecursionError as error:
+        raise ValueError(
+            f"payload JSON 嵌套过深 (上限 {INBOX_MAX_DEPTH})"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"payload JSON 无效: {error}") from error
+
+    nodes = 0
+    stack = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > INBOX_MAX_NODES:
+            raise ValueError(
+                f"payload JSON 节点过多 (上限 {INBOX_MAX_NODES})"
+            )
+        if depth > INBOX_MAX_DEPTH:
+            raise ValueError(
+                f"payload JSON 嵌套过深 (上限 {INBOX_MAX_DEPTH})"
+            )
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+    return value
+
+def _profile_cache_key(project: object, profile_key: object) -> str:
+    """Encode the internal cache key without cross-project collisions."""
+    return json.dumps(
+        [project, profile_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+_FINGERPRINT_UNSET = object()
 # B12-a: 配置冷键 —— 变更拒绝热更新, 必须重启 daemon (调研 §2.3).
 
 
@@ -85,8 +178,7 @@ class Dispatcher:
         self.cfg = cfg
         self.fake = fake
         self.state_dir = state.default_state_dir()
-        self.host_dir = os.path.join(self.state_dir, state.hostname())
-        os.makedirs(self.host_dir, exist_ok=True)
+        self.host_dir = state.ensure_private_directory(state.host_dir())
         self.pid_file = os.path.join(self.host_dir, "daemon.pid")
         self.heartbeat_file = os.path.join(self.host_dir, "daemon.heartbeat")
         # B26: tick_ok —— heartbeat=活着, tick_ok=主循环在正常完成调度轮
@@ -97,8 +189,11 @@ class Dispatcher:
         self._notify_threads: list[threading.Thread] = []  # 在途通知线程 (退出前 join)
         self._probe_offsets: dict[str, int] = {}  # job_id -> 日志已扫字节偏移 (P2)
         self.lock_dir = os.path.join(self.host_dir, "dispatcher.lock")
-        self.log = open(
-            os.path.join(self.host_dir, "scheduler.log"), "a", encoding="utf-8"
+        self._lease_owner: dict | None = None
+        self._lease_id: str | None = None
+        self.log = state.open_private_text(
+            os.path.join(self.host_dir, "scheduler.log"),
+            "a",
         )
         # B13-§1: 环境净化默认开 (sanitize_env: false 可关回旧行为)
         self.executor = Executor(sanitize_env=bool(cfg.get("sanitize_env", True)))
@@ -164,12 +259,14 @@ class Dispatcher:
     def _update_project_quota_used(self, conn) -> None:
         self._project_quota_used.clear()
         rows = conn.execute(
-            "SELECT project, COUNT(*) FROM jobs"
-            " WHERE status='running' AND gpu IS NOT NULL AND project IS NOT NULL"
-            " GROUP BY project"
+            "SELECT COALESCE(j.project, b.project) AS project, COUNT(*) AS n"
+            " FROM jobs j JOIN batches b ON b.id=j.batch_id"
+            " WHERE j.status='running' AND j.gpu IS NOT NULL"
+            "   AND COALESCE(j.project, b.project) IS NOT NULL"
+            " GROUP BY COALESCE(j.project, b.project)"
         ).fetchall()
-        for r in rows:
-            self._project_quota_used[r["project"]] = r[1]
+        for row in rows:
+            self._project_quota_used[row["project"]] = row["n"]
 
     def _project_quota_available(self, conn, project) -> bool:
         if not project:
@@ -210,61 +307,219 @@ class Dispatcher:
     # ---------- 单实例锁 ----------
 
     def acquire_lock(self) -> bool:
-        """B11 F3/F4: PID 文件 + 心跳 mtime 双校验; 崩溃残留先杀旧进程再清锁."""
-        if self._is_running():
+        """Acquire an exact process lease, reclaiming only a rechecked dead owner."""
+        physical_host = socket.gethostname().strip()
+        if not physical_host:
+            self.log_line("dispatcher physical_host 为空，拒绝发布 lease")
             return False
-        # 清理残留锁
-        if os.path.isdir(self.lock_dir):
-            pid = self._read_pid()
-            if pid and self._pid_exists(pid) and not self._heartbeat_fresh():
-                # L16: NFS mtime 可能在首次读取后刚刷新; 二次确认避免
-                # 把仍健康的 daemon 当成 stalled 并误杀。
-                if self._heartbeat_fresh():
-                    self.log_line(
-                        f"F4: 心跳二次读取已恢复新鲜, 保留 daemon pid={pid}"
-                    )
+        lock_exists = os.path.isdir(self.lock_dir)
+        observed_present = self._lock_owner_entry_present() if lock_exists else False
+        observed = self._read_lock_owner() if lock_exists else None
+        if lock_exists and observed is None and observed_present:
+            self.log_line("dispatcher lock owner 无法验证，拒绝回收")
+            return False
+        if lock_exists:
+            try:
+                lock_age = max(0.0, time.time() - os.path.getmtime(self.lock_dir))
+            except OSError:
+                return False
+            if lock_age < LOCK_STARTUP_GRACE_SEC:
+                if observed is None:
+                    self.log_line("检测到新鲜 ownerless dispatcher lock, 视为启动中")
+                return False
+            if observed is not None and self._lock_owner_is_live(observed):
+                return False
+
+        with self._serialized_lock_update():
+            if os.path.isdir(self.lock_dir):
+                current_present = self._lock_owner_entry_present()
+                current = self._read_lock_owner()
+                if current != observed or current_present != observed_present:
                     return False
-                # M4: kill 前身份校验 —— pid 文件残留 + PID 复用时凭数字发
-                # 信号会误杀无关进程; cmdline 不含 gsched 则只清锁不杀
-                if not pid_cmdline_matches(pid, "gsched"):
-                    self.log_line(
-                        f"F4: 残留 pid={pid} cmdline 非 gsched (PID 复用?), 只清锁不 kill"
-                    )
-                else:
-                    # 卡死场景 (O2): 先杀再清锁
-                    self.log_line(f"F4: 检测到卡死 daemon pid={pid}, SIGTERM -> 5s -> SIGKILL")
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        time.sleep(5)
-                        if self._pid_exists(pid):
-                            os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            self._cleanup_lock()
-        try:
-            os.makedirs(self.lock_dir)
-        except FileExistsError:
-            return False
-        with open(self.pid_file, "w") as f:
-            f.write(str(os.getpid()))
-        # H2 修复: 触心跳前采样旧 mtime 供 _check_node_restart 用;
-        # 否则 touch 后 hb_ts≈now > boot_ts, D4 节点重启检测恒不触发
-        try:
-            self._prev_hb_ts = os.path.getmtime(self.heartbeat_file)
-        except OSError:
-            self._prev_hb_ts = None
-        self._touch_heartbeat()
+                try:
+                    lock_age = max(0.0, time.time() - os.path.getmtime(self.lock_dir))
+                except OSError:
+                    return False
+                if lock_age < LOCK_STARTUP_GRACE_SEC:
+                    return False
+                if current is not None and self._lock_owner_is_live(current):
+                    return False
+                if not self._remove_exact_lock(current):
+                    return False
+
+            try:
+                os.mkdir(self.lock_dir, 0o700)
+                os.chmod(self.lock_dir, 0o700)
+            except FileExistsError:
+                return False
+
+            pid = os.getpid()
+            self._lease_owner = {
+                "schema_version": 1,
+                "lease_id": secrets.token_hex(16),
+                "pid": pid,
+                "start_token": self._proc_start_time(pid),
+                "physical_host": physical_host,
+            }
+            self._lease_id = self._lease_owner["lease_id"]
+            try:
+                self._publish_lock_owner()
+                self._atomic_write(self.pid_file, str(pid))
+                # H2: sample the old heartbeat before publishing the new heartbeat.
+                try:
+                    self._prev_hb_ts = os.path.getmtime(self.heartbeat_file)
+                except OSError:
+                    self._prev_hb_ts = None
+                self._touch_heartbeat()
+            except OSError:
+                self._remove_exact_lock(self._lease_owner)
+                self._lease_owner = None
+                self._lease_id = None
+                raise
         return True
 
-    def _is_running(self) -> bool:
-        return self._pid_exists(self._read_pid()) and self._heartbeat_fresh()
+    def _lock_owner_file(self) -> str:
+        return os.path.join(self.lock_dir, "owner.json")
 
-    def _read_pid(self) -> int | None:
+    def _lock_guard_file(self) -> str:
+        return f"{self.lock_dir}.guard"
+
+    @contextmanager
+    def _serialized_lock_update(self):
+        """Serialize lease replacement and cleanup across dispatcher processes."""
+        with state.open_private_text(self._lock_guard_file(), "a+") as guard:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+
+    def _read_lock_owner(self) -> dict | None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
-            with open(self.pid_file) as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
+            fd = os.open(self._lock_owner_file(), flags)
+        except OSError:
             return None
+        try:
+            owner_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(owner_stat.st_mode)
+                or owner_stat.st_uid != os.getuid()
+                or owner_stat.st_size > 4096
+                or owner_stat.st_nlink != 1
+            ):
+                return None
+            raw = os.read(fd, 4097)
+            if len(raw) > 4096:
+                return None
+            owner = json.loads(raw.decode("utf-8"))
+            if not isinstance(owner, dict):
+                return None
+            if owner.get("schema_version") != 1:
+                return None
+            lease_id = owner.get("lease_id")
+            if not isinstance(lease_id, str) or not lease_id:
+                return None
+            physical_host = owner.get("physical_host")
+            if not isinstance(physical_host, str) or not physical_host.strip():
+                return None
+            pid = owner.get("pid")
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                return None
+            owner = dict(owner)
+            owner["pid"] = pid
+            owner["physical_host"] = physical_host.strip()
+            return owner
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+        ):
+            return None
+        finally:
+            os.close(fd)
+
+    def _lock_owner_entry_present(self) -> bool:
+        """Distinguish a missing startup owner from an invalid/unreadable entry."""
+        try:
+            os.lstat(self._lock_owner_file())
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
+    def _owns_current_lease(self) -> bool:
+        """Return whether this process still owns the published dispatcher lease."""
+        owner = getattr(self, "_lease_owner", None)
+        return isinstance(owner, dict) and self._read_lock_owner() == owner
+
+    def _lock_owner_is_live(self, owner: dict) -> bool:
+        local_host = socket.gethostname().strip()
+        owner_host = owner.get("physical_host")
+        if (
+            not local_host
+            or not isinstance(owner_host, str)
+            or owner_host.strip() != local_host
+        ):
+            return True
+        pid = owner["pid"]
+        if not self._pid_exists(pid):
+            return False
+        expected_start = owner.get("start_token")
+        if not _is_strong_start_token(expected_start):
+            return True
+        actual_start = self._proc_start_time(pid)
+        # Failure to prove PID reuse must never authorize reclaiming a live PID.
+        return actual_start is None or actual_start == expected_start
+
+    def _remove_exact_lock(self, expected_owner: dict | None) -> bool:
+        """Remove the currently observed lease only if its owner is unchanged."""
+        if self._read_lock_owner() != expected_owner:
+            return False
+        try:
+            os.unlink(self._lock_owner_file())
+        except FileNotFoundError:
+            if expected_owner is not None:
+                return False
+        except OSError:
+            return False
+        try:
+            os.rmdir(self.lock_dir)
+        except OSError:
+            return False
+        return True
+
+    def _atomic_write(self, path: str, content: str) -> None:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with state.open_private_text(tmp, "w") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _publish_lock_owner(self) -> None:
+        owner = getattr(self, "_lease_owner", None)
+        if (
+            not isinstance(owner, dict)
+            or owner.get("schema_version") != 1
+            or not isinstance(owner.get("physical_host"), str)
+            or not owner["physical_host"].strip()
+        ):
+            raise OSError("dispatcher lease owner is not initialized")
+        self._atomic_write(self._lock_owner_file(), json.dumps(owner))
+
 
     def _pid_exists(self, pid: int | None) -> bool:
         if not pid:
@@ -277,24 +532,16 @@ class Dispatcher:
         except PermissionError:
             return True
 
-    def _heartbeat_fresh(self) -> bool:
-        try:
-            age = time.time() - os.path.getmtime(self.heartbeat_file)
-            return age < 2 * HEARTBEAT_SEC  # 阈值必须 > 心跳间隔 (F3)
-        except OSError:
-            return False
 
     def _touch_heartbeat(self) -> None:
-        open(self.heartbeat_file, "a").close()
-        os.utime(self.heartbeat_file, None)
+        state.touch_private_file(self.heartbeat_file)
 
     # B26: tick_ok = 调度主循环健康的真信号 (heartbeat 只是进程活性)
     _touch_tick_ok_ts: float = 0.0
     _frozen_incident_at: float = 0.0
 
     def _touch_tick_ok(self) -> None:
-        open(self.tick_ok_file, "a").close()
-        os.utime(self.tick_ok_file, None)
+        state.touch_private_file(self.tick_ok_file)
         self._touch_tick_ok_ts = time.time()
 
     def tick_ok_age(self) -> float | None:
@@ -336,81 +583,167 @@ class Dispatcher:
 
     def _cleanup_lock(self) -> None:
         # 通知线程收尾: 退出前等在途通知发完 (超时则放弃, 记 log)
-        for t in self._notify_threads:
-            t.join(timeout=10)
-            if t.is_alive():
+        for thread in getattr(self, "_notify_threads", ()):
+            thread.join(timeout=10)
+            if thread.is_alive():
                 self.log_line("notify 线程超时未结束, 放弃等待")
-        if os.path.isdir(self.lock_dir):
-            try:
-                os.rmdir(self.lock_dir)
-            except OSError:
-                pass
-        if os.path.exists(self.pid_file):
+        owner = getattr(self, "_lease_owner", None)
+        if not isinstance(owner, dict):
+            return
+        # Keep replacement serialized until all shared lease sidecars are gone;
+        # otherwise an exiting owner could unlink its successor's PID/heartbeat.
+        with self._serialized_lock_update():
+            if not self._remove_exact_lock(owner):
+                return
             try:
                 os.unlink(self.pid_file)
             except OSError:
                 pass
-        # 定案 38 "优雅退出 = 停心跳+清锁" (2026-08-16 修): idle 退出/stop 必须删
-        # heartbeat 文件, 否则 is_running() 看 mtime<60s 仍判 alive -> submit 不
-        # 触发拉起 (6b 场景: 任务 pending 无人派发). 崩溃路径不删 (60s 自然过期).
-        if os.path.exists(self.heartbeat_file):
+            # 优雅退出必须停心跳; 崩溃路径保留并等待自然过期。
             try:
                 os.unlink(self.heartbeat_file)
             except OSError:
                 pass
+            self._lease_owner = None
+            self._lease_id = None
 
-    def stop(self) -> None:
+    def _wait_for_job_states(self, jobs, timeout: float) -> dict[str, str]:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            states = {
+                str(job["id"]): (
+                    self._job_process_state(job) if job["pgid"] else "dead"
+                )
+                for job in jobs
+            }
+            if all(
+                process_state in {"dead", "mismatch"}
+                for process_state in states.values()
+            ):
+                return states
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return states
+            time.sleep(min(JOB_STOP_POLL_SEC, remaining))
+
+    def stop(self) -> bool:
         with state.submission_lock():
             try:
                 state.mark_idle_shutdown()
             except OSError:
                 pass
-            self._stop_locked()
+            return self._stop_locked()
 
-    def _stop_locked(self) -> None:
-        """daemon stop: 未完成任务标 cancelled 收尾 (N11).
+    def _stop_locked(self) -> bool:
+        """Terminate exact owned groups, settling state only after proven exit."""
+        self._recover_launch_markers()
+        try:
+            with state.connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE status='running'"
+                ).fetchall()
+        except sqlite3.Error as error:
+            self.log_line(f"stop 读取 running jobs 失败: {error}")
+            return False
 
-        审查 B1: 主循环 tick 边界调用 (任何 connect() 块之外), 不再由信号
-        handler 嵌套调用; 锁冲突 (database is locked) 短暂重试兜底, 防与
-        同轮其他连接竞争。幂等: 重复调用无害 (无 running 任务则空转)。
-        """
-        import sqlite3 as _sq
+        for job in rows:
+            if not job["pgid"]:
+                continue
+            process_state = self._job_process_state(job)
+            if process_state == "alive":
+                self._signal_job(job, signal.SIGTERM)
+            elif process_state == "group_alive":
+                self.log_line(
+                    f"stop job {job['id']}: leader 已退出，永不向复用风险进程组发信号"
+                )
+            elif process_state == "unknown":
+                self.log_line(
+                    f"stop 保留 running job {job['id']}: process identity 无法确认"
+                )
 
+        after_term = self._wait_for_job_states(
+            rows,
+            JOB_STOP_TERM_GRACE_SEC,
+        )
+        for job in rows:
+            if after_term.get(str(job["id"])) != "alive":
+                continue
+            self._signal_job(job, signal.SIGKILL)
+        self._wait_for_job_states(rows, JOB_STOP_KILL_GRACE_SEC)
+
+        settled_rows = []
+        settlement_ok = False
         for attempt in range(3):
             try:
                 with state.connect() as conn:
-                    rows = conn.execute(
-                        "SELECT * FROM jobs WHERE status='running'"
-                    ).fetchall()
-                    for j in rows:
-                        if j["pgid"]:
-                            self.executor.kill_pgid(j["pgid"])
+                    settled_rows = []
+                    for original in rows:
+                        current = state.get_job(conn, original["id"])
+                        if current is None or current["status"] != "running":
+                            continue
+                        if current["pgid"] != original["pgid"]:
+                            self.log_line(
+                                f"stop 保留 job {original['id']}: DB pgid 已变化"
+                            )
+                            continue
+                        if (
+                            not current["pgid"]
+                            and self._prepare_launch_marker(current)
+                        ):
+                            self.log_line(
+                                f"stop 保留 job {current['id']}: "
+                                "pgid 未回写且 launch marker 无法安全收敛"
+                            )
+                            continue
+                        process_state = (
+                            self._job_process_state(current)
+                            if current["pgid"]
+                            else "dead"
+                        )
+                        if process_state not in {"dead", "mismatch"}:
+                            self.log_line(
+                                f"stop 保留 running job {current['id']}: "
+                                f"process identity={process_state}"
+                            )
+                            continue
                         state.update_job(
-                            conn, j["id"], status="cancelled", kill_reason="cancelled",
+                            conn,
+                            current["id"],
+                            status="cancelled",
+                            kill_reason="cancelled",
+                            rc=137 if current["rc"] is None else current["rc"],
                             finished_at=state.now(),
                         )
-                        self._drop_job_rc(j)
-                        if not j["pgid"]:
-                            self._drop_launch_marker(j)
-                        else:
-                            try:
-                                if not self.executor.alive(j["pgid"]):
-                                    self._drop_launch_marker(j)
-                            except (OSError, OverflowError):
-                                pass
-                        # N11 收尾 bug 修复 (2026-08-15 排雷): kill 后必须释放占用卡
-                        # (assigned -> releasing), 否则 cancelled 任务残留 assigned
-                        # 卡 -> daemon 重启后 GPU 永久不可用 (本次事故根因之一)
-                        # 多归属 (定案 36 + §3.2e B): 计数释放, co-tenant 不误杀
-                        if j["gpu"] is not None:
-                            self._release_in_tx(conn, j["id"])
+                        if current["gpu"] is not None:
+                            self._release_in_tx(conn, current["id"])
+                        settled_rows.append(current)
+                settlement_ok = True
                 break
-            except _sq.OperationalError as e:
-                if attempt == 2 or "locked" not in str(e):
-                    self.log_line(f"stop 收尾失败: {e}")
+            except sqlite3.OperationalError as error:
+                if attempt == 2 or "locked" not in str(error).lower():
+                    self.log_line(f"stop 收尾失败: {error}")
                     break
                 time.sleep(1)
-        self._cleanup_lock()
+            except sqlite3.Error as error:
+                self.log_line(f"stop 收尾失败: {error}")
+                break
+
+        for job in settled_rows if settlement_ok else ():
+            self._drop_job_rc(job)
+            self._drop_profile(job)
+            self._drop_launch_marker(job)
+
+        self._recover_launch_markers()
+        completed = (
+            settlement_ok
+            and len(settled_rows) == len(rows)
+            and not self._unresolved_launch_markers()
+        )
+        if completed:
+            self._cleanup_lock()
+        else:
+            self.log_line("stop 未完成: 保留 running/resources/lease 并继续重试")
+        return completed
 
     # ---------- 主循环 ----------
 
@@ -432,12 +765,16 @@ class Dispatcher:
 
         tick_failures = 0
         while True:
+            if not self._owns_current_lease():
+                self.log_line("dispatcher lease 已丢失，停止旧实例")
+                break
             try:
                 self._heartbeat()
                 if self._stop_requested:
                     self.log_line("收到停止请求 (tick 边界), 收尾未完成任务")
-                    self.stop()
-                    break
+                    if self.stop():
+                        break
+                    continue
                 if self._idle_check():
                     break
                 self._tick()
@@ -555,6 +892,7 @@ class Dispatcher:
         self._prune_notify_threads()  # L11: 清理已结束通知线程引用
         self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
+        self._recover_launch_markers()
         self._reap_finished_jobs()
         _freed, _to = self.allocator.settle_releasing()
         for g in _to:
@@ -599,6 +937,8 @@ class Dispatcher:
         任一 failed/blocked/cancelled/timed_out -> blocked (interrupted 除外 R4).
         定案 37 (2026-08-15): blocked 批次人工 retry/resubmit 解除失败终态后
         -> 自动回 active 继续派发 (本次事故需手动 UPDATE 的 gap)."""
+        marker_effects: list[tuple[str, str, str, str | None]] = []
+        notify_batches: list[dict] = []
         with state.connect() as conn:
             batches = conn.execute(
                 "SELECT * FROM batches WHERE status IN ('active','blocked')"
@@ -635,12 +975,15 @@ class Dispatcher:
                     conn.execute(
                         "UPDATE batches SET status='done' WHERE id=?", (b["id"],)
                     )
-                    self._write_marker(
-                        b["name"], "done",
-                        f"{len(statuses)} 任务全部成功终态 (done/skip)",
+                    marker_effects.append(
+                        (
+                            "write",
+                            b["name"],
+                            "done",
+                            f"{len(statuses)} 任务全部成功终态 (done/skip)",
+                        )
                     )
-                    self.log_line(f"批次 {b['name']} done (全部任务成功终态)")
-                    self._notify_batch(conn, b)  # 终态通知 (设计 §2, 一次性迁移点)
+                    notify_batches.append(dict(b))
                 elif any(
                     s in ("failed", "blocked", "cancelled", "timed_out")
                     for s in statuses
@@ -656,19 +999,40 @@ class Dispatcher:
                                 (b["id"],),
                             ).fetchall()
                         ]
-                        self._write_marker(
-                            b["name"], "blocked",
-                            f"失败任务: {','.join(fails) if fails else '-'}",
+                        marker_effects.append(
+                            (
+                                "write",
+                                b["name"],
+                                "blocked",
+                                f"失败任务: {','.join(fails) if fails else '-'}",
+                            )
                         )
-                        self.log_line(f"批次 {b['name']} blocked (有失败任务, 等人工)")
-                        self._notify_batch(conn, b)  # 终态通知 (cancelled 也发, 决策 4)
+                        notify_batches.append(dict(b))
                 elif b["status"] == "blocked":
                     # 人工 retry/resubmit 已解除全部失败终态 (只剩 pending/running 等)
                     conn.execute(
                         "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
                     )
-                    self._remove_marker(b["name"], "blocked")  # P7: 解除阻塞删除 marker
-                    self.log_line(f"批次 {b['name']} 失败终态解除 -> active (人工 retry 生效)")
+                    marker_effects.append(("remove", b["name"], "blocked", None))
+
+        for operation, name, kind, detail in marker_effects:
+            if operation == "write":
+                assert detail is not None
+                self._write_marker(name, kind, detail)
+                self.log_line(
+                    f"批次 {name} {kind} "
+                    + (
+                        "(全部任务成功终态)"
+                        if kind == "done"
+                        else "(有失败任务, 等人工)"
+                    )
+                )
+            else:
+                self._remove_marker(name, kind)
+                self.log_line(f"批次 {name} 失败终态解除 -> active (人工 retry 生效)")
+        for batch in notify_batches:
+            with state.connect() as conn:
+                self._notify_batch(conn, batch)
 
     # ---------- 批次终态通知 (设计 docs/sched_notify_design.md) ----------
 
@@ -717,8 +1081,7 @@ class Dispatcher:
         # 决策 5B: 按节点隔离 ({STATE}/<hostname>/markers) —— 共享 NFS 多节点
         # 时同名批次 marker 不再互相覆盖 (与 state.db/logs/profiles 一致)
         d = os.path.join(self.host_dir, "markers")
-        os.makedirs(d, exist_ok=True)
-        return d
+        return state.ensure_private_directory(d)
 
     def _write_marker(self, name: str, kind: str, detail: str) -> None:
         """P7: 批次进入终态 (done/blocked) 写 marker 文件, 供一行查看 (sched markers).
@@ -727,7 +1090,7 @@ class Dispatcher:
         """
         p = os.path.join(self._marker_dir(), f"{name}.{kind}")
         try:
-            with open(p, "w", encoding="utf-8") as f:
+            with state.open_private_text(p, "w") as f:
                 f.write(f"{state.now()} | {detail}\n")
         except OSError:
             pass  # marker 非关键路径, 写失败不影响调度
@@ -756,6 +1119,7 @@ class Dispatcher:
             boot_ts = time.time() - uptime
             if boot_ts > hb_ts:
                 self.log_line("D4: 检测到节点重启, running 任务标 interrupted (不计 retries)")
+                cleanup_jobs: list[dict] = []
                 with state.connect() as conn:
                     rows = conn.execute(
                         "SELECT * FROM jobs WHERE status='running'"
@@ -766,6 +1130,9 @@ class Dispatcher:
                             kill_reason=None,
                         )
                         self._requeue_for_retry(conn, j)
+                        cleanup_jobs.append(dict(j))
+                for job in cleanup_jobs:
+                    self._drop_launch_marker(job)
         except (OSError, ValueError):
             pass
     def _job_rc_prefix(self, job) -> str:
@@ -788,58 +1155,218 @@ class Dispatcher:
             os.unlink(self._launch_marker_path(job))
         except OSError:
             pass
+
     def _proc_start_time(self, pgid: int) -> str | None:
+        return process_start_token(pgid)
+
+    def _read_launch_marker_identity(self, job) -> tuple[int, str] | None:
+        """Read one owned, bounded marker containing a strong identity."""
+        marker_path = self._launch_marker_path(job)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
-            with open(f"/proc/{pgid}/stat", encoding="utf-8") as proc_stat:
-                fields = proc_stat.read().rsplit(")", 1)[1].split()
-            return f"proc:{fields[19]}" if len(fields) > 19 else None
-        except (OSError, IndexError):
-            try:
-                ps = subprocess.run(
-                    ["ps", "-p", str(pgid), "-o", "lstart="],
-                    capture_output=True,
-                    text=True,
-                    timeout=1,
-                )
-                start = ps.stdout.strip()
-                return f"ps:{start}" if ps.returncode == 0 and start else None
-            except (OSError, subprocess.SubprocessError):
+            fd = os.open(marker_path, flags)
+        except OSError:
+            return None
+        try:
+            marker_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(marker_stat.st_mode)
+                or marker_stat.st_uid != os.getuid()
+                or marker_stat.st_nlink != 1
+                or marker_stat.st_size > 4096
+            ):
                 return None
-    def _launch_marker_alive(self, job) -> bool:
+            raw = os.read(fd, 4097)
+            if len(raw) > 4096:
+                return None
+            fields = raw.decode("utf-8").split()
+        except (OSError, UnicodeDecodeError):
+            return None
+        finally:
+            os.close(fd)
+        if len(fields) != 2:
+            return None
+        try:
+            pgid = int(fields[0])
+        except (TypeError, ValueError):
+            return None
+        marker_start = fields[1]
+        if (
+            pgid <= 0
+            or pgid > 2**31 - 1
+            or not _is_strong_start_token(marker_start)
+        ):
+            return None
+        return pgid, marker_start
+
+    def _read_launch_identity(self, job) -> tuple[int, str] | None:
+        identity = self._read_launch_marker_identity(job)
+        if identity is None:
+            return None
+        try:
+            row_pgid = job["pgid"]
+        except (KeyError, TypeError):
+            return None
+        return identity if identity[0] == row_pgid else None
+
+    def _launch_identity_state(self, identity: tuple[int, str]) -> str:
+        pgid, expected_start = identity
+        actual_start = self._proc_start_time(pgid)
+        if actual_start is None:
+            try:
+                local_supervisor_completed = (
+                    self.executor.local_supervisor_completed(pgid)
+                )
+            except (AttributeError, OSError, OverflowError, TypeError):
+                local_supervisor_completed = None
+            try:
+                group_alive = self.executor.alive(pgid)
+            except (OSError, OverflowError, TypeError):
+                return "unknown"
+            if local_supervisor_completed is True and group_alive:
+                # The persistent local supervisor exited only after its original
+                # group emptied; a live group with the same number is a reuse.
+                return "mismatch"
+            return "group_alive" if group_alive else "dead"
+        if actual_start != expected_start:
+            return "mismatch"
+        try:
+            return "alive" if self.executor.alive(pgid) else "dead"
+        except (OSError, OverflowError, TypeError):
+            return "unknown"
+
+    def _job_process_state(self, job) -> str:
+        """Return identity-aware process-group state without trusting a bare PID."""
+        identity = self._read_launch_identity(job)
+        if identity is not None:
+            return self._launch_identity_state(identity)
+        try:
+            pgid = job["pgid"]
+            return "unknown" if self.executor.alive(pgid) else "dead"
+        except (KeyError, OSError, OverflowError, TypeError):
+            return "unknown"
+
+    def _signal_job_result(
+        self,
+        job,
+        sig: int = signal.SIGTERM,
+    ) -> str:
+        """Signal only a twice-attested exact leader and classify the result."""
+        for attempt in range(2):
+            process_state = self._job_process_state(job)
+            if process_state in {"dead", "mismatch"}:
+                return _SIGNAL_DEAD
+            if process_state != "alive":
+                phase = "re-attest" if attempt else "attest"
+                self.log_line(
+                    f"job {job['id']} signal 拒绝 ({phase}): "
+                    f"process identity={process_state}"
+                )
+                return _SIGNAL_UNKNOWN
+        try:
+            if self.executor.kill_pgid(job["pgid"], sig):
+                return _SIGNAL_SENT
+        except Exception as error:
+            try:
+                self.log_line(
+                    f"job {job['id']} signal 传递失败 sig={sig}: {error}"
+                )
+            except Exception:
+                pass
+            return _SIGNAL_UNKNOWN
+        final_state = self._job_process_state(job)
+        if final_state in {"dead", "mismatch"}:
+            return _SIGNAL_DEAD
+        return _SIGNAL_UNKNOWN
+
+    def _signal_job(
+        self,
+        job,
+        sig: int = signal.SIGTERM,
+    ) -> bool:
+        return self._signal_job_result(job, sig) == _SIGNAL_SENT
+
+    def _signal_launch_identity(
+        self,
+        job_id: str,
+        identity: tuple[int, str],
+        sig: int,
+    ) -> bool:
+        for attempt in range(2):
+            process_state = self._launch_identity_state(identity)
+            if process_state != "alive":
+                phase = "re-attest" if attempt else "attest"
+                self.log_line(
+                    f"job {job_id} marker signal 拒绝 ({phase}): "
+                    f"process identity={process_state}"
+                )
+                return False
+        return bool(self.executor.kill_pgid(identity[0], sig))
+
+    def _prepare_launch_marker(self, job) -> bool:
+        """Return True while a prior attempt's marker must block relaunch."""
         marker_path = self._launch_marker_path(job)
         try:
-            with open(marker_path, encoding="utf-8") as marker:
-                fields = marker.read().split()
-            pgid = int(fields[0])
-            marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
-            if marker_start and marker_start.isdigit():
-                marker_start = f"proc:{marker_start}"
+            marker_stat = os.lstat(marker_path)
         except FileNotFoundError:
             return False
-        except OSError:
+        except OSError as error:
+            self.log_line(
+                f"job {job['id']} launch marker 无法检查; 阻止派发: {error}"
+            )
             return True
-        except (ValueError, IndexError):
-            self._drop_launch_marker(job)
-            return False
-        if pgid <= 0 or pgid > 2**31 - 1:
-            self._drop_launch_marker(job)
-            return False
-        if marker_start:
-            process_start = self._proc_start_time(pgid)
-            if process_start and process_start != marker_start:
-                self._drop_launch_marker(job)
-                return False
-        try:
-            return bool(self.executor.alive(pgid))
-        except (OSError, OverflowError):
+        if not stat.S_ISREG(marker_stat.st_mode):
+            self.log_line(
+                f"job {job['id']} launch marker 非普通文件; 阻止派发"
+            )
             return True
+        identity = self._read_launch_marker_identity(job)
+        if identity is None:
+            self.log_line(
+                f"job {job['id']} launch marker identity=unknown; 阻止派发"
+            )
+            return True
+        process_state = self._launch_identity_state(identity)
+        if process_state in {"dead", "mismatch"}:
+            self._drop_rc_path(self._job_rc_path(job, identity[0]))
+            self._drop_rc_path(marker_path)
+            self.log_line(
+                f"job {job['id']} 清理旧 launch marker "
+                f"(process identity={process_state})"
+            )
+            return False
+        if process_state == "alive":
+            sent = self._signal_launch_identity(
+                str(job["id"]),
+                identity,
+                signal.SIGKILL,
+            )
+            self.log_line(
+                f"job {job['id']} crash-window orphan "
+                + ("已发送 SIGKILL; 保留 marker 等待死亡"
+                   if sent else "SIGKILL 未发送; 保留 marker 阻止派发")
+            )
+        else:
+            self.log_line(
+                f"job {job['id']} launch identity={process_state}; "
+                "保留 marker 阻止派发"
+            )
+        return True
+
+    def _launch_marker_alive(self, job) -> bool:
+        return self._job_process_state(job) in {"alive", "group_alive"}
 
 
 
     def _recover_launch_markers(self) -> None:
         marker_dir = os.path.join(self.host_dir, "launch")
         try:
-            names = [name for name in os.listdir(marker_dir) if name.endswith(".launch")]
+            names = sorted(
+                name for name in os.listdir(marker_dir)
+                if name.endswith(".launch")
+            )
         except FileNotFoundError:
             return
         except OSError:
@@ -849,79 +1376,75 @@ class Dispatcher:
             by_prefix = {self._job_rc_prefix(row): row for row in rows}
             for name in names:
                 path = os.path.join(marker_dir, name)
-                try:
-                    with open(path, encoding="utf-8") as marker:
-                        fields = marker.read().split()
-                    pgid = int(fields[0])
-                    marker_start = " ".join(fields[1:]) if len(fields) > 1 else None
-                    if marker_start and marker_start.isdigit():
-                        marker_start = f"proc:{marker_start}"
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    continue
-                except (ValueError, IndexError):
-                    self._drop_rc_path(path)
-                    continue
-                if pgid <= 0 or pgid > 2**31 - 1:
-                    self._drop_rc_path(path)
-                    continue
                 row = by_prefix.get(name[:-len(".launch")])
                 if row is None:
-                    self._drop_rc_path(path)
+                    self.log_line(
+                        f"launch marker 无对应 job, 拒绝信号并保留: {path}"
+                    )
                     continue
-                same_process = row["status"] == "running" and row["pgid"] == pgid
-                process_start = self._proc_start_time(pgid) if marker_start else None
-                if marker_start and process_start and marker_start != process_start:
-                    if same_process:
-                        state.update_job(
-                            conn,
-                            row["id"],
-                            status="failed",
-                            failure="launch_identity",
-                            pgid=None,
-                            finished_at=state.now(),
-                        )
-                        self._release_gpu_for_job(conn, row)
-                        self._maybe_retry(conn, row)
-                    self._drop_rc_path(self._job_rc_path(row, pgid))
-                    self._drop_rc_path(path)
+                if row["status"] != "running":
+                    self._prepare_launch_marker(row)
                     continue
-                if same_process:
-                    try:
-                        if self.executor.alive(pgid):
-                            continue
-                    except (OSError, OverflowError):
-                        pass
-                elif row["status"] == "running" and row["pgid"] is not None:
-                    self._drop_rc_path(self._job_rc_path(row, pgid))
-                    self._drop_rc_path(path)
-                    continue
-                try:
-                    self.executor.kill_pgid(pgid, signal.SIGKILL)
-                except Exception:
-                    pass
-                try:
-                    still_alive = self.executor.alive(pgid)
-                except (OSError, OverflowError):
-                    still_alive = True
-                if not still_alive:
-                    if not same_process:
-                        self._drop_rc_path(self._job_rc_path(row, pgid))
-                    self._drop_rc_path(path)
+                identity = self._read_launch_marker_identity(row)
+                process_state = (
+                    "unknown"
+                    if identity is None
+                    else self._launch_identity_state(identity)
+                )
+                if identity is not None and not row["pgid"]:
+                    state.update_job(conn, row["id"], pgid=identity[0])
+                    self.log_line(
+                        f"job {row['id']} 从 launch marker 恢复 pgid={identity[0]}"
+                    )
+                if process_state == "unknown":
+                    self.log_line(
+                        f"job {row['id']} launch identity=unknown; "
+                        "保留 running/资源与 marker"
+                    )
+
+
+    def _unresolved_launch_markers(self) -> bool:
+        marker_dir = os.path.join(self.host_dir, "launch")
+        try:
+            return any(
+                name.endswith(".launch") for name in os.listdir(marker_dir)
+            )
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
 
     def _read_job_rc(self, job) -> int | None:
         path = self._job_rc_path(job)
         if path is None:
             return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read().strip()
+            fd = os.open(path, flags)
+        except OSError:
+            return None
+        try:
+            rc_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(rc_stat.st_mode)
+                or rc_stat.st_uid != os.getuid()
+                or rc_stat.st_nlink != 1
+                or rc_stat.st_size > RC_MAX_BYTES
+            ):
+                return None
+            raw = os.read(fd, RC_MAX_BYTES + 1)
+            if len(raw) > RC_MAX_BYTES:
+                return None
+            text = raw.decode("utf-8").strip()
             if not text or not text.lstrip("-").isdigit():
                 return None
             return int(text)
-        except (OSError, ValueError):
+        except (OSError, UnicodeDecodeError, ValueError):
             return None
+        finally:
+            os.close(fd)
 
     def _drop_rc_path(self, path: str | None) -> None:
         if path is None:
@@ -936,35 +1459,67 @@ class Dispatcher:
 
     def _adopt_running(self) -> None:
         drop_paths: list[str] = []
+        cleanup_jobs: list[tuple[str, dict]] = []
         with state.connect() as conn:
             # P1: SQL 层过滤 running
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE status='running'"
             ).fetchall()
             for j in rows:
-                if j["pgid"] and self.executor.alive(j["pgid"]):
-                    self.log_line(f"A3: 接管 running job {j['id']} (pgid={j['pgid']})")
+                if not j["pgid"] and self._prepare_launch_marker(j):
+                    self.log_line(
+                        f"A3: job {j['id']} pgid 未回写且 launch marker 未决; "
+                        "保留 running/资源"
+                    )
                     continue
+                if j["pgid"]:
+                    process_state = self._job_process_state(j)
+                    if process_state in {"alive", "group_alive"}:
+                        self.log_line(
+                            f"A3: 接管 running job {j['id']} (pgid={j['pgid']})"
+                        )
+                        continue
+                    if process_state == "unknown":
+                        self.log_line(
+                            f"A3: job {j['id']} process identity=unknown; "
+                            "保留 running/资源且拒绝接管与信号"
+                        )
+                        continue
+                    if process_state == "mismatch":
+                        self.log_line(
+                            f"A3: job {j['id']} 原 process identity 已退出; "
+                            "检测到 PGID 复用，绝不信号新进程"
+                        )
                 rc = self._read_job_rc(j)
                 if rc is not None:
                     rc_path = self._job_rc_path(j)
-                    self.log_line(f"A3: job {j['id']} pgid 已死, 读取持久退出码 rc={rc}")
+                    self.log_line(
+                        f"A3: job {j['id']} pgid 已死, 读取持久退出码 rc={rc}"
+                    )
                     state.update_job(conn, j["id"], rc=rc)
-                    self._handle_job_done(conn, j, rc)
+                    cleanup_jobs.extend(self._handle_job_done(conn, j, rc))
                     if rc_path is not None:
                         drop_paths.append(rc_path)
                     continue
                 if j["kill_reason"] in ("cancelled", "timed_out"):
                     rc_path = self._job_rc_path(j)
                     state.update_job(conn, j["id"], rc=137)
-                    self._handle_job_done(conn, j, 137)
+                    cleanup_jobs.extend(self._handle_job_done(conn, j, 137))
                     if rc_path is not None:
                         drop_paths.append(rc_path)
                     continue
                 # M6: 成功任务恰在 reap 前 daemon 重启 -> pgid 已死但产物
                 # 齐全; 先查产物/指纹, 有效判 done, 避免白跑一遍
-                spec = json.loads(self._get_task_spec(conn, j) or "{}")
-                if self._should_skip(conn, spec, j):
+                try:
+                    spec = self._load_task_spec(conn, j)
+                except ValueError as exc:
+                    self.log_line(f"A3: job {j['id']} 存量 spec 非法: {exc}")
+                    state.update_job(
+                        conn, j["id"], status="failed", failure="invalid_spec",
+                        finished_at=state.now(),
+                    )
+                    spec = None
+                if spec is not None and self._should_skip(conn, spec, j):
                     state.update_job(
                         conn, j["id"], status="done",
                         finished_at=state.now(),
@@ -981,6 +1536,20 @@ class Dispatcher:
                 # 不再直接堵批次; 重试满 -> blocked 语义与正常运行路径一致
                 if state.get_job(conn, j["id"])["status"] == "failed":
                     self._maybe_retry(conn, j)
+                cleanup_jobs.extend(
+                    (
+                        ("launch", dict(j)),
+                        ("profile", dict(j)),
+                    )
+                )
+                rc_path = self._job_rc_path(j)
+                if rc_path is not None:
+                    drop_paths.append(rc_path)
+        for kind, job in cleanup_jobs:
+            if kind == "launch":
+                self._drop_launch_marker(job)
+            else:
+                self._drop_profile(job)
         for path in drop_paths:
             self._drop_rc_path(path)
 
@@ -992,7 +1561,6 @@ class Dispatcher:
         if now_t - self._last_progress_scan < 10:
             return
         self._last_progress_scan = now_t
-        import re as _re
 
         with state.connect() as conn:
             rows = conn.execute(
@@ -1006,8 +1574,11 @@ class Dispatcher:
                     spec = json.loads(r["spec"] or "{}")
                 except (json.JSONDecodeError, TypeError):
                     continue
+                if not isinstance(spec, dict):
+                    self.log_line(f"job {r['id']} 存量 spec 顶层非对象, 跳过进度规则")
+                    continue
                 rx = spec.get("progress_regex")
-                if not rx:
+                if not isinstance(rx, str) or not rx:
                     continue
                 log_path = os.path.join(
                     self.host_dir, "logs", r["batch_id"],
@@ -1017,15 +1588,14 @@ class Dispatcher:
                     text = read_tail(log_path, 4096)
                 except OSError:
                     continue
-                last = None
-                try:
-                    for m in _re.finditer(str(rx), text):
-                        last = m
-                except _re.error:
-                    continue  # 非法正则: 静默跳过 (校验期已拦大部分)
-                if last is None:
+                val = bounded_regex_last_match(
+                    str(rx),
+                    text,
+                    timeout=0.25,
+                    max_match_chars=120,
+                )
+                if val is None:
                     continue
-                val = last.group(0)[:120]
                 if r["progress"] != val:
                     state.update_job(conn, r["id"], progress=val)
 
@@ -1049,7 +1619,9 @@ class Dispatcher:
     def _reload_config_now(self) -> bool:
         """加载并校验新配置, 通过冷键检查后原子换引用 + 刷新缓存字段. 幂等."""
         try:
-            new_cfg = load_config(self._config_path)
+            new_cfg = load_config(
+                self._config_path, apply_runtime_state=False
+            )
             old_gpu_list, old_mem, _ = parse_gpus(self.cfg)
             new_gpu_list, new_mem, new_mj = parse_gpus(new_cfg)
         except Exception as e:  # ConfigError/json/OSError — 半写或非法
@@ -1165,7 +1737,6 @@ class Dispatcher:
 
     def _process_control_requests(self) -> None:
         """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.
-
         CLI (登录节点) 看不到计算节点进程组 (PID namespace 跨节点, 定案 44 同类),
         本地 killpg 恒失败曾致孤儿占卡 13 分钟。现在 CLI 只写 control_requests 队列,
         本方法每轮 tick 拉取并在本地完成:
@@ -1175,6 +1746,7 @@ class Dispatcher:
         GPU 释放交给 reap (_handle_job_done cancelled 分支), 与正常路径一致.
         """
         cleanup_payloads: list[str] = []
+        signal_intents: list[tuple[dict, int, int]] = []
         with state.connect() as conn:
             reqs = state.pending_control_requests(conn)
             if not reqs:
@@ -1223,13 +1795,12 @@ class Dispatcher:
                         try:
                             payload_fd = os.open(
                                 payload_path,
-                                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                                os.O_RDONLY
+                                | os.O_NONBLOCK
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | getattr(os, "O_NOFOLLOW", 0),
                             )
-                            if not stat.S_ISREG(os.fstat(payload_fd).st_mode):
-                                raise ValueError("payload 必须是普通文件")
-                            with os.fdopen(payload_fd, "r", encoding="utf-8") as pf:
-                                payload_fd = None
-                                envelope = json.load(pf)
+                            envelope = _load_bounded_submit_json(payload_fd)
                         finally:
                             if payload_fd is not None:
                                 os.close(payload_fd)
@@ -1273,8 +1844,6 @@ class Dispatcher:
                                                 stage["cmd"], cfg_now, stage_art, t["cwd_abs"]
                                             ),
                                             "artifacts": stage["artifacts"],
-                                            "probes": stage.get("probes"),
-                                            "retry_transform": stage.get("retry_transform"),
                                             "paths_escape": stage.get("paths_escape", False),
                                         }
                                     )
@@ -1306,7 +1875,7 @@ class Dispatcher:
                             norm["name"],
                             norm["mode"],
                             norm["depends_on"],
-                            norm["gpus"],
+                            None,
                             norm["cwd"],
                             norm["env"],
                             norm.get("notify"),
@@ -1325,7 +1894,7 @@ class Dispatcher:
                                 "duration_min": t["duration_min"],
                                 "max_retry": t["max_retry"],
                                 "artifacts": t["artifacts"],
-                                "retry_transform": t.get("retry_transform"),
+                                "paths_escape": t.get("paths_escape", False),
                                 "probes": t.get("probes"),
                                 "max_parallel": t.get("max_parallel"),
                                 "_force_rerun": t.get("_force_rerun"),
@@ -1381,28 +1950,66 @@ class Dispatcher:
                     state.finish_control_request(conn, r["id"], "job 非 running, 无需 kill")
                     self.log_line(f"cancel req {r['id']}: job {r['job_id']} 非 running, 跳过")
                     continue
-                pgid = j["pgid"]
-                if not self.executor.alive(pgid):
-                    # 已死。区分: 若是我们上一轮 SIGTERM 杀死的 -> 保留 reason,
-                    # reap 判 cancelled; 若从未 kill (自然结束) -> 清 reason 按 rc 判 (O5)
+                process_state = self._job_process_state(j)
+                if process_state in {"dead", "mismatch"}:
+                    # The owned leader is conclusively gone. Preserve a prior
+                    # cancel reason for reap; otherwise this was a natural exit.
                     if j["kill_reason"] == "cancelled":
-                        state.finish_control_request(conn, r["id"], "SIGTERM 生效, 已退出")
-                        self.log_line(f"cancel req {r['id']}: job {j['id']} SIGTERM 生效 (等 reap 收敛 cancelled)")
+                        state.finish_control_request(
+                            conn,
+                            r["id"],
+                            f"进程已退出 (identity={process_state})",
+                        )
                     else:
                         state.update_job(conn, j["id"], kill_reason=None)
-                        state.finish_control_request(conn, r["id"], "进程已自然结束 (O5)")
-                        self.log_line(f"cancel req {r['id']}: job {j['id']} 进程已自然结束 (O5), 清 reason")
+                        state.finish_control_request(
+                            conn,
+                            r["id"],
+                            f"进程已自然结束 (identity={process_state})",
+                        )
                     continue
                 if j["kill_reason"] == "cancelled":
-                    # 上一轮已 SIGTERM 但仍存活 -> SIGKILL 升级
-                    self.executor.kill_pgid(pgid, signal.SIGKILL)
-                    state.finish_control_request(conn, r["id"], "SIGKILL 升级")
-                    self.log_line(f"⚠️ cancel req {r['id']}: job {j['id']} SIGTERM 未生效 -> SIGKILL (pgid={pgid})")
+                    if process_state == "alive":
+                        signal_intents.append(
+                            (dict(j), signal.SIGKILL, int(r["id"]))
+                        )
+                    else:
+                        self.log_line(
+                            f"cancel req {r['id']}: job {j['id']} identity="
+                            f"{process_state}, 保留请求与 cancel intent"
+                        )
+                    continue
+                if process_state != "alive":
+                    self.log_line(
+                        f"cancel req {r['id']}: job {j['id']} identity="
+                        f"{process_state}, 保留请求等待重试"
+                    )
                     continue
                 state.update_job(conn, j["id"], kill_reason="cancelled")
-                self.executor.kill_pgid(pgid)  # SIGTERM
-                self.log_line(f"cancel req {r['id']}: job {j['id']} killpg SIGTERM (pgid={pgid})")
-                # 请求本轮不 finish: 下轮 tick 复查, 仍存活则 SIGKILL 升级
+                signal_intents.append(
+                    (dict(j), signal.SIGTERM, int(r["id"]))
+                )
+
+        for job, sig, request_id in signal_intents:
+            result = self._signal_job_result(job, sig)
+            if result == _SIGNAL_UNKNOWN:
+                self.log_line(
+                    f"cancel req {request_id}: job {job['id']} signal 未确认; "
+                    "保留请求与 cancel intent"
+                )
+                continue
+            if sig == signal.SIGTERM and result == _SIGNAL_SENT:
+                self.log_line(
+                    f"cancel req {request_id}: job {job['id']} "
+                    f"killpg SIGTERM (pgid={job['pgid']})"
+                )
+                continue
+            if result == _SIGNAL_SENT:
+                detail = "SIGKILL 升级"
+            else:
+                detail = "进程已退出 (signal re-attest)"
+            with state.connect() as conn:
+                state.finish_control_request(conn, request_id, detail)
 
         for payload_path in cleanup_payloads:
             try:
@@ -1419,26 +2026,33 @@ class Dispatcher:
              reap 按 reason 收尾 (_handle_job_done timed_out 分支, 不 retry ——
              超时任务重跑大概率再超时)
         """
+        signal_intents: list[tuple[dict, int, object]] = []
         with state.connect() as conn:
             escal = conn.execute(
                 "SELECT * FROM jobs WHERE status='running'"
                 " AND kill_reason='timed_out' AND pgid IS NOT NULL"
             ).fetchall()
             for j in escal:
-                if self.executor.alive(j["pgid"]):
-                    self.log_line(
-                        f"⚠️ job {j['id']} 超时 SIGTERM 未生效 -> SIGKILL (pgid={j['pgid']})"
+                if self._job_process_state(j) == "alive":
+                    signal_intents.append(
+                        (dict(j), signal.SIGKILL, None)
                     )
-                    self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE status='running'"
                 " AND kill_reason IS NULL AND started_at IS NOT NULL"
                 " AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
-                spec = json.loads(self._get_task_spec(conn, j) or "{}")
-                dur = spec.get("duration_min")
-                if not dur:
+                try:
+                    spec = self._load_task_spec(conn, j)
+                    dur = spec.get("duration_min")
+                    if dur is None:
+                        continue
+                    duration = float(dur)
+                    if not math.isfinite(duration) or duration <= 0:
+                        raise ValueError("duration_min 必须为有限正数")
+                except (TypeError, ValueError) as exc:
+                    self.log_line(f"job {j['id']} 存量 duration 规则非法, 已忽略: {exc}")
                     continue
                 try:
                     started = time.mktime(
@@ -1446,13 +2060,29 @@ class Dispatcher:
                     )
                 except (TypeError, ValueError):
                     continue
-                if time.time() - started <= float(dur) * 60:
+                if time.time() - started <= duration * 60:
                     continue
                 state.update_job(conn, j["id"], kill_reason="timed_out")
-                self.executor.kill_pgid(j["pgid"])  # SIGTERM
+                signal_intents.append(
+                    (dict(j), signal.SIGTERM, dur)
+                )
+
+        for job, sig, duration_min in signal_intents:
+            if sig == signal.SIGKILL:
                 self.log_line(
-                    f"job {j['id']} 超时 (duration_min={dur}) -> killpg SIGTERM"
-                    f" (pgid={j['pgid']})"
+                    f"⚠️ job {job['id']} 超时 SIGTERM 未生效 -> "
+                    f"SIGKILL (pgid={job['pgid']})"
+                )
+            result = self._signal_job_result(job, sig)
+            if sig == signal.SIGTERM and result == _SIGNAL_SENT:
+                self.log_line(
+                    f"job {job['id']} 超时 (duration_min={duration_min}) "
+                    f"-> killpg SIGTERM (pgid={job['pgid']})"
+                )
+            elif result == _SIGNAL_UNKNOWN:
+                self.log_line(
+                    f"job {job['id']} 超时 signal 未确认; "
+                    "保留 timed_out intent 等待重试"
                 )
 
     def _check_probes(self) -> None:
@@ -1468,23 +2098,64 @@ class Dispatcher:
           pgid 仍存活 -> 逐轮 SIGKILL, 与 cancel 的升级语义对齐 (防进程忽略
           SIGTERM 占卡直至 releasing 超时)
         """
-        drop_paths: list[str] = []
+        signal_intents: list[tuple[dict, int, str | None]] = []
+        skipped_ranges: list[tuple[str, int]] = []
+        offset_updates: dict[str, int] = {}
         with state.connect() as conn:
+            # Capture only pre-existing durable probe intents for escalation.
+            # Intents discovered below receive TERM after this commit and are
+            # not eligible for KILL until the next tick.
+            escal = conn.execute(
+                "SELECT * FROM jobs WHERE status='running'"
+                " AND kill_reason IN"
+                " ('probe_invalid','probe_failed','probe_ready')"
+                " AND pgid IS NOT NULL"
+            ).fetchall()
+            escal_ids = {j["id"] for j in escal}
+            for j in escal:
+                if self._job_process_state(j) == "alive":
+                    signal_intents.append((dict(j), signal.SIGKILL, None))
+
             # P1: SQL 层过滤, 不再每 tick 全表扫描历史 job
             running = conn.execute(
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in running:
-                spec = json.loads(self._get_task_spec(conn, j) or "{}")
-                probes = spec.get("probes") or {}
-                fail_pat = probes.get("fail_on_log")
-                ready_pat = probes.get("ready_on_log")
+                if j["id"] in escal_ids:
+                    continue
+                try:
+                    spec = self._load_task_spec(conn, j)
+                    probes = spec.get("probes") or {}
+                    if not isinstance(probes, dict):
+                        raise ValueError("probes 必须是对象")
+                    fail_pat = probes.get("fail_on_log")
+                    ready_pat = probes.get("ready_on_log")
+                    if any(
+                        pattern is not None and not isinstance(pattern, str)
+                        for pattern in (fail_pat, ready_pat)
+                    ):
+                        raise ValueError("probe 模式必须是字符串")
+                except (TypeError, ValueError) as exc:
+                    self.log_line(
+                        f"job {j['id']} 存量 probe 规则非法, 终止后隔离: {exc}"
+                    )
+                    state.update_job(
+                        conn,
+                        j["id"],
+                        failure="invalid_spec",
+                        kill_reason="probe_invalid",
+                    )
+                    signal_intents.append(
+                        (dict(j), signal.SIGTERM, "probe_invalid")
+                    )
+                    continue
                 if not fail_pat and not ready_pat:
                     continue
                 log_path = self._job_log_path(j)
                 try:
-                    # P2: 增量扫描 —— 记录已扫偏移只读新增字节 (重叠回退最长
-                    # 模式长度防跨块切断); 日志截断/轮转则从头重扫
+                    # Read a bounded tail of the newly visible range. Preserve
+                    # enough overlap for a pattern split at the prior offset;
+                    # when an append exceeds the cap, prefer the current tail.
                     off = self._probe_offsets.get(j["id"], 0)
                     size = os.path.getsize(log_path)
                     if size < off:
@@ -1493,124 +2164,220 @@ class Dispatcher:
                         len((fail_pat or "").encode("utf-8")),
                         len((ready_pat or "").encode("utf-8")),
                     )
+                    overlap_start = max(0, off - longest)
+                    start = max(
+                        overlap_start,
+                        size - PROBE_READ_MAX_BYTES,
+                    )
+                    if start > overlap_start:
+                        skipped_ranges.append(
+                            (str(j["id"]), start - overlap_start)
+                        )
                     with open(log_path, "rb") as f:
-                        f.seek(max(0, off - longest))
-                        text = f.read().decode("utf-8", "replace")
+                        f.seek(start)
+                        raw = f.read(PROBE_READ_MAX_BYTES)
+                    text = raw.decode("utf-8", "replace")
                     text = text.replace("\r\n", "\n").replace("\r", "\n")
-                    self._probe_offsets[j["id"]] = size
+                    offset_updates[str(j["id"])] = size
                 except OSError:
                     continue  # 日志未就绪, 下轮再查
                 if fail_pat and fail_pat in text:
                     self.log_line(
-                        f"probe fail_on_log 命中: job {j['id']} ({fail_pat!r}) -> kill + blocked"
+                        f"probe fail_on_log 命中: job {j['id']} "
+                        f"({fail_pat!r}) -> 终止后 blocked"
                     )
-                    self.executor.kill_pgid(j["pgid"])
-                    # probe 命中视为确定失败: 不 retry, 直接 blocked (等人工)
                     state.update_job(
-                        conn, j["id"], status="blocked", failure="probe",
-                        kill_reason="probe", finished_at=state.now(),
+                        conn,
+                        j["id"],
+                        failure="probe",
+                        kill_reason="probe_failed",
                     )
-                    rc_path = self._job_rc_path(j)
-                    self._release_gpu_for_job(conn, j)
-                    if rc_path is not None:
-                        drop_paths.append(rc_path)
+                    signal_intents.append(
+                        (dict(j), signal.SIGTERM, "probe_failed")
+                    )
                     continue
                 if ready_pat and ready_pat in text:
                     self.log_line(
-                        f"probe ready_on_log 命中: job {j['id']} ({ready_pat!r}) -> kill + done"
+                        f"probe ready_on_log 命中: job {j['id']} "
+                        f"({ready_pat!r}) -> 终止并 reap 后结算"
                     )
-                    self.executor.kill_pgid(j["pgid"])
                     state.update_job(
-                        conn, j["id"], status="done", kill_reason="probe",
-                        finished_at=state.now(),
+                        conn,
+                        j["id"],
+                        kill_reason="probe_ready",
                     )
-                    # ready 命中但产物校验不过 -> 降级 failed (probe 只是看起来成功)
-                    artifacts = spec.get("artifacts", {})
-                    if not self._check_artifacts(artifacts, spec.get("cwd_abs") or "."):
-                        self.log_line(f"job {j['id']} ready probe 但产物校验失败 -> 降级 failed")
-                        state.update_job(conn, j["id"], status="failed", failure="artifact")
-                        self._drop_profile(j)  # 失败路径: 只删临时不 upsert (同 rc!=0)
-                    else:
-                        self._consume_profile(conn, j, spec)
-                    rc_path = self._job_rc_path(j)
-                    self._release_gpu_for_job(conn, j)
-                    if rc_path is not None:
-                        drop_paths.append(rc_path)
-            # L3: SIGKILL 升级 —— probe kill 已触发但进程忽略 SIGTERM 仍存活
-            # (终态 done/blocked 的 job 不会再进上面的 running 循环, 在此补杀)
-            # P1: SQL 层过滤, 不扫全表
-            escal = conn.execute(
-                "SELECT * FROM jobs WHERE kill_reason='probe' AND pgid IS NOT NULL"
-            ).fetchall()
-            for j in escal:
-                if self.executor.alive(j["pgid"]):
-                    self.log_line(f"probe kill 升级: job {j['id']} SIGTERM 未生效 -> SIGKILL")
-                    self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
-                    # A6: 进程仍存活 (含 D-state, SIGKILL 未立即生效) 时**不清**
-                    # pgid —— 否则下个 tick 不再命中本升级查询, 孤儿进程持卡
-                    # 永不重试; 与 _check_timeouts 逐轮升级语义一致
-                else:
-                    # H4 修复: 确认死亡后清 pgid, 解除对历史终态 job 的永久
-                    # 探测 —— 否则 OS 复用该 pgid 后每轮 SIGKILL 无关进程组
-                    state.update_job(conn, j["id"], pgid=None)
-                    self._drop_launch_marker(j)
-            # P2: 清理已不在 running 的 job 的偏移记录, 防内存随历史膨胀
-            live = {j["id"] for j in running}
-            for jid in [k for k in self._probe_offsets if k not in live]:
-                del self._probe_offsets[jid]
-        for path in drop_paths:
-            self._drop_rc_path(path)
+                    signal_intents.append(
+                        (dict(j), signal.SIGTERM, "probe_ready")
+                    )
+
+            live = {str(j["id"]) for j in running}
+
+        self._probe_offsets.update(offset_updates)
+        for job_id in [key for key in self._probe_offsets if key not in live]:
+            del self._probe_offsets[job_id]
+
+        for job_id, skipped in skipped_ranges:
+            self.log_line(
+                f"probe 增量过大: job {job_id} 跳过中间 {skipped} bytes, "
+                f"只扫描末尾 {PROBE_READ_MAX_BYTES} bytes"
+            )
+        for job, sig, _expected_reason in signal_intents:
+            if sig == signal.SIGKILL:
+                self.log_line(
+                    f"probe kill 升级: job {job['id']} "
+                    "SIGTERM 未生效 -> SIGKILL"
+                )
+            result = self._signal_job_result(job, sig)
+            if result == _SIGNAL_UNKNOWN:
+                self.log_line(
+                    f"probe signal 未确认: job {job['id']}; "
+                    "保留 durable intent 等待重试"
+                )
 
     def _reap_finished_jobs(self) -> None:
         drop_paths: list[str] = []
+        cleanup_jobs: list[tuple[str, dict]] = []
         with state.connect() as conn:
-            # P1: SQL 层过滤 running, 不再每 tick 全表扫描历史 job
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
+                process_state = self._job_process_state(j)
+                if process_state == "unknown":
+                    self.log_line(
+                        f"reap 保留 job {j['id']}: process identity 无法确认"
+                    )
+                    continue
                 known_proc = self.executor.has_process(j["pgid"])
-                rc = self.executor.poll_rc(j["pgid"])
-                if rc is None:
-                    continue  # 仍在运行
+                marker_rc = self._read_job_rc(j)
+                if process_state == "mismatch":
+                    # The immutable leader identity proves our process exited.
+                    # Never poll or signal the unrelated replacement group.
+                    rc = marker_rc if marker_rc is not None else 137
+                else:
+                    rc = self.executor.poll_rc(j["pgid"])
+                    if rc is None:
+                        continue
+                    final_state = self._job_process_state(j)
+                    if final_state in {"alive", "group_alive", "unknown"}:
+                        self.log_line(
+                            f"reap 延后 job {j['id']}: "
+                            f"post-poll identity={final_state}"
+                        )
+                        continue
+                    if marker_rc is not None:
+                        rc = marker_rc
+                    elif not known_proc and process_state == "dead":
+                        rc = 137
                 rc_path = self._job_rc_path(j)
-                marker_rc = None if known_proc else self._read_job_rc(j)
-                if marker_rc is not None:
-                    rc = marker_rc
                 state.update_job(conn, j["id"], rc=rc)
-                self._handle_job_done(conn, j, rc)
+                cleanup_jobs.extend(self._handle_job_done(conn, j, rc))
                 if rc_path is not None:
                     drop_paths.append(rc_path)
+        for kind, job in cleanup_jobs:
+            if kind == "launch":
+                self._drop_launch_marker(job)
+            else:
+                self._drop_profile(job)
         for path in drop_paths:
             self._drop_rc_path(path)
 
-    def _handle_job_done(self, conn, j, rc: int | None = None) -> None:
-        """reap 顺序 (N2): 先读 kill_reason 定终态; 无 reason 按 rc + 日志分类."""
-        self._drop_launch_marker(j)
+    def _handle_job_done(
+        self,
+        conn,
+        j,
+        rc: int | None = None,
+    ) -> list[tuple[str, dict]]:
+        """Settle after exact exit and return cleanup actions for commit."""
         reason = j["kill_reason"]
+        if j["pgid"]:
+            process_state = self._job_process_state(j)
+            if process_state in {"alive", "group_alive", "unknown"}:
+                self.log_line(
+                    f"job {j['id']} settlement 延后: "
+                    f"process identity={process_state}"
+                )
+                return []
+
+        job_snapshot = dict(j)
+        cleanup_paths = [
+            ("launch", job_snapshot),
+            ("profile", job_snapshot),
+        ]
         if rc is None:
             rc = j["rc"]
         if reason == "cancelled":
-            # 修复建议 2 (事故记录 4): reap 前二次校验——标 cancelled 但进程仍
-            # 存活 (SIGTERM 未生效/孤儿逃逸) -> 绝不静默, SIGKILL 兜底
-            if j["pgid"] and self.executor.alive(j["pgid"]):
-                self.log_line(f"⚠️ 兜底: job {j['id']} 标 cancelled 但 pgid={j['pgid']} 仍存活 -> SIGKILL")
-                self.executor.kill_pgid(j["pgid"], signal.SIGKILL)
             self.log_line(f"job {j['id']} cancelled (用户终止)")
-            state.update_job(conn, j["id"], status="cancelled", finished_at=state.now())
+            state.update_job(
+                conn,
+                j["id"],
+                status="cancelled",
+                finished_at=state.now(),
+            )
             self._release_gpu_for_job(conn, j)
-            self._drop_profile(j)  # 失败路径: 只删临时不 upsert
-            return
+            return cleanup_paths
         if reason == "timed_out":
             self.log_line(f"job {j['id']} timed_out (超时)")
             state.update_job(conn, j["id"], status="timed_out", finished_at=state.now())
             self._release_gpu_for_job(conn, j)
-            self._drop_profile(j)
-            return
+            return cleanup_paths
+        if reason in {"probe_invalid", "probe_failed", "probe_ready"}:
+            if reason == "probe_ready":
+                try:
+                    spec = self._load_task_spec(conn, j)
+                except ValueError as exc:
+                    spec = None
+                    self.log_line(
+                        f"job {j['id']} ready probe 存量 spec 非法: {exc}"
+                    )
+                if spec is not None and check_declared_artifacts(
+                    spec, spec.get("cwd_abs") or "."
+                ):
+                    state.update_job(
+                        conn,
+                        j["id"],
+                        status="done",
+                        rc=rc,
+                        failure=None,
+                        finished_at=state.now(),
+                    )
+                    self._consume_profile(conn, j, spec)
+                    self.log_line(
+                        f"job {j['id']} ready probe 进程已退出且产物有效 -> done"
+                    )
+                else:
+                    state.update_job(
+                        conn,
+                        j["id"],
+                        status="failed",
+                        rc=rc,
+                        failure="artifact",
+                        finished_at=state.now(),
+                    )
+                    self.log_line(
+                        f"job {j['id']} ready probe 进程已退出但产物无效 -> failed"
+                    )
+            else:
+                failure = (
+                    "invalid_spec" if reason == "probe_invalid" else "probe"
+                )
+                state.update_job(
+                    conn,
+                    j["id"],
+                    status="blocked",
+                    rc=rc,
+                    failure=failure,
+                    finished_at=state.now(),
+                )
+                self.log_line(
+                    f"job {j['id']} probe 终止完成 -> blocked ({failure})"
+                )
+            self._release_gpu_for_job(conn, j)
+            return cleanup_paths
 
-        log_path = self._job_log_path(j)
         # rc 缺失 (executor 崩溃/被强杀) -> 兜底
         if rc is None:
+            log_path = self._job_log_path(j)
             failure, _ = self.executor.failed_classify(log_path)
             state.update_job(
                 conn, j["id"], status="failed", failure=failure,
@@ -1620,36 +2387,39 @@ class Dispatcher:
             if failure in ("oom", "gpu_fault"):
                 self._capture_incident(conn, j, failure, log_path)
             self._release_gpu_for_job(conn, j)
-            self._drop_profile(j)
             self._maybe_retry(conn, j)
-            return
+            return cleanup_paths
 
         if rc == 0:
             # 产物校验 (D8)
-            spec = json.loads(self._get_task_spec(conn, j) or "{}")
-            artifacts = spec.get("artifacts", {})
-            if self._check_artifacts(artifacts, spec.get("cwd_abs") or "."):
+            try:
+                spec = self._load_task_spec(conn, j)
+            except ValueError as exc:
+                spec = None
+                self.log_line(f"job {j['id']} 存量 spec 非法, 产物验证失败: {exc}")
+            if spec is not None and check_declared_artifacts(
+                spec, spec.get("cwd_abs") or "."
+            ):
                 state.update_job(conn, j["id"], status="done", rc=rc,
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} done rc=0 产物校验通过")
-                # profile 消费 (定案 39): rc=0 后 upsert profile_cache + 删临时
                 self._consume_profile(conn, j, spec)
             else:
                 state.update_job(conn, j["id"], status="failed", rc=rc,
                                  failure="artifact",
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} failed (rc=0 但产物校验失败)")
-                self._drop_profile(j)  # 失败路径: 只删临时不 upsert (同 rc!=0)
         else:
+            log_path = self._job_log_path(j)
             failure, _ = self.executor.failed_classify(log_path)
             state.update_job(conn, j["id"], status="failed", rc=rc, failure=failure,
                              finished_at=state.now())
             self.log_line(f"job {j['id']} failed rc={rc} ({failure})")
             if failure in ("oom", "gpu_fault"):
                 self._capture_incident(conn, j, failure, log_path)
-            self._drop_profile(j)  # 失败路径: 只删不 upsert
         self._release_gpu_for_job(conn, j)
         self._maybe_retry(conn, j)
+        return cleanup_paths
 
     def _release_gpu_for_job(self, conn, j) -> None:
         """assigned -> releasing (立即, B5). 多归属计数释放 (§3.2e B)."""
@@ -1689,41 +2459,90 @@ class Dispatcher:
         return os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
 
     def _consume_profile(self, conn, j, spec: dict) -> None:
-        """job 成功 (rc=0 且产物校验通过) 后: 读 peak_gib -> upsert profile_cache -> 删临时.
+        """Read and upsert a successful profile without deleting it.
 
-        失败路径 (定案 39): 读取失败/JSON 畸形按"无 profile"忽略 (只删不 upsert);
-        任务未声明 resources.profile_key -> 只删 (profile_cache 按 key 索引, 无 key 不入库).
+        The caller records the profile path and unlinks it only after the
+        surrounding job-settlement transaction commits.
         """
-        import json as _json
-
         p = self._profile_path(j)
-        profile_key = (spec.get("resources") or {}).get("profile_key")
+        resources = spec.get("resources") or {}
+        profile_key = (
+            resources.get("profile_key")
+            if isinstance(resources, dict)
+            else None
+        )
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = None
         try:
-            if not os.path.isfile(p):
+            fd = os.open(p, flags)
+            profile_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(profile_stat.st_mode)
+                or profile_stat.st_uid != os.getuid()
+                or profile_stat.st_nlink != 1
+                or profile_stat.st_size > PROFILE_MAX_BYTES
+            ):
                 return
-            data = _json.loads(open(p, encoding="utf-8").read())
-            peak = data.get("peak_gib")
-            if peak is None:
+            chunks = []
+            remaining = PROFILE_MAX_BYTES + 1
+            while remaining:
+                chunk = os.read(fd, min(8192, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > PROFILE_MAX_BYTES:
                 return
-            peak = float(peak)
-        except (OSError, ValueError, TypeError, _json.JSONDecodeError):
+            data = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"peak_gib"}
+            ):
+                return
+            peak_value = data.get("peak_gib")
+            if isinstance(peak_value, bool) or not isinstance(
+                peak_value, (int, float)
+            ):
+                return
+            peak = float(peak_value)
+            if (
+                not math.isfinite(peak)
+                or peak < 0
+                or peak > PROFILE_MAX_PEAK_GIB
+            ):
+                return
+        except (
+            OSError,
+            UnicodeDecodeError,
+            ValueError,
+            TypeError,
+            RecursionError,
+        ):
             return
         finally:
-            # 无论成败删临时 (失败只删不 upsert, 防垃圾累积)
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         if not profile_key:
-            return  # 无 key 不入库 (文件已删)
+            return  # 无 key 不入库; caller 仍在 commit 后清理文件
+        try:
+            project = j["project"]
+        except (KeyError, TypeError):
+            project = None
+        internal_key = _profile_cache_key(project, profile_key)
         conn.execute(
             "INSERT INTO profile_cache (profile_key, peak_gib, updated_at, git_rev)"
             " VALUES (?,?,?,?) "
             "ON CONFLICT(profile_key) DO UPDATE SET peak_gib=excluded.peak_gib,"
             " updated_at=excluded.updated_at, git_rev=excluded.git_rev",
-            (profile_key, peak, state.now(), j["git_rev"]),
+            (internal_key, peak, state.now(), j["git_rev"]),
         )
-        self.log_line(f"profile upsert {profile_key} peak={peak:.2f} GiB")
+        self.log_line(f"profile upsert job={j['id']} peak={peak:.2f} GiB")
 
     def _drop_profile(self, j) -> None:
         """失败/取消/超时路径: 只删临时文件不 upsert."""
@@ -1765,7 +2584,8 @@ class Dispatcher:
         pk = res.get("profile_key")
         if pk:
             prow = conn.execute(
-                "SELECT peak_gib FROM profile_cache WHERE profile_key=?", (pk,)
+                "SELECT peak_gib FROM profile_cache WHERE profile_key=?",
+                (_profile_cache_key(j["project"], pk),),
             ).fetchone()
             if prow and prow["peak_gib"]:
                 profile_peak = float(prow["peak_gib"])
@@ -1778,7 +2598,7 @@ class Dispatcher:
         co_runners = []
         for r in conn.execute(
             "SELECT gj.job_id, gj.vram_gib, j.batch_id, j.task_id,"
-            " j.status, j.started_at"
+            " j.status, j.started_at, j.project"
             " FROM gpu_jobs gj JOIN jobs j ON j.id = gj.job_id"
             " WHERE gj.gpu_id=? AND gj.job_id != ?", (gpu_idx, j["id"]),
         ).fetchall():
@@ -1797,7 +2617,8 @@ class Dispatcher:
                     pass
             if cpk:
                 cpk_row = conn.execute(
-                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?", (cpk,)
+                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?",
+                    (_profile_cache_key(r["project"], cpk),),
                 ).fetchone()
             runtime_sec = None
             if r["started_at"]:
@@ -1901,8 +2722,15 @@ class Dispatcher:
             # H4: 权限错不重试
             state.update_job(conn, j["id"], status="blocked")
             return
-        spec = json.loads(self._get_task_spec(conn, j) or "{}")
-        max_retry = spec.get("max_retry", DEFAULT_MAX_RETRY)
+        try:
+            spec = self._load_task_spec(conn, j)
+            max_retry = int(spec.get("max_retry", DEFAULT_MAX_RETRY))
+            if max_retry < 0:
+                raise ValueError("max_retry 必须非负")
+        except (TypeError, ValueError) as exc:
+            state.update_job(conn, j["id"], status="blocked", failure="invalid_spec")
+            self.log_line(f"job {j['id']} 存量 retry 规则非法, 已隔离: {exc}")
+            return
         if j["retries"] < max_retry:
             state.update_job(
                 conn, j["id"], status="pending", retries=j["retries"] + 1,
@@ -1919,7 +2747,7 @@ class Dispatcher:
         H3 修复: 回队前必须释放 GPU 占用 (assigned -> releasing + 删 gpu_jobs
         行), 否则节点重启后卡仍 assigned 给已死 job, GPU 永久泄漏.
         """
-        self._drop_launch_marker(j)
+        # Launch marker cleanup is owned by _check_node_restart after commit.
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
         state.update_job(
@@ -1933,7 +2761,19 @@ class Dispatcher:
         with state.connect() as conn:
             batches = conn.execute("SELECT * FROM batches WHERE status='queued'").fetchall()
             for b in batches:
-                deps = json.loads(b["depends_on"] or "[]")
+                try:
+                    deps = json.loads(b["depends_on"] or "[]")
+                    if (
+                        not isinstance(deps, list)
+                        or any(not isinstance(dep, str) or not dep for dep in deps)
+                    ):
+                        raise ValueError("depends_on 必须是非空字符串数组")
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    conn.execute(
+                        "UPDATE batches SET status='blocked' WHERE id=?", (b["id"],)
+                    )
+                    self.log_line(f"批次 {b['name']} 存量依赖规则非法, 已隔离: {exc}")
+                    continue
                 if not deps:
                     conn.execute(
                         "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
@@ -1988,7 +2828,10 @@ class Dispatcher:
         except BaseException:
             for job_id, pgid in list(self._launch_inflight.items()):
                 try:
-                    self.executor.kill_pgid(pgid, signal.SIGKILL)
+                    self._signal_job(
+                        {"id": job_id, "pgid": pgid},
+                        signal.SIGKILL,
+                    )
                 except Exception:
                     pass
                 try:
@@ -2003,6 +2846,8 @@ class Dispatcher:
             raise
         finally:
             self._launch_inflight.clear()
+            self._ready_task_specs = {}
+            self._ready_fingerprint_snapshots = {}
     def _dispatch_ready_jobs(self) -> None:
         with self._dispatch_connection() as conn:
             # 只派发所属批次已解锁 (active/done) 的 pending job——
@@ -2025,6 +2870,23 @@ class Dispatcher:
                 -r["batch_priority"],
                 r["rid"],
             ))
+            # Snapshot every ready job before this connection performs any DML.
+            # Git/NFS probes must never hold a SQLite writer transaction, and
+            # the exact same snapshot feeds skip, cleanup, and launch.
+            self._ready_task_specs: dict[str, dict] = {}
+            self._ready_fingerprint_snapshots: dict[str, tuple] = {}
+            for job in ready:
+                try:
+                    task_spec = self._load_task_spec(conn, job)
+                except ValueError:
+                    continue
+                task_cwd = task_spec.get("cwd_abs") or resolve_template(
+                    self.cfg.get("default_project", "{ROOT}"), self.cfg
+                )
+                self._ready_task_specs[job["id"]] = task_spec
+                self._ready_fingerprint_snapshots[job["id"]] = (
+                    self._snapshot_fingerprint(task_spec, task_cwd, job["id"])
+                )
             # B11c: waiting_quota 只是"配额不足被跳过"的可见标记, 不是终态;
             # 重新入候选前归一化回 pending, 否则 _launch_job 的 pending 条件
             # 更新 (M1 竞态防护) 会永远拒绝启动
@@ -2043,7 +2905,6 @@ class Dispatcher:
             cpu_only_running = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL"
             ).fetchone()[0]
-            gpu_full = False
             now_ts = datetime.now()
             # B14 L4: batch 内并发上限 (sweep.max_parallel)
             running_per_batch: dict[str, int] = {}
@@ -2060,11 +2921,7 @@ class Dispatcher:
                     # A previous launch survived transaction rollback; keep its
                     # marker and wait for recovery instead of double-starting.
                     continue
-                # B11c: project quota gate -- 本轮跳过, 状态保持 pending
-                # (绝不落 waiting_quota 终态化, 否则配额释放后无人再捞起)
                 project = j["project"] or j["batch_project"]
-                if not self._project_quota_available(conn, project):
-                    continue
 
                 # M2: 重试退避 —— 失败重试 (retries>0) 的 job 等 RETRY_BACKOFF_SEC
                 # 再派发, 防秒级崩溃任务同 tick 重新拉起形成紧密崩溃循环
@@ -2076,13 +2933,37 @@ class Dispatcher:
                         ft = None
                     if ft and (now_ts - ft).total_seconds() < RETRY_BACKOFF_SEC:
                         continue  # 退避中, 下轮再试
-                spec = json.loads(self._get_task_spec(conn, j) or "{}")
-                resources = spec.get("resources") or {}
-                is_cpu_only = resources.get("gpu", 1) == 0
-                task_cpus = self._task_cpus(spec)
+                try:
+                    spec = self._ready_task_specs.get(j["id"])
+                    if spec is None:
+                        spec = self._load_task_spec(conn, j)
+                    resources = spec.get("resources") or {}
+                    if not isinstance(resources, dict):
+                        raise ValueError("resources 必须是对象")
+                    gpu_request = resources.get("gpu", 1)
+                    if isinstance(gpu_request, bool) or gpu_request not in (0, 1):
+                        raise ValueError("resources.gpu 必须是 0 或 1")
+                    is_cpu_only = gpu_request == 0
+                    task_cpus = self._task_cpus(spec)
+                    if task_cpus <= 0:
+                        raise ValueError("resources.cpus 必须为正整数")
+                    mp = spec.get("max_parallel")
+                    if mp is not None:
+                        mp = int(mp)
+                        if mp <= 0:
+                            raise ValueError("max_parallel 必须为正整数")
+                except (TypeError, ValueError) as exc:
+                    state.update_job(
+                        conn, j["id"], status="blocked", failure="invalid_spec",
+                        finished_at=state.now(),
+                    )
+                    self.log_line(f"job {j['id']} 存量 spec 非法, 已隔离: {exc}")
+                    continue
+                # GPU quota does not apply to CPU-only work.
+                if not is_cpu_only and not self._project_quota_available(conn, project):
+                    continue
                 # B14 L4: sweep.max_parallel -- 同批 running 达上限则等下轮
-                mp = spec.get("max_parallel")
-                if mp and running_per_batch.get(j["batch_id"], 0) >= int(mp):
+                if mp and running_per_batch.get(j["batch_id"], 0) >= mp:
                     continue
                 if cpus_total > 0 and used_cpu + task_cpus > cpus_total:
                     # CPU 配额不足: 本任务等下轮 (CPU 超卖禁止, 与 GPU 同纪律)
@@ -2093,16 +2974,12 @@ class Dispatcher:
                         continue  # 回退模式: CPU-only 并发上限 (旧语义)
                     gpu = None  # CPU-only: 不占 GPU 槽位
                 else:
-                    if gpu_full:
-                        continue  # GPU 已满: 跳过后续 GPU 任务, 继续扫 CPU-only (防饿死)
-                    # 用同一事务 assign (避免嵌套 connect 的 database is locked)
+                    # A rejection is request-specific unless the allocator can
+                    # prove a task-independent global exhaustion condition.
+                    self._assign_reject_scope = "request"
                     gpu = self._assign_in_tx(conn, j["id"], spec, project)
                     if gpu is None:
-                        # B12-c: 项目级上限挡住的卡对其他项目仍有余量 ->
-                        # 不置 gpu_full, 继续扫后续任务 (否则他项目被误饿死)
-                        if getattr(self, "_assign_reject_scope", "all") == "all":
-                            gpu_full = True
-                        continue  # 本任务本轮无卡, 下轮再试
+                        continue
                 try:
                     launched = self._launch_job(conn, j, gpu)
                     # D1: 竞态放弃/skip 不占 CPU 配额 (skip 密集批次不再人为压低并发)
@@ -2110,28 +2987,44 @@ class Dispatcher:
                         used_cpu += task_cpus
                         if is_cpu_only:
                             cpu_only_running += 1
+                        else:
+                            self._project_quota_used[project] = (
+                                self._project_quota_used.get(project, 0) + 1
+                            )
                         running_per_batch[j["batch_id"]] = (
                             running_per_batch.get(j["batch_id"], 0) + 1
                         )
                 except Exception as e:
-                    # 启动失败: 释放 GPU (如占) + 标 failed (走 retry 路径), 不中断整轮派发
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")
+                    if self._prepare_launch_marker(j):
+                        self.log_line(
+                            f"LAUNCH FAIL job {j['id']}: orphan identity 未决; "
+                            "保留 running/resource/marker"
+                        )
+                        continue
                     if gpu is not None:
                         self._release_in_tx(conn, j["id"])
                     state.update_job(
-                        conn, j["id"], status="failed", failure="launch",
+                        conn,
+                        j["id"],
+                        status="failed",
+                        failure="launch",
                         finished_at=state.now(),
                     )
                     self._maybe_retry(conn, j)
 
     def _task_cpus(self, spec: dict) -> int:
-        """任务 CPU 占用: resources.cpus 优先; GPU 任务未声明用 config.gpu_job_cpus."""
+        """Return a validated CPU reservation for one task."""
         resources = spec.get("resources") or {}
+        if not isinstance(resources, dict):
+            raise ValueError("resources 必须是对象")
         cpus = resources.get("cpus")
-        if cpus:
-            return int(cpus)
+        if cpus is not None:
+            if isinstance(cpus, bool) or not isinstance(cpus, int) or cpus <= 0:
+                raise ValueError("resources.cpus 必须为正整数")
+            return cpus
         if resources.get("gpu", 1) == 0:
-            return 1  # CPU-only 缺省 1 核 (schema 已补, 双保险)
+            return 1
         return int(self.cfg.get("gpu_job_cpus", DEFAULT_GPU_JOB_CPUS))
 
     def _cpu_in_use(self, conn) -> int:
@@ -2142,10 +3035,12 @@ class Dispatcher:
         ).fetchall()
         for j in rows:
             try:
-                spec = json.loads(self._get_task_spec(conn, j) or "{}")
-            except (json.JSONDecodeError, TypeError):
-                spec = {}
-            used += self._task_cpus(spec)
+                spec = self._load_task_spec(conn, j)
+                used += self._task_cpus(spec)
+            except (AttributeError, TypeError, ValueError):
+                # Fail closed for quota accounting: reserve the default GPU
+                # job CPU share until the malformed record is isolated.
+                used += int(self.cfg.get("gpu_job_cpus", DEFAULT_GPU_JOB_CPUS))
         return used
 
     def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None, project: str | None = None) -> int | None:
@@ -2183,7 +3078,8 @@ class Dispatcher:
             pk = resources.get("profile_key")
             if pk:
                 row = conn.execute(
-                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?", (pk,)
+                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?",
+                    (_profile_cache_key(project, pk),),
                 ).fetchone()
                 if row and row["peak_gib"]:
                     task_vram = max(task_vram, float(row["peak_gib"]))
@@ -2361,6 +3257,27 @@ class Dispatcher:
     def _release_in_tx(self, conn, job_id: str) -> None:
         """事务内释放: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
         state.release_gpu(conn, job_id)
+    def _snapshot_fingerprint(
+        self, spec: dict, cwd: str, job_id: str
+    ) -> tuple[str | None, dict, str | None]:
+        try:
+            current_fp, stage_fingerprints, git_rev = compute_fingerprint(
+                spec.get("cmd"),
+                spec.get("stages"),
+                cwd,
+                spec.get("git"),
+                getattr(self, "venv_paths", {}),
+                runtime_prefix=spec.get("runtime_prefix"),
+            )
+        except Exception as exc:
+            self.log_line(
+                f"job {job_id} 指纹探测失败, 禁止复用 checkpoint: {exc}"
+            )
+            return None, {}, None
+        if not isinstance(stage_fingerprints, dict):
+            stage_fingerprints = {}
+        return current_fp, stage_fingerprints, git_rev
+
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
         """启动任务; 返回是否真正启动 (调用方据此计 CPU/并发配额, D1)。
@@ -2368,9 +3285,31 @@ class Dispatcher:
         未启动的正常返回路径: M1 竞态 (已非 pending) 与产物指纹 skip ——
         二者都不该占用 CPU 配额 (skip 密集批次会人为压低并发)。
         """
-        # M1 修复: 条件更新抢占 —— SELECT 快照到 launch 之间 (指纹计算/产物清理
-        # 可达秒级) CLI 可能已把 pending 标 cancelled; 只有仍为 pending 才允许
-        # 转 running, 否则放弃派发并释放本事务已 assign 的卡
+        if self._prepare_launch_marker(j):
+            self.log_line(
+                f"job {j['id']} 存在未决 launch marker; 本轮不派发"
+            )
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
+        spec_cache = getattr(self, "_ready_task_specs", {})
+        spec = spec_cache.pop(j["id"], None)
+        if spec is None:
+            spec = self._load_task_spec(conn, j)
+        cwd = spec.get("cwd_abs") or resolve_template(
+            self.cfg.get("default_project", "{ROOT}"), self.cfg
+        )
+        snapshot_cache = getattr(self, "_ready_fingerprint_snapshots", {})
+        fingerprint_snapshot = snapshot_cache.pop(j["id"], _FINGERPRINT_UNSET)
+        if fingerprint_snapshot is _FINGERPRINT_UNSET:
+            # Direct callers receive the same no-writer-transaction guarantee.
+            if conn.in_transaction:
+                conn.commit()
+            fingerprint_snapshot = self._snapshot_fingerprint(spec, cwd, j["id"])
+        current_fp, stage_fingerprints, git_rev = fingerprint_snapshot
+
+        # M1 修复: 条件更新抢占 —— SELECT 快照到 launch 之间可能已被 cancel;
+        # only a still-pending row may transition to running.
         cur = conn.execute(
             "UPDATE jobs SET status='running', started_at=?"
             " WHERE id=? AND status='pending'",
@@ -2381,33 +3320,58 @@ class Dispatcher:
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
-        # H2: retry/previous daemon attempts may leave a stale marker for this job id.
-        self._drop_job_rc(j)
-        spec = json.loads(self._get_task_spec(conn, j) or "{}")
-        cwd = spec.get("cwd_abs") or resolve_template(self.cfg.get("default_project", "{ROOT}"), self.cfg)
         log_path = self._job_log_path(j)
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-
-        # 产物指纹 skip 判据 (A2 + O3): 指纹有效 且 规则校验通过 -> skip
-        if self._should_skip(conn, spec, j):
+        state.ensure_private_directory(os.path.dirname(log_path))
+        should_skip = self._should_skip(
+            conn, spec, j, current_fingerprint=current_fp
+        )
+        state.update_job(
+            conn,
+            j["id"],
+            fingerprint=current_fp,
+            stage_fingerprints=(
+                json.dumps(stage_fingerprints) if stage_fingerprints else None
+            ),
+            git_rev=git_rev,
+        )
+        if should_skip:
             state.update_job(conn, j["id"], status="skip", finished_at=state.now())
             self.log_line(
                 f"job {j['id']} skip (产物指纹有效, 不执行)"
-                f" 匹配版本 git_rev={str(j['git_rev'] or '-')[:8]}"
+                f" 匹配版本 git_rev={str(git_rev or '-')[:8]}"
                 " —— 若为改码后误 SKIP: 确认已 commit, 或 submit 加 \"force_rerun\": true"
             )
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
+        # Destructive launch preparation is safe only after the reservation and
+        # running claim can be recovered independently of this outer dispatch
+        # transaction. A skip remains part of the caller's transaction.
+        state.update_job(
+            conn,
+            j["id"],
+            gpu=gpu,
+            pgid=None,
+            kill_reason=None,
+        )
+        conn.commit()
+        prior_inflight = getattr(self, "_launch_inflight", None)
+        if isinstance(prior_inflight, dict):
+            # This commit also made any earlier launch pgid writebacks durable.
+            prior_inflight.clear()
+        # H2: retry/previous daemon attempts may leave a stale RC for this job.
+        self._drop_job_rc(j)
         # 半成品清理 (§3.2): 产物存在但无效 (指纹不匹配/规则不过) -> 删除后启动
-        self._clean_stale_artifacts(conn, spec, j)
+        self._clean_stale_artifacts(
+            conn,
+            spec,
+            j,
+            current_fingerprint=current_fp,
+            stage_fingerprints=stage_fingerprints,
+        )
 
-        # 显存峰值回写通道 (定案 39 profile 协议, daemon 侧注入):
-        #   注入 SCHED_PROFILE_OUT=<host_dir>/profiles/<job_id>.json, 训练侧写
-        #   {"peak_gib": X} (GiB); job rc=0 后 _consume_profile upsert profile_cache
-        #   并删临时; 失败路径只删不 upsert. 任务显式声明 SCHED_PROFILE_OUT 则尊重.
-        # M15: 批次级 env 生效 —— batch.env 打底 + task.env 覆盖, 此前批次 env
-        # 校验入库后无读取方被静默丢弃
+        # The scheduler-owned profile path is a reserved control channel.
+        # Batch, task, and deployment defaults may not redirect it.
         b = state.get_batch(conn, j["batch_id"])
         batch_env = json.loads(b["env"]) if b and b["env"] else {}
         task_env = {**batch_env, **dict(spec.get("env", {}))}
@@ -2416,18 +3380,17 @@ class Dispatcher:
         # ~/.local 用户站点污染 (策略在配置, 不在代码)。
         for _dk, _dv in (self.cfg.get("task_default_env") or {}).items():
             task_env.setdefault(str(_dk), str(_dv))
-        task_env.setdefault(
-            "SCHED_PROFILE_OUT", os.path.join(self.host_dir, "profiles", f"{j['id']}.json")
-        )
+        task_env["SCHED_PROFILE_OUT"] = self._profile_path(j)
         rc_dir = os.path.join(self.host_dir, "rc")
-        os.makedirs(rc_dir, exist_ok=True)
+        state.ensure_private_directory(rc_dir)
         task_env["SCHED_RC_DIR"] = rc_dir
         task_env["SCHED_RC_PREFIX"] = self._job_rc_prefix(j)
         launch_marker = self._launch_marker_path(j)
-        os.makedirs(os.path.dirname(launch_marker), exist_ok=True)
-        self._drop_launch_marker(j)
+        state.ensure_private_directory(os.path.dirname(launch_marker))
         task_env["SCHED_LAUNCH_MARKER"] = launch_marker
-        os.makedirs(os.path.dirname(task_env["SCHED_PROFILE_OUT"]), exist_ok=True)
+        state.ensure_private_directory(
+            os.path.dirname(task_env["SCHED_PROFILE_OUT"])
+        )
         pgid = self.executor.launch(
             cmd=spec.get("cmd"),
             stages=spec.get("stages"),
@@ -2436,13 +3399,21 @@ class Dispatcher:
             gpu=gpu,
             log_path=log_path,
             conda_env_dir=spec.get("runtime_prefix"),
+            stage_fingerprints=stage_fingerprints,
+            stage_checkpoint_dir=os.path.join(
+                self.host_dir, "stage_checkpoints", j["id"]
+            ),
+            force_rerun=bool(spec.get("_force_rerun")),
         )
         inflight = getattr(self, "_launch_inflight", None)
         if isinstance(inflight, dict):
             inflight[j["id"]] = pgid
         def abort_launch() -> None:
             try:
-                self.executor.kill_pgid(pgid, signal.SIGKILL)
+                self._signal_job(
+                    {"id": j["id"], "pgid": pgid},
+                    signal.SIGKILL,
+                )
             except Exception:
                 pass
             try:
@@ -2454,19 +3425,10 @@ class Dispatcher:
                 self._drop_launch_marker(j)
             if isinstance(inflight, dict):
                 inflight.pop(j["id"], None)
-        git_rev = None
-        try:
-            _, _, git_rev = compute_fingerprint(
-                spec.get("cmd"), spec.get("stages"), cwd,
-                spec.get("git"), self.venv_paths,
-                runtime_prefix=spec.get("runtime_prefix"),
-            )
-        except Exception:
-            pass
         try:
             state.update_job(
                 conn, j["id"], gpu=gpu, pgid=pgid,
-                git_rev=git_rev, kill_reason=None,
+                kill_reason=None,
             )
         except Exception:
             try:
@@ -2489,38 +3451,59 @@ class Dispatcher:
             raise
         return True
 
-    def _should_skip(self, conn, spec: dict, j) -> bool:
-        """A2/O3: 产物指纹有效 且 规则校验通过 -> skip.
-
-        B13-§4: batch.json 声明 "force_rerun": true 时跳过 SKIP 判定强制重跑.
-        """
+    def _should_skip(
+        self,
+        conn,
+        spec: dict,
+        j,
+        current_fingerprint=_FINGERPRINT_UNSET,
+    ) -> bool:
+        """Return whether valid artifacts were produced by the current code."""
         if spec.get("_force_rerun"):
             return False
-        artifacts = spec.get("artifacts", {})
-        if not artifacts:
+        artifact_groups = [spec.get("artifacts")]
+        stages = spec.get("stages")
+        if isinstance(stages, list):
+            artifact_groups.extend(
+                stage.get("artifacts") for stage in stages
+                if isinstance(stage, dict)
+            )
+        if not any(
+            isinstance(artifacts, dict) and artifacts
+            for artifacts in artifact_groups
+        ):
             return False
-        if not self._fingerprint_matches(conn, spec, j):
+        if not self._fingerprint_matches(
+            conn, spec, j, current_fingerprint=current_fingerprint
+        ):
             return False
-        return self._check_artifacts(artifacts, spec.get("cwd_abs") or ".")
+        return check_declared_artifacts(spec, spec.get("cwd_abs") or ".")
 
-    def _fingerprint_matches(self, conn, spec: dict, j) -> bool:
+    def _fingerprint_matches(
+        self,
+        conn,
+        spec: dict,
+        j,
+        current_fingerprint=_FINGERPRINT_UNSET,
+    ) -> bool:
         """B13-§4 语义修正: 对照"产物生产者"的指纹, 而非本行自比.
 
         旧实现 cur == j["fingerprint"] 是提交时/派发时两次对同一树状态采样,
         永远自洽 —— 改码后 resubmit 照样 SKIP (SelfDistOTS 实际踩坑).
-        正确语义: 磁盘上的产物由同 task 最新终态版本 (done/skip) 生产,
-        其提交时指纹才是"产物的代码版本"; 当前态指纹与之不同 => 产物过期须重跑.
-        无前序终态版本 (首跑) 时回退自比较 (保持既有行为).
+        正确语义: 磁盘上的产物必须有同 task 的可信 done/skip 生产者;
+        当前态指纹与其不同时必须重跑。首跑没有可信生产者，绝不复用磁盘上
+        预先存在的产物。
         """
-        if not j["fingerprint"]:
-            return False
-        try:
-            cur, _, _ = compute_fingerprint(
-                spec.get("cmd"), spec.get("stages"),
-                spec.get("cwd_abs") or ".", spec.get("git"), self.venv_paths,
-                runtime_prefix=spec.get("runtime_prefix"),
-            )
-        except Exception:
+        if current_fingerprint is _FINGERPRINT_UNSET:
+            try:
+                current_fingerprint, _, _ = compute_fingerprint(
+                    spec.get("cmd"), spec.get("stages"),
+                    spec.get("cwd_abs") or ".", spec.get("git"), self.venv_paths,
+                    runtime_prefix=spec.get("runtime_prefix"),
+                )
+            except Exception:
+                return False
+        if not current_fingerprint:
             return False
         # 产物生产者 = 同项目同任务名最近一个终态 job (跨批次实例:
         # 每次 submit 都生成新 batch id, 同 batch 内永远没有"前序版本")
@@ -2533,28 +3516,127 @@ class Dispatcher:
             (j["project"] if "project" in j.keys() else None,
              j["task_id"], j["id"]),
         ).fetchone()
-        ref_fp = prev["fingerprint"] if prev and prev["fingerprint"] else j["fingerprint"]
-        return cur == ref_fp
+        if not prev or not prev["fingerprint"]:
+            return False
+        return current_fingerprint == prev["fingerprint"]
 
-    def _clean_stale_artifacts(self, conn, spec: dict, j) -> None:
-        """§3.2 半成品: 产物存在但指纹/规则无效 -> 删除后启动."""
-        from .artifacts import check_artifact
+    def _clean_stale_artifacts(
+        self,
+        conn,
+        spec: dict,
+        j,
+        current_fingerprint=_FINGERPRINT_UNSET,
+        stage_fingerprints: dict | None = None,
+    ) -> None:
+        """Remove outputs without valid task or job-scoped stage provenance."""
 
         cwd = spec.get("cwd_abs") or "."
-        for key, a in spec.get("artifacts", {}).items():
-            p = str(a["path"])
-            if p and not os.path.isabs(p):
-                p = os.path.normpath(os.path.join(cwd, p))
-            if os.path.exists(p):
-                ok = self._fingerprint_matches(conn, spec, j) and (
-                    check_artifact(p, a) is None
+        force_rerun = bool(spec.get("_force_rerun"))
+        checkpoint_dir = os.path.join(
+            self.host_dir, "stage_checkpoints", j["id"]
+        )
+        fingerprints = stage_fingerprints or {}
+        stages = spec.get("stages")
+        stage_paths: set[str] = set()
+
+        def resolved_path(rule) -> str | None:
+            if not isinstance(rule, dict):
+                return None
+            raw = rule.get("path")
+            if not isinstance(raw, str) or not raw:
+                return None
+            return raw if os.path.isabs(raw) else os.path.normpath(
+                os.path.join(cwd, raw)
+            )
+
+        def remove_rule(rule, *, paths_escape: bool) -> None:
+            path = resolved_path(rule)
+            if path is None or not isinstance(rule, dict):
+                return
+            raw = rule.get("path")
+            if not isinstance(raw, str):
+                return
+            if unlink_artifact(
+                cwd,
+                raw,
+                paths_escape=paths_escape,
+            ):
+                self.log_line(f"清理过期产物 {path}")
+
+        rerun_downstream = force_rerun
+        if isinstance(stages, list):
+            for index, stage in enumerate(stages):
+                artifacts = (
+                    stage.get("artifacts", {})
+                    if isinstance(stage, dict)
+                    else {}
                 )
-                if not ok:
-                    try:
-                        os.unlink(p)
-                        self.log_line(f"清理过期产物 {p}")
-                    except OSError:
-                        pass
+                if isinstance(artifacts, dict):
+                    for rule in artifacts.values():
+                        path = resolved_path(rule)
+                        if path is not None:
+                            stage_paths.add(path)
+                valid = (
+                    not rerun_downstream
+                    and isinstance(stage, dict)
+                    and stage_checkpoint_valid(
+                        stage,
+                        cwd,
+                        fingerprints.get(str(index)),
+                        checkpoint_dir,
+                        index,
+                    )
+                )
+                if valid:
+                    continue
+                rerun_downstream = True
+                if isinstance(artifacts, dict):
+                    stage_paths_escape = (
+                        stage.get("paths_escape", False)
+                        if isinstance(stage, dict)
+                        else False
+                    )
+                    for rule in artifacts.values():
+                        remove_rule(
+                            rule,
+                            paths_escape=stage_paths_escape,
+                        )
+                try:
+                    os.unlink(
+                        os.path.join(checkpoint_dir, f"stage-{index}.json")
+                    )
+                except OSError:
+                    pass
+
+        fingerprint_matches = (
+            not force_rerun
+            and self._fingerprint_matches(
+                conn, spec, j, current_fingerprint=current_fingerprint
+            )
+        )
+        task_artifacts = spec.get("artifacts", {})
+        if not isinstance(task_artifacts, dict):
+            return
+        task_paths_escape = spec.get("paths_escape", False)
+        for rule in task_artifacts.values():
+            path = resolved_path(rule)
+            if path is None or path in stage_paths:
+                continue
+            valid = (
+                fingerprint_matches
+                and isinstance(rule, dict)
+                and check_artifacts(
+                    {"artifact": rule},
+                    cwd,
+                    paths_escape=task_paths_escape,
+                ).get("artifact")
+                is None
+            )
+            if not valid:
+                remove_rule(
+                    rule,
+                    paths_escape=task_paths_escape,
+                )
 
     # ---------- 工具 ----------
 
@@ -2565,6 +3647,18 @@ class Dispatcher:
         ).fetchone()
         return row["spec"] if row else None
 
+    def _load_task_spec(self, conn, job) -> dict:
+        raw = self._get_task_spec(conn, job)
+        if raw is None:
+            raise ValueError("任务 spec 不存在")
+        try:
+            spec = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("任务 spec 不是合法 JSON") from exc
+        if not isinstance(spec, dict):
+            raise ValueError("任务 spec 顶层必须是对象")
+        return spec
+
     def _job_log_path(self, j) -> str:
         # 审查 L1: 带 version —— resubmit 新版本不再覆盖旧 job 日志
         # (否则 log -f/probes/diag 读到串扰内容)。
@@ -2573,16 +3667,8 @@ class Dispatcher:
         )
 
     def _check_artifacts(self, artifacts: dict, cwd: str) -> bool:
-        """D8 产物校验: path 相对任务 cwd 解析 (E4 已保证在 cwd 内)."""
-        from .artifacts import check_artifact
-
-        for key, a in artifacts.items():
-            p = a.get("path")
-            if p and not os.path.isabs(p):
-                p = os.path.normpath(os.path.join(cwd, p))
-            if check_artifact(p or "", a) is not None:
-                return False
-        return True
+        """Validate a task-level artifact mapping through the shared checker."""
+        return check_declared_artifacts({"artifacts": artifacts}, cwd)
 
     def _heartbeat(self) -> None:
         self._touch_heartbeat()

@@ -2,6 +2,7 @@
 # L15: agent-facing documentation references must point to files in this repo.
 set -u
 cd "$(dirname "$0")/.."
+source tests/acceptance_cleanup.sh
 python3 - <<'PY'
 import re
 from pathlib import Path

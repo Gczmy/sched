@@ -17,6 +17,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -29,19 +30,19 @@ cnt(){ export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print(-1); raise SystemExit
-print(sum(1 for j in d['jobs'] if j['batch'].split('-')[0]=='$2' and j['status']=='$3'))"; }
+print(sum(1 for j in d['jobs'] if j['batch_name']=='$2' and j['status']=='$3'))"; }
 wait_for(){ for _ in $(seq 1 ${2:-40}); do eval "$1" && return 0; sleep 2; done; return 1; }
 wait_batch_done(){ for _ in $(seq 1 ${3:-30}); do
     SCHED_STATE=$1 SCHED_CONFIG=$1/config.json $PY -m gsched.cli status --json 2>/dev/null | \
       $PY -c "
 import json,sys
 d=json.load(sys.stdin)
-bad=[b for b in d['batches'] if b['name'].split('-')[0]=='$2' and b['status'] not in ('done','blocked','cancelled')]
+bad=[b for b in d['batches'] if b['batch_name']=='$2' and b['status'] not in ('done','blocked','cancelled')]
 sys.exit(0 if not bad else 1)" && return 0
     sleep 2
   done; return 1; }
 
-S=/tmp/sched_rsbatch; rm -rf $S $HOME/rs_t3_flag; mkdir -p $S
+sched_accept_make_root S "sched-resubmit-batch"
 cat > $S/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -53,7 +54,7 @@ EOF
 export SCHED_STATE=$S SCHED_CONFIG=$S/config.json
 sched(){ $PY -m gsched.cli "$@"; }
 
-FLAG=$HOME/rs_t3_flag
+FLAG=$S/rs_t3_flag
 cat > $S/rs.json << EOF
 {"name":"rs","project":"default","mode":"mix",
  "tasks":[
@@ -107,7 +108,6 @@ echo "$ALLD" | grep -q "将 resubmit 3 个任务" && ok "--all 列出全部 3 �
 
 stop_daemon() {
   sched daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
 }
 stop_daemon
 

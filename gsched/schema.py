@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -20,6 +21,98 @@ SHELL_TOKENS = {"sh", "bash", "dash", "zsh", "ksh", "fish"}
 
 class SchemaError(Exception):
     pass
+
+MAX_IDENTIFIER_LENGTH = 128
+MAX_PATTERN_LENGTH = 4096
+MAX_PATH_LENGTH = 4096
+MAX_ARTIFACTS_PER_GROUP = 64
+MAX_ARTIFACT_RULE_BYTES = 64 * 1024
+MAX_NORMALIZED_TASKS = 10_000
+ARTIFACT_RULE_KEYS = frozenset({"path", "min_bytes", "check", "has_key", "regex"})
+SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+SAFE_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+DANGEROUS_ENV_NAMES = {
+    "BASH_ENV",
+    "ENV",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+}
+
+
+def _check_normalized_task_count(count: int) -> None:
+    if count > MAX_NORMALIZED_TASKS:
+        raise SchemaError(
+            f"tasks: 规范化后任务数 {count} 超过硬上限 {MAX_NORMALIZED_TASKS}"
+        )
+
+
+def _validate_identifier(value: Any, where: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > MAX_IDENTIFIER_LENGTH
+        or value in {".", ".."}
+        or SAFE_IDENTIFIER_RE.fullmatch(value) is None
+    ):
+        raise SchemaError(
+            f"{where}: 必须是 1..{MAX_IDENTIFIER_LENGTH} 位 ASCII 安全标识符"
+            " ([A-Za-z0-9][A-Za-z0-9._-]*)"
+        )
+    return value
+
+
+def _validate_env(value: Any, where: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise SchemaError(f"{where}: 必须是字符串键值对象")
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or SAFE_ENV_NAME_RE.fullmatch(key) is None
+            or key in DANGEROUS_ENV_NAMES
+            or key.startswith(("LD_", "DYLD_"))
+        ):
+            raise SchemaError(f"{where}: 包含非法或危险的环境变量名")
+        if not isinstance(item, str) or "\0" in item:
+            raise SchemaError(f"{where}.{key}: 必须是无 NUL 字符串")
+    return value
+
+
+def _validate_command(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise SchemaError(f"{where}: 必须是非空字符串数组")
+    for index, token in enumerate(value):
+        if not isinstance(token, str) or not token or "\0" in token:
+            raise SchemaError(f"{where}[{index}]: 必须是非空无 NUL 字符串")
+    return value
+
+
+def _is_finite_positive_number(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return value > 0 and math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _validate_regex(value: Any, where: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\0" in value
+        or len(value) > MAX_PATTERN_LENGTH
+    ):
+        raise SchemaError(
+            f"{where}: 必须是 1..{MAX_PATTERN_LENGTH} 位正则字符串"
+        )
+    try:
+        re.compile(value)
+    except (re.error, OverflowError, RecursionError) as exc:
+        raise SchemaError(f"{where}: 无效正则: {exc}") from exc
+    return value
 
 
 def _require_type(v: Any, t: type, field: str, where: str) -> None:
@@ -398,6 +491,83 @@ def _check_path_in_cwd(path: str, cwd_abs: str, where: str) -> None:
         )
 
 
+def _validate_artifacts(
+    artifacts: Any,
+    cfg: dict,
+    cwd_abs: str,
+    where: str,
+    *,
+    paths_escape: bool,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(artifacts, dict):
+        raise SchemaError(f"{where}: 必须是对象")
+    if len(artifacts) > MAX_ARTIFACTS_PER_GROUP:
+        raise SchemaError(
+            f"{where}: 最多声明 {MAX_ARTIFACTS_PER_GROUP} 个产物"
+        )
+    for key, rule in artifacts.items():
+        rule_where = f"{where}.{key}"
+        if not isinstance(key, str) or not isinstance(rule, dict):
+            raise SchemaError(f"{rule_where}: 必须是对象")
+        _validate_identifier(key, f"{rule_where} 名称")
+        unknown_keys = set(rule) - ARTIFACT_RULE_KEYS
+        if unknown_keys:
+            raise SchemaError(
+                f"{rule_where}: 未知规则 "
+                f"{sorted((repr(key) for key in unknown_keys))!r}"
+            )
+        path = rule.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or "\0" in path
+            or len(path) > MAX_PATH_LENGTH
+        ):
+            raise SchemaError(
+                f"{rule_where}.path: 必须是 1..{MAX_PATH_LENGTH} 位有效路径字符串"
+            )
+        min_bytes = rule.get("min_bytes")
+        if min_bytes is not None and (
+            not isinstance(min_bytes, int)
+            or isinstance(min_bytes, bool)
+            or min_bytes < 0
+        ):
+            raise SchemaError(f"{rule_where}.min_bytes: 必须是非负整数")
+        check = rule.get("check")
+        if check is not None and check != "json":
+            raise SchemaError(f"{rule_where}.check: 仅支持 'json'")
+        has_key = rule.get("has_key")
+        if has_key is not None and (
+            not isinstance(has_key, str)
+            or not has_key
+            or "\0" in has_key
+            or len(has_key) > MAX_PATTERN_LENGTH
+        ):
+            raise SchemaError(f"{rule_where}.has_key: 必须是非空字符串")
+        regex = rule.get("regex")
+        if regex is not None:
+            _validate_regex(regex, f"{rule_where}.regex")
+        if not paths_escape:
+            expanded_path = expand_path(path, cfg, cwd_abs)
+            _check_path_in_cwd(expanded_path, cwd_abs, rule_where)
+    try:
+        encoded_size = len(
+            json.dumps(
+                artifacts,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise SchemaError(f"{where}: 无法序列化产物规则: {exc}") from exc
+    if encoded_size > MAX_ARTIFACT_RULE_BYTES:
+        raise SchemaError(
+            f"{where}: 规则总大小超过 {MAX_ARTIFACT_RULE_BYTES} bytes"
+        )
+    return artifacts
+
+
 def validate_batch(spec: dict, cfg: dict) -> dict:
     """校验整个 batch.json, 返回规范化后的 spec (模板已展开, cwd 已归一化).
 
@@ -406,29 +576,22 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
     if not isinstance(spec, dict):
         raise SchemaError("batch.json 顶层必须是 JSON 对象")
 
-    name = spec.get("name")
-    if not name or not isinstance(name, str):
-        raise SchemaError("缺少 name (批次名, 依赖按 name 引用)")
+    name = _validate_identifier(spec.get("name"), "name")
 
     mode = spec.get("mode", "mix")
     if mode != "mix":
         raise SchemaError(f"mode 目前仅支持 mix (实际 {mode})")
 
     depends_on = spec.get("depends_on", [])
-    if not isinstance(depends_on, list) or not all(
-        isinstance(d, str) for d in depends_on
-    ):
+    if not isinstance(depends_on, list):
         raise SchemaError("depends_on 必须是 [batch_name] 字符串数组")
+    for index, dependency in enumerate(depends_on):
+        _validate_identifier(dependency, f"depends_on[{index}]")
 
-    gpus = spec.get("gpus")
-    if gpus is not None and (
-        not isinstance(gpus, list) or not all(isinstance(g, int) for g in gpus)
-    ):
-        raise SchemaError("gpus 必须是卡号整数数组 (如 [0,1,2,3])")
+    if "gpus" in spec:
+        raise SchemaError("gpus: 批次级选卡未实现, 请使用 task.resources")
 
-    env = spec.get("env", {})
-    if not isinstance(env, dict):
-        raise SchemaError("env 必须是对象")
+    env = _validate_env(spec.get("env", {}), "env")
 
     # 批次级通知覆盖 (设计 §3): false = 本批不通知; {"email_to": [...]} 改收件人;
     # 缺省/true = 跟随全局 config.notify
@@ -461,12 +624,16 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
     # ({PROJECT:<project>})，而非 {ROOT}(=default_project) —— 否则 selfdist
     # 批次没写 cwd 时会在 veighna 仓库里跑、指纹也取错仓库 (GPU 隔离了但
     # cwd/指纹没隔离)。显式声明 cwd/{ROOT} 仍可覆盖。
-    batch_cwd = resolve_template(
-        spec.get("cwd", "{PROJECT:" + str(project) + "}"), cfg
-    )
-    batch_cwd_abs = os.path.realpath(
-        os.path.expanduser(batch_cwd)
-    )
+    batch_cwd = spec.get("cwd", "{PROJECT:" + str(project) + "}")
+    if (
+        not isinstance(batch_cwd, str)
+        or not batch_cwd
+        or "\0" in batch_cwd
+        or len(batch_cwd) > MAX_PATH_LENGTH
+    ):
+        raise SchemaError("cwd: 必须是有效且有界的路径字符串")
+    batch_cwd = resolve_template(batch_cwd, cfg)
+    batch_cwd_abs = os.path.realpath(os.path.expanduser(batch_cwd))
 
     tasks = spec.get("tasks")
     if not isinstance(tasks, list) or not tasks:
@@ -481,6 +648,7 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
     if sweep_spec is not None:
         tasks, batch_max_parallel = _expand_sweep(tasks, sweep_spec)
     else:
+        _check_normalized_task_count(len(tasks))
         batch_max_parallel = None
 
     norm_tasks = []
@@ -508,9 +676,9 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         # B13-§5: 进度正则 (daemon 周期从日志尾部提取, status 可视化)
         prx = t.get("progress_regex")
         if prx is not None:
-            if not isinstance(prx, str) or not prx.strip():
-                raise SchemaError(f"tasks[{i}].progress_regex: 必须是非空字符串")
-            nt["progress_regex"] = prx
+            nt["progress_regex"] = _validate_regex(
+                prx, f"tasks[{i}].progress_regex"
+            )
         norm_tasks.append(nt)
 
     project = spec.get("project")
@@ -525,7 +693,6 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
         "name": name,
         "mode": mode,
         "depends_on": depends_on,
-        "gpus": gpus,
         "cwd": spec.get("cwd", "{ROOT}"),
         "cwd_abs": batch_cwd_abs,
         "env": env,
@@ -542,18 +709,24 @@ def _validate_task(
     if not isinstance(t, dict):
         raise SchemaError(f"{where}: 任务必须是对象")
 
-    tid = t.get("id")
-    if not tid or not isinstance(tid, str):
-        raise SchemaError(f"{where}: 缺少 id")
+    tid = _validate_identifier(t.get("id"), f"{where}.id")
     if tid in seen_ids:
         raise SchemaError(f"{where}: 重复任务 id '{tid}'")
     seen_ids.add(tid)
 
     # cwd: 任务级覆盖 (任意目录, J 类)
     t_cwd_abs = batch_cwd_abs
-    if t.get("cwd"):
+    if "cwd" in t:
+        task_cwd = t["cwd"]
+        if (
+            not isinstance(task_cwd, str)
+            or not task_cwd
+            or "\0" in task_cwd
+            or len(task_cwd) > MAX_PATH_LENGTH
+        ):
+            raise SchemaError(f"{where}.cwd: 必须是有效且有界的路径字符串")
         t_cwd_abs = os.path.realpath(
-            os.path.expanduser(resolve_template(t["cwd"], cfg))
+            os.path.expanduser(resolve_template(task_cwd, cfg))
         )
 
     # cmd 数组
@@ -569,31 +742,23 @@ def _validate_task(
         cmd = None
         stage_specs = norm_stages
     else:
-        cmd = t.get("cmd")
-        if not isinstance(cmd, list) or not cmd:
-            raise SchemaError(f"{where}: 必须提供 cmd 数组 (或 stages 数组)")
-        _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd", cfg)
+        cmd = _validate_command(t.get("cmd"), f"{where}.cmd")
+        _check_sudo_tokens(cmd, f"{where}.cmd", cfg)
         # B15: I 类规则放宽 —— cmd[0] 自由格式。环境声明走可选 runtime 字段
         # (三通道) 或保留 {VENV:x} 语法糖；两者皆无 -> 放行, 由调用方打印警告
         # 并在指纹中省略环境分量 (git rev 仍锚定代码版本)。定案 Q1。
         stage_specs = None
 
-    # 产物路径 E4 校验
-    artifacts = t.get("artifacts", {})
-    if not isinstance(artifacts, dict):
-        raise SchemaError(f"{where}.artifacts: 必须是对象")
-    for key, a in artifacts.items():
-        if not isinstance(a, dict) or not a.get("path"):
-            raise SchemaError(f"{where}.artifacts.{key}: 缺 path")
-        # M14: min_bytes 未校验会在 reap 路径 int() ValueError 炸整轮
-        mb = a.get("min_bytes")
-        if mb is not None and (
-            not isinstance(mb, int) or isinstance(mb, bool) or mb < 0
-        ):
-            raise SchemaError(f"{where}.artifacts.{key}.min_bytes: 必须是非负整数")
-        if not t.get("paths_escape"):
-            p = expand_path(a["path"], cfg, t_cwd_abs)
-            _check_path_in_cwd(p, t_cwd_abs, f"{where}.artifacts.{key}")
+    paths_escape = t.get("paths_escape", False)
+    if not isinstance(paths_escape, bool):
+        raise SchemaError(f"{where}.paths_escape: 必须是布尔")
+    artifacts = _validate_artifacts(
+        t.get("artifacts", {}),
+        cfg,
+        t_cwd_abs,
+        f"{where}.artifacts",
+        paths_escape=paths_escape,
+    )
 
     # resources: {cpus: N, gpu: 0|1} —— gpu: 0 = CPU-only 任务 (不占 GPU 槽位, §5b B4)
     resources = t.get("resources", {})
@@ -605,7 +770,11 @@ def _validate_task(
             raise SchemaError(f"{where}.resources.cpus: 必须是正整数 (声明 CPU 配额)")
     gpu_req = resources.get("gpu", 1)  # 缺省 gpu=1 (向后兼容: 每卡一任务)
     # M14: bool 穿透 —— JSON true/false == 1/0, 与 cpus/vram 的排除保持一致
-    if isinstance(gpu_req, bool) or gpu_req not in (0, 1):
+    if (
+        not isinstance(gpu_req, int)
+        or isinstance(gpu_req, bool)
+        or gpu_req not in (0, 1)
+    ):
         raise SchemaError(f"{where}.resources.gpu: 必须是 0 (CPU-only) 或 1 (占 1 GPU)")
     resources = dict(resources)
     resources["gpu"] = gpu_req
@@ -614,93 +783,103 @@ def _validate_task(
     # co-location (§3.2e 待定项 2, 定案 39): gpu_share 必须声明 vram_gib (GiB,
     # 装箱必须有名数, 缺省 = 无法装箱); vram_gib 非法值拒绝.
     gpu_share = resources.get("gpu_share", False)
-    if gpu_share not in (True, False):
+    if not isinstance(gpu_share, bool):
         raise SchemaError(f"{where}.resources.gpu_share: 必须是布尔")
     vram = resources.get("vram_gib")
-    if gpu_share:
-        if vram is None:
-            raise SchemaError(
-                f"{where}.resources: gpu_share=true 必须声明 vram_gib (GiB 峰值)"
-            )
-        if not isinstance(vram, (int, float)) or isinstance(vram, bool) or vram <= 0:
-            raise SchemaError(f"{where}.resources.vram_gib: 必须是正数 (GiB)")
-    elif vram is not None and (
-        not isinstance(vram, (int, float)) or isinstance(vram, bool) or vram <= 0
-    ):
-        raise SchemaError(f"{where}.resources.vram_gib: 必须是正数 (GiB)")
+    if gpu_share and vram is None:
+        raise SchemaError(
+            f"{where}.resources: gpu_share=true 必须声明 vram_gib (GiB 峰值)"
+        )
+    if vram is not None and not _is_finite_positive_number(vram):
+        raise SchemaError(f"{where}.resources.vram_gib: 必须是有限正数 (GiB)")
     resources["gpu_share"] = gpu_share
     if vram is not None:
         resources["vram_gib"] = float(vram)
     profile_key = resources.get("profile_key")
-    if profile_key is not None and not isinstance(profile_key, str):
-        raise SchemaError(f"{where}.resources.profile_key: 必须是字符串")
-
-    # retry_transform / probes 透传
-    retry_transform = t.get("retry_transform")
-    probes = t.get("probes")
-    duration_min = t.get("duration_min")
-    if duration_min is not None and (
-        not isinstance(duration_min, (int, float)) or isinstance(duration_min, bool)
+    if profile_key is not None and (
+        not isinstance(profile_key, str)
+        or not profile_key
+        or len(profile_key) > MAX_PATTERN_LENGTH
     ):
-        raise SchemaError(f"{where}.duration_min: 必须是数字 (分钟)")
+        raise SchemaError(f"{where}.resources.profile_key: 必须是非空字符串")
+
+    if "retry_transform" in t:
+        raise SchemaError(f"{where}.retry_transform: 未实现, 不接受该字段")
+    probes = t.get("probes")
+    if probes is not None:
+        if not isinstance(probes, dict):
+            raise SchemaError(f"{where}.probes: 必须是对象")
+        unknown_probes = set(probes) - {"fail_on_log", "ready_on_log"}
+        if unknown_probes:
+            raise SchemaError(
+                f"{where}.probes: 未知规则 {sorted(unknown_probes)!r}"
+            )
+        for probe_name, pattern in probes.items():
+            _validate_regex(pattern, f"{where}.probes.{probe_name}")
+
+    duration_min = t.get("duration_min")
+    if duration_min is not None and not _is_finite_positive_number(duration_min):
+        raise SchemaError(f"{where}.duration_min: 必须是有限正数 (分钟)")
     # M14: max_retry 原先完全未校验 —— 字符串/负数会在 dispatcher 比较处
     # TypeError 炸掉整轮 reap
     max_retry = t.get("max_retry", 1)
     if not isinstance(max_retry, int) or isinstance(max_retry, bool) or max_retry < 0:
         raise SchemaError(f"{where}.max_retry: 必须是非负整数")
 
-    project = t.get("project")
-    if project is not None and not isinstance(project, str):
-        raise SchemaError(f"{where}.project: 必须是字符串")
+    if "project" in t:
+        raise SchemaError(
+            f"{where}.project: 未实现任务级覆盖; 项目必须在 batch.project 声明"
+        )
+
+    task_git = t.get("git")
+    if task_git is not None and not isinstance(task_git, bool):
+        raise SchemaError(f"{where}.git: 必须是布尔")
+    task_env = _validate_env(t.get("env", {}), f"{where}.env")
 
     return {
         "id": tid,
         "cmd": cmd,
         "stages": stage_specs,
         "cwd_abs": t_cwd_abs,
-        "git": t.get("git"),  # None=自动探测
-        "env": t.get("env", {}),
+        "git": task_git,  # None=自动探测
+        "env": task_env,
         "resources": resources,
         "duration_min": duration_min,
         "max_retry": max_retry,
         "artifacts": artifacts,
-        "retry_transform": retry_transform,
         "probes": probes,
-        "paths_escape": t.get("paths_escape", False),
-        "project": project,
+        "paths_escape": paths_escape,
     }
 
 
 def _validate_stage(s: Any, cfg: dict, t_cwd_abs: str, where: str) -> dict:
     if not isinstance(s, dict):
         raise SchemaError(f"{where}: stage 必须是对象")
-    cmd = s.get("cmd")
-    if not isinstance(cmd, list) or not cmd:
-        raise SchemaError(f"{where}: 缺 cmd 数组")
-    _check_sudo_tokens([str(c) for c in cmd], f"{where}.cmd", cfg)
+    cmd = _validate_command(s.get("cmd"), f"{where}.cmd")
+    _check_sudo_tokens(cmd, f"{where}.cmd", cfg)
     # B15: stage 级同样放开 cmd[0] (runtime 为任务级声明, stages 继承)
 
-    artifacts = s.get("artifacts", {})
-    if not isinstance(artifacts, dict):
-        raise SchemaError(f"{where}.artifacts: 必须是对象")
-    for key, a in artifacts.items():
-        if not isinstance(a, dict) or not a.get("path"):
-            raise SchemaError(f"{where}.artifacts.{key}: 缺 path")
-        mb = a.get("min_bytes")
-        if mb is not None and (
-            not isinstance(mb, int) or isinstance(mb, bool) or mb < 0
-        ):
-            raise SchemaError(f"{where}.artifacts.{key}.min_bytes: 必须是非负整数")
-        if not s.get("paths_escape"):
-            p = expand_path(a["path"], cfg, t_cwd_abs)
-            _check_path_in_cwd(p, t_cwd_abs, f"{where}.artifacts.{key}")
+    if "retry_transform" in s:
+        raise SchemaError(f"{where}.retry_transform: 未实现, 不接受该字段")
+    if "probes" in s:
+        raise SchemaError(f"{where}.probes: stage 级探测未实现, 不接受该字段")
+    if "env" in s:
+        raise SchemaError(f"{where}.env: stage 级环境变量未实现, 不接受该字段")
+    paths_escape = s.get("paths_escape", False)
+    if not isinstance(paths_escape, bool):
+        raise SchemaError(f"{where}.paths_escape: 必须是布尔")
+    artifacts = _validate_artifacts(
+        s.get("artifacts", {}),
+        cfg,
+        t_cwd_abs,
+        f"{where}.artifacts",
+        paths_escape=paths_escape,
+    )
 
     return {
         "cmd": cmd,
         "artifacts": artifacts,
-        "probes": s.get("probes"),
-        "retry_transform": s.get("retry_transform"),
-        "paths_escape": s.get("paths_escape", False),
+        "paths_escape": paths_escape,
     }
 
 
@@ -722,6 +901,11 @@ def _expand_sweep(tasks: list[dict], sweep: Any) -> tuple[list[dict], int | None
         if not isinstance(vs, list) or not vs:
             raise SchemaError(f"sweep.matrix.{k}: 必须是非空数组")
         val_sets.append([str(v) for v in vs])
+
+    combination_count = 1
+    for values in val_sets:
+        combination_count *= len(values)
+    _check_normalized_task_count(len(tasks) * combination_count)
 
     mp = sweep.get("max_parallel")
     if mp is not None and (

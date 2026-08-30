@@ -18,6 +18,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 set -u
 cd "$(dirname "$0")/.."   # 仓库根 (standalone 布局: tests/ 的上一级)
 PY=${PY:-$(command -v python3 || echo python3)}
+source tests/acceptance_cleanup.sh
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -28,7 +29,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -42,7 +42,7 @@ d = json.load(sys.stdin)
 bn = '$bn'; want = '$want'
 n = 0
 for j in d['jobs']:
-    if j['batch'].split('-')[0] == bn and j['status'] == want:
+    if j['batch_name'] == bn and j['status'] == want:
         n += 1
 print(n)
 "
@@ -86,7 +86,7 @@ echo "=== F2 事故快照验收 (fake-gpu) ==="
 
 # ---------- 场景 1+2: 共享装箱 OOM -> 快照 + diag 集成 ----------
 echo "--- 场景 1: 共享装箱 OOM -> 快照 (co_runners 非空) ---"
-S1=/tmp/sched_inc1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-incident-oom"
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
@@ -154,7 +154,7 @@ echo "$DIAG_OUT" | grep -qE "判读假设|邻居:" && ok "diag 有判读/邻居�
 
 # ---------- 场景 3: 外部进程判定 (unit, 不起 daemon) ----------
 echo "--- 场景 3: external pid 判定 ---"
-S3=/tmp/sched_inc3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-incident-external"
 mk_config $S3
 cat > $S3/unit_ext.py << 'UNITPY'
 import json, os
@@ -184,7 +184,7 @@ CLEAN_OUT=$(SCHED_STATE=$S3 $PY $S3/unit_clean.py)
 
 # ---------- 场景 4: 裁剪 (unit) — 双限 + blocked 豁免 ----------
 echo "--- 场景 4: prune 裁剪 ---"
-S4=/tmp/sched_inc4; rm -rf $S4; mkdir -p $S4
+sched_accept_make_root S4 "sched-incident-prune"
 mk_config $S4
 cat > $S4/unit_prune.py << 'UNITPY'
 from gsched import state
@@ -210,7 +210,7 @@ PRUNE_OUT=$(SCHED_STATE=$S4 $PY $S4/unit_prune.py)
   || bad "裁剪结果异常: $PRUNE_OUT (期望 7:5:2)"
 
 echo "--- 场景 5: TTL 删除也保留 blocked 证据 ---"
-S5=/tmp/sched_inc5; rm -rf $S5; mkdir -p $S5
+sched_accept_make_root S5 "sched-incident-ttl"
 mk_config $S5
 cat > $S5/unit_ttl.py << 'UNITPY'
 from gsched import state

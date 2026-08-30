@@ -2,7 +2,9 @@
 # L4: read-only config get must work from a login node.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-config-guard"
+export SCHED_STATE
 cat > "$SCHED_STATE/config.json" <<EOF
 {
   "schema_version": 1, "user": "t", "node": "compute-node", "state_dir": "$SCHED_STATE",

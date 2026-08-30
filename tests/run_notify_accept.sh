@@ -20,6 +20,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
@@ -58,7 +59,6 @@ start_fake() { # $1=state_dir
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -81,7 +81,7 @@ echo "=== 批次终态通知验收 (fake-gpu) ==="
 
 # ---------- 场景 1: 批次 done -> .done.json ----------
 echo "--- 场景 1: 批次 done -> inbox 落 .done.json ---"
-S1=/tmp/sched_ntf1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-notify-done"
 mk_config $S1 '{"file": {}}'
 cat > $S1/batch.json << EOF
 {
@@ -110,7 +110,7 @@ stop_daemon $S1
 
 # ---------- 场景 2: 批次 blocked -> .blocked.json (failures 带日志路径) ----------
 echo "--- 场景 2: 批次 blocked -> .blocked.json ---"
-S2=/tmp/sched_ntf2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-notify-blocked"
 mk_config $S2 '{"file": {}}'
 cat > $S2/batch.json << EOF
 {
@@ -139,7 +139,7 @@ stop_daemon $S2
 
 # ---------- 场景 3: retry 解除 -> active 不重发; 再 done -> 仅各一封 ----------
 echo "--- 场景 3: unblock 不重发 + 终态各一封 ---"
-S3=/tmp/sched_ntf3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-notify-unblock"
 mk_config $S3 '{"file": {}}'
 # 首跑失败 (建 flag 后 exit 1), retry 后成功
 cat > $S3/batch.json << EOF
@@ -183,7 +183,7 @@ $PY -m gsched.cli notify-inbox --all 2>&1 | grep -q "n1" \
 
 # ---------- 场景 5: email 渠道异常不影响 file 渠道与批次收敛 ----------
 echo "--- 场景 5: email 渠道异常隔离 ---"
-S5=/tmp/sched_ntf5; rm -rf $S5; mkdir -p $S5
+sched_accept_make_root S5 "sched-notify-email"
 # smtp 指向 127.0.0.1:1 (拒连, 快速失败) + file 渠道
 mk_config $S5 '{"file": {}, "email": {"smtp_host": "127.0.0.1", "smtp_port": 1, "from": "sched@test", "to": ["x@test"]}}'
 cat > $S5/batch.json << EOF
@@ -208,7 +208,7 @@ stop_daemon $S5
 
 # ---------- 场景 6: 批次级 notify=false -> 不发 ----------
 echo "--- 场景 6: 批次级 notify=false ---"
-S6=/tmp/sched_ntf6; rm -rf $S6; mkdir -p $S6
+sched_accept_make_root S6 "sched-notify-disabled"
 mk_config $S6 '{"file": {}}'
 cat > $S6/batch.json << EOF
 {
@@ -232,7 +232,7 @@ stop_daemon $S6
 
 # ---------- 场景 7: command 渠道 (stdin 事件 JSON + rc!=0 降级) ----------
 echo "--- 场景 7: command 渠道 ---"
-S7=/tmp/sched_ntf7; rm -rf $S7; mkdir -p $S7
+sched_accept_make_root S7 "sched-notify-command"
 # sink 脚本: stdin 落盘 (模拟唤醒 agent 的接收端)
 cat > $S7/sink.sh << EOF
 #!/bin/bash
@@ -263,7 +263,7 @@ else
   bad "command 渠道未触发 (sink.json 不存在)"
 fi
 # rc!=0 降级: 换必败命令, file 渠道仍落盘
-S7B=/tmp/sched_ntf7b; rm -rf $S7B; mkdir -p $S7B
+sched_accept_make_root S7B "sched-notify-command-fail"
 mk_config $S7B "{\"file\": {}, \"command\": [\"$PY\", \"-c\", \"import sys; sys.exit(3)\"]}"
 cat > $S7B/batch.json << EOF
 {

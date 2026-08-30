@@ -18,6 +18,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
@@ -29,7 +30,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -40,11 +40,18 @@ count_status() {
   $PY -m gsched.cli status --json 2>/dev/null | \
     $PY -c "
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.loads(sys.stdin.read())
+except (json.JSONDecodeError, RecursionError):
+    print(-1)
+    raise SystemExit(0)
+if not isinstance(d, dict) or not isinstance(d.get('jobs'), list):
+    print(-1)
+    raise SystemExit(0)
 bn = '$bn'; want = '$want'
 n = 0
 for j in d['jobs']:
-    if j['batch'].split('-')[0] == bn and j['status'] == want:
+    if j['batch_name'] == bn and j['status'] == want:
         n += 1
 print(n)
 "
@@ -76,7 +83,7 @@ echo "=== cancel 排队任务验收 (fake-gpu) ==="
 
 # ---------- 场景 1+4: 批次级 cancel (running + pending) + Q4 下游告警 ----------
 echo "--- 场景 1+4: 批次 cancel 收敛 running + pending, 提示下游 ---"
-S1=/tmp/sched_acc_c1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-cancel-pending-1"
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
@@ -113,7 +120,7 @@ else
 fi
 # 批次级 cancel
 $PY -m gsched.cli cancel c1 --yes > $S1/cancel_out.txt 2>&1
-wait_status $S1 c1 cancelled 3 15 && ok "3 任务全部 cancelled (1 running kill + 2 pending 直标)" \
+wait_status $S1 c1 cancelled 3 30 && ok "3 任务全部 cancelled (1 running kill + 2 pending 直标)" \
   || bad "cancelled 数 != 3 (got $(count_status $S1 c1 cancelled))"
 [ "$(count_status $S1 c1 running)" = "0" ] && [ "$(count_status $S1 c1 pending)" = "0" ] \
   && ok "无 running/pending 残留" || bad "有 running/pending 残留"
@@ -121,13 +128,14 @@ grep -q "c1_down" $S1/cancel_out.txt && ok "Q4 下游依赖告警输出 (c1_down
   || bad "Q4 告警缺失 (输出: $(cat $S1/cancel_out.txt))"
 # 批次收敛 blocked (cancelled 是终态)
 export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
-$PY -m gsched.cli status --json 2>/dev/null | grep -A2 '"name": "c1"' | grep -q '"status": "blocked"' \
+$PY -m gsched.cli status --json 2>/dev/null | \
+  $PY -c 'import json,sys; raise SystemExit(0 if any(b.get("name") == "c1" and b.get("status") == "blocked" for b in json.load(sys.stdin).get("batches", [])) else 1)' \
   && ok "批次 c1 收敛 blocked" || bad "批次 c1 未收敛 blocked"
 stop_daemon $S1
 
 # ---------- 场景 2+3: 任务级 cancel 只取消单个 ----------
 echo "--- 场景 2+3: 任务级 cancel <batch>:<task> 只取消单个 ---"
-S2=/tmp/sched_acc_c2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-cancel-pending-2"
 mk_config $S2
 cat > $S2/batch.json << EOF
 {
@@ -155,7 +163,7 @@ sleep 1
   || bad "取消输出未指明任务 (输出: $(cat $S2/cancel2_out.txt))"
 # 收尾: 批次 cancel 全杀 (t1 running + t3 pending)
 $PY -m gsched.cli cancel c2 --yes >/dev/null 2>&1
-wait_status $S2 c2 cancelled 3 15 && ok "批次 cancel 收尾: 3 任务全 cancelled" \
+wait_status $S2 c2 cancelled 3 30 && ok "批次 cancel 收尾: 3 任务全 cancelled" \
   || bad "收尾 cancelled 数 != 3 (got $(count_status $S2 c2 cancelled))"
 
 stop_daemon $S2

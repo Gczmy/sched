@@ -7,7 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
+import io
 import json
+import math
 import os
 import re
 import shlex
@@ -19,6 +23,7 @@ from datetime import datetime
 from typing import Any
 
 from . import state, __version__
+from . import artifacts
 from .executor import PROGRESS_RE
 from .config import (
     ConfigError,
@@ -59,14 +64,23 @@ def _ensure_running_locked() -> str:
 
 
 
-def _batch_id_from_name(name: str) -> str | None:
-    """batch name -> 最新批次 id (带时间戳). 找不到返回 None."""
-    with state.connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (name,),
+def _resolve_batch_ref(ref: str, conn=None) -> str | None:
+    """Resolve an exact batch ID first, otherwise the latest matching name."""
+    def resolve(db) -> str | None:
+        row = db.execute("SELECT id FROM batches WHERE id=?", (ref,)).fetchone()
+        if row:
+            return row["id"]
+        row = db.execute(
+            "SELECT id FROM batches WHERE name=?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (ref,),
         ).fetchone()
-    return row["id"] if row else None
+        return row["id"] if row else None
+
+    if conn is not None:
+        return resolve(conn)
+    with state.connect() as db:
+        return resolve(db)
 
 
 def _parse_task_ref(ref: str) -> tuple[str, str]:
@@ -89,7 +103,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if os.path.exists(p):
         print(f"config.json 已存在: {p} (如需重建请先删除)", file=sys.stderr)
         return 1
-    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    state.ensure_private_directory(os.path.dirname(p) or ".")
     cfg = {
         "schema_version": 1,
         "user": input(f"运行账户 [{os.environ.get('USER','')}]: ").strip()
@@ -147,7 +161,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # M16: 原子写 —— 崩溃不留截断的 config.json (截断会导致 load_config 全线报错)
     tmp_p = p + ".tmp"
-    with open(tmp_p, "w", encoding="utf-8") as f:
+    with state.open_private_text(tmp_p, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.replace(tmp_p, p)
     print(f"已生成 {p}")
@@ -156,102 +170,130 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
-    """§G4 A 类 dry-run: 纯只读预览 (不写 state).
-
-    返回 {"tasks": [{id, cmd_flat, stage_preds, skip, reason}],
-          "dep_status": {name: (status, n_done, n_total)}, "git_rev"}.
-    skip 预测 = 产物指纹有效 (A2) 且规则校验通过 (D8) -> skip;
-    依赖就绪 = depends_on 上游当前状态 (O1 name->id 解析, 一次 SELECT).
-    """
+    """Build a read-only preview using the same trust boundaries as execution."""
     from .artifacts import check_artifact
     from .fingerprint import compute_fingerprint
 
-
-    def _pred_stage(cmd_e: list[str], arts: dict, cwd_abs: str) -> tuple[str, str]:
-        """单 stage 预测: (skip/run, 原因). 产物路径相对 cwd 解析."""
-        if not arts:
-            return "run", "无产物声明 (必跑)"
-        bad: list[str] = []
-        for key, a in arts.items():
-            p = a.get("path")
-            if p and not os.path.isabs(p):
-                p = os.path.normpath(os.path.join(cwd_abs, p))
-            r = check_artifact(p or "", a)
-            if r is not None:
-                bad.append(f"{key}:{r}")
-        if bad:
-            return "run", "产物缺失/无效: " + "; ".join(bad)
-        return "skip", "产物已就绪且规则通过"
-
-    # 1) 展开命令 + skip 预测 (逐 stage, 对齐 dispatcher._should_skip 语义)
-    venv_paths = cfg.get("venvs", {})
-    preview_tasks = []
-    git_rev: str | None = None
-    n_skip = 0
-    n_run = 0
-    for t in norm["tasks"]:
-        cwd_abs = t["cwd_abs"]
-        stage_art: dict[int, dict] = {}
-        if t["stages"]:
-            stages_e = []
-            stage_preds = []
-            for j, s in enumerate(t["stages"]):
-                stage_art[j] = s["artifacts"]
-                cmd_e = expand_cmd(s["cmd"], cfg, stage_art, cwd_abs)
-                stages_e.append(cmd_e)
-                # 指纹 (A2): 展开 cmd + git rev + venv
-                fp, _, rev = compute_fingerprint(
-                    None, [{"cmd": cmd_e}], cwd_abs, t["git"], venv_paths,
-                    runtime_prefix=t.get("runtime_prefix"),
-                )
-                git_rev = rev or git_rev
-                st, why = _pred_stage(cmd_e, s["artifacts"], cwd_abs)
-                stage_preds.append({"stage": j, "skip": st == "skip", "reason": why})
-                if st == "skip":
-                    n_skip += 1
-                else:
-                    n_run += 1
-            preview_tasks.append({
-                "id": t["id"],
-                "cmd_flat": " && ".join(" ".join(c) for c in stages_e),
-                "stages": stage_preds,
-                "skip": all(p["skip"] for p in stage_preds),
-            })
-        else:
-            cmd_e = expand_cmd(t["cmd"], cfg, None, cwd_abs)
-            fp, _, rev = compute_fingerprint(
-                cmd_e, None, cwd_abs, t["git"], venv_paths,
-                runtime_prefix=t.get("runtime_prefix"),
-            )
-            git_rev = rev or git_rev
-            st, why = _pred_stage(cmd_e, t["artifacts"], cwd_abs)
-            if st == "skip":
-                n_skip += 1
-            else:
-                n_run += 1
-            preview_tasks.append({
-                "id": t["id"],
-                "cmd_flat": " ".join(cmd_e),
-                "stages": [{"stage": 0, "skip": st == "skip", "reason": why}],
-                "skip": st == "skip",
-            })
-
-    # 2) 依赖就绪预览 (O1): depends_on name -> 最新批次 id + 状态
+    producer_fps: dict[tuple[str | None, str], str] = {}
     dep_status: dict[str, str] = {}
     if use_state:
         with state.connect() as conn:
+            producers = conn.execute(
+                "SELECT project, task_id, fingerprint FROM jobs"
+                " WHERE status IN ('done','skip') AND fingerprint IS NOT NULL"
+                " ORDER BY finished_at DESC, rowid DESC"
+            ).fetchall()
+            for row in producers:
+                key = (row["project"], row["task_id"])
+                producer_fps.setdefault(key, row["fingerprint"])
             for dep in norm["depends_on"]:
                 row = conn.execute(
-                    "SELECT id, status FROM batches WHERE name=?"
+                    "SELECT status FROM batches WHERE name=?"
                     " ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     (dep,),
                 ).fetchone()
-                if row:
-                    dep_status[dep] = row["status"]
-                else:
-                    dep_status[dep] = "NOT_FOUND"
+                dep_status[dep] = row["status"] if row else "NOT_FOUND"
     else:
         dep_status = {dep: "UNAVAILABLE" for dep in norm["depends_on"]}
+
+    def predict_task(
+        task: dict, fingerprint: str | None, artifacts: dict, cwd_abs: str
+    ) -> tuple[bool, str]:
+        if task.get("_force_rerun"):
+            return False, "force_rerun=true (必跑)"
+        if not artifacts:
+            return False, "无产物声明 (必跑)"
+        producer = producer_fps.get(
+            (task.get("project", norm.get("project")), task["id"])
+        )
+        if not producer or not fingerprint or producer != fingerprint:
+            return False, "无可信匹配的 producer fingerprint (必跑)"
+        failures: list[str] = []
+        for key, rule in artifacts.items():
+            path = rule.get("path")
+            if path and not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(cwd_abs, path))
+            result = check_artifact(path or "", rule)
+            if result is not None:
+                failures.append(f"{key}:{result}")
+        if failures:
+            return False, "产物缺失/无效: " + "; ".join(failures)
+        return True, "producer fingerprint 匹配且产物规则通过"
+
+    venv_paths = cfg.get("venvs", {})
+    preview_tasks: list[dict[str, Any]] = []
+    git_rev: str | None = None
+    n_skip = 0
+    n_run = 0
+    for task in norm["tasks"]:
+        cwd_abs = task["cwd_abs"]
+        if task["stages"]:
+            expanded_stages: list[list[str]] = []
+            stage_artifacts: dict[int, dict] = {}
+            fingerprint_stages: list[dict] = []
+            for index, stage in enumerate(task["stages"]):
+                stage_artifacts[index] = stage["artifacts"]
+                expanded = expand_cmd(
+                    stage["cmd"], cfg, stage_artifacts, cwd_abs
+                )
+                expanded_stages.append(expanded)
+                fingerprint_stages.append({"cmd": expanded})
+            _, _, rev = compute_fingerprint(
+                None,
+                fingerprint_stages,
+                cwd_abs,
+                task["git"],
+                venv_paths,
+                runtime_prefix=task.get("runtime_prefix"),
+            )
+            git_rev = rev or git_rev
+            reason = (
+                "force_rerun=true (必跑)"
+                if task.get("_force_rerun")
+                else "新提交无可信 stage checkpoint sidecar (必跑)"
+            )
+            stage_preds = [
+                {"stage": index, "skip": False, "reason": reason}
+                for index in range(len(expanded_stages))
+            ]
+            n_run += len(stage_preds)
+            preview_tasks.append(
+                {
+                    "id": task["id"],
+                    "cmd_flat": " && ".join(
+                        " ".join(command) for command in expanded_stages
+                    ),
+                    "stages": stage_preds,
+                    "skip": False,
+                }
+            )
+            continue
+
+        expanded = expand_cmd(task["cmd"], cfg, None, cwd_abs)
+        fingerprint, _, rev = compute_fingerprint(
+            expanded,
+            None,
+            cwd_abs,
+            task["git"],
+            venv_paths,
+            runtime_prefix=task.get("runtime_prefix"),
+        )
+        git_rev = rev or git_rev
+        skip, reason = predict_task(
+            task, fingerprint, task["artifacts"], cwd_abs
+        )
+        if skip:
+            n_skip += 1
+        else:
+            n_run += 1
+        preview_tasks.append(
+            {
+                "id": task["id"],
+                "cmd_flat": " ".join(expanded),
+                "stages": [{"stage": 0, "skip": skip, "reason": reason}],
+                "skip": skip,
+            }
+        )
 
     return {
         "tasks": preview_tasks,
@@ -263,6 +305,9 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
 
 
 def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, conflict: bool) -> None:
+    if args.json:
+        print(json.dumps(prev, ensure_ascii=False, indent=2))
+        return
     print(f"=== dry-run: {norm['name']} ({len(norm['tasks'])} 任务, mode={norm['mode']}) ===")
     if conflict:
         print("  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
@@ -293,8 +338,6 @@ def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, con
     print(f"  将跑 {prev['n_run']} / 将 skip {prev['n_skip']} / 共 {len(norm['tasks'])} 任务")
     if prev["git_rev"]:
         print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
-    if args.json:
-        print(json.dumps(prev, ensure_ascii=False, indent=2))
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -314,8 +357,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(f"校验失败: {e}", file=sys.stderr)
         return 1
 
-    # B12-b: 项目级 colocate 禁用提示 (dry-run 与实提交都看得到)
-    _warn_colocate_disabled(norm, cfg)
+    diagnostic_stream = (
+        sys.stderr
+        if getattr(args, "dry_run", False) and getattr(args, "json", False)
+        else sys.stdout
+    )
+    _warn_colocate_disabled(norm, cfg, stream=diagnostic_stream)
 
     # B18: 用户站点包检测提示 (配置了 PYTHONNOUSERSITE 隔离后不再打扰)
     if not (_load_cfg().get("task_default_env") or {}).get("PYTHONNOUSERSITE"):
@@ -323,9 +370,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
         _hits = [d for d in _glob.glob(os.path.expanduser(
             "~/.local/lib/python3.*/site-packages")) if os.listdir(d)]
         if _hits:
-            print(f"ℹ️ 检测到用户站点包 ({_hits[0]} 非空)。若任务 import 到"
-                    "非预期来源的包, 可在 config 设 "
-                    'task_default_env.PYTHONNOUSERSITE="1" 隔离')
+            print(
+                f"ℹ️ 检测到用户站点包 ({_hits[0]} 非空)。若任务 import 到"
+                "非预期来源的包, 可在 config 设 "
+                'task_default_env.PYTHONNOUSERSITE="1" 隔离',
+                file=diagnostic_stream,
+            )
 
     # B15: 未声明运行环境的任务 -> 一次性警告
     _unwarn = [t["id"] for t in norm.get("tasks", [])
@@ -334,36 +384,51 @@ def cmd_submit(args: argparse.Namespace) -> int:
                and not any("{VENV:" in str(c) for st in (t.get("stages") or [])
                            for c in (st.get("cmd") or []))]
     if _unwarn:
-        print(f"⚠️ 任务 {', '.join(_unwarn)} 未声明运行环境"
-              " ({VENV} 或 runtime 字段), 指纹仅含 git rev")
+        print(
+            f"⚠️ 任务 {', '.join(_unwarn)} 未声明运行环境"
+            " ({VENV} 或 runtime 字段), 指纹仅含 git rev",
+            file=diagnostic_stream,
+        )
 
     from datetime import datetime
 
     # M13: 批次 id 到毫秒 (与 cmd_run 一致) —— 秒级精度下同秒重提/并发 submit
     # 撞主键抛裸 IntegrityError; 毫秒 + IntegrityError 兜底友好报错
     bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-    foreign_write = _is_foreign_host(cfg) and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE")
+    foreign_write = (
+        _is_foreign_host(cfg)
+        and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1"
+    )
     if foreign_write:
         bid = f"{bid}-{uuid.uuid4().hex[:12]}"
     dry_run = bool(getattr(args, "dry_run", False))
+    stateless_dry_run = dry_run and (
+        foreign_write or not os.path.isfile(state.db_path())
+    )
 
     # B27/C2: 网关 submit 只投递 inbox 文件; control_requests 由计算节点
     # daemon 每轮扫描后本地写入, 避免 NFS+WAL 跨主机双写。该分支必须
     # 位于所有 state.connect() 之前。
     if foreign_write and not dry_run:
-        with state.submission_lock():
-            if state.submission_shutdown_active():
-                print(
-                    "错误: daemon 正在退出，未投递 payload；请先恢复 daemon 后重试",
-                    file=sys.stderr,
+        tmp_path: str | None = None
+        payload_path: str | None = None
+        renamed = False
+        try:
+            with state.submission_lock():
+                if state.submission_shutdown_active():
+                    print(
+                        "错误: daemon 正在退出，未投递 payload；请先恢复 daemon 后重试",
+                        file=sys.stderr,
+                    )
+                    return 2
+                inbox_dir = state.submission_inbox_dir()
+                state.ensure_private_directory(inbox_dir)
+                payload_path = os.path.join(
+                    inbox_dir,
+                    f"submit-{uuid.uuid4().hex}.json",
                 )
-                return 2
-            inbox_dir = state.submission_inbox_dir()
-            os.makedirs(inbox_dir, exist_ok=True)
-            payload_path = os.path.join(inbox_dir, f"submit-{uuid.uuid4().hex}.json")
-            tmp_path = payload_path + ".tmp"
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as pf:
+                tmp_path = payload_path + ".tmp"
+                with state.open_private_text(tmp_path, "w") as pf:
                     json.dump(
                         {
                             "spec": spec,
@@ -375,14 +440,40 @@ def cmd_submit(args: argparse.Namespace) -> int:
                         ensure_ascii=False,
                         indent=2,
                     )
+                    pf.flush()
+                    os.fsync(pf.fileno())
                 os.replace(tmp_path, payload_path)
-            except Exception:
+                renamed = True
+                directory_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                inbox_fd = os.open(inbox_dir, directory_flags)
+                try:
+                    os.fsync(inbox_fd)
+                finally:
+                    os.close(inbox_fd)
+        except Exception as exc:
+            if tmp_path is not None and not renamed:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-                raise
-        print(f"已投递: {bid} ({len(norm['tasks'])} 任务) -> {cfg.get('node')} (inbox)")
+            if renamed:
+                detail = f"; payload 保留在 {payload_path} 供诊断"
+            else:
+                detail = ""
+            print(
+                f"错误: inbox payload 持久化失败: {exc}{detail}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"已投递: {bid} ({len(norm['tasks'])} 任务) "
+            f"-> {cfg.get('node')} (inbox)"
+        )
         health = _daemon_health()
         heartbeat_age = health.get("heartbeat_age_s")
         tick_age = health.get("tick_ok_age_s")
@@ -395,9 +486,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
             print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
         return 0
 
-    # 登录节点 dry-run 不能创建/迁移/写入 state.db。依赖状态降级为
-    # UNAVAILABLE，实际提交时由 daemon 在同一数据库事务内重新解析。
-    if not (foreign_write and dry_run):
+    # Foreign-host or first-run dry-run cannot create/migrate/write state.db.
+    # Dependency and producer state is UNAVAILABLE; the daemon rechecks on submit.
+    if not stateless_dry_run:
         # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
         with state.connect() as conn:
             for dep in norm["depends_on"]:
@@ -478,8 +569,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     {
                         "cmd": stage_cmd,
                         "artifacts": s["artifacts"],
-                        "probes": s.get("probes"),
-                        "retry_transform": s.get("retry_transform"),
                         "paths_escape": s.get("paths_escape", False),
                     }
                 )
@@ -488,7 +577,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             runtime_prefix=t.get("runtime_prefix"),
         )
         prepared_tasks.append((i, t, cmd_e, stages_e, fp, stage_fps))
-    if foreign_write and dry_run:
+    if stateless_dry_run:
         prev = _dry_run_preview(norm, cfg, use_state=False)
         _print_dry_run_preview(norm, args, prev, conflict=False)
         return 0
@@ -520,7 +609,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         try:
             state.insert_batch(
                 conn, bid, norm["name"], norm["mode"], norm["depends_on"],
-                norm["gpus"], norm["cwd"], norm["env"], norm.get("notify"),
+                None, norm["cwd"], norm["env"], norm.get("notify"),
                 norm.get("project"), norm.get("priority", 0),
             )
         except sqlite3.IntegrityError:
@@ -540,7 +629,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "duration_min": t["duration_min"],
                 "max_retry": t["max_retry"],
                 "artifacts": t["artifacts"],
-                "retry_transform": t["retry_transform"],
+                "paths_escape": t.get("paths_escape", False),
                 "probes": t["probes"],
                 "max_parallel": t.get("max_parallel"),
                 # B13: 透传新增任务级字段 (漏传 = 功能静默失效, force_rerun 曾中招)
@@ -557,15 +646,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
                 fp, stage_fps, norm.get("project"),
             )
-        conn.commit()
-        wake_result = _ensure_running_locked()
-
+    wake_deferred = state.defer_after_commit(_ensure_running_locked)
     # BugFix (2026-08-26, sd_repro_v3 消失事故): "已入队"/ensure_running 此前
     # 在 with 事务块**内部** —— commit 发生在块退出时, 若 ensure_running 抛
     # 异常 (如 NFS 读配置瞬断 -> ConfigError), 整个事务回滚但 "已入队" 已
     # 打印, 用户以为成功实际批次消失。打印必须在提交之后。
     print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
-    print(wake_result)
+    if not wake_deferred:
+        print(_ensure_running_locked())
     return 0
 
 
@@ -653,7 +741,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "artifacts": (
             {"out": {"path": args.out}} if args.out else {}
         ),
-        "retry_transform": None,
+        "paths_escape": bool(args.out and os.path.isabs(args.out)),
         "probes": None,
     }
 
@@ -745,216 +833,530 @@ def _daemon_health() -> dict[str, Any]:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """B27: 提交凭证 —— 确认批次已真实持久化 (防吞批假成功)."""
-    cfg = _load_cfg()
-    name = args.batch.strip()
+    _load_cfg()
+    reference = args.batch.strip()
     with state.connect() as conn:
-        rows = conn.execute(
-            "SELECT id, name, status, created_at, project FROM batches"
-            " WHERE id=? OR name=? ORDER BY created_at DESC LIMIT 3",
-            (name, name),
-        ).fetchall()
-    if not rows:
-        print(f"❌ 未找到批次: {name}")
-        print("   可能原因: 登录节点直提被守护检查点覆盖; 请在计算节点重提或检查 submit_inbox")
+        batch_id = _resolve_batch_ref(reference, conn)
+        row = conn.execute(
+            "SELECT id, name, status, created_at, project FROM batches WHERE id=?",
+            (batch_id,),
+        ).fetchone() if batch_id else None
+    if not row:
+        print(f"❌ 未找到批次: {reference}")
+        print("   可能原因: 登录节点直提被守护检查点覆盖; 请检查 submit_inbox")
         return 1
-    print(f"✅ 批次已持久化:")
-    for r in rows:
-        print(f"   {r['id']} [{r['status']}] {r['created_at']} project={r['project'] or '-'}")
+    print("✅ 批次已持久化:")
+    print(
+        f"   {row['id']} [{row['status']}] {row['created_at']}"
+        f" project={row['project'] or '-'}"
+    )
     return 0
 
 
+def _encode_status_cursor(rank: int, created_at: str, rowid: int) -> str:
+    payload = json.dumps(
+        [rank, created_at, rowid],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_status_cursor(value: Any) -> tuple[int, str, int] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or len(value) > 1024:
+        raise ValueError("cursor 必须是有界字符串")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.b64decode(
+            padded.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        parsed = json.loads(raw.decode("utf-8"))
+        rank, created_at, rowid = parsed
+    except (
+        ValueError,
+        TypeError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as exc:
+        raise ValueError("无效 status cursor") from exc
+    if (
+        isinstance(rank, bool)
+        or rank not in (0, 1)
+        or not isinstance(created_at, str)
+        or not created_at
+        or isinstance(rowid, bool)
+        or not isinstance(rowid, int)
+        or rowid <= 0
+    ):
+        raise ValueError("无效 status cursor")
+    return rank, created_at, rowid
+
+
+def _encode_status_job_cursor(
+    created_at: str,
+    batch_rowid: int,
+    task_order: int,
+    task_id: str,
+    job_rowid: int,
+) -> str:
+    payload = json.dumps(
+        [created_at, batch_rowid, task_order, task_id, job_rowid],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_status_job_cursor(
+    value: Any,
+) -> tuple[str, int, int, str, int] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("job cursor 必须是有界字符串")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.b64decode(
+            padded.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        created_at, batch_rowid, task_order, task_id, job_rowid = json.loads(
+            raw.decode("utf-8")
+        )
+    except (
+        ValueError,
+        TypeError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as exc:
+        raise ValueError("无效 status job cursor") from exc
+    integers = (batch_rowid, task_order, job_rowid)
+    if (
+        not isinstance(created_at, str)
+        or not created_at
+        or not isinstance(task_id, str)
+        or not task_id
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in integers)
+        or batch_rowid <= 0
+        or task_order < 0
+        or job_rowid <= 0
+    ):
+        raise ValueError("无效 status job cursor")
+    return created_at, batch_rowid, task_order, task_id, job_rowid
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    """sched status [batch]: 三视图总览 + --json + --project (B11c)."""
+    """sched status [batch]: bounded, coherent latest-version current state."""
     cfg = _load_cfg()
-    out: dict[str, Any] = {"batches": [], "jobs": [], "gpus": []}
+    limit = max(1, min(1000, int(getattr(args, "limit", 200))))
+    out: dict[str, Any] = {
+        "schema_version": 1,
+        "limit": limit,
+        "batches": [],
+        "jobs": [],
+        "gpus": [],
+        "truncated": {"batches": False, "jobs": False},
+        "next_cursor": None,
+        "next_job_cursor": None,
+    }
+    try:
+        batch_cursor = _decode_status_cursor(
+            getattr(args, "cursor", None)
+        )
+        job_cursor = _decode_status_job_cursor(
+            getattr(args, "job_cursor", None)
+        )
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
     proj_filter = getattr(args, "project", None)
     if proj_filter and proj_filter not in cfg.get("projects", {}):
         known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "无"
-        print(f"错误: project 未在 config.projects 中定义: {proj_filter} (可选: {known})",
-              file=sys.stderr)
+        print(
+            f"错误: project 未在 config.projects 中定义: {proj_filter}"
+            f" (可选: {known})",
+            file=sys.stderr,
+        )
         return 1
-    # B26: 调度健康可见性 —— hb=进程活性, tick_ok=主循环真的在完成调度轮
     out["daemon_health"] = _daemon_health()
+    gpu_assignments: dict[int, list] = {}
 
     with state.connect() as conn:
-        batches = conn.execute(
-            "SELECT * FROM batches ORDER BY created_at DESC"
+        # Pin every query below to one SQLite view even when this command is
+        # called in writer mode by an in-process client.
+        conn.execute("BEGIN")
+        selected_batch_id = None
+        if getattr(args, "batch", None):
+            selected_batch_id = _resolve_batch_ref(args.batch, conn)
+            if not selected_batch_id:
+                print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+                return 1
+
+        state_rank_sql = (
+            "CASE WHEN b.status IN ('done','discarded','cancelled') THEN 1 ELSE 0 END"
+        )
+        batch_where: list[str] = []
+        batch_params: list[Any] = []
+        if selected_batch_id:
+            batch_where.append("b.id=?")
+            batch_params.append(selected_batch_id)
+        if proj_filter:
+            batch_where.append("b.project=?")
+            batch_params.append(proj_filter)
+        if batch_cursor is not None:
+            if selected_batch_id:
+                print(
+                    "错误: 指定批次时不能同时使用 --cursor",
+                    file=sys.stderr,
+                )
+                return 1
+            rank, created_at, rowid = batch_cursor
+            batch_where.append(
+                f"({state_rank_sql}>? OR "
+                f"({state_rank_sql}=? AND "
+                "(b.created_at<? OR "
+                "(b.created_at=? AND b.rowid<?))))"
+            )
+            batch_params.extend(
+                [rank, rank, created_at, created_at, rowid]
+            )
+        where_sql = (
+            " WHERE " + " AND ".join(batch_where) if batch_where else ""
+        )
+        batch_rows = conn.execute(
+            "SELECT b.*,"
+            f" {state_rank_sql} AS state_rank,"
+            " b.rowid AS batch_rowid,"
+            " (SELECT COUNT(*) FROM jobs j"
+            "   WHERE j.batch_id=b.id"
+            "     AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+            "       WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))"
+            " AS current_jobs,"
+            " (SELECT COUNT(*) FROM jobs j"
+            "   WHERE j.batch_id=b.id AND j.status IN ('done','skip')"
+            "     AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+            "       WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))"
+            " AS completed_jobs"
+            " FROM batches b"
+            + where_sql
+            + f" ORDER BY {state_rank_sql} ASC,"
+            " b.created_at DESC, b.rowid DESC LIMIT ?",
+            (*batch_params, limit + 1),
         ).fetchall()
-        if args.batch and not any(b["name"] == args.batch for b in batches):
-            # 与 history/cancel/retry/diag 一致: 批次名不存在要报错而非静默空表
-            print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
-            return 1
-        for b in batches:
-            if args.batch and b["name"] != args.batch:
-                continue
-            # B11c: 项目过滤 (batches.project 列; NULL = 旧数据/无项目)
-            if proj_filter and b["project"] != proj_filter:
-                continue
-            jobs = conn.execute(
-                "SELECT status FROM jobs WHERE batch_id=?", (b["id"],)
-            ).fetchall()
-            statuses = [j["status"] for j in jobs]
-            progress = f"{statuses.count('done') + statuses.count('skip')}/{len(statuses)}"
+        out["truncated"]["batches"] = len(batch_rows) > limit
+        batch_rows = batch_rows[:limit]
+        if out["truncated"]["batches"] and batch_rows:
+            last_batch = batch_rows[-1]
+            out["next_cursor"] = _encode_status_cursor(
+                int(last_batch["state_rank"]),
+                str(last_batch["created_at"]),
+                int(last_batch["batch_rowid"]),
+            )
+        visible_batch_ids = [row["id"] for row in batch_rows]
+        name_by_id = {row["id"]: row["name"] for row in batch_rows}
+        for batch in batch_rows:
+            batch_id = batch["id"]
+            batch_name = batch["name"]
             out["batches"].append(
                 {
-                    "id": b["id"], "name": b["name"], "mode": b["mode"],
-                    "status": b["status"], "depends_on": json.loads(b["depends_on"] or "[]"),
-                    "progress": progress,
-                    "project": b["project"] if "project" in b.keys() else None,
+                    "id": batch_id,
+                    "name": batch_name,
+                    "batch_id": batch_id,
+                    "batch_name": batch_name,
+                    "mode": batch["mode"],
+                    "status": batch["status"],
+                    "depends_on": json.loads(batch["depends_on"] or "[]"),
+                    "progress": (
+                        f"{batch['completed_jobs']}/{batch['current_jobs']}"
+                    ),
+                    "project": batch["project"],
+                    "revision": int(batch["revision"]),
                 }
             )
-        jobs = conn.execute("SELECT * FROM jobs ORDER BY rowid").fetchall()
-        # batch_id -> name 映射 (显示用, 避免截断 batch_id 丢 name 首字符)
-        name_by_id = {b["id"]: b["name"] for b in batches}
-        # task spec 的 resources 预加载 (batch_id, task_id, version) -> resources
-        # (带 version: resubmit 新版本改了 resources 时, 旧 job 显示旧 spec 的值)
-        res_by_task: dict[tuple[str, str, int], dict] = {}
-        for r in conn.execute("SELECT batch_id, id, version, spec FROM tasks").fetchall():
-            try:
-                spec = json.loads(r["spec"])
-            except (json.JSONDecodeError, TypeError):
-                spec = {}
-            res_by_task[(r["batch_id"], r["id"], r["version"])] = spec.get("resources") or {}
-        proj_batch_ids = None
-        if proj_filter:
-            proj_batch_ids = {
-                b["id"] for b in conn.execute(
-                    "SELECT id FROM batches WHERE project=?", (proj_filter,)
-                ).fetchall()
-            }
-        elif args.batch:
-            proj_batch_ids = {
-                b["id"] for b in conn.execute(
-                    "SELECT id FROM batches WHERE name=?", (args.batch,)
-                ).fetchall()
-            }
-        # B1: 配额排队标记 -- 项目 running GPU 任务数已达 gpu_quota 时,
-        # 该项目 pending 任务实际处于"等配额"状态, 视图层显式标注 (不落库)
-        running_gpu_by_proj: dict[str, int] = {}
-        for r in conn.execute(
-            "SELECT project, COUNT(*) AS n FROM jobs"
-            " WHERE status='running' AND gpu IS NOT NULL AND project IS NOT NULL"
-            " GROUP BY project"
-        ):
-            running_gpu_by_proj[r["project"]] = r["n"]
 
-        def _quota_wait(j) -> bool:
-            proj = j["project"] if "project" in j.keys() else None
-            if not proj or j["status"] != "pending":
+        latest_jobs = []
+        if visible_batch_ids:
+            placeholders = ",".join("?" for _ in visible_batch_ids)
+            job_cursor_sql = ""
+            job_cursor_params: list[Any] = []
+            if job_cursor is not None:
+                (
+                    job_created_at,
+                    job_batch_rowid,
+                    job_task_order,
+                    job_task_id,
+                    job_rowid,
+                ) = job_cursor
+                task_order_sql = "COALESCE(t.order_idx, 2147483647)"
+                job_cursor_sql = (
+                    " WHERE (b.created_at<?"
+                    " OR (b.created_at=? AND b.rowid<?)"
+                    f" OR (b.created_at=? AND b.rowid=? AND {task_order_sql}>?)"
+                    f" OR (b.created_at=? AND b.rowid=? AND {task_order_sql}=?"
+                    " AND j.task_id>?)"
+                    f" OR (b.created_at=? AND b.rowid=? AND {task_order_sql}=?"
+                    " AND j.task_id=? AND j.rowid>?))"
+                )
+                job_cursor_params = [
+                    job_created_at,
+                    job_created_at,
+                    job_batch_rowid,
+                    job_created_at,
+                    job_batch_rowid,
+                    job_task_order,
+                    job_created_at,
+                    job_batch_rowid,
+                    job_task_order,
+                    job_task_id,
+                    job_created_at,
+                    job_batch_rowid,
+                    job_task_order,
+                    job_task_id,
+                    job_rowid,
+                ]
+            latest_jobs = conn.execute(
+                "WITH latest AS ("
+                " SELECT batch_id, task_id, MAX(version) AS version"
+                " FROM jobs WHERE batch_id IN ("
+                + placeholders
+                + ") GROUP BY batch_id, task_id)"
+                " SELECT j.*, t.spec AS task_spec, t.order_idx AS task_order,"
+                " b.created_at AS job_batch_created_at,"
+                " b.rowid AS job_batch_rowid, j.rowid AS job_rowid,"
+                " COALESCE(t.order_idx, 2147483647) AS job_task_order"
+                " FROM jobs j JOIN latest l"
+                " ON j.batch_id=l.batch_id AND j.task_id=l.task_id"
+                " AND j.version=l.version"
+                " LEFT JOIN tasks t ON t.batch_id=j.batch_id"
+                " AND t.id=j.task_id AND t.version=j.version"
+                " JOIN batches b ON b.id=j.batch_id"
+                + job_cursor_sql
+                + " ORDER BY b.created_at DESC, b.rowid DESC,"
+                " COALESCE(t.order_idx, 2147483647), j.task_id, j.rowid"
+                " LIMIT ?",
+                (*visible_batch_ids, *job_cursor_params, limit + 1),
+            ).fetchall()
+        out["truncated"]["jobs"] = len(latest_jobs) > limit
+        latest_jobs = latest_jobs[:limit]
+        if out["truncated"]["jobs"] and latest_jobs:
+            last_job = latest_jobs[-1]
+            out["next_job_cursor"] = _encode_status_job_cursor(
+                str(last_job["job_batch_created_at"]),
+                int(last_job["job_batch_rowid"]),
+                int(last_job["job_task_order"]),
+                str(last_job["task_id"]),
+                int(last_job["job_rowid"]),
+            )
+
+        running_gpu_by_project = {
+            row["project"]: row["n"]
+            for row in conn.execute(
+                "WITH latest AS ("
+                " SELECT batch_id, task_id, MAX(version) AS version"
+                " FROM jobs GROUP BY batch_id, task_id)"
+                " SELECT j.project, COUNT(*) AS n FROM jobs j JOIN latest l"
+                " ON j.batch_id=l.batch_id AND j.task_id=l.task_id"
+                " AND j.version=l.version"
+                " WHERE j.status='running' AND j.gpu IS NOT NULL"
+                " AND j.project IS NOT NULL GROUP BY j.project"
+            ).fetchall()
+        }
+
+        def quota_wait(job, resources: dict) -> bool:
+            project = job["project"]
+            if (
+                not project
+                or job["status"] != "pending"
+                or resources.get("gpu", 1) == 0
+            ):
                 return False
-            pcfg = cfg.get("projects", {}).get(proj, {})
-            quota = int(pcfg.get("gpu_quota", 0) or 0)
-            return quota > 0 and running_gpu_by_proj.get(proj, 0) >= quota
+            project_cfg = cfg.get("projects", {}).get(project, {})
+            quota = int(project_cfg.get("gpu_quota", 0) or 0)
+            return (
+                quota > 0
+                and running_gpu_by_project.get(project, 0) >= quota
+            )
 
-        for j in jobs:
-            if proj_batch_ids is not None and j["batch_id"] not in proj_batch_ids:
-                continue
-            res = res_by_task.get((j["batch_id"], j["task_id"], j["version"]), {})
-            st = j["status"]
-            if st == "pending" and _quota_wait(j):
-                st = "pending(quota)"
+        for job in latest_jobs:
+            try:
+                task_spec = json.loads(job["task_spec"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                task_spec = {}
+            resources = task_spec.get("resources") or {}
+            stored_status = job["status"]
+            wait_reason = None
+            status = stored_status
+            if stored_status == "waiting_quota":
+                status, wait_reason = "pending", "quota"
+            elif stored_status == "waiting_dep":
+                status, wait_reason = "pending", "dependency"
+            elif quota_wait(job, resources):
+                wait_reason = "quota"
+            batch_id = job["batch_id"]
             out["jobs"].append(
                 {
-                    "id": j["id"], "batch": j["batch_id"], "task": j["task_id"],
-                    "status": st, "gpu": j["gpu"], "version": j["version"],
-                    "resources": res,
-                    "retries": j["retries"], "failure": j["failure"],
-                    "started_at": j["started_at"], "finished_at": j["finished_at"],
-                    "progress": (j["progress"] if "progress" in j.keys() else None),
+                    "id": job["id"],
+                    "batch_id": batch_id,
+                    "batch_name": name_by_id.get(batch_id, batch_id),
+                    "task": job["task_id"],
+                    "status": status,
+                    "wait_reason": wait_reason,
+                    "gpu": job["gpu"],
+                    "version": job["version"],
+                    "resources": resources,
+                    "retries": job["retries"],
+                    "failure": job["failure"],
+                    "started_at": job["started_at"],
+                    "finished_at": job["finished_at"],
+                    "progress": (
+                        job["progress"] if "progress" in job.keys() else None
+                    ),
                 }
             )
-        gpus = conn.execute("SELECT * FROM gpus ORDER BY idx").fetchall()
-        for g in gpus:
+
+        for assignment in conn.execute(
+            "SELECT gpu_id, job_id, vram_gib FROM gpu_jobs"
+            " ORDER BY gpu_id, job_id"
+        ).fetchall():
+            gpu_assignments.setdefault(assignment["gpu_id"], []).append(
+                {
+                    "job_id": assignment["job_id"],
+                    "vram_gib": assignment["vram_gib"],
+                }
+            )
+        for gpu in conn.execute("SELECT * FROM gpus ORDER BY idx").fetchall():
             out["gpus"].append(
                 {
-                    "idx": g["idx"], "status": g["status"], "job": g["job_id"],
-                    "quarantined": g["quarantined"],
+                    "idx": gpu["idx"],
+                    "status": gpu["status"],
+                    "job": gpu["job_id"],
+                    "quarantined": gpu["quarantined"],
+                    "revision": int(gpu["revision"]),
+                    "assignments": gpu_assignments.get(gpu["idx"], []),
                 }
             )
-        # CPU 配额: running 任务 CPU 占用 (与 dispatcher._task_cpus 同口径)
-        cpus_total = cfg.get("cpus_total", 0)
+
         cpu_used = 0
-        for j in conn.execute("SELECT * FROM jobs WHERE status='running'").fetchall():
-            res = res_by_task.get((j["batch_id"], j["task_id"], j["version"]), {})
-            cpu_used += _task_cpus_of(res, cfg)
-        out["cpu"] = {"used": cpu_used, "total": cpus_total}
+        running_specs = conn.execute(
+            "WITH latest AS ("
+            " SELECT batch_id, task_id, MAX(version) AS version"
+            " FROM jobs GROUP BY batch_id, task_id)"
+            " SELECT t.spec FROM jobs j JOIN latest l"
+            " ON j.batch_id=l.batch_id AND j.task_id=l.task_id"
+            " AND j.version=l.version"
+            " LEFT JOIN tasks t ON t.batch_id=j.batch_id"
+            " AND t.id=j.task_id AND t.version=j.version"
+            " WHERE j.status='running'"
+        ).fetchall()
+        for row in running_specs:
+            try:
+                task_spec = json.loads(row["spec"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                task_spec = {}
+            cpu_used += _task_cpus_of(task_spec.get("resources") or {}, cfg)
+        out["cpu"] = {"used": cpu_used, "total": cfg.get("cpus_total", 0)}
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
 
     print("=== 批次 ===")
-    for b in out["batches"]:
+    for batch in out["batches"]:
         print(
-            f"  {b['name']:<28} [{b['status']:<8}] {b['progress']:<6}"
-            f" dep={b['depends_on']}"
+            f"  {batch['name']:<28} [{batch['status']:<8}]"
+            f" {batch['progress']:<6} dep={batch['depends_on']}"
         )
     print("=== 任务 ===")
-    for j in out["jobs"]:
-        if j["gpu"] is not None:
-            extra = f" gpu={j['gpu']}"
-        elif j["resources"].get("gpu", 1) == 0:
+    for job in out["jobs"]:
+        if job["gpu"] is not None:
+            extra = f" gpu={job['gpu']}"
+        elif job["resources"].get("gpu", 1) == 0:
             extra = " cpu"
         else:
             extra = ""
-        cpus = j["resources"].get("cpus")
+        cpus = job["resources"].get("cpus")
         if cpus:
             extra += f" cpus={cpus}"
-        # P4: running 任务进度列 (从日志尾部 best-effort 解析 epoch/trial)
-        prog = ""
-        if j["status"] == "running":
-            # B13-§5: progress_regex 解析结果优先, 回退 P4 启发式 (epoch/trial)
-            p = j.get("progress") or _job_progress(j["batch"], j["task"], j["version"])
-            if p:
-                prog = f" {p}"
-        fail = f" ({j['failure']})" if j["failure"] else ""
-        bname = name_by_id.get(j["batch"], j["batch"])
-        print(f"  {bname:<22}:{j['task']:<20} [{j['status']:<10}]{extra}{prog}{fail}")
+        progress = ""
+        if job["status"] == "running":
+            parsed = job.get("progress") or _job_progress(
+                job["batch_id"], job["task"], job["version"]
+            )
+            if parsed:
+                progress = f" {parsed}"
+        status_text = job["status"]
+        if job["wait_reason"]:
+            status_text += f"({job['wait_reason']})"
+        failure = f" ({job['failure']})" if job["failure"] else ""
+        print(
+            f"  {job['batch_name']:<22}:{job['task']:<20}"
+            f" [{status_text:<10}]{extra}{progress}{failure}"
+        )
         if args.detail:
-            # P5: 中间档视图 — 每任务起止时间/耗时/version
-            t0 = j.get("started_at") or "-"
-            t1 = j.get("finished_at") or "-"
-            dur = "-"
-            if j.get("started_at") and j.get("finished_at"):
+            started = job.get("started_at") or "-"
+            finished = job.get("finished_at") or "-"
+            duration = "-"
+            if job.get("started_at") and job.get("finished_at"):
                 try:
-                    a = datetime.fromisoformat(j["started_at"])
-                    b = datetime.fromisoformat(j["finished_at"])
-                    dur = f"{int((b - a).total_seconds())}s"
+                    start = datetime.fromisoformat(job["started_at"])
+                    end = datetime.fromisoformat(job["finished_at"])
+                    duration = f"{int((end - start).total_seconds())}s"
                 except (ValueError, TypeError):
                     pass
-            pj = j.get("progress") or _job_progress(j["batch"], j["task"], j["version"]) \
-                if j["status"] == "running" else None
-            print(f"      v{j['version']}  start={t0}  end={t1}  耗时={dur}"
-                  + (f"  进度={pj}" if pj else ""))
-    print("=== GPU ===")
-    for g in out["gpus"]:
-        q = " QUARANTINED" if g["quarantined"] else ""
-        # 多归属展示 (定案 39 E 连带): assigned 卡显示 gpu_jobs 全部 job (共享共存)
-        jobs_txt = str(g["job"]) if g["job"] else "None"
-        with state.connect() as conn:
-            gj = conn.execute(
-                "SELECT job_id, vram_gib FROM gpu_jobs WHERE gpu_id=? ORDER BY job_id",
-                (g["idx"],),
-            ).fetchall()
-        if gj:
-            # 注意: 不嵌套 f-string (PEP 701 嵌套引号需 Py3.12+, 远程 3.11 兼容)
-            jobs_txt = ",".join(
-                r["job_id"] + (f"({r['vram_gib']}GiB)" if r["vram_gib"] else "")
-                for r in gj
+            print(
+                f"      v{job['version']}  start={started}  end={finished}"
+                f"  耗时={duration}"
+                + (f"  进度={progress.strip()}" if progress else "")
             )
-        print(f"  GPU{g['idx']} [{g['status']:<10}] job={jobs_txt}{q}")
-    c = out.get("cpu")
-    if c:
-        total_txt = str(c["total"]) if c["total"] else "未配置"
-        print(f"=== CPU ===\n  占用 {c['used']} / {total_txt} 核")
+    print("=== GPU ===")
+    for gpu in out["gpus"]:
+        quarantined = " QUARANTINED" if gpu["quarantined"] else ""
+        jobs_text = str(gpu["job"]) if gpu["job"] else "None"
+        assignments = gpu_assignments.get(gpu["idx"], [])
+        if assignments:
+            jobs_text = ",".join(
+                row["job_id"]
+                + (f"({row['vram_gib']}GiB)" if row["vram_gib"] else "")
+                for row in assignments
+            )
+        print(
+            f"  GPU{gpu['idx']} [{gpu['status']:<10}]"
+            f" job={jobs_text}{quarantined}"
+        )
+    cpu = out.get("cpu")
+    if cpu:
+        total_text = str(cpu["total"]) if cpu["total"] else "未配置"
+        print(f"=== CPU ===\n  占用 {cpu['used']} / {total_text} 核")
     return 0
 
 
 def cmd_task(args: argparse.Namespace) -> int:
-    """sched task <batch>:<task>: 状态时间线 + 失败原因 + 产物校验."""
+    """Return one task's version timeline in human or stable JSON form."""
     batch, task = _resolve_task_ref(args.task)
-    cfg = _load_cfg()
+    output: dict[str, Any] = {
+        "schema_version": 1,
+        "batch_id": batch,
+        "batch_name": batch,
+        "batch_revision": 0,
+        "task": task,
+        "jobs": [],
+    }
     with state.connect() as conn:
+        conn.execute("BEGIN")
+        batch_row = conn.execute(
+            "SELECT name, revision FROM batches WHERE id=?",
+            (batch,),
+        ).fetchone()
+        if batch_row is not None:
+            output["batch_name"] = batch_row["name"]
+            output["batch_revision"] = int(batch_row["revision"])
         jobs = conn.execute(
             "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version",
             (batch, task),
@@ -962,103 +1364,264 @@ def cmd_task(args: argparse.Namespace) -> int:
         if not jobs:
             print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
             return 1
-        for j in jobs:
-            print(f"=== {j['id']} ===")
-            print(f"  status: {j['status']}")
-            print(f"  submitted: {j['submitted_at']}")
-            print(f"  started:   {j['started_at'] or '-'}")
-            print(f"  finished:  {j['finished_at'] or '-'}")
-            dur = "-"
-            if j["started_at"] and j["finished_at"]:
-                try:
-                    t0 = datetime.fromisoformat(j["started_at"])
-                    t1 = datetime.fromisoformat(j["finished_at"])
-                    dur = f"{(t1 - t0).total_seconds():.0f}s"
-                except (ValueError, TypeError):
-                    pass
-            print(f"  elapsed:   {dur}")
+        for job in jobs:
             spec = None
             row = conn.execute(
                 "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
-                (batch, task, j["version"]),
+                (batch, task, job["version"]),
             ).fetchone()
             if row:
                 try:
                     spec = json.loads(row["spec"])
                 except (json.JSONDecodeError, TypeError):
                     spec = None
-            res = (spec or {}).get("resources") or {}
-            gpu_txt = "cpu" if j["gpu"] is None and res.get("gpu", 1) == 0 else j["gpu"]
-            cpus_txt = f" cpus={res['cpus']}" if res.get("cpus") else ""
-            print(f"  gpu: {gpu_txt}  pgid: {j['pgid']}  retries: {j['retries']}{cpus_txt}")
-            print(f"  rc: {j['rc']}  failure: {j['failure'] or '-'}")
-            print(f"  kill_reason: {j['kill_reason'] or '-'}")
-            print(f"  git_rev: {j['git_rev'] or '-'}")
-            print(f"  log: {state.default_state_dir()}/{state.hostname()}/logs/{batch}/{task}-v{j['version']}.log")
+            resources = (spec or {}).get("resources") or {}
+            duration_seconds = None
+            if job["started_at"] and job["finished_at"]:
+                try:
+                    started = datetime.fromisoformat(job["started_at"])
+                    finished = datetime.fromisoformat(job["finished_at"])
+                    duration_seconds = (finished - started).total_seconds()
+                except (ValueError, TypeError):
+                    pass
+            log_path = (
+                f"{state.default_state_dir()}/{state.hostname()}/logs/"
+                f"{batch}/{task}-v{job['version']}.log"
+            )
+            output["jobs"].append(
+                {
+                    "id": job["id"],
+                    "status": job["status"],
+                    "version": job["version"],
+                    "submitted_at": job["submitted_at"],
+                    "started_at": job["started_at"],
+                    "finished_at": job["finished_at"],
+                    "duration_seconds": duration_seconds,
+                    "gpu": job["gpu"],
+                    "pgid": job["pgid"],
+                    "retries": job["retries"],
+                    "rc": job["rc"],
+                    "failure": job["failure"],
+                    "kill_reason": job["kill_reason"],
+                    "git_rev": job["git_rev"],
+                    "resources": resources,
+                    "spec": spec,
+                    "log": log_path,
+                }
+            )
+
+    if getattr(args, "json", False):
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+
+    for job in output["jobs"]:
+        print(f"=== {job['id']} ===")
+        print(f"  status: {job['status']}")
+        print(f"  submitted: {job['submitted_at']}")
+        print(f"  started:   {job['started_at'] or '-'}")
+        print(f"  finished:  {job['finished_at'] or '-'}")
+        elapsed = (
+            f"{job['duration_seconds']:.0f}s"
+            if job["duration_seconds"] is not None
+            else "-"
+        )
+        print(f"  elapsed:   {elapsed}")
+        resources = job["resources"]
+        gpu_text = (
+            "cpu"
+            if job["gpu"] is None and resources.get("gpu", 1) == 0
+            else job["gpu"]
+        )
+        cpus_text = (
+            f" cpus={resources['cpus']}" if resources.get("cpus") else ""
+        )
+        print(
+            f"  gpu: {gpu_text}  pgid: {job['pgid']}"
+            f"  retries: {job['retries']}{cpus_text}"
+        )
+        print(f"  rc: {job['rc']}  failure: {job['failure'] or '-'}")
+        print(f"  kill_reason: {job['kill_reason'] or '-'}")
+        print(f"  git_rev: {job['git_rev'] or '-'}")
+        print(f"  log: {job['log']}")
     return 0
 
 
-def cmd_history(args: argparse.Namespace) -> int:
-    """sched history [batch] [--limit N] [--status s1,s2]: 终态任务历史.
+def _encode_history_cursor(finished_at: str, rowid: int) -> str:
+    payload = json.dumps(
+        [finished_at, rowid],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
-    展示批次名 (非截断 batch_id) + 耗时 + 失败原因; 支持按批次过滤.
-    """
-    limit = getattr(args, "limit", 50)
+
+def _decode_history_cursor(value: Any) -> tuple[str, int] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or len(value) > 1024:
+        raise ValueError("cursor 必须是有界字符串")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.b64decode(
+            padded.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        parsed = json.loads(raw.decode("utf-8"))
+        finished_at, rowid = parsed
+    except (
+        ValueError,
+        TypeError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as exc:
+        raise ValueError("无效 history cursor") from exc
+    if (
+        not isinstance(finished_at, str)
+        or isinstance(rowid, bool)
+        or not isinstance(rowid, int)
+        or rowid <= 0
+    ):
+        raise ValueError("无效 history cursor")
+    return finished_at, rowid
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """Return bounded terminal task history in human or stable JSON form."""
+    cfg = _load_cfg()
+    limit = max(1, min(200, int(getattr(args, "limit", 50))))
     statuses = getattr(args, "status", None)
-    proj_filter = getattr(args, "project", None)
+    project = getattr(args, "project", None)
+    as_json = bool(getattr(args, "json", False))
+    try:
+        history_cursor = _decode_history_cursor(
+            getattr(args, "cursor", None)
+        )
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+    if project and project not in cfg.get("projects", {}):
+        known = ", ".join(sorted(cfg.get("projects", {}))) or "无"
+        print(
+            f"错误: project 未在 config.projects 中定义: {project}"
+            f" (可选: {known})",
+            file=sys.stderr,
+        )
+        return 1
+
     with state.connect() as conn:
-        batches = conn.execute(
-            "SELECT id, name FROM batches ORDER BY created_at DESC"
-        ).fetchall()
-        name_by_id = {b["id"]: b["name"] for b in batches}
-        where = "WHERE status IN ('done','skip','failed','blocked','cancelled','timed_out')"
-        params: list = []
-        if args.batch:
-            b = _batch_id_from_name(args.batch)
-            if not b:
+        where = (
+            "WHERE j.status IN"
+            " ('done','skip','failed','blocked','cancelled','timed_out','interrupted')"
+        )
+        params: list[Any] = []
+        if getattr(args, "batch", None):
+            batch_id = _resolve_batch_ref(args.batch, conn)
+            if not batch_id:
                 print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
                 return 1
-            where += " AND batch_id=?"
-            params.append(b)
-        # B11c: 项目过滤 (jobs.project 列, insert_job 起即落库; 旧行 NULL 不命中)
-        if proj_filter and proj_filter not in cfg.get("projects", {}):
-            known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "无"
-            print(f"错误: project 未在 config.projects 中定义: {proj_filter} (可选: {known})",
-                  file=sys.stderr)
-            return 1
+            where += " AND j.batch_id=?"
+            params.append(batch_id)
         if statuses:
-            sts = [s.strip() for s in statuses.split(",") if s.strip()]
-            if sts:
-                where += " AND status IN (%s)" % ",".join("?" * len(sts))
-                params.extend(sts)
-        if proj_filter:
-            where += " AND project=?"
-            params.append(proj_filter)
-        rows = conn.execute(
-            f"SELECT * FROM jobs {where} ORDER BY finished_at DESC LIMIT ?",
-            (*params, limit),
-        ).fetchall()
-        if not rows:
-            print("(无历史任务)")
-            return 0
-        print(f"{'批次':<20} {'任务':<16} {'状态':<10} {'rc':<4} {'耗时':<8} {'gpu':<4} {'失败原因'}")
-        for j in rows:
-            bname = name_by_id.get(j["batch_id"], j["batch_id"])
-            dur = "-"
-            if j["started_at"] and j["finished_at"]:
-                try:
-                    t0 = datetime.fromisoformat(j["started_at"])
-                    t1 = datetime.fromisoformat(j["finished_at"])
-                    dur = f"{(t1 - t0).total_seconds():.0f}s"
-                except (ValueError, TypeError):
-                    pass
-            rc = "-" if j["rc"] is None else str(j["rc"])
-            gpu = "-" if j["gpu"] is None else str(j["gpu"])
-            fail = j["failure"] or (j["kill_reason"] or "-")
-            print(
-                f"  {bname:<18} {j['task_id']:<16} [{j['status']:<8}] {rc:<4} "
-                f"{dur:<8} {gpu:<4} {fail}"
+            selected = [
+                status.strip() for status in statuses.split(",") if status.strip()
+            ]
+            if selected:
+                where += " AND j.status IN (%s)" % ",".join("?" * len(selected))
+                params.extend(selected)
+        if project:
+            where += " AND j.project=?"
+            params.append(project)
+        if history_cursor is not None:
+            finished_at, rowid = history_cursor
+            where += (
+                " AND (COALESCE(j.finished_at,'')<?"
+                " OR (COALESCE(j.finished_at,'')=? AND j.rowid<?))"
             )
+            params.extend([finished_at, finished_at, rowid])
+        rows = conn.execute(
+            "SELECT j.*, b.name AS batch_name,"
+            " j.rowid AS job_rowid,"
+            " COALESCE(j.finished_at,'') AS history_finished_at"
+            f" FROM jobs j JOIN batches b ON b.id=j.batch_id {where}"
+            " ORDER BY COALESCE(j.finished_at,'') DESC, j.rowid DESC"
+            " LIMIT ?",
+            (*params, limit + 1),
+        ).fetchall()
+
+    truncated = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = None
+    if truncated and page_rows:
+        last_job = page_rows[-1]
+        next_cursor = _encode_history_cursor(
+            str(last_job["history_finished_at"]),
+            int(last_job["job_rowid"]),
+        )
+    history = []
+    for job in page_rows:
+        duration_seconds = None
+        if job["started_at"] and job["finished_at"]:
+            try:
+                started = datetime.fromisoformat(job["started_at"])
+                finished = datetime.fromisoformat(job["finished_at"])
+                duration_seconds = (finished - started).total_seconds()
+            except (ValueError, TypeError):
+                pass
+        batch_id = job["batch_id"]
+        history.append(
+            {
+                "id": job["id"],
+                "batch_id": batch_id,
+                "batch_name": job["batch_name"],
+                "task": job["task_id"],
+                "status": job["status"],
+                "version": job["version"],
+                "rc": job["rc"],
+                "gpu": job["gpu"],
+                "started_at": job["started_at"],
+                "finished_at": job["finished_at"],
+                "duration_seconds": duration_seconds,
+                "failure": job["failure"] or job["kill_reason"],
+            }
+        )
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "history": history,
+                    "limit": limit,
+                    "truncated": truncated,
+                    "next_cursor": next_cursor,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if not history:
+        print("(无历史任务)")
+        return 0
+    print(
+        f"{'批次':<20} {'任务':<16} {'状态':<10} {'rc':<4}"
+        f" {'耗时':<8} {'gpu':<4} {'失败原因'}"
+    )
+    for row in history:
+        duration = (
+            "-"
+            if row["duration_seconds"] is None
+            else f"{row['duration_seconds']:.0f}s"
+        )
+        rc = "-" if row["rc"] is None else str(row["rc"])
+        gpu = "-" if row["gpu"] is None else str(row["gpu"])
+        failure = row["failure"] or "-"
+        print(
+            f"  {row['batch_name']:<18} {row['task']:<16}"
+            f" [{row['status']:<8}] {rc:<4} {duration:<8} {gpu:<4} {failure}"
+        )
     return 0
 
 
@@ -1105,7 +1668,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         if ":" in ref:
             # R1: <batch_name>:<task> — batch 段是 name, 解析为最新 id
             b_name, t = _parse_task_ref(ref)
-            b = _batch_id_from_name(b_name)
+            b = _resolve_batch_ref(b_name, conn)
             if not b:
                 print(f"错误: 批次不存在: {b_name}", file=sys.stderr)
                 return 1
@@ -1124,12 +1687,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 (b, t),
             ).fetchall()
             pendings = conn.execute(
-                "SELECT * FROM jobs WHERE batch_id=? AND task_id=? AND status='pending'",
+                "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
+                " AND status IN ('pending','waiting_quota','waiting_dep')",
                 (b, t),
             ).fetchall()
         else:
-            row = conn.execute("SELECT id FROM batches WHERE id=?", (ref,)).fetchone()
-            b = row["id"] if row else _batch_id_from_name(ref)
+            b = _resolve_batch_ref(ref, conn)
             if not b:
                 print(f"错误: 批次不存在: {ref}", file=sys.stderr)
                 return 1
@@ -1138,7 +1701,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 (b,),
             ).fetchall()
             pendings = conn.execute(
-                "SELECT * FROM jobs WHERE batch_id=? AND status='pending'",
+                "SELECT * FROM jobs WHERE batch_id=?"
+                " AND status IN ('pending','waiting_quota','waiting_dep')",
                 (b,),
             ).fetchall()
         n = 0
@@ -1189,14 +1753,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_task_ref(ref: str) -> tuple[str, str]:
-    """R1: <batch_name>:<task> -> (batch_id, task). batch 段是 name, 解析为最新 id."""
-    b_name, task = _parse_task_ref(ref)
-    b = _batch_id_from_name(b_name)
-    if not b:
-        print(f"错误: 批次不存在: {b_name}", file=sys.stderr)
+def _resolve_task_ref(ref: str, conn=None) -> tuple[str, str]:
+    """Resolve <batch-id-or-latest-name>:<task> to its canonical pair."""
+    batch_ref, task = _parse_task_ref(ref)
+    batch = _resolve_batch_ref(batch_ref, conn)
+    if not batch:
+        print(f"错误: 批次不存在: {batch_ref}", file=sys.stderr)
         raise SystemExit(1)
-    return b, task
+    return batch, task
 
 
 def _rev_diff_warn(conn, j) -> str | None:
@@ -1237,38 +1801,49 @@ def cmd_retry(args: argparse.Namespace) -> int:
     - P3: git_rev 与当前仓库不一致 -> 警告 (retry 复用旧 spec)
     """
     ref = args.task
+    reopened = False
+    batch_name = ""
     with state.submission_connect() as conn:
         if ":" in ref:
-            batch, task = _resolve_task_ref(ref)
+            batch, task = _resolve_task_ref(ref, conn)
+        else:
+            batch = _resolve_batch_ref(ref, conn)
+            if not batch:
+                print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+                return 1
+            task = None
+        batch_row = conn.execute(
+            "SELECT status, name FROM batches WHERE id=?",
+            (batch,),
+        ).fetchone()
+        if not batch_row:
+            print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+            return 1
+        if batch_row["status"] == "discarded":
+            print(
+                "错误: 批次已退役 (discarded), 请用新批次名重新提交",
+                file=sys.stderr,
+            )
+            return 1
+        batch_name = batch_row["name"]
+        if task is not None:
             targets = conn.execute(
-                "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1",
+                "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
+                " ORDER BY version DESC LIMIT 1",
                 (batch, task),
             ).fetchall()
             if not targets:
                 print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
                 return 1
         else:
-            b = _batch_id_from_name(ref)
-            if not b:
-                print(f"错误: 批次不存在: {ref}", file=sys.stderr)
-                return 1
-            # B16: discarded 批次不可 retry (任务不会被派发, 防静默挂起)
-            bstat = conn.execute(
-                "SELECT status FROM batches WHERE id=?", (b,)
-            ).fetchone()
-            if bstat and bstat["status"] == "discarded":
-                print(f"错误: 批次已退役 (discarded), 请用新批次名重新提交",
-                      file=sys.stderr)
-                return 1
-            # C4 修复: 每 task 只取最新 version —— 否则 resubmit 产生的旧版本
-            # 失败终态 job 会被复活, 与新版本并发执行写相同产物路径
+            # C4: revive only each task's latest generation.
             targets = conn.execute(
                 "SELECT j.* FROM jobs j"
                 " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
                 "       WHERE batch_id=? GROUP BY task_id) t"
                 "   ON j.batch_id=? AND j.task_id=t.task_id AND j.version=t.mv"
                 " WHERE j.status IN ('blocked','cancelled','timed_out','failed')",
-                (b, b),
+                (batch, batch),
             ).fetchall()
         if not targets:
             print(f"无失败终态任务: {ref}")
@@ -1310,10 +1885,36 @@ def cmd_retry(args: argparse.Namespace) -> int:
             )
             print(f"已解锁重跑: {j['id']}")
             n += 1
+        if n and batch_row["status"] == "blocked":
+            conn.execute(
+                "UPDATE batches SET status='active' WHERE id=?",
+                (batch,),
+            )
+            reopened = True
         print(f"({n} 个任务)")
-        conn.commit()
-        wake_result = _ensure_running_locked()
-    print(wake_result)
+
+    def remove_blocked_marker() -> None:
+        marker = os.path.join(
+            default_state_dir(),
+            state.hostname(),
+            "markers",
+            f"{batch_name}.blocked",
+        )
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+
+    marker_deferred = (
+        state.defer_after_commit(remove_blocked_marker) if reopened else False
+    )
+    wake_deferred = state.defer_after_commit(_ensure_running_locked)
+    if reopened and not marker_deferred:
+        remove_blocked_marker()
+    if not wake_deferred:
+        print(_ensure_running_locked())
+    if reopened:
+        print("批次已回 active (blocked marker 已清除)")
     return 0
 
 
@@ -1350,16 +1951,7 @@ def cmd_markers(args: argparse.Namespace) -> int:
 
 
 def cmd_resubmit(args: argparse.Namespace) -> int:
-    """sched resubmit <batch>[:<task>] [--failed|--all] [--dry-run]: 新版本排队尾.
-
-    - <batch>:<task>      单任务新版本排队尾 (原有语义)
-    - <batch> --failed    该批全部失败终态任务 (failed/blocked/timed_out/interrupted;
-                          cancelled 属人工决策, 不含 —— 需要时用 :task 单独指定)
-    - <batch> --all       该批全部任务
-    --dry-run             只列将重跑的清单, 不写入
-
-    批次按名解析为最新实例; discarded 守卫; 完成后自动拉起 idle daemon.
-    """
+    """Create new task versions after preparing every fingerprint off-transaction."""
     cfg = _load_cfg()
     if args.failed and args.resubmit_all:
         print("错误: --failed 与 --all 互斥", file=sys.stderr)
@@ -1368,89 +1960,96 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     batch_level = ":" not in ref
     mode = "all" if args.resubmit_all else ("failed" if args.failed else None)
     if batch_level and mode is None:
-        print("错误: 批次级 resubmit 需要 --failed 或 --all"
-              " (单任务请用 <batch>:<task>)", file=sys.stderr)
+        print(
+            "错误: 批次级 resubmit 需要 --failed 或 --all"
+            " (单任务请用 <batch>:<task>)",
+            file=sys.stderr,
+        )
         return 1
-    if (not batch_level) and mode is not None:
-        print("错误: 单任务引用 (<batch>:<task>) 不需要 --failed/--all",
-              file=sys.stderr)
+    if not batch_level and mode is not None:
+        print(
+            "错误: 单任务引用 (<batch>:<task>) 不需要 --failed/--all",
+            file=sys.stderr,
+        )
         return 1
 
     if batch_level:
-        batch = _batch_id_from_name(ref)
+        batch = _resolve_batch_ref(ref)
         if not batch:
             print(f"错误: 批次不存在: {ref}", file=sys.stderr)
             return 1
+        task = None
     else:
         batch, task = _resolve_task_ref(ref)
 
-    db_context = state.connect() if args.dry_run else state.submission_connect()
-    with db_context as conn:
-        bstat = conn.execute(
-            "SELECT status FROM batches WHERE id=?", (batch,)
+    prepared_specs = []
+    with state.connect() as conn:
+        batch_row = conn.execute(
+            "SELECT status, project, name FROM batches WHERE id=?", (batch,)
         ).fetchone()
-        if bstat and bstat["status"] == "discarded":
-            print("错误: 批次已退役 (discarded), 请用新批次名重新提交",
-                  file=sys.stderr)
+        if not batch_row:
+            print(f"错误: 批次不存在: {ref}", file=sys.stderr)
             return 1
-        if bstat and bstat["status"] == "queued":
-            print("错误: queued 批次 (等上游依赖) 不支持 resubmit;"
-                  " 上游完成后批次会自动 active", file=sys.stderr)
+        if batch_row["status"] == "discarded":
+            print(
+                "错误: 批次已退役 (discarded), 请用新批次名重新提交",
+                file=sys.stderr,
+            )
             return 1
-        bproj = conn.execute(
-            "SELECT project, name FROM batches WHERE id=?", (batch,)
-        ).fetchone()
-        proj = bproj["project"] if bproj else None
-        bname = bproj["name"] if bproj else batch
-
-        # 收集目标任务最新版本 job 行
+        if batch_row["status"] == "queued":
+            print(
+                "错误: queued 批次 (等上游依赖) 不支持 resubmit;"
+                " 上游完成后批次会自动 active",
+                file=sys.stderr,
+            )
+            return 1
+        project = batch_row["project"]
+        batch_name = batch_row["name"]
         if batch_level:
-            jrows = conn.execute(
+            jobs = conn.execute(
                 "SELECT j.* FROM jobs j"
-                " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
-                "       WHERE batch_id=? GROUP BY task_id) t"
-                "   ON j.batch_id=? AND j.task_id=t.task_id AND j.version=t.mv"
-                " ORDER BY j.rowid",
+                " JOIN (SELECT task_id, MAX(version) AS version FROM jobs"
+                "       WHERE batch_id=? GROUP BY task_id) latest"
+                " ON j.batch_id=? AND j.task_id=latest.task_id"
+                " AND j.version=latest.version ORDER BY j.rowid",
                 (batch, batch),
             ).fetchall()
             if mode == "failed":
-                jrows = [j for j in jrows if j["status"] in
-                         ("failed", "blocked", "timed_out", "interrupted")]
+                jobs = [
+                    job
+                    for job in jobs
+                    if job["status"]
+                    in ("failed", "blocked", "timed_out", "interrupted")
+                ]
         else:
-            jrows = conn.execute(
+            jobs = conn.execute(
                 "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
                 " ORDER BY version DESC LIMIT 1",
                 (batch, task),
             ).fetchall()
-        if not jrows:
-            msg = ("无匹配任务" if mode == "failed"
-                   else f"任务不存在 {batch}:{task}")
-            print(f"错误: {msg}", file=sys.stderr)
+        if not jobs:
+            message = (
+                "无匹配任务"
+                if mode == "failed"
+                else f"任务不存在 {batch}:{task}"
+            )
+            print(f"错误: {message}", file=sys.stderr)
             return 1
-        target_tasks = {j["task_id"] for j in jrows}
-        active_targets = [
-            j for j in conn.execute(
-                "SELECT task_id, status, version FROM jobs"
-                " WHERE batch_id=?"
-                "   AND status IN ('running','pending','waiting_quota','waiting_dep')",
+        target_tasks = {job["task_id"] for job in jobs}
+        active = [
+            row
+            for row in conn.execute(
+                "SELECT task_id, status, version FROM jobs WHERE batch_id=?"
+                " AND status IN"
+                " ('running','pending','waiting_quota','waiting_dep')",
                 (batch,),
             ).fetchall()
-            if j["task_id"] in target_tasks
+            if row["task_id"] in target_tasks
         ]
-        marker_targets = [
-            j for j in jrows if state.launch_marker_active(j["id"])
-        ]
-        if marker_targets:
-            labels = ", ".join(f"{j['task_id']}v{j['version']}" for j in marker_targets)
-            print(
-                f"错误: 进程组终止尚未确认完成: {labels}; 请等待 daemon 完成清理",
-                file=sys.stderr,
-            )
-            return 1
-        if active_targets:
+        if active:
             labels = ", ".join(
-                f"{j['task_id']}[{j['status']}]v{j['version']}"
-                for j in active_targets
+                f"{row['task_id']}[{row['status']}]v{row['version']}"
+                for row in active
             )
             print(
                 f"错误: 禁止 resubmit 仍在运行/排队的任务: {labels}；"
@@ -1458,63 +2057,174 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-
+        marked = [job for job in jobs if state.launch_marker_active(job["id"])]
+        if marked:
+            labels = ", ".join(
+                f"{job['task_id']}v{job['version']}" for job in marked
+            )
+            print(
+                f"错误: 进程组终止尚未确认完成: {labels};"
+                " 请等待 daemon 完成清理",
+                file=sys.stderr,
+            )
+            return 1
         if args.dry_run:
-            print(f"[dry-run] 将 resubmit {len(jrows)} 个任务 (各生成新版本排队尾):")
-            for j in jrows:
-                print(f"  {j['task_id']} [{j['status']}] v{j['version']} -> v{j['version'] + 1}")
+            print(
+                f"[dry-run] 将 resubmit {len(jobs)} 个任务"
+                " (各生成新版本排队尾):"
+            )
+            for job in jobs:
+                print(
+                    f"  {job['task_id']} [{job['status']}]"
+                    f" v{job['version']} -> v{job['version'] + 1}"
+                )
             return 0
-
-        from .fingerprint import compute_fingerprint
-
-        done_labels = []
-        for j in jrows:
-            t = conn.execute(
-                "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
-                (batch, j["task_id"], j["version"]),
+        for job in jobs:
+            task_row = conn.execute(
+                "SELECT spec, order_idx FROM tasks"
+                " WHERE batch_id=? AND id=? AND version=?",
+                (batch, job["task_id"], job["version"]),
             ).fetchone()
-            if not t:
-                continue
-            spec = json.loads(t["spec"])
-            new_v = j["version"] + 1
-            state.insert_task(conn, batch, j["task_id"], new_v, spec, 0, proj)
-            fp, stage_fps, rev = compute_fingerprint(
-                spec.get("cmd"), spec.get("stages"), spec.get("cwd_abs", "."),
-                spec.get("git"), cfg.get("venvs", {}),
-                runtime_prefix=spec.get("runtime_prefix"),
+            if not task_row:
+                print(
+                    f"错误: 任务 spec 缺失 {batch}:{job['task_id']}"
+                    f":v{job['version']}",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                spec = json.loads(task_row["spec"])
+            except (json.JSONDecodeError, TypeError) as error:
+                print(
+                    f"错误: 任务 spec 损坏 {batch}:{job['task_id']}: {error}",
+                    file=sys.stderr,
+                )
+                return 1
+            spec.pop("retry_transform", None)
+            for stage in spec.get("stages") or []:
+                if isinstance(stage, dict):
+                    stage.pop("retry_transform", None)
+                    stage.pop("probes", None)
+            prepared_specs.append(
+                {
+                    "task_id": job["task_id"],
+                    "old_version": job["version"],
+                    "new_version": job["version"] + 1,
+                    "spec": spec,
+                    "order_idx": task_row["order_idx"],
+                }
+            )
+
+    from .fingerprint import compute_fingerprint
+
+    for prepared in prepared_specs:
+        spec = prepared["spec"]
+        fingerprint, stage_fingerprints, _ = compute_fingerprint(
+            spec.get("cmd"),
+            spec.get("stages"),
+            spec.get("cwd_abs", "."),
+            spec.get("git"),
+            cfg.get("venvs", {}),
+            runtime_prefix=spec.get("runtime_prefix"),
+        )
+        prepared["fingerprint"] = fingerprint
+        prepared["stage_fingerprints"] = stage_fingerprints
+
+    reopened = False
+    dependency_names: list[str] = []
+    labels: list[str] = []
+    with state.submission_connect() as conn:
+        current_batch = conn.execute(
+            "SELECT status FROM batches WHERE id=?", (batch,)
+        ).fetchone()
+        if not current_batch or current_batch["status"] in ("discarded", "queued"):
+            print(
+                "错误: fingerprint 准备期间批次状态已变化，请重试",
+                file=sys.stderr,
+            )
+            return 1
+        for prepared in prepared_specs:
+            latest = conn.execute(
+                "SELECT version, status FROM jobs WHERE batch_id=? AND task_id=?"
+                " ORDER BY version DESC LIMIT 1",
+                (batch, prepared["task_id"]),
+            ).fetchone()
+            if (
+                not latest
+                or latest["version"] != prepared["old_version"]
+                or latest["status"]
+                in ("running", "pending", "waiting_quota", "waiting_dep")
+            ):
+                print(
+                    f"错误: fingerprint 准备期间任务状态已变化:"
+                    f" {prepared['task_id']}，请重试",
+                    file=sys.stderr,
+                )
+                return 1
+        for prepared in prepared_specs:
+            new_version = prepared["new_version"]
+            task_id = prepared["task_id"]
+            state.insert_task(
+                conn,
+                batch,
+                task_id,
+                new_version,
+                prepared["spec"],
+                prepared["order_idx"],
+                project,
             )
             state.insert_job(
-                conn, f"{batch}-{j['task_id']}-v{new_v}", batch,
-                j["task_id"], new_v, fp, stage_fps, proj,
+                conn,
+                f"{batch}-{task_id}-v{new_version}",
+                batch,
+                task_id,
+                new_version,
+                prepared["fingerprint"],
+                prepared["stage_fingerprints"],
+                project,
             )
-            done_labels.append(f"{j['task_id']}->v{new_v}")
-
-        # Q4: 下游依赖告警 (C5: 按 name 全串匹配防截断漏报)
-        deps = conn.execute(
-            "SELECT name FROM batches WHERE depends_on LIKE ?", (f'%"{bname}"%',)
-        ).fetchall()
-        for d in deps:
-            print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 上游已更新, 请重提下游 (Q4)")
-        # B17: 若批次因失败终态被钉在 blocked, 重提交后自动回 active
-        # (配合 dispatcher 的"最新版本"settle 口径, 否则旧失败行永久冻结新 pending)
-        if bstat and bstat["status"] == "blocked":
-            # 复用外层事务连接 —— 嵌套 connect 会 database is locked
+            labels.append(f"{task_id}->v{new_version}")
+        if current_batch["status"] in ("done", "blocked"):
             conn.execute(
-                "UPDATE batches SET status='active' WHERE id=?", (batch,))
+                "UPDATE batches SET status='active' WHERE id=?", (batch,)
+            )
+            reopened = True
+        dependency_names = [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM batches WHERE depends_on LIKE ?",
+                (f'%"{batch_name}"%',),
+            ).fetchall()
+        ]
+    def remove_terminal_markers() -> None:
+        for suffix in ("done", "blocked"):
+            marker = os.path.join(
+                default_state_dir(),
+                state.hostname(),
+                "markers",
+                f"{batch_name}.{suffix}",
+            )
             try:
-                mk = os.path.join(default_state_dir(), state.hostname(),
-                                  "markers", f"{bname}.blocked")
-                if os.path.isfile(mk):
-                    os.remove(mk)
-            except OSError:
+                os.remove(marker)
+            except (FileNotFoundError, OSError):
                 pass
-            print("批次已回 active (旧版本失败终态不再阻塞新版本派发)")
 
-        print(f"已 resubmit {len(done_labels)} 个任务: {', '.join(done_labels)}")
-        conn.commit()
+    effects_deferred = state.defer_after_commit(remove_terminal_markers)
+    state.defer_after_commit(_ensure_running_locked)
+    if not effects_deferred:
+        remove_terminal_markers()
         wake_result = _ensure_running_locked()
 
-    print(wake_result)
+    for dependency in dependency_names:
+        print(
+            f"⚠️ 提示: 批次 '{dependency}' depends_on 本批次,"
+            " 上游已更新, 请重提下游 (Q4)"
+        )
+    if reopened:
+        print("批次已回 active (旧终态不再遮蔽新版本)")
+    print(f"已 resubmit {len(labels)} 个任务: {', '.join(labels)}")
+    if not effects_deferred:
+        print(wake_result)
     return 0
 
 
@@ -1550,35 +2260,38 @@ def _job_progress(batch_id: str, task_id: str, version: int) -> str | None:
     return None
 
 
-def _warn_colocate_disabled(norm: dict, cfg: dict) -> None:
-    """B12-b: 项目禁用 colocate 时, 对 gpu_share 任务提交期提前告知降级."""
+def _warn_colocate_disabled(
+    norm: dict, cfg: dict, *, stream=None
+) -> None:
+    """Warn when project configuration downgrades requested co-location."""
     pc = cfg.get("projects", {}).get(norm.get("project") or "", {})
     if pc.get("colocate") is False and any(
         (t.get("resources") or {}).get("gpu_share") for t in norm.get("tasks", [])
     ):
         print(
             f"⚠️ 项目 {norm['project']} 已禁用 colocate:"
-            " gpu_share 任务将按独占运行 (装箱声明被忽略)"
+            " gpu_share 任务将按独占运行 (装箱声明被忽略)",
+            file=stream,
         )
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    """sched clean <batch>: 清除批次全部版本的产物指纹 (B13-§4c).
+    """Clear fingerprints and remove the latest task/stage declared artifacts.
 
-    之后对该批次的 submit/resubmit 不再命中 SKIP, 任务强制重跑.
-    不删除产物文件本身 —— 只清"指纹匹配记录"; 需要连产物一起清理时手动删文件.
+    Database state is committed before artifact deletion.  Confined artifact
+    paths are removed through the same descriptor-relative policy used by the
+    runtime; ``paths_escape`` remains an explicit opt-in at each declaration.
     """
-    b = _batch_id_from_name(args.batch)
+    b = _resolve_batch_ref(args.batch)
     if not b:
         print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
         return 1
     if not args.yes:
-        print(f"确认清除 {b} 的全部产物指纹? 加 --yes 执行")
+        print(f"确认清除 {b} 的全部产物与指纹? 加 --yes 执行")
         return 1
+
+    deletions: list[tuple[str, str, Any]] = []
     with state.connect() as conn:
-        # 最新版本任务声明的产物文件一并删除 —— 否则产物仍有效时,
-        # 新提交的自洽指纹照样 SKIP (B13-§4 语义修正的配套)
-        removed = []
         trows = conn.execute(
             "SELECT t.spec FROM tasks t"
             " JOIN (SELECT id, MAX(version) AS mv FROM tasks"
@@ -1591,19 +2304,32 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 spec = json.loads(tr["spec"] or "{}")
             except (json.JSONDecodeError, TypeError):
                 continue
+            if not isinstance(spec, dict):
+                continue
             cwd = spec.get("cwd_abs") or "."
-            for a in (spec.get("artifacts") or {}).values():
-                ap = str(a.get("path", ""))
-                if not ap:
-                    continue
-                if not os.path.isabs(ap):
-                    ap = os.path.normpath(os.path.join(cwd, ap))
-                if os.path.isfile(ap):
-                    try:
-                        os.remove(ap)
-                        removed.append(ap)
-                    except OSError:
-                        pass
+            if not isinstance(cwd, str):
+                continue
+
+            def collect(group: Any, paths_escape: Any) -> None:
+                if not isinstance(group, dict):
+                    return
+                for rule in group.values():
+                    if not isinstance(rule, dict):
+                        continue
+                    path = rule.get("path")
+                    if isinstance(path, str) and path:
+                        deletions.append((cwd, path, paths_escape))
+
+            collect(spec.get("artifacts"), spec.get("paths_escape", False))
+            stages = spec.get("stages")
+            if isinstance(stages, list):
+                for stage in stages:
+                    if isinstance(stage, dict):
+                        collect(
+                            stage.get("artifacts"),
+                            stage.get("paths_escape", False),
+                        )
+
         cur = conn.execute(
             "UPDATE jobs SET fingerprint=NULL, stage_fingerprints=NULL"
             " WHERE batch_id=?",
@@ -1614,9 +2340,25 @@ def cmd_clean(args: argparse.Namespace) -> int:
             "UPDATE jobs SET status='pending' WHERE batch_id=? AND status='skip'",
             (b,),
         )
-    for ap in removed[:10]:
-        print(f"  已删产物: {ap}")
-    print(f"✅ 已清除 {n} 个任务的指纹并删除 {len(removed)} 个产物 ({b}); 后续将重跑")
+
+    removed = []
+    for cwd, path, paths_escape in deletions:
+        if artifacts.unlink_artifact(
+            cwd,
+            path,
+            paths_escape=paths_escape,
+        ):
+            removed.append(
+                path
+                if os.path.isabs(path)
+                else os.path.normpath(os.path.join(cwd, path))
+            )
+    for artifact_path in removed[:10]:
+        print(f"  已删产物: {artifact_path}")
+    print(
+        f"✅ 已清除 {n} 个任务的指纹并删除 {len(removed)} 个产物"
+        f" ({b}); 后续将重跑"
+    )
     return 0
 
 
@@ -1630,77 +2372,69 @@ def _deep_merge(base: dict, patch: dict) -> None:
 
 
 def cmd_discard(args: argparse.Namespace) -> int:
-    """sched discard <batch>: 退役被取代的 blocked 批次 (backlog#1, B16).
-
-    适用: 同名新实例已取代旧批次, 旧 blocked 实例永久滞留视图的场景.
-    行为: 仅翻转批次状态为 discarded; 任务行保持 failed/blocked 原样
-    (保留排查证据). discarded 批次不被 settle 复活、不可 retry/resubmit
-    (需用新批次名重新提交). 依赖本批次的下游将挂起 —— 与 cancel 同警告.
-    """
+    """Retire the canonical blocked/queued batch while preserving evidence."""
     if not args.yes:
         print("确认退役? 加 --yes 执行", file=sys.stderr)
         return 1
-    # 支持批次名或完整 id (同名多实例需按 id 逐一退役)
-    brow = None
-    b = args.batch
     with state.connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM batches WHERE id=?", (args.batch,)
-        ).fetchone()
-        if row is None:
-            row = conn.execute(
-                "SELECT * FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                (args.batch,),
-            ).fetchone()
-            if row is not None:
-                b = row["id"]
-        brow = row
-    if brow is None:
-        print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
-        return 1
-    with state.connect() as conn:
-        if brow is None:
-            print(f"错误: 批次不存在: {b}", file=sys.stderr)
+        batch_id = _resolve_batch_ref(args.batch, conn)
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE id=?", (batch_id,)
+        ).fetchone() if batch_id else None
+        if batch is None:
+            print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
             return 1
-        if brow["status"] not in ("blocked", "queued"):
-            print(f"错误: 仅 blocked/queued 批次可退役 (当前 {brow['status']});"
-                    " done 无需退役", file=sys.stderr)
+        if batch["status"] not in ("blocked", "queued"):
+            print(
+                f"错误: 仅 blocked/queued 批次可退役"
+                f" (当前 {batch['status']}); done 无需退役",
+                file=sys.stderr,
+            )
             return 1
-        # 仅拒真 running; queued 批次的 pending 由下方统一转 cancelled
         running = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE batch_id=?"
-            " AND status='running'", (b,),
+            "SELECT COUNT(*) FROM jobs WHERE batch_id=? AND status='running'",
+            (batch_id,),
         ).fetchone()[0]
         if running:
-            print(f"错误: 批次仍有 {running} 个运行中任务,"
-                    " 请先 sched cancel", file=sys.stderr)
+            print(
+                f"错误: 批次仍有 {running} 个运行中任务, 请先 sched cancel",
+                file=sys.stderr,
+            )
             return 1
-        # queued 批次的 pending 任务一并标记 cancelled (kill_reason 留痕);
-        # blocked 批次的失败终态任务保留原状 (排查证据)
-        pend = conn.execute(
-            "SELECT id FROM jobs WHERE batch_id=? AND status='pending'", (b,),
+        pending = conn.execute(
+            "SELECT id FROM jobs WHERE batch_id=? AND status='pending'",
+            (batch_id,),
         ).fetchall()
-        for jr in pend:
+        for job in pending:
             state.update_job(
-                conn, jr["id"], status="cancelled", kill_reason="discarded",
+                conn,
+                job["id"],
+                status="cancelled",
+                kill_reason="discarded",
                 finished_at=state.now(),
             )
-        n = conn.execute(
+        affected = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE batch_id=?"
-            " AND status IN ('failed','blocked','timed_out','interrupted','cancelled')",
-            (b,),
+            " AND status IN"
+            " ('failed','blocked','timed_out','interrupted','cancelled')",
+            (batch_id,),
         ).fetchone()[0]
         conn.execute(
-            "UPDATE batches SET status='discarded' WHERE id=?", (b,))
-        # Q4 下游依赖告警 (与 cancel 对称)
-        deps = conn.execute(
+            "UPDATE batches SET status='discarded' WHERE id=?", (batch_id,)
+        )
+        dependencies = conn.execute(
             "SELECT name FROM batches WHERE depends_on LIKE ?",
-            (f'%"{brow["name"]}"%',),
+            (f'%"{batch["name"]}"%',),
         ).fetchall()
-        for d in deps:
-            print(f"⚠️ 提示: 批次 '{d['name']}' depends_on 本批次, 已退役, 下游将挂起")
-    print(f"✅ 批次 {b} 已退役 (涉及 {n} 个任务, 失败终态证据保留); "
-          "重跑请用新批次名提交")
+    for dependency in dependencies:
+        print(
+            f"⚠️ 提示: 批次 '{dependency['name']}' depends_on 本批次,"
+            " 已退役, 下游将挂起"
+        )
+    print(
+        f"✅ 批次 {batch_id} 已退役 (涉及 {affected} 个任务,"
+        " 失败终态证据保留); 重跑请用新批次名提交"
+    )
     return 0
 
 
@@ -1750,7 +2484,7 @@ def cmd_config_set(args: argparse.Namespace) -> int:
     # 全量校验: 写临时文件走 load_config 完整管线 (含 parse_gpus/notify 等)
     cfg_p = config_path()
     tmp_p = cfg_p + ".tmp-set"
-    with open(tmp_p, "w", encoding="utf-8") as f:
+    with state.open_private_text(tmp_p, "w") as f:
         json.dump(new_cfg, f, indent=2, ensure_ascii=False)
     try:
         load_config(tmp_p)
@@ -1760,11 +2494,19 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         print(f"错误: 新配置校验失败 (未写入): {e}", file=sys.stderr)
         return 1
     os.replace(tmp_p, cfg_p)
-
-    with state.connect() as conn:
-        state.insert_control_request(conn, "*config*", op="config_reload")
     changed = sorted(set(_flatten_keys(patch)))
-    print(f"✅ 配置已写入并请求热重载: {', '.join(changed)}")
+    try:
+        with state.connect() as conn:
+            state.insert_control_request(conn, "*config*", op="config_reload")
+    except Exception as error:
+        print(f"✅ 配置文件已应用: {', '.join(changed)}")
+        print(
+            "警告: control reload 请求入队失败"
+            f" ({error}); daemon 仍会通过 mtime 检测热重载",
+            file=sys.stderr,
+        )
+        return 0
+    print(f"✅ 配置文件已应用并请求热重载: {', '.join(changed)}")
     return 0
 
 
@@ -1936,7 +2678,7 @@ def cmd_diag(args: argparse.Namespace) -> int:
     ref = args.task
     with state.connect() as conn:
         if ":" in ref:
-            batch, task = _resolve_task_ref(ref)
+            batch, task = _resolve_task_ref(ref, conn)
             targets = conn.execute(
                 "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
                 " ORDER BY version DESC LIMIT 1",
@@ -1946,7 +2688,7 @@ def cmd_diag(args: argparse.Namespace) -> int:
                 print(f"错误: 任务不存在 {batch}:{task}", file=sys.stderr)
                 return 1
         else:
-            b = _batch_id_from_name(ref)
+            b = _resolve_batch_ref(ref, conn)
             if not b:
                 print(f"错误: 批次不存在: {ref}", file=sys.stderr)
                 return 1
@@ -2258,22 +3000,43 @@ def cmd_gpu_free(args: argparse.Namespace) -> int:
 def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
 
-    if args.action == "start":
-        print(daemon.start(fake=args.fake or False))
-    elif args.action == "stop":
-        print(daemon.stop())
-    elif args.action == "status":
-        print(daemon.status_str())
-    elif args.action == "check":
-        issues = daemon.check(fake=args.fake or False)
-        fails = 0
-        for i in issues:
-            mark = {"ok": "✅", "warn": "⚠️", "fail": "❌"}[i["level"]]
-            print(f"  {mark} {i['item']}: {i['detail']}")
-            if i["level"] == "fail":
-                fails += 1
-        print(f"\n{fails} 项 FAIL" if fails else "\n全部通过 ✅")
-    return 0
+    try:
+        if args.action == "start":
+            text = daemon.start(fake=getattr(args, "fake", False))
+            print(text)
+            return 1 if any(
+                marker in text
+                for marker in ("拒绝", "失败", "错误", "超时", "请到计算节点")
+            ) else 0
+        if args.action == "stop":
+            text = daemon.stop()
+            print(text)
+            return 1 if any(
+                marker in text
+                for marker in (
+                    "拒绝",
+                    "失败",
+                    "错误",
+                    "超时",
+                    "请到计算节点",
+                    "放弃 kill",
+                )
+            ) else 0
+        if args.action == "status":
+            print(daemon.status_str())
+            return 0
+        issues = daemon.check(fake=getattr(args, "fake", False))
+        failures = 0
+        for issue in issues:
+            mark = {"ok": "✅", "warn": "⚠️", "fail": "❌"}[issue["level"]]
+            print(f"  {mark} {issue['item']}: {issue['detail']}")
+            if issue["level"] == "fail":
+                failures += 1
+        print(f"\n{failures} 项 FAIL" if failures else "\n全部通过 ✅")
+        return 1 if failures else 0
+    except Exception as error:
+        print(f"错误: daemon {args.action} 失败: {error}", file=sys.stderr)
+        return 1
 
 
 # ---------- 通知 (设计 docs/sched_notify_design.md) ----------
@@ -2385,7 +3148,459 @@ def cmd_project_list(args: argparse.Namespace) -> int:
     return 0
 
 
+_REQUEST_CAPTURE_BYTES = 2 * 1024 * 1024
+
+
+class _BoundedTextCapture(io.TextIOBase):
+    """UTF-8 text sink whose retained bytes never exceed a fixed ceiling."""
+
+    def __init__(self, limit: int = _REQUEST_CAPTURE_BYTES) -> None:
+        super().__init__()
+        self._limit = max(128, int(limit))
+        self._payload_limit = self._limit - 96
+        self._buffer = bytearray()
+        self._dropped = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        if not isinstance(value, str):
+            raise TypeError("capture accepts text only")
+        for offset in range(0, len(value), 64 * 1024):
+            encoded = value[offset : offset + 64 * 1024].encode(
+                "utf-8",
+                errors="replace",
+            )
+            remaining = self._payload_limit - len(self._buffer)
+            if remaining > 0:
+                self._buffer.extend(encoded[:remaining])
+            self._dropped += max(0, len(encoded) - max(0, remaining))
+        return len(value)
+
+    def getvalue(self) -> str:
+        retained = bytes(self._buffer).decode("utf-8", errors="ignore")
+        if not self._dropped:
+            return retained
+        marker = f"\n[output truncated: {self._dropped} bytes dropped]\n"
+        value = retained + marker
+        encoded = value.encode("utf-8")
+        if len(encoded) <= self._limit:
+            return value
+        return encoded[: self._limit].decode("utf-8", errors="ignore")
+
+
+def _run_captured_mutation(
+    command: list[str],
+    conn: sqlite3.Connection | None = None,
+) -> tuple[int, str, str, list[Any]]:
+    captured_stdout = _BoundedTextCapture()
+    captured_stderr = _BoundedTextCapture()
+    callbacks: list[Any] = []
+    code = 1
+    try:
+        with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(
+            captured_stderr
+        ):
+            if conn is None:
+                code = int(main(command))
+            else:
+                with state.bind_connection(conn) as callbacks:
+                    code = int(main(command))
+    except SystemExit as exc:
+        code = int(exc.code) if isinstance(exc.code, int) else 1
+    except Exception as exc:
+        code = 1
+        captured_stderr.write(f"错误: mutation 执行异常: {exc}\n")
+    return code, captured_stdout.getvalue(), captured_stderr.getvalue(), callbacks
+
+
+def _canonical_assignment_precondition(raw: Any) -> list[dict[str, Any]] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 64 * 1024:
+        raise ValueError("GPU assignments precondition 必须是有界 JSON")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
+        raise ValueError("GPU assignments precondition 不是合法 JSON") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("GPU assignments precondition 必须是数组")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for assignment in parsed:
+        if not isinstance(assignment, dict) or set(assignment) != {
+            "job_id",
+            "vram_gib",
+        }:
+            raise ValueError("GPU assignment 必须只含 job_id/vram_gib")
+        job_id = assignment["job_id"]
+        vram_gib = assignment["vram_gib"]
+        if (
+            not isinstance(job_id, str)
+            or not job_id
+            or len(job_id) > 512
+            or job_id in seen
+        ):
+            raise ValueError("GPU assignment job_id 无效或重复")
+        if vram_gib is not None and (
+            isinstance(vram_gib, bool)
+            or not isinstance(vram_gib, (int, float))
+            or not math.isfinite(float(vram_gib))
+            or vram_gib < 0
+        ):
+            raise ValueError("GPU assignment vram_gib 无效")
+        seen.add(job_id)
+        result.append({"job_id": job_id, "vram_gib": vram_gib})
+    result.sort(key=lambda item: item["job_id"])
+    return result
+
+
+def cmd_request(args: argparse.Namespace) -> int:
+    """Execute a mutation once with revision-bound durable replay."""
+    request_id = str(getattr(args, "request_id", ""))
+    command = list(getattr(args, "command", []) or [])
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id):
+        print("错误: request_id 格式无效", file=sys.stderr)
+        return 64
+    allowed = {
+        "submit",
+        "cancel",
+        "retry",
+        "resubmit",
+        "gpu-free",
+        "gpu-ignore",
+        "gpu-ok",
+        "daemon",
+        "config",
+    }
+    if not command or command[0] not in allowed:
+        print("错误: request 只允许调度器 mutation 子命令", file=sys.stderr)
+        return 64
+    if command[0] == "daemon" and (
+        len(command) < 2 or command[1] not in {"start", "stop"}
+    ):
+        print("错误: request 只允许 daemon start/stop", file=sys.stderr)
+        return 64
+    if command[0] == "config" and (
+        len(command) < 2 or command[1] != "set"
+    ):
+        print("错误: request 只允许 config set", file=sys.stderr)
+        return 64
+
+    expect_kind = str(getattr(args, "expect_kind", "none") or "none")
+    expect_id = getattr(args, "expect_id", None)
+    expect_status = getattr(args, "expect_status", None)
+    expect_version = getattr(args, "expect_version", None)
+    expect_quarantined = getattr(args, "expect_quarantined", None)
+    expect_revision = getattr(args, "expect_revision", None)
+    try:
+        expect_assignments = _canonical_assignment_precondition(
+            getattr(args, "expect_assignments_json", None)
+        )
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 64
+
+    if (
+        isinstance(expect_revision, bool)
+        or not isinstance(expect_revision, int)
+        or expect_revision < 0
+    ):
+        print("错误: mutation 必须提供非负 --expect-revision", file=sys.stderr)
+        return 64
+
+    target_kind = "none"
+    target_id: str | None = None
+    if command[0] in {"cancel", "retry", "resubmit"}:
+        if len(command) < 2:
+            print("错误: mutation 缺少目标", file=sys.stderr)
+            return 64
+        target_id = command[1]
+        target_kind = "task" if ":" in target_id else "batch"
+    elif command[0].startswith("gpu-"):
+        if len(command) < 2:
+            print("错误: GPU mutation 缺少目标", file=sys.stderr)
+            return 64
+        target_id = command[1]
+        target_kind = "gpu"
+
+    if target_kind != expect_kind or (
+        target_kind != "none" and target_id != expect_id
+    ):
+        print("错误: mutation precondition 与命令目标不匹配", file=sys.stderr)
+        return 64
+    if expect_kind == "none":
+        if (
+            expect_revision != 0
+            or any(
+                value is not None
+                for value in (
+                    expect_id,
+                    expect_status,
+                    expect_version,
+                    expect_quarantined,
+                    expect_assignments,
+                )
+            )
+        ):
+            print("错误: 无目标 mutation 只接受 --expect-revision 0", file=sys.stderr)
+            return 64
+    elif (
+        not isinstance(expect_id, str)
+        or not expect_id
+        or not isinstance(expect_status, str)
+        or not expect_status
+    ):
+        print("错误: mutation precondition 字段不完整", file=sys.stderr)
+        return 64
+    if expect_kind == "task" and (
+        not isinstance(expect_version, int)
+        or isinstance(expect_version, bool)
+        or expect_version < 1
+        or not isinstance(expect_id, str)
+        or expect_id.count(":") != 1
+    ):
+        print("错误: task mutation precondition 无效", file=sys.stderr)
+        return 64
+    if expect_kind != "task" and expect_version is not None:
+        print("错误: 非 task mutation 不接受 version precondition", file=sys.stderr)
+        return 64
+    if expect_kind == "gpu" and (
+        not isinstance(expect_id, str)
+        or not expect_id.isdigit()
+        or expect_assignments is None
+    ):
+        print("错误: GPU mutation precondition 无效", file=sys.stderr)
+        return 64
+    if expect_kind != "gpu" and (
+        expect_quarantined is not None or expect_assignments is not None
+    ):
+        print("错误: 非 GPU mutation 不接受 GPU precondition", file=sys.stderr)
+        return 64
+    if expect_quarantined is not None and (
+        not isinstance(expect_quarantined, int)
+        or isinstance(expect_quarantined, bool)
+        or expect_quarantined not in {0, 1}
+    ):
+        print("错误: GPU quarantined precondition 无效", file=sys.stderr)
+        return 64
+
+    expectation = {
+        "kind": expect_kind,
+        "id": expect_id,
+        "status": expect_status,
+        "version": expect_version,
+        "quarantined": expect_quarantined,
+        "revision": expect_revision,
+        "assignments": expect_assignments,
+    }
+    argv_json = json.dumps(
+        {"command": command, "expect": expectation},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    def existing_result(conn: sqlite3.Connection):
+        return conn.execute(
+            "SELECT argv, status, code, stdout, stderr, output_compacted"
+            " FROM operation_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+
+    def replay(existing) -> int | None:
+        if existing is None:
+            return None
+        if existing["argv"] != argv_json:
+            print(
+                "错误: request_id 已绑定到不同 mutation",
+                file=sys.stderr,
+            )
+            return 64
+        if existing["status"] != "done":
+            print(
+                "错误: prior mutation outcome unknown; refusing replay",
+                file=sys.stderr,
+            )
+            return 75
+        sys.stdout.write(existing["stdout"] or "")
+        sys.stderr.write(existing["stderr"] or "")
+        return int(existing["code"])
+
+    def precondition_conflict(conn: sqlite3.Connection) -> str | None:
+        if expect_kind == "none":
+            return None
+        if expect_kind == "batch":
+            row = conn.execute(
+                "SELECT status, revision FROM batches WHERE id=?",
+                (expect_id,),
+            ).fetchone()
+            if row is None:
+                return "batch absent"
+            if row["status"] != expect_status:
+                return (
+                    f"batch status changed: expected {expect_status},"
+                    f" found {row['status']}"
+                )
+            if row["revision"] != expect_revision:
+                return (
+                    f"batch revision changed: expected {expect_revision},"
+                    f" found {row['revision']}"
+                )
+            return None
+        if expect_kind == "task":
+            batch_id, task_id = expect_id.split(":", 1)
+            row = conn.execute(
+                "SELECT j.status, j.version, b.revision"
+                " FROM jobs j JOIN batches b ON b.id=j.batch_id"
+                " WHERE j.batch_id=? AND j.task_id=?"
+                " ORDER BY j.version DESC LIMIT 1",
+                (batch_id, task_id),
+            ).fetchone()
+            if row is None:
+                return "task absent"
+            actual_status = {
+                "waiting_quota": "pending",
+                "waiting_dep": "pending",
+            }.get(row["status"], row["status"])
+            if actual_status != expect_status or row["version"] != expect_version:
+                return (
+                    f"task changed: expected {expect_status} v{expect_version},"
+                    f" found {actual_status} v{row['version']}"
+                )
+            if row["revision"] != expect_revision:
+                return (
+                    f"batch revision changed: expected {expect_revision},"
+                    f" found {row['revision']}"
+                )
+            return None
+        row = conn.execute(
+            "SELECT status, quarantined, revision FROM gpus WHERE idx=?",
+            (int(expect_id),),
+        ).fetchone()
+        if row is None:
+            return "GPU absent"
+        if row["status"] != expect_status:
+            return (
+                f"GPU status changed: expected {expect_status},"
+                f" found {row['status']}"
+            )
+        if (
+            expect_quarantined is not None
+            and row["quarantined"] != expect_quarantined
+        ):
+            return (
+                "GPU quarantine changed:"
+                f" expected {expect_quarantined}, found {row['quarantined']}"
+            )
+        if row["revision"] != expect_revision:
+            return (
+                f"GPU revision changed: expected {expect_revision},"
+                f" found {row['revision']}"
+            )
+        assignments = [
+            {"job_id": item["job_id"], "vram_gib": item["vram_gib"]}
+            for item in conn.execute(
+                "SELECT job_id, vram_gib FROM gpu_jobs"
+                " WHERE gpu_id=? ORDER BY job_id",
+                (int(expect_id),),
+            ).fetchall()
+        ]
+        if assignments != expect_assignments:
+            return (
+                "GPU assignments changed:"
+                f" expected {expect_assignments}, found {assignments}"
+            )
+        return None
+
+    unbound = command[0] in {"daemon", "config"}
+    if unbound:
+        with state.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state.compact_operation_outputs(conn)
+            existing = existing_result(conn)
+            replay_code = replay(existing)
+            if replay_code is not None:
+                return replay_code
+            conflict = precondition_conflict(conn)
+            conn.execute(
+                "INSERT INTO operation_requests"
+                " (request_id, argv, status, created_at)"
+                " VALUES (?, ?, 'started', ?)",
+                (request_id, argv_json, state.now()),
+            )
+            if conflict is not None:
+                stderr = f"错误: mutation precondition failed: {conflict}\n"
+                conn.execute(
+                    "UPDATE operation_requests SET status='done', code=65,"
+                    " stdout='', stderr=?, finished_at=? WHERE request_id=?",
+                    (stderr, state.now(), request_id),
+                )
+                sys.stderr.write(stderr)
+                return 65
+
+        code, stdout, stderr, _callbacks = _run_captured_mutation(command)
+        with state.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE operation_requests"
+                " SET status='done', code=?, stdout=?, stderr=?, finished_at=?"
+                " WHERE request_id=? AND status='started'",
+                (code, stdout, stderr, state.now(), request_id),
+            )
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        return code
+
+    deferred: list[Any] = []
+    with state.submission_lock(), state.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state.compact_operation_outputs(conn)
+        existing = existing_result(conn)
+        replay_code = replay(existing)
+        if replay_code is not None:
+            return replay_code
+        conn.execute(
+            "INSERT INTO operation_requests"
+            " (request_id, argv, status, created_at)"
+            " VALUES (?, ?, 'started', ?)",
+            (request_id, argv_json, state.now()),
+        )
+        conflict = precondition_conflict(conn)
+        if conflict is not None:
+            code = 65
+            stdout = ""
+            stderr = f"错误: mutation precondition failed: {conflict}\n"
+        else:
+            conn.execute("SAVEPOINT request_mutation")
+            code, stdout, stderr, deferred = _run_captured_mutation(command, conn)
+            if code:
+                conn.execute("ROLLBACK TO request_mutation")
+                deferred.clear()
+            conn.execute("RELEASE request_mutation")
+        conn.execute(
+            "UPDATE operation_requests"
+            " SET status='done', code=?, stdout=?, stderr=?, finished_at=?"
+            " WHERE request_id=? AND status='started'",
+            (code, stdout, stderr, state.now(), request_id),
+        )
+
+    while deferred:
+        effect = deferred.pop(0)
+        try:
+            effect()
+        except Exception as exc:
+            print(f"警告: mutation 已提交，但提交后副作用失败: {exc}", file=sys.stderr)
+    sys.stdout.write(stdout)
+    sys.stderr.write(stderr)
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
+    state.set_read_only(False)
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
     )
@@ -2425,6 +3640,17 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("status", help="三视图总览")
     p.add_argument("batch", nargs="?", default=None)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=200, help="批次/任务最大行数 (默认 200)")
+    p.add_argument(
+        "--cursor",
+        default=None,
+        help="上一页 JSON 的 next_cursor（稳定键集分页）",
+    )
+    p.add_argument(
+        "--job-cursor",
+        default=None,
+        help="上一页 JSON 的 next_job_cursor（独立任务键集分页）",
+    )
     p.add_argument("--detail", action="store_true",
                    help="任务视图含起止时间/耗时/version (P5)")
     p.add_argument("--project", default=None,
@@ -2433,11 +3659,18 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("task", help="单任务详情")
     p.add_argument("task", help="<batch>:<task>")
+    p.add_argument("--json", action="store_true", help="稳定版本化 JSON 输出")
     p.set_defaults(fn=cmd_task)
 
     p = sub.add_parser("history", help="历史查询")
     p.add_argument("batch", nargs="?", default=None)
     p.add_argument("--limit", type=int, default=50, help="最大行数 (默认 50)")
+    p.add_argument(
+        "--cursor",
+        default=None,
+        help="上一页 JSON 的 next_cursor（稳定键集分页）",
+    )
+    p.add_argument("--json", action="store_true", help="稳定版本化 JSON 输出")
     p.add_argument("--status", default=None, help="按状态过滤, 逗号分隔 (如 done,failed)")
     p.add_argument("--project", default=None, help="按项目过滤 (B11c)")
     p.set_defaults(fn=cmd_history)
@@ -2466,7 +3699,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true", help="确认执行")
     p.set_defaults(fn=cmd_discard)
 
-    p = sub.add_parser("clean", help="清除批次产物指纹 (强制后续重跑)")
+    p = sub.add_parser("clean", help="清除批次最新产物与指纹 (强制后续重跑)")
     p.add_argument("batch", help="批次名或 id")
     p.add_argument("--yes", action="store_true", help="确认执行")
     p.set_defaults(fn=cmd_clean)
@@ -2526,6 +3759,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_gpu_free)
 
+    p = sub.add_parser(
+        "request",
+        help="以 durable request_id 最多执行一次 mutation",
+    )
+    p.add_argument("request_id")
+    p.add_argument(
+        "--expect-kind",
+        choices=["none", "batch", "task", "gpu"],
+        default="none",
+    )
+    p.add_argument("--expect-id")
+    p.add_argument("--expect-status")
+    p.add_argument("--expect-version", type=int)
+    p.add_argument("--expect-quarantined", type=int, choices=[0, 1])
+    p.add_argument("--expect-revision", type=int, required=True)
+    p.add_argument(
+        "--expect-assignments-json",
+        help='GPU 当前 assignments JSON，如 [{"job_id":"j","vram_gib":1.5}]',
+    )
+    p.add_argument("command", nargs="+")
+    p.set_defaults(fn=cmd_request)
+
     p = sub.add_parser("daemon", help="daemon 生命周期")
     p.add_argument("action", choices=["start", "stop", "status", "check"])
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
@@ -2553,62 +3808,129 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "fn", None):
         ap.print_help()
         return 1
-    # B24d (2026-08-26, sd_repro_v3 丢失事故): 写操作跨主机执行 = 静默丢数据。
-    # state.db 在 NFS 上以 WAL 模式被双主机共享 (网关 CLI 写 + 计算节点 daemon
-    # 读/写/检查点), SQLite 官方明确不支持此场景 —— 跨主机锁不可靠时, 网关提交
-    # 的事务会被 daemon 的检查点静默抹掉 (已实测 100% 复现)。写操作必须在
-    # config.node 所指的计算节点上执行; 违反则拒绝并给出明确指引。
-    # B27: submit 不在顶层守卫列表 —— 它有专属 inbox 投递通道 (cmd_submit 内),
-    # 在登录节点上会把 spec 落 inbox + 插控制请求行, 由 daemon 消费入库。
-    _WRITE_COMMANDS = {
-        "run", "cancel", "retry", "resubmit", "discard", "clean",
-        "config", "gpu-ok", "gpu-free", "gpu-ignore", "gpu-set-mem",
-    }
-    is_read_only_config = (
-        getattr(args, "cmd", None) == "config"
-        and getattr(args, "config_cmd", None) == "get"
+
+    command = getattr(args, "cmd", None)
+    daemon_action = getattr(args, "action", None) if command == "daemon" else None
+    config_get = (
+        command == "config" and getattr(args, "config_cmd", None) == "get"
     )
+    dry_run = bool(getattr(args, "dry_run", False))
+    allow_foreign_write = os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") == "1"
+    cfg = None
+    config_error = None
+    if command != "init":
+        try:
+            from . import config as config_module
+
+            cfg = config_module.load_config()
+        except Exception as error:
+            config_error = error
+
     if (
-        getattr(args, "cmd", None) in _WRITE_COMMANDS
-        and not is_read_only_config
-        and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE")
+        command == "daemon"
+        and daemon_action in ("start", "stop", "check")
+        and not allow_foreign_write
+        and cfg is None
     ):
-        try:
-            from .config import load_config as _lc
-            import socket as _socket
-            _node = str(_lc().get("node") or "")
-            if _node and _socket.gethostname() != _node:
-                print(
-                    f"错误: 写操作 ({args.cmd}) 必须在计算节点 {_node} 上执行,"
-                    f" 当前在登录节点 {_socket.gethostname()}。\n"
-                    "原因: state.db 经 NFS 双主机共享时 WAL 跨主机锁不可靠,"
-                    " 登录节点提交的事务会被 daemon 检查点静默抹掉。\n"
-                    f"做法: 进入计算节点会话 (screen/srun) 后再执行 sched {args.cmd}? "
-                    f"(确知风险强制继续: SCHED_ALLOW_FOREIGN_WRITE=1)",
-                    file=sys.stderr,
-                )
-                return 2
-        except Exception:
-            pass  # 配置不可读等场景交由后续正常路径报错
-    foreign_submit = False
-    if getattr(args, "cmd", None) == "submit" and not os.environ.get("SCHED_ALLOW_FOREIGN_WRITE"):
-        try:
-            foreign_submit = _is_foreign_host(load_config())
-        except Exception:
-            pass
-    # Gateway submit is file-only; foreign dry-run is also DB-free.
-    if not foreign_submit and not is_read_only_config:
+        print(
+            f"错误: 无法读取配置并验证 daemon 写入主机，拒绝执行: {config_error}",
+            file=sys.stderr,
+        )
+        return 2
+
+    foreign = bool(cfg and _is_foreign_host(cfg))
+    if (
+        command == "daemon"
+        and daemon_action in ("start", "stop", "check")
+        and foreign
+        and not allow_foreign_write
+    ):
+        print(
+            f"错误: daemon {daemon_action} 必须在计算节点"
+            f" {cfg.get('node')} 上执行；当前主机只允许 daemon status",
+            file=sys.stderr,
+        )
+        return 2
+
+    write_commands = {
+        "run",
+        "cancel",
+        "retry",
+        "resubmit",
+        "request",
+        "discard",
+        "clean",
+        "config",
+        "gpu-ok",
+        "gpu-free",
+        "gpu-ignore",
+        "gpu-set-mem",
+        "notify-test",
+        "notify-ack",
+    }
+    protected_write = (
+        command in write_commands and not config_get and not dry_run
+    )
+    if protected_write and foreign and not allow_foreign_write:
+        print(
+            f"错误: 写操作 ({command}) 必须在计算节点 {cfg.get('node')} 上执行,"
+            " 当前主机仅允许只读查询。"
+            " (明确强制继续: SCHED_ALLOW_FOREIGN_WRITE=1)",
+            file=sys.stderr,
+        )
+        return 2
+
+    read_commands = {
+        "verify",
+        "status",
+        "task",
+        "history",
+        "markers",
+        "incidents",
+        "diag",
+        "log",
+        "list-gpus",
+        "notify-inbox",
+        "project",
+    }
+    foreign_submit = command == "submit" and foreign and not allow_foreign_write
+    foreign_read = foreign and (
+        command in read_commands
+        or dry_run
+        or (command == "daemon" and daemon_action == "status")
+    )
+    state.set_read_only(foreign_read or dry_run)
+
+    should_init = (
+        command != "init"
+        and cfg is not None
+        and not config_get
+        and not foreign_submit
+        and not foreign_read
+        and not dry_run
+    )
+    if should_init:
         try:
             state.init_db()
-        except Exception as e:
-            print(f"警告: state DB 初始化失败 ({e}), 后续命令可能报错", file=sys.stderr)
+        except Exception as error:
+            print(
+                f"错误: state DB 初始化或迁移失败 ({error}); 拒绝执行命令",
+                file=sys.stderr,
+            )
+            state.set_read_only(False)
+            return 1
     try:
         return args.fn(args)
-    except state.SubmissionBlocked as e:
-        print(f"错误: {e}", file=sys.stderr)
+    except state.SubmissionBlocked as error:
+        print(f"错误: {error}", file=sys.stderr)
         return 2
+    except state.StateError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 130
+    finally:
+        state.set_read_only(False)
 
 
 if __name__ == "__main__":

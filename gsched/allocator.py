@@ -15,7 +15,16 @@ import json
 import subprocess
 from typing import Any
 
-from .state import connect, default_state_dir, get_gpu, hostname, now, release_gpu
+from .state import (
+    connect,
+    default_state_dir,
+    ensure_private_directory,
+    get_gpu,
+    hostname,
+    now,
+    open_private_text,
+    release_gpu,
+)
 
 _UNSET = object()  # P3: by_card 预取参数哨兵 (区分"未传"与"查询失败返回 None")
 
@@ -32,7 +41,7 @@ class Allocator:
         self.gpu_list = gpu_list  # 配置集 (D3: 实际可用集 = 配置集 - quarantine)
         self.mem_overrides = mem_overrides or {}  # config.gpus[{idx,mem_gib}] 手动覆盖
         self.fake = fake or bool(os.environ.get("SCHED_FAKE_GPUS"))
-        self._uuid_map: dict[str, int] | None = None  # gpu_uuid->idx 缓存 (M8, 建一次)
+        self._uuid_map: dict[str, int] | None = None  # 上次完整拓扑; 每次归属前重探
         # B26: GPU 健康自愈 —— nvidia-smi 连续异常计数 -> 自动熔断 (2026-08-26 幽灵卡事故)
         self._probe_fail_streak: dict[int, int] = {}
         self._auto_quarantine_threshold = 5  # 连续 5 次探测失败 (~50s) 即熔断
@@ -231,14 +240,15 @@ class Allocator:
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=10,
                 )
-                uuid_map = self._uuid_to_idx() if out.returncode == 0 else {}
-                for line in out.stdout.splitlines():
-                    parts = [x.strip() for x in line.split(",")]
-                    if len(parts) != 3:
-                        continue
-                    pid_i = int(parts[0])
-                    if uuid_map.get(parts[2]) == idx:
-                        mem_by_pid[pid_i] = int(parts[1])
+                uuid_map = self._uuid_to_idx() if out.returncode == 0 else None
+                if uuid_map is not None:
+                    for line in out.stdout.splitlines():
+                        parts = [x.strip() for x in line.split(",")]
+                        if len(parts) != 3:
+                            continue
+                        pid_i = int(parts[0])
+                        if uuid_map.get(parts[2]) == idx:
+                            mem_by_pid[pid_i] = int(parts[1])
             except (subprocess.SubprocessError, ValueError, FileNotFoundError):
                 pass
         ext: list[dict] = []
@@ -277,6 +287,9 @@ class Allocator:
                 ]
             return out
         try:
+            topology_before = self._uuid_to_idx()
+            if topology_before is None:
+                return None
             out = subprocess.run(
                 ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid",
                  "--format=csv,noheader"],
@@ -286,50 +299,77 @@ class Allocator:
             )
             if out.returncode != 0:
                 return None
-            uuid_map = self._uuid_to_idx()
+            topology_after = self._uuid_to_idx()
+            if topology_after is None or topology_after != topology_before:
+                return None
+            lines = [line for line in out.stdout.splitlines() if line.strip()]
+            if not lines:
+                return {}
             by_card: dict[int, list[int]] = {}
-            for line in out.stdout.splitlines():
+            for line in lines:
                 parts = line.split(",")
                 if len(parts) != 2:
-                    continue
+                    return None
                 pid_s, uuid = parts[0].strip(), parts[1].strip()
-                idx = uuid_map.get(uuid)
-                if idx is not None:
-                    by_card.setdefault(idx, []).append(int(pid_s))
+                idx = topology_before.get(uuid)
+                if idx is None:
+                    # A complete topology was bracketed around the compute
+                    # sample. Any other UUID makes attribution indeterminate.
+                    return None
+                by_card.setdefault(idx, []).append(int(pid_s))
             return by_card
         except (subprocess.SubprocessError, ValueError, FileNotFoundError):
             return None
 
-    def _uuid_to_idx(self) -> dict[str, int]:
-        """gpu_uuid -> idx 映射 (§3.2e C: compute-apps 返回 UUID 非 idx).
+    def _uuid_to_idx(self) -> dict[str, int] | None:
+        """Re-probe a complete topology before attributing any compute PID.
 
-        --query-gpu=index,uuid 建一次 (daemon 启动时首次调用缓存).
-        fake 返回空 (fake 路径不走 UUID).
+        A successful probe replaces the cached map as one unit. If topology
+        changed since the preceding sample, discard this attribution cycle:
+        the compute-app and topology queries may straddle a reconfiguration.
         """
         if self.fake:
             return {}
-        if self._uuid_map is None:
-            self._uuid_map = {}
-            try:
-                out = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=index,uuid",
-                     "--format=csv,noheader"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                for line in out.stdout.splitlines():
-                    parts = line.split(",")
-                    if len(parts) == 2:
-                        try:
-                            self._uuid_map[parts[1].strip()] = int(
-                                parts[0].strip()
-                            )
-                        except ValueError:
-                            pass
-            except (subprocess.SubprocessError, ValueError, FileNotFoundError):
-                pass
-        return self._uuid_map
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,uuid",
+                 "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return None
+        if result.returncode != 0:
+            return None
+
+        mapping: dict[str, int] = {}
+        indices: set[int] = set()
+        try:
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            if not lines:
+                return None
+            for line in lines:
+                parts = line.split(",")
+                if len(parts) != 2:
+                    return None
+                idx = int(parts[0].strip())
+                uuid = parts[1].strip()
+                if not uuid or uuid in mapping or idx in indices:
+                    return None
+                mapping[uuid] = idx
+                indices.add(idx)
+        except ValueError:
+            return None
+        configured = set(getattr(self, "gpu_list", ()) or ())
+        if configured and not configured.issubset(indices):
+            return None
+
+        previous = getattr(self, "_uuid_map", None)
+        self._uuid_map = mapping
+        if previous is not None and previous != mapping:
+            return None
+        return mapping
 
     def _pgid_of(self, pid: int) -> int | None:
         """pid -> pgid (os.getpgid, stdlib 同用户无 sudo 可行). 已死/权限 -> None.
@@ -461,42 +501,57 @@ class Allocator:
             ).fetchall()
             # P3: 循环外预取一次 compute-apps 和已知 pgid, 逐卡分发
             # (每卡各查一次 = 2N 次子进程/全表扫描, N=卡数)
-            by_card = self._compute_pids_by_card() if rows else None
-            known = self._known_job_pgids() if rows else None
+            by_card = self._compute_pids_by_card() if rows else {}
+            try:
+                known = self._known_job_pgids() if rows else set()
+            except Exception:
+                known = None
             for row in rows:
                 idx = row["idx"]
-                has_proc = self._card_has_compute(idx, by_card, known)
-                # 冷却起点 = updated_at (R6: daemon 重启不重置)
+                pids = None if by_card is None else by_card.get(idx, [])
                 try:
                     elapsed = _t.time() - _t.mktime(
                         _t.strptime(row["updated_at"], "%Y-%m-%d %H:%M:%S")
                     )
-                except ValueError:
+                except (TypeError, ValueError):
                     elapsed = 0
-                if not has_proc:
-                    if self._confirm_release(idx):
-                        conn.execute(
-                            "UPDATE gpus SET status='free', job_id=NULL, updated_at=? WHERE idx=?",
-                            (now(), idx),
-                        )
-                        # 防御: releasing 卡应已无 gpu_jobs 行 (计数释放), 清残留
-                        conn.execute(
-                            "DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,)
-                        )
-                        freed.append(idx)
-                else:
-                    self._reset_release_confirm(idx)  # 中间不干净: 中断连续计数
+
+                if pids is None:
+                    # An indeterminate physical probe is not a clean sample.
+                    self._reset_release_confirm(idx)
                     if elapsed > RELEASE_TIMEOUT_SEC:
-                        conn.execute(
-                            "UPDATE gpus SET status='unmanaged', job_id=NULL, updated_at=? WHERE idx=?",
-                            (now(), idx),
-                        )
-                        # 防御: unmanaged 卡不应有 gpu_jobs 行 (任务已离场)
-                        conn.execute(
-                            "DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,)
-                        )
+                        self._set_unmanaged(conn, idx)
                         timeout.append(idx)
+                    continue
+                if pids:
+                    self._reset_release_confirm(idx)
+                    external_or_unknown = known is None or any(
+                        (pgid := self._pgid_of(pid)) is None or pgid not in known
+                        for pid in pids
+                    )
+                    if external_or_unknown:
+                        # Scheduler ownership has ended; an external/unknown
+                        # compute process makes this card unmanaged immediately.
+                        self._set_unmanaged(conn, idx)
+                    elif elapsed > RELEASE_TIMEOUT_SEC:
+                        self._set_unmanaged(conn, idx)
+                        timeout.append(idx)
+                    continue
+                if self._confirm_release(idx):
+                    conn.execute(
+                        "UPDATE gpus SET status='free', job_id=NULL, updated_at=? WHERE idx=?",
+                        (now(), idx),
+                    )
+                    conn.execute("DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,))
+                    freed.append(idx)
         return freed, timeout
+
+    def _set_unmanaged(self, conn, idx: int) -> None:
+        conn.execute(
+            "UPDATE gpus SET status='unmanaged', job_id=NULL, updated_at=? WHERE idx=?",
+            (now(), idx),
+        )
+        conn.execute("DELETE FROM gpu_jobs WHERE gpu_id=?", (idx,))
 
     def _card_any_occupied(self, idx: int, by_card: Any = _UNSET) -> bool | None:
         """probe 占用判据 (审查 M7): 有 compute 进程 (不分归属) 或 util>0 -> True.
@@ -504,10 +559,9 @@ class Allocator:
         与 _card_has_compute 的区别: 不做 pgid 归属判定 —— 外部进程驻留显存
         即使 util=0 也判占用, 否则 probe_free 永远抓不出 "驻留但空闲" 的外部
         进程, 派发新任务上卡会显存冲突 (归属判定只用于 settle_releasing 等离场)。
-        None = 查询失败 (M8 fail-closed: 调用方保持现状不转态)。
+        None = 查询失败 (M8 fail-closed: releasing 不计干净样本，free 卡转 unmanaged).
 
-        P3: by_card 传入预取的 compute-apps 结果 (每轮 tick 查一次按卡分发);
-        显式传 None = 查询已失败 (fail-closed); 不传 (哨兵) = 自行查询。
+        by_card 可传入本轮预取结果；None 表示查询失败。
         """
         if by_card is _UNSET:
             by_card = self._compute_pids_by_card()
@@ -522,36 +576,13 @@ class Allocator:
 
     def _card_has_compute(
         self, idx: int, by_card: Any = _UNSET, known: set[int] | None = None
-    ) -> bool:
-        """M8 主判据: 该卡是否有未离场的 compute 进程 (§3.2e C).
-
-        层次:
-          1. compute-apps 按卡列 pid -> 逐 os.getpgid(pid) 对照 jobs.pgid:
-             - 任一 pid 属于已知 job pgid -> 残留框架进程 -> True (等离场)
-             - 无 pid / 全外部进程 -> False (干净)
-          2. 兜底: compute-apps 查询失败 -> util==0 (现状语义)
-
-        行为路径变化 (评审确认): 外部进程判干净 -> 回 free -> 同 tick 的
-        probe_free 用 _card_any_occupied (不分归属) 立即抓回 unmanaged,
-        无 free 窗口可派发 (dispatch 在 probe_free 之后).
-
-        P3: by_card/known 可预取 (settle_releasing 每轮查一次按卡分发),
-        不再逐卡各查一次 nvidia-smi + 全表 DISTINCT。
-        """
+    ) -> bool | None:
+        """Return physical compute occupancy; None means the probe is indeterminate."""
         if by_card is _UNSET:
             by_card = self._compute_pids_by_card()
         if by_card is None:
-            return self._util(idx) > 0  # 兜底: 查询失败回退 util 判据
-        pids = by_card.get(idx, [])
-        if not pids:
-            return False
-        if known is None:
-            known = self._known_job_pgids()
-        for pid in pids:
-            pgid = self._pgid_of(pid)
-            if pgid is not None and pgid in known:
-                return True  # 残留框架进程: 等离场
-        return False  # 全外部进程: 干净
+            return None
+        return bool(by_card.get(idx))
 
     def _confirm_flag(self, kind: str, idx: int) -> str:
         """连续采样确认标记路径 (决策 5B: 按节点隔离 + 统一走 state 路径函数,
@@ -568,11 +599,11 @@ class Allocator:
         if self.fake:
             return True
         flag = self._confirm_flag("release_confirm", idx)
-        os.makedirs(os.path.dirname(flag), exist_ok=True)
+        ensure_private_directory(os.path.dirname(flag))
         if os.path.exists(flag):
             os.unlink(flag)
             return True
-        open(flag, "w").close()
+        open_private_text(flag, "w").close()
         return False
 
     def _reset_release_confirm(self, idx: int) -> None:
@@ -588,11 +619,11 @@ class Allocator:
         if self.fake:
             return True
         flag = self._confirm_flag("unmanaged_confirm", idx)
-        os.makedirs(os.path.dirname(flag), exist_ok=True)
+        ensure_private_directory(os.path.dirname(flag))
         if os.path.exists(flag):
             os.unlink(flag)
             return True
-        open(flag, "w").close()
+        open_private_text(flag, "w").close()
         return False
 
     def _reset_unmanaged_confirm(self, idx: int) -> None:
@@ -642,25 +673,6 @@ class Allocator:
         """采样成功 -> 清零失败计数."""
         self._probe_fail_streak.pop(idx, None)
 
-    def _reset_occupied(self, idx: int) -> None:
-        """中断 unmanaged 连续计数 (采样干净/查询失败, 审查 M10)."""
-        if self.fake:
-            return
-        flag = self._confirm_flag("occupied_confirm", idx)
-        if os.path.exists(flag):
-            os.unlink(flag)
-
-    def _confirm_occupied(self, idx: int) -> bool:
-        """unmanaged 探测连续 2 次 (M7)."""
-        if self.fake:
-            return True
-        flag = self._confirm_flag("occupied_confirm", idx)
-        os.makedirs(os.path.dirname(flag), exist_ok=True)
-        if os.path.exists(flag):
-            os.unlink(flag)
-            return True
-        open(flag, "w").close()
-        return False
 
     def probe_unmanaged(self) -> list[int]:
         """unmanaged 卡周期复查 (Q3 扩展): 物理真实空闲 (util==0) 连续 2 次采样
@@ -701,11 +713,7 @@ class Allocator:
         return moved
 
     def probe_free(self) -> list[int]:
-        """free 卡抽查: 有 compute 进程 (不分归属) 或 util>0 -> unmanaged (孤儿防线).
-
-        审查 M7/M8: 判据不分 pgid 归属 (外部驻留进程也判占用); 查询失败
-        (occ=None) fail-closed 保持 free 不转态, 并中断连续计数.
-        """
+        """Remove physically occupied or indeterminate cards from the free pool."""
         if self.fake:
             return []
         moved: list[int] = []
@@ -713,24 +721,15 @@ class Allocator:
             rows = conn.execute(
                 "SELECT idx FROM gpus WHERE status='free'"
             ).fetchall()
-            # P3: 循环外预取一次 compute-apps 逐卡分发
-            by_card = self._compute_pids_by_card() if rows else None
+            by_card = self._compute_pids_by_card() if rows else {}
             for row in rows:
                 idx = row["idx"]
                 occ = self._card_any_occupied(idx, by_card)
-                if occ is None:
-                    self._reset_occupied(idx)  # 查询失败: 中断连续计数 (M10)
-                    continue  # nvidia-smi 故障: fail-closed 保持现状 (M8)
-                if occ:
-                    # 连续 2 次 (M7): 这里用标记确认
-                    if self._confirm_occupied(idx):
-                        conn.execute(
-                            "UPDATE gpus SET status='unmanaged', updated_at=? WHERE idx=?",
-                            (now(), idx),
-                        )
-                        moved.append(idx)
-                else:
-                    self._reset_occupied(idx)  # 干净采样重置标记, 才是"连续 2 次" (M10)
+                if occ is not False:
+                    # There must never be a dispatchable confirmation window:
+                    # both observed occupancy and probe uncertainty fail closed.
+                    self._set_unmanaged(conn, idx)
+                    moved.append(idx)
         return moved
 
     def available_gpus(self) -> list[int]:

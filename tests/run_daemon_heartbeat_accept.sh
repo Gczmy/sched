@@ -21,6 +21,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
@@ -63,7 +64,7 @@ echo "=== daemon 跨节点判活 + CPU-only check 降级验收 ==="
 
 # ---------- 场景 1: fake daemon 生命周期 ----------
 echo "--- 场景 1: fake daemon 启动/停止判活 ---"
-S1=/tmp/sched_acc_hb1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-heartbeat-1"
 mk_config $S1 "[0]"
 export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
 SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
@@ -74,7 +75,7 @@ $PY -m gsched.cli daemon stop >/dev/null 2>&1
 
 # ---------- 场景 2+5: 跨节点模拟 (无 PID, 心跳新鲜) ----------
 echo "--- 场景 2+5: 无 PID + 心跳新鲜 = 别的主机在跑 ---"
-S2=/tmp/sched_acc_hb2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-heartbeat-2"
 mk_config $S2 "[0]"
 # 模拟: 登录节点视角 —— PID 文件不存在, 但共享 home 里计算节点的心跳新鲜
 HB=$S2/testnode/daemon.heartbeat
@@ -91,16 +92,16 @@ grep -q "计算节点" $S2/stop_out.txt && ok "stop 跨节点提示去计算节�
 
 # ---------- 场景 3: 心跳过期 ----------
 echo "--- 场景 3: 心跳过期 -> 判死 ---"
-S3=/tmp/sched_acc_hb3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-heartbeat-3"
 mk_config $S3 "[0]"
 HB3=$S3/testnode/daemon.heartbeat
 mkdir -p $(dirname $HB3)
-touch -d "5 minutes ago" $HB3
+$PY -c "import os,time; open('$HB3','a').close(); os.utime('$HB3', (time.time()-300, time.time()-300))"
 [ "$(is_running $S3)" = "0" ] && ok "心跳过期 (>60s) -> 判死" || bad "心跳过期仍判运行"
 
 # ---------- 场景 4: 纯 CPU check 降级 ----------
 echo "--- 场景 4: config.gpus=[] 无 nvidia-smi -> warn 非 fail ---"
-S4=/tmp/sched_acc_hb4; rm -rf $S4; mkdir -p $S4
+sched_accept_make_root S4 "sched-heartbeat-4"
 mk_config $S4 "[]"
 export SCHED_STATE=$S4 SCHED_CONFIG=$S4/config.json
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -118,7 +119,7 @@ else
 fi
 # 对照: config.gpus=[0] 无 nvidia-smi -> fail
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-  S5=/tmp/sched_acc_hb5; rm -rf $S5; mkdir -p $S5
+  sched_accept_make_root S5 "sched-heartbeat-5"
   mk_config $S5 "[0]"
   export SCHED_STATE=$S5 SCHED_CONFIG=$S5/config.json
   OUT=$($PY -m gsched.cli daemon check 2>&1)

@@ -2,11 +2,13 @@
 # B27: 单写者收编验收 —— 非计算节点 submit 走 inbox + daemon 消费入队
 set -u
 cd "$(dirname "$0")/.."
+source tests/acceptance_cleanup.sh
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 
-export SCHED_STATE="$(mktemp -d)"
+sched_accept_make_root SCHED_STATE "sched-submit-inbox"
+export SCHED_STATE
 export SCHED_ALLOW_FOREIGN_WRITE=1
 
 NODE="$(uname -n)"
@@ -61,11 +63,11 @@ class _FakeExec:
 d.executor = None  # 消费路径不 touch executor
 
 # 构造最少依赖后调用 _process_control_requests
-import gsched.state as st2
-# allocator 属性仅在 cancel 分支用——batch_submit 分支不触及
 try:
+    import gsched.state as st2
+    # allocator 属性仅在 cancel 分支用——batch_submit 分支不触及
     # 需要 self._notify_threads? 不, _process_control_requests 不用
-    with open("/tmp/ns_cfg.json","w") as f:
+    with open(os.path.join(os.environ["SCHED_STATE"], "ns_cfg.json"), "w") as f:
         f.write(json.dumps(d.cfg))
     # 手动调用目标方法所在类的未绑定方法
     Dispatcher._process_control_requests(d)

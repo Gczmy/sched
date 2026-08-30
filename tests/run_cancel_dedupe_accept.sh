@@ -2,7 +2,9 @@
 # M3: duplicate cancel requests for one job must not escalate to SIGKILL in one tick.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-cancel-dedupe"
+export SCHED_STATE
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
@@ -34,10 +36,18 @@ with state.connect() as conn:
 signals = []
 class Exec:
     def alive(self, _pgid): return True
-    def kill_pgid(self, _pgid, sig=signal.SIGTERM): signals.append(sig)
+    def kill_pgid(self, _pgid, sig=signal.SIGTERM):
+        signals.append(sig)
+        return True
 d = Dispatcher.__new__(Dispatcher)
+d.host_dir = os.path.join(os.environ["SCHED_STATE"], state.hostname())
 d.executor = Exec()
 d.log_line = lambda _msg: None
+d._proc_start_time = lambda _pgid: "proc:1"
+marker = d._launch_marker_path({"id": job_id, "pgid": 4242})
+os.makedirs(os.path.dirname(marker), exist_ok=True)
+with open(marker, "w", encoding="utf-8") as stream:
+    stream.write("4242 proc:1\n")
 Dispatcher._process_control_requests(d)
 conn = sqlite3.connect(state.db_path())
 statuses = [r[0] for r in conn.execute("SELECT status FROM control_requests ORDER BY id")]

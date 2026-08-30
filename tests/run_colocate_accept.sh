@@ -17,6 +17,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
+source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
@@ -29,7 +30,7 @@ echo "=== co-location 共享装箱验收 (fake-gpu 显存模拟) ==="
 
 # ---------- S1/S2/S3: 装箱核心 (直接调 _assign_in_tx 单元验证) ----------
 echo "--- S1/S2/S3: Least-Loaded 装箱 + 计数释放 ---"
-S1=/tmp/sched_coloc_s1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-colocate-core"
 SCHED_STATE=$S1 SCHED_FAKE_GPUS="0:24,1:24" $PY - <<'EOF'
 import os, sys, tempfile
 sys.path.insert(0, os.getcwd() + '/sched')
@@ -82,7 +83,7 @@ if [ $? -eq 0 ]; then ok "S1/S2/S3: 计数释放 + Least-Loaded 装箱 (均衡�
 
 # ---------- S4: 动态加入 (新批次任务 pack 到有余量卡) ----------
 echo "--- S4: 动态加入 ---"
-S4=/tmp/sched_coloc_s4; rm -rf $S4; mkdir -p $S4
+sched_accept_make_root S4 "sched-colocate-dynamic"
 cat > $S4/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -135,11 +136,11 @@ else
   bad "S4: 动态加入失败 (a_gpu0=$LA b_gpu0=$LB b1=$([ -f $S4/b1.txt ] && echo yes || echo no))"
 fi
 env SCHED_STATE=$S4 SCHED_CONFIG=$S4/config.json $PY -m gsched.cli daemon stop >/dev/null 2>&1
-pkill -f "gsched.dispatcher_main" 2>/dev/null; sleep 1
+sleep 1
 
 # ---------- S5: 组合缺格 (gpu_share × co_locate=false) ----------
 echo "--- S5: 组合缺格 ---"
-S5=/tmp/sched_coloc_s5; rm -rf $S5; mkdir -p $S5
+sched_accept_make_root S5 "sched-colocate-grid"
 cat > $S5/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -166,7 +167,7 @@ if [ $? -eq 0 ]; then ok "S5: 组合缺格 - gpu_share × co_locate=false -> 独
 
 # ---------- S7: Least-Loaded 均衡 + 独占卡保护 (定案 40) ----------
 echo "--- S7: Least-Loaded 均衡 + 独占卡保护 ---"
-S7=/tmp/sched_coloc_s7; rm -rf $S7; mkdir -p $S7
+sched_accept_make_root S7 "sched-colocate-balance"
 SCHED_STATE=$S7 SCHED_FAKE_GPUS="0:24,1:24,2:24,3:24" $PY - <<'EOF'
 import os, sys
 sys.path.insert(0, os.getcwd() + '/sched')
@@ -200,7 +201,7 @@ if [ $? -eq 0 ]; then ok "S7: Least-Loaded 均衡 (5×0.6 -> 0/1/2/3/0) + 独占
 # 16GB@4GiB(load 0.25) vs 24GB@8GiB(load 0.33): 放 8GiB 任务后 16GB->0.75 / 24GB->0.67
 # 归一化负载应选 24GB 卡 (绝对 used 8>4 会误选 16GB 卡 -> 大卡空转)
 echo "--- S8: 异构容量归一化负载 (16+24 混用) ---"
-S8=/tmp/sched_coloc_s8; rm -rf $S8; mkdir -p $S8
+sched_accept_make_root S8 "sched-colocate-heterogeneous"
 SCHED_STATE=$S8 SCHED_FAKE_GPUS="0:16,1:24" $PY - <<'EOF'
 import os, sys
 sys.path.insert(0, os.getcwd() + '/sched')
@@ -232,7 +233,7 @@ if [ $? -eq 0 ]; then ok "S8: 异构归一化负载 - 24GB 卡 load 更低被选
 
 # ---------- S9: 独占容量适配 (方案 B: 声明 vram 跳过容量不足卡) ----------
 echo "--- S9: 独占容量适配 ---"
-S9=/tmp/sched_coloc_s9; rm -rf $S9; mkdir -p $S9
+sched_accept_make_root S9 "sched-colocate-exclusive"
 SCHED_STATE=$S9 SCHED_FAKE_GPUS="0:16,1:24" $PY - <<'EOF'
 import os, sys
 sys.path.insert(0, os.getcwd() + '/sched')
@@ -258,7 +259,7 @@ if [ $? -eq 0 ]; then ok "S9: 独占容量适配 - 声明 vram 20GiB 跳过 16GB
 
 # ---------- S6: L3 冻结 ----------
 echo "--- S6: L3 冻结 ---"
-S6=/tmp/sched_coloc_s6; rm -rf $S6; mkdir -p $S6
+sched_accept_make_root S6 "sched-colocate-freeze"
 SCHED_STATE=$S6 SCHED_FAKE_GPUS="0:24" $PY - <<'EOF'
 import os, sys
 sys.path.insert(0, os.getcwd() + '/sched')

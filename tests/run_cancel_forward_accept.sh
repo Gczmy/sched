@@ -22,6 +22,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 set -u
 cd "$(dirname "$0")/.."   # 仓库根
 PY=${PY:-$(command -v python3 || echo python3)}
+source tests/acceptance_cleanup.sh
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
@@ -32,7 +33,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -46,7 +46,7 @@ d = json.load(sys.stdin)
 bn = '$bn'; want = '$want'
 n = 0
 for j in d['jobs']:
-    if j['batch'].split('-')[0] == bn and j['status'] == want:
+    if j['batch_name'] == bn and j['status'] == want:
         n += 1
 print(n)
 "
@@ -77,7 +77,7 @@ echo "=== cancel 转发 daemon 验收 (事故记录 4) ==="
 
 # ---------- 场景 1: running cancel 转发 daemon + GPU 释放 ----------
 echo "--- 场景 1: running cancel 转发 daemon, kill 生效, GPU 释放 ---"
-S1=/tmp/sched_acc_cf1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-cancel-forward-1"
 mk_config $S1
 cat > $S1/batch.json << EOF
 {
@@ -121,7 +121,7 @@ stop_daemon $S1
 
 # ---------- 场景 2: SIGTERM 抗杀进程 -> SIGKILL 升级 ----------
 echo "--- 场景 2: SIGTERM 忽略进程 -> SIGKILL 升级收敛 cancelled ---"
-S2=/tmp/sched_acc_cf2; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-cancel-forward-2"
 mk_config $S2
 cat > $S2/trap_sleep.py << 'EOF'
 import signal, sys, time
@@ -150,7 +150,7 @@ stop_daemon $S2
 
 # ---------- 场景 3: 请求表干净 (处理后 done) ----------
 echo "--- 场景 3: control_requests 处理后全 done ---"
-S3=/tmp/sched_acc_cf3; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-cancel-forward-3"
 mk_config $S3
 cat > $S3/batch.json << EOF
 {

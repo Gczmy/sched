@@ -159,12 +159,12 @@ def _send_email(event: dict[str, Any], ncfg: dict[str, Any]) -> str:
 def _send_file(event: dict[str, Any], _ncfg: dict[str, Any]) -> str:
     """file 渠道 (§10 L1): 事件 JSON 落 notify_inbox, 供 LLM agent 拉取."""
     d = inbox_dir()
-    os.makedirs(d, exist_ok=True)
+    state.ensure_private_directory(d)
     ts = (event.get("finished_at") or state.now()).replace("-", "").replace(" ", "-").replace(":", "")
     safe = re.sub(r"[^0-9A-Za-z_一-鿿-]", "_", event["batch"])
     kind = "done" if event["event"] == "batch_done" else "blocked"
     p = os.path.join(d, f"{ts}-{safe}.{kind}.json")
-    with open(p, "w", encoding="utf-8") as f:
+    with state.open_private_text(p, "w") as f:
         json.dump(event, f, ensure_ascii=False, indent=2)
     return f"file -> {p}"
 

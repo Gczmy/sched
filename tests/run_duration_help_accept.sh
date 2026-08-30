@@ -2,6 +2,7 @@
 # L5: run help must describe the actual one-times duration watchdog.
 set -u
 cd "$(dirname "$0")/.."
+source tests/acceptance_cleanup.sh
 python3 - <<'PY'
 import subprocess, sys
 result = subprocess.run([sys.executable, "-m", "gsched.cli", "run", "--help"], text=True, capture_output=True)

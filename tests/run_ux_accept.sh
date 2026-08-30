@@ -18,6 +18,8 @@ PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
 
+source tests/acceptance_cleanup.sh
+RUN_TAG=$$
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
@@ -25,7 +27,6 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -35,11 +36,18 @@ count_status() { # $1=state_dir $2=batch_name $3=status -> 数量
   $PY -m gsched.cli status --json 2>/dev/null | \
     $PY -c "
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.loads(sys.stdin.read())
+except (json.JSONDecodeError, RecursionError):
+    print(-1)
+    raise SystemExit(0)
+if not isinstance(d, dict) or not isinstance(d.get('jobs'), list):
+    print(-1)
+    raise SystemExit(0)
 bn = '$bn'; want = '$want'
 n = 0
 for j in d['jobs']:
-    if j['batch'].split('-')[0] == bn and j['status'] == want:
+    if j['batch_name'] == bn and j['status'] == want:
         n += 1
 print(n)
 "
@@ -73,7 +81,7 @@ echo "=== 使用体验优化验收 (fake-gpu) ==="
 #   t2: max_retry 0 -> 首跑失败直接 failed, 批次 blocked (t3 pending 冻结)
 #   t3: max_retry 0 -> retry 批次解锁后才跑, 首跑失败 -> 需第二次 retry
 echo "--- 场景 1+2: retry 批次级解锁 + diag 一站式诊断 ---"
-S1=/tmp/sched_acc_u1; rm -rf $S1; mkdir -p $S1
+sched_accept_make_root S1 "sched-ux-retry"
 mk_config $S1 true
 cat > $S1/batch.json << EOF
 {
@@ -126,7 +134,7 @@ wait_status $S1 u1 done 3 40 && ok "第二次 retry 后全部 done" \
 
 # ---------- 场景 5: status --detail (P5) + 终态 marker (P7) ----------
 echo "--- 场景 5: status --detail + sched markers ---"
-S3=/tmp/sched_acc_u5; rm -rf $S3; mkdir -p $S3
+sched_accept_make_root S3 "sched-ux-detail"
 mk_config $S3 false
 cat > $S3/batch.json << EOF
 {
@@ -176,7 +184,7 @@ grep -q "u5bad.blocked" $S3/markers2_out.txt && ok "sched markers 列出 blocked
 
 # ---------- 场景 4: status 进度列 (P4) ----------
 echo "--- 场景 4: running 任务 status 显示进度列 ---"
-S2=/tmp/sched_acc_u4; rm -rf $S2; mkdir -p $S2
+sched_accept_make_root S2 "sched-ux-progress"
 mk_config $S2 false
 cat > $S2/batch.json << EOF
 {
@@ -196,7 +204,7 @@ $PY -m gsched.cli status > $S2/status_out.txt 2>&1
 grep -q "3/30" $S2/status_out.txt && ok "status 显示进度 3/30" \
   || bad "status 无进度列 (输出: $(grep 'u4' $S2/status_out.txt))"
 $PY -m gsched.cli cancel u4 --yes >/dev/null 2>&1
-wait_status $S2 u4 cancelled 1 15 && ok "清理: u4 已 cancel" || bad "u4 cancel 失败"
+wait_status $S2 u4 cancelled 1 30 && ok "清理: u4 已 cancel" || bad "u4 cancel 失败"
 
 stop_daemon $S1; stop_daemon $S2; stop_daemon $S3
 

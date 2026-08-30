@@ -2,7 +2,9 @@
 # H4: gateway submit must warn when the remote daemon heartbeat is stale/missing.
 set -u
 cd "$(dirname "$0")/.."
-export SCHED_STATE="$(mktemp -d)"
+source tests/acceptance_cleanup.sh
+sched_accept_make_root SCHED_STATE "sched-submit-health"
+export SCHED_STATE
 CUSTOM_STATE="$SCHED_STATE/custom-state"
 mkdir -p "$CUSTOM_STATE/compute-node"
 touch "$CUSTOM_STATE/compute-node/daemon.heartbeat" "$CUSTOM_STATE/compute-node/daemon.tick_ok"

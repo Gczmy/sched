@@ -17,11 +17,12 @@ ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PASS=0; FAIL=0
+source tests/acceptance_cleanup.sh
 ok(){ PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad(){ FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 wait_for(){ for _ in $(seq 1 ${2:-40}); do eval "$1" && return 0; sleep 2; done; return 1; }
 
-S=/tmp/sched_tenv; rm -rf $S; mkdir -p $S
+sched_accept_make_root S "sched-taskenv"
 cat > $S/config.json << EOF
 {
   "schema_version": 1, "user": "$(whoami)", "node": "testnode",
@@ -54,8 +55,8 @@ sched submit $S/t2.json >/dev/null 2>&1 && ok "t2 提交" || bad "t2 提交失�
 SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
 sleep 4
 # 等 t2 完成 (单卡串行, 排在 t1 之后)
-wait_for '[ -n "$(ls $S/testnode/logs/te_ovr-*/t1-v1.log 2>/dev/null)" ]' 40 \
-  && ok "t2 已执行" || bad "t2 未执行"
+wait_for 'grep -q "MARK batch_win" "$S"/testnode/logs/te_ovr-*/t1-v1.log 2>/dev/null' 40 \
+  && ok "t2 已完成并写出环境" || bad "t2 未完成"
 L1=$(ls $S/testnode/logs/te_def-*/t1-v1.log 2>/dev/null | head -1)
 L2=$(ls $S/testnode/logs/te_ovr-*/t1-v1.log 2>/dev/null | head -1)
 grep -q "MARK default_on" "$L1" && ok "缺省值注入生效" || bad "缺省值未注入: $(cat $L1 2>/dev/null)"
@@ -78,7 +79,6 @@ else
 fi
 
 $PY -m gsched.cli daemon stop >/dev/null 2>&1
-pkill -f "gsched.dispatcher_main" 2>/dev/null
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="

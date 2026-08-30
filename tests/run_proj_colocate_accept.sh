@@ -18,12 +18,12 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
+source tests/acceptance_cleanup.sh
 bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 
 stop_daemon() {
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  pkill -f "gsched.dispatcher_main" 2>/dev/null
   sleep 1
 }
 
@@ -37,7 +37,7 @@ d = json.load(sys.stdin)
 bn = '$bn'; want = '$want'
 n = 0
 for j in d['jobs']:
-    if j['batch'].split('-')[0] == bn and j['status'] == want:
+    if j['batch_name'] == bn and j['status'] == want:
         n += 1
 print(n)
 "
@@ -93,7 +93,7 @@ echo "=== B12-b 项目级 colocate 开关验收 ==="
 
 # ---------- S1a: 缺省(中立) -> 并发装箱 ----------
 echo "--- S1a: 项目缺省 -> 共享装箱生效 ---"
-SA=/tmp/sched_pc_a; rm -rf $SA; mkdir -p $SA
+sched_accept_make_root SA "sched-project-colocate-a"
 mk_config $SA absent
 mk_pair_batch $SA pa 25
 export SCHED_STATE=$SA SCHED_CONFIG=$SA/config.json
@@ -106,7 +106,7 @@ wait_for '[ "$(count_status $SA pa running)" = "2" ]' 25 \
 
 # ---------- S1b: colocate=false -> 降级独占串行 ----------
 echo "--- S1b: 项目 colocate=false -> 独占串行 ---"
-SB=/tmp/sched_pc_b; rm -rf $SB; mkdir -p $SB
+sched_accept_make_root SB "sched-project-colocate-b"
 mk_config $SB false
 mk_pair_batch $SB pb 25
 export SCHED_STATE=$SB SCHED_CONFIG=$SB/config.json
