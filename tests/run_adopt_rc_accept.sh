@@ -12,7 +12,7 @@ cat > "$SCHED_STATE/config.json" <<EOF
 }
 EOF
 python3 - <<'PY'
-import json, os, sqlite3, sys, time
+import hashlib, json, os, sqlite3, sys, time
 sys.path.insert(0, ".")
 from gsched import state
 from gsched.executor import Executor
@@ -112,7 +112,15 @@ stale_batch = "stale-marker-batch"
 stale_job = "stale-marker-batch-t1-v1"
 stale_spec = {
     "id": "t1", "cmd": ["echo", "ok"], "stages": None, "cwd_abs": "/tmp",
-    "git": None, "env": {}, "resources": {"gpu": 0}, "duration_min": None,
+    "git": None,
+    "env": {
+        "SCHED_BATCH_ID": "spoof-batch",
+        "SCHED_TASK_ID": "spoof-task",
+        "SCHED_RUN_ID": "spoof-run",
+        "SCHED_PROJECT": "spoof-project",
+        "SCHED_RC_PREFIX": "spoof-rc-prefix",
+    },
+    "resources": {"gpu": 0}, "duration_min": None,
     "max_retry": 0, "artifacts": {}, "retry_transform": None, "probes": None,
 }
 with state.connect() as conn:
@@ -128,7 +136,10 @@ with open(old_marker, "w", encoding="utf-8") as f:
     f.write("0\n")
 
 class LaunchExecutor:
-    def launch(self, **_kwargs):
+    def __init__(self):
+        self.last_env = None
+    def launch(self, **kwargs):
+        self.last_env = dict(kwargs["env"])
         return 515151
 
 d2 = Dispatcher.__new__(Dispatcher)
@@ -143,8 +154,17 @@ d2._clean_stale_artifacts = lambda _conn, _spec, _job: None
 d2._job_log_path = lambda _job: os.path.join(d.host_dir, "logs", f"{stale_job}.log")
 with state.connect() as conn:
     assert Dispatcher._launch_job(d2, conn, stale_row, None)
+launch_env = d2.executor.last_env
+assert launch_env is not None
+assert launch_env["SCHED_BATCH_ID"] == "stale_marker" != stale_batch
+assert launch_env["SCHED_TASK_ID"] == "t1"
+assert launch_env["SCHED_RUN_ID"] == stale_job
+assert launch_env["SCHED_PROJECT"] == "p"
+expected_rc_prefix = hashlib.sha256(stale_job.encode("utf-8")).hexdigest()[:24]
+assert launch_env["SCHED_RC_PREFIX"] == expected_rc_prefix
 assert d2._read_job_rc({"id": stale_job, "pgid": 515151}) is None
 assert os.path.exists(old_marker)
+print("dispatcher-owned scheduler identity overrides task env spoofing")
 print("H2 retry process group gets a distinct exit marker")
 assert row == ("done", 0), row
 print("H2 adopted completed job uses durable rc=0 and becomes done")
