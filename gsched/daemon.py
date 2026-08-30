@@ -26,6 +26,10 @@ STOP_TIMEOUT_SEC = 120
 START_TIMEOUT_SEC = 10.0
 START_POLL_SEC = 0.5
 START_STOP_GRACE_SEC = 2.0
+FORCE_STOP_GRACE_SEC = 2.0
+FORCE_STOP_KILL_WAIT_SEC = 2.0
+FORCE_STOP_POLL_SEC = 0.1
+
 
 
 
@@ -290,7 +294,25 @@ def start(fake: bool = False, force: bool = False) -> str:
     )
 
 
-def stop() -> str:
+def _wait_for_identity_to_disappear(
+    pid: int,
+    expected_start: str,
+    timeout: float,
+) -> bool:
+    attempts = max(1, int(timeout / FORCE_STOP_POLL_SEC))
+    for _ in range(attempts):
+        time.sleep(FORCE_STOP_POLL_SEC)
+        actual_start = process_start_token(pid)
+        if actual_start == expected_start:
+            continue
+        if actual_start is None and _pid_alive(pid):
+            # An unreadable token cannot prove that the original process died.
+            continue
+        return True
+    return False
+
+
+def stop(*, force: bool = False) -> str:
     owner = _read_lease_owner()
     if owner is None:
         if os.path.lexists(_owner_file()):
@@ -389,6 +411,62 @@ def stop() -> str:
             f"daemon pid={pid} SIGTERM 发送失败: {exc}; "
             "保留 ownership 状态"
         )
+    if force:
+        if _wait_for_identity_to_disappear(
+            pid,
+            expected_start,
+            FORCE_STOP_GRACE_SEC,
+        ):
+            if not _cleanup(owner):
+                return (
+                    "daemon lease 在 force-stop SIGTERM 确认后已被替换; "
+                    "拒绝清理 successor sidecar"
+                )
+            return f"daemon force-stop 已停止 (pid={pid}, SIGTERM)"
+
+        current_owner = _read_lease_owner()
+        if current_owner != owner:
+            return (
+                f"daemon pid={pid} ownership 在 SIGKILL 前不可读或已变化; "
+                "拒绝 SIGKILL 并保留 ownership 状态"
+            )
+        if process_start_token(pid) != expected_start:
+            return (
+                f"daemon pid={pid} identity 在 SIGKILL 前不可读或已变化; "
+                "拒绝 SIGKILL 并保留 ownership 状态"
+            )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            if not _cleanup(owner):
+                return (
+                    "daemon lease 在 SIGKILL 前进程退出后已被替换; "
+                    "拒绝清理 successor sidecar"
+                )
+            return f"daemon force-stop 已停止 (pid={pid}, SIGKILL 前已退出)"
+        except (PermissionError, OSError) as exc:
+            return (
+                f"daemon pid={pid} SIGKILL 发送失败: {exc}; "
+                "保留 ownership 状态"
+            )
+
+        if not _wait_for_identity_to_disappear(
+            pid,
+            expected_start,
+            FORCE_STOP_KILL_WAIT_SEC,
+        ):
+            return (
+                f"daemon SIGKILL 后停止确认超时 (pid={pid}, "
+                f"已等待 {FORCE_STOP_KILL_WAIT_SEC:g}s); "
+                "保留 ownership 状态"
+            )
+        if not _cleanup(owner):
+            return (
+                "daemon lease 在 SIGKILL 停止确认后已被替换; "
+                "拒绝清理 successor sidecar"
+            )
+        return f"daemon force-stop 已停止 (pid={pid}, exact SIGKILL)"
+
     for _ in range(int(STOP_TIMEOUT_SEC / 0.5)):
         time.sleep(0.5)
         actual_start = process_start_token(pid)
