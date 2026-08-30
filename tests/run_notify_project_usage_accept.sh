@@ -3,18 +3,20 @@
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
+PY=${PY:-python3}
 sched_accept_make_root SCHED_STATE "sched-notify-usage"
 export SCHED_STATE
+export SCHED_CONFIG="$SCHED_STATE/config.json"
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
-  "schema_version": 1, "user": "t", "node": "$NODE", "state_dir": "$SCHED_STATE",
-  "default_project": "p", "gpus": [], "venvs": {"k": "/bin"},
+  "schema_version": 1, "user": "$(whoami)", "node": "$NODE", "state_dir": "$SCHED_STATE",
+  "default_project": "p", "gpus": [0], "venvs": {"k": "$PY"},
   "projects": {"p": {"root": "/tmp", "git": false}},
   "notify": {"on": ["batch_done"]}
 }
 EOF
-python3 - <<'PY'
+"$PY" - <<'PY'
 import argparse, contextlib, io, os, sqlite3
 from gsched import cli, notify, state
 state.init_db()
@@ -47,3 +49,34 @@ text = out.getvalue()
 assert "1/∞" in text, text
 print("L14 disabled file notifications skip and project usage counts GPU jobs only")
 PY
+
+if ! SCHED_FAKE_GPUS=0:24 "$PY" -m gsched.cli daemon start --fake >/dev/null 2>&1; then
+  echo "failed to start isolated daemon for usage-fixture convergence" >&2
+  exit 1
+fi
+settled=0
+for _ in $(seq 1 120); do
+  if "$PY" -m gsched.cli status usage-batch --json 2>/dev/null | "$PY" -c '
+import json, sys
+d = json.load(sys.stdin)
+batches = d.get("batches", [])
+jobs = {j.get("task"): j.get("status") for j in d.get("jobs", [])}
+ok = (
+    len(batches) == 1
+    and batches[0].get("status") == "blocked"
+    and jobs.get("cpu") == "blocked"
+    and jobs.get("gpu") == "blocked"
+)
+raise SystemExit(0 if ok else 1)' \
+    && [ -f "$SCHED_STATE/$NODE/markers/usage.blocked" ] \
+    && [ ! -e "$SCHED_STATE/$NODE/markers/usage.done" ]; then
+    settled=1
+    break
+  fi
+  sleep 1
+done
+if [ "$settled" != "1" ]; then
+  echo "project-usage fixture did not fully converge" >&2
+  exit 1
+fi
+"$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1

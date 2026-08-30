@@ -21,6 +21,8 @@ source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+# submit 会自动 ensure_running；独立运行本验收时也必须先进入 fake 模式。
+export SCHED_FAKE_GPUS=0:24
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -45,37 +47,148 @@ n = sum(1 for j in d['jobs'] if j['batch_name'] == '$2' and j['status'] == '$3')
 print(n)"
 }
 
-wait_batch_done() { # $1=dir $2=batch名前缀 $3=超时秒 —— 等同名批次全部收敛终态
-  for _ in $(seq 1 ${3:-30}); do
-    SCHED_STATE=$1 SCHED_CONFIG=$1/config.json $PY -m gsched.cli status --json 2>/dev/null | \
-      $PY -c "
-import json, sys
-d = json.load(sys.stdin)
-bad = [b for b in d['batches'] if b['batch_name'] == '$2' and b['status'] not in ('done','blocked','cancelled')]
-sys.exit(0 if not bad else 1)" && return 0
-    sleep 2
-  done
-  return 1
-}
-
 wait_for() { # $1=条件 $2=超时秒
-wait_batch_done() { # $1=dir $2=batch名 $3=超时秒 —— 等同名批次全部终态
-  for _ in $(seq 1 ${3:-20}); do
-    SCHED_STATE=$1 SCHED_CONFIG=$1/config.json $PY -m gsched.cli status --json 2>/dev/null | \
-      $PY -c "
-import json, sys
-d = json.load(sys.stdin)
-bad = [b for b in d['batches'] if b['batch_name'] == '$2' and b['status'] not in ('done','blocked','cancelled')]
-sys.exit(0 if not bad else 1)" && return 0
-    sleep 1
-  done
-  return 1
-}
-
   for _ in $(seq 1 ${2:-30}); do
     eval "$1" && return 0
     sleep 1
   done
+  return 1
+}
+
+latest_batch_id() { # $1=state dir $2=batch name
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli status "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    batches = json.load(sys.stdin).get("batches", [])
+except Exception:
+    batches = []
+print(batches[0].get("batch_id", "") if batches else "")'
+}
+
+submit_batch_id() { # $1=state dir $2=spec path $3=batch name
+  local output rc bid
+  output=$(SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli submit "$2" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "submit failed (rc=$rc): $output" >&2
+    return "$rc"
+  fi
+  bid=$(latest_batch_id "$1" "$3")
+  if [ -z "$bid" ]; then
+    echo "submit succeeded but latest batch id was not visible: $output" >&2
+    return 1
+  fi
+  printf '%s\n' "$bid"
+}
+
+dry_run_task_skip() { # $1=state dir $2=spec path
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli submit "$2" --dry-run --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    tasks = json.load(sys.stdin).get("tasks", [])
+except Exception:
+    tasks = []
+if tasks:
+    print("true" if tasks[0].get("skip") is True else "false")'
+}
+
+task_status() { # $1=state dir $2=<batch id>:<task>
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli task "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    jobs = json.load(sys.stdin).get("jobs", [])
+except Exception:
+    jobs = []
+print(jobs[-1].get("status", "") if jobs else "")'
+}
+
+batch_status() { # $1=state dir $2=batch id
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli status "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    batches = json.load(sys.stdin).get("batches", [])
+except Exception:
+    batches = []
+print(batches[0].get("status", "") if batches else "")'
+}
+
+wait_task_terminal() { # $1=state dir $2=<batch id>:<task> $3=timeout seconds
+  local status
+  for _ in $(seq 1 ${3:-120}); do
+    status=$(task_status "$1" "$2")
+    case "$status" in
+      done|skip|failed|blocked|cancelled|timed_out|interrupted) return 0 ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+wait_batch_terminal() { # $1=state dir $2=batch id $3=timeout seconds
+  local status
+  for _ in $(seq 1 ${3:-120}); do
+    status=$(batch_status "$1" "$2")
+    case "$status" in
+      done|blocked|cancelled|discarded) return 0 ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+wait_batch_done() { # $1=state dir $2=batch id $3=timeout seconds
+  if ! wait_batch_terminal "$1" "$2" "${3:-120}"; then
+    return 1
+  fi
+  [ "$(batch_status "$1" "$2")" = "done" ]
+}
+
+assert_task_status() { # $1=state dir $2=batch id $3=expected $4=description
+  local actual
+  if ! wait_task_terminal "$1" "$2:t1" 120; then
+    bad "$4 (等待精确任务 $2:t1 终态超时)"
+    return 1
+  fi
+  actual=$(task_status "$1" "$2:t1")
+  if [ "$actual" = "$3" ]; then
+    ok "$4"
+    return 0
+  fi
+  bad "$4 (期望=$3, 实际=$actual, 任务=$2:t1)"
+  return 1
+}
+
+run_count() { # $1=count file
+  if [ -f "$1" ]; then
+    tr -d '[:space:]' < "$1"
+  else
+    echo 0
+  fi
+}
+
+assert_count_increment() { # $1=before $2=after $3=description
+  local expected
+  case "$1:$2" in
+    *[!0-9:]*|:*|*:)
+      bad "$3 (非法计数 $1 -> $2)"
+      return 1
+      ;;
+  esac
+  expected=$(( $1 + 1 ))
+  if [ "$2" -eq "$expected" ]; then
+    ok "$3"
+    return 0
+  fi
+  bad "$3 (计数异常 $1 -> $2)"
   return 1
 }
 
@@ -108,11 +221,22 @@ cat > $S/b1.json << EOF
 }
 EOF
 export SCHED_STATE=$S SCHED_CONFIG=$S/config.json
-$PY -m gsched.cli submit $S/b1.json >/dev/null 2>&1
+ENV_BID=$(submit_batch_id "$S" "$S/b1.json" envp) || {
+  bad "净化任务提交失败"
+  exit 1
+}
 # 关键: 以被污染的父环境启动 daemon (模拟 kronos_ft 下启动)
 CONDA_PREFIX=/poison/conda CONDA_DEFAULT_ENV=kronos_ft \
   SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-wait_for '[ "$(count_status $S envp done)" = "1" ]' 30 && ok "净化任务执行完成" || bad "任务未完成"
+assert_task_status "$S" "$ENV_BID" done "净化任务执行完成" || {
+  stop_daemon "$S"
+  exit 1
+}
+wait_batch_done "$S" "$ENV_BID" 120 || {
+  bad "净化任务批次未收敛"
+  stop_daemon "$S"
+  exit 1
+}
 LOGF=$(ls $S/testnode/logs/envp-*/t1-v1.log)
 grep -q "PREFIX=\[$S/envs/myenv\]" "$LOGF" && ok "CONDA_PREFIX 注入为任务自己的 env" || bad "PREFIX 异常: $(grep PREFIX= $LOGF)"
 grep -q "DENV=\[\]" "$LOGF" && ok "污染键 CONDA_DEFAULT_ENV 已剥离" || bad "DENV 未剥离: $(grep DENV= $LOGF)"
@@ -126,7 +250,12 @@ cd "$W"
 git init -q . && git config user.email t@t && git config user.name t
 sched_accept_make_root OUT "sched-b13-out"
 cat > runner.py << EOF
-open("$OUT/res.json", "w").write('{"result": 1}')
+from pathlib import Path
+
+counter = Path("$OUT/run_count")
+count = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(count + 1))
+Path("$OUT/res.json").write_text('{"result": 1}')
 EOF
 git add -A && git commit -qm init
 sched_accept_make_root S2 "sched-b13-fingerprint"
@@ -148,51 +277,158 @@ cat > $S2/b.json << EOF
 }
 EOF
 export SCHED_STATE=$S2 SCHED_CONFIG=$S2/config.json
-$PY -m gsched.cli submit $S2/b.json >/dev/null 2>&1
+FIRST_BID=$(submit_batch_id "$S2" "$S2/b.json" fp) || {
+  bad "首跑提交失败"
+  exit 1
+}
 SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-wait_for '[ "$(count_status $S2 fp done)" = "1" ]' 120 && ok "首跑完成" || bad "首跑未完成"
-wait_batch_done $S2 fp 60   # 批次 settle 后再重提 (防同名未终态拒绝)
+assert_task_status "$S2" "$FIRST_BID" done "首跑完成" || {
+  stop_daemon "$S2"
+  exit 1
+}
+wait_batch_done "$S2" "$FIRST_BID" 120 || {
+  bad "首跑批次未收敛"
+  stop_daemon "$S2"
+  exit 1
+}
 # 同内容重提 -> SKIP
-$PY -m gsched.cli submit $S2/b.json >/dev/null 2>&1
-wait_for '[ "$(count_status $S2 fp skip)" = "1" ]' 60 && ok "同内容重提正确 SKIP" || bad "未 SKIP"
-wait_batch_done $S2 fp 60   # 批次 settle
+SKIP_BID=$(submit_batch_id "$S2" "$S2/b.json" fp) || {
+  bad "同内容重提失败"
+  stop_daemon "$S2"
+  exit 1
+}
+assert_task_status "$S2" "$SKIP_BID" skip "同内容重提正确 SKIP" || {
+  stop_daemon "$S2"
+  exit 1
+}
+wait_batch_done "$S2" "$SKIP_BID" 120 || {
+  bad "SKIP 批次未收敛"
+  stop_daemon "$S2"
+  exit 1
+}
 # 工作区改动不提交 -> 重提应重跑 (dirty-tree 指纹)
 echo "" >> $W/runner.py   # 未提交改动 -> dirty-tree 指纹必变
-DIRTY_OUT=$($PY -m gsched.cli submit $S2/b.json 2>&1)
-echo "$DIRTY_OUT" | grep -q "已入队" || bad "脏树提交失败: $DIRTY_OUT"
-BEFORE=$(count_status $S2 fp done)
-wait_for '[ "$(count_status $S2 fp done)" = '"$((BEFORE+1))"' ]' 30 \
-  && ok "dirty-tree: 未提交改动触发重跑 (不再误 SKIP)" \
-  || bad "脏树仍被 SKIP"
+DIRTY_BEFORE=$(run_count "$OUT/run_count")
+DIRTY_BID=$(submit_batch_id "$S2" "$S2/b.json" fp) || {
+  bad "脏树提交失败"
+  stop_daemon "$S2"
+  exit 1
+}
+assert_task_status "$S2" "$DIRTY_BID" done \
+  "dirty-tree: 未提交改动触发重跑 (不再误 SKIP)" || {
+  stop_daemon "$S2"
+  exit 1
+}
+DIRTY_AFTER=$(run_count "$OUT/run_count")
+assert_count_increment "$DIRTY_BEFORE" "$DIRTY_AFTER" \
+  "dirty-tree: 执行计数精确增加一次" || {
+  stop_daemon "$S2"
+  exit 1
+}
+wait_batch_done "$S2" "$DIRTY_BID" 120 || {
+  bad "dirty-tree 批次未收敛"
+  stop_daemon "$S2"
+  exit 1
+}
 git -C $W add -A && git -C $W commit -qm change2
-# S3: force_rerun —— 干净树也强制重跑
-python3 - << PYEOF
+# 提交 dirty 变更后先建立当前 clean fingerprint 的可信 producer。
+CLEAN_SEED_BID=$(submit_batch_id "$S2" "$S2/b.json" fp) || {
+  bad "clean fingerprint producer 提交失败"
+  stop_daemon "$S2"
+  exit 1
+}
+assert_task_status "$S2" "$CLEAN_SEED_BID" done \
+  "已建立 clean fingerprint producer" || {
+  stop_daemon "$S2"
+  exit 1
+}
+wait_batch_done "$S2" "$CLEAN_SEED_BID" 120 || {
+  bad "clean fingerprint producer 批次未收敛"
+  stop_daemon "$S2"
+  exit 1
+}
+if [ "$(dry_run_task_skip "$S2" "$S2/b.json")" = "true" ]; then
+  ok "force_rerun 前普通提交确实可 SKIP"
+else
+  bad "force_rerun 前未建立可 SKIP 基线"
+  stop_daemon "$S2"
+  exit 1
+fi
+
+# S3: force_rerun —— 保留有效产物和同一指纹，仍必须再执行一次。
+"$PY" - << PYEOF
 import json
 spec = json.load(open("$S2/b.json"))
-spec["name"] = "fpf"
 spec["force_rerun"] = True
 json.dump(spec, open("$S2/bf.json", "w"), indent=2)
 PYEOF
-rm -f "$OUT/res.json"
-$PY -m gsched.cli submit $S2/bf.json >/dev/null 2>&1
-wait_for '[ "$(count_status $S2 fpf done)" = "1" ]' 30 \
-  && ok "force_rerun: 干净树也强制重跑" || bad "force_rerun 未生效"
+FORCE_BEFORE=$(run_count "$OUT/run_count")
+FORCE_BID=$(submit_batch_id "$S2" "$S2/bf.json" fp) || {
+  bad "force_rerun 提交失败"
+  stop_daemon "$S2"
+  exit 1
+}
+assert_task_status "$S2" "$FORCE_BID" done \
+  "force_rerun: 有效产物与同指纹仍强制重跑" || {
+  stop_daemon "$S2"
+  exit 1
+}
+FORCE_AFTER=$(run_count "$OUT/run_count")
+assert_count_increment "$FORCE_BEFORE" "$FORCE_AFTER" \
+  "force_rerun: 执行计数精确增加一次" || {
+  stop_daemon "$S2"
+  exit 1
+}
 [ -f "$OUT/res.json" ] && ok "产物已重新生成" || bad "产物缺失"
+wait_batch_done "$S2" "$FORCE_BID" 120 || {
+  bad "force_rerun 批次未收敛"
+  stop_daemon "$S2"
+  exit 1
+}
 
 # ---------- S4: sched clean ----------
 echo "--- S4: sched clean 清指纹+删产物 ---"
-S4OUT=$($PY -m gsched.cli submit $S2/b.json 2>&1)
-echo "$S4OUT" | grep -q "已入队" || bad "S4 提交失败: $S4OUT"
-wait_for '[ "$(count_status $S2 fp skip)" -ge 1 ]' 45 \
-  && ok "clean 前正确 SKIP" || bad "clean 前 未 SKIP"
-wait_batch_done $S2 fp 30
-CLEANOUT=$($PY -m gsched.cli clean fp --yes 2>&1)
-echo "$CLEANOUT" | grep -q "已清除" || bad "clean 异常: $CLEANOUT"
-[ -f "$OUT/res.json" ] && bad "产物未被 clean 删除" || ok "clean 已删除产物文件"
-$PY -m gsched.cli submit $S2/b.json >/dev/null 2>&1
-BEFORE=$(count_status $S2 fp done)
-wait_for '[ "$(count_status $S2 fp done)" = '"$((BEFORE+1))"' ]' 40 \
-  && ok "clean 后重跑 (不再 SKIP)" || bad "clean 后仍 SKIP"
+S4_SKIP_BID=$(submit_batch_id "$S2" "$S2/b.json" fp) || {
+  bad "S4 提交失败"
+  stop_daemon "$S2"
+  exit 1
+}
+assert_task_status "$S2" "$S4_SKIP_BID" skip "clean 前正确 SKIP" || {
+  stop_daemon "$S2"
+  exit 1
+}
+wait_batch_done "$S2" "$S4_SKIP_BID" 120 || {
+  bad "clean 前 SKIP 批次未收敛"
+  stop_daemon "$S2"
+  exit 1
+}
+CLEAN_BEFORE=$(run_count "$OUT/run_count")
+stop_daemon "$S2"
+CLEANOUT=$("$PY" -m gsched.cli clean "$S4_SKIP_BID" --yes 2>&1)
+CLEAN_RC=$?
+if [ "$CLEAN_RC" -ne 0 ]; then
+  bad "clean 异常 (rc=$CLEAN_RC): $CLEANOUT"
+  exit 1
+fi
+[ -f "$OUT/res.json" ] && {
+  bad "产物未被 clean 删除"
+  exit 1
+} || ok "clean 已删除产物文件"
+SCHED_FAKE_GPUS=0:24 "$PY" -m gsched.cli daemon start --fake >/dev/null 2>&1 || {
+  bad "clean 后 daemon 重启失败"
+  stop_daemon "$S2"
+  exit 1
+}
+assert_task_status "$S2" "$S4_SKIP_BID" done "clean 后同一任务重跑 (不再 SKIP)" || {
+  stop_daemon "$S2"
+  exit 1
+}
+CLEAN_AFTER=$(run_count "$OUT/run_count")
+assert_count_increment "$CLEAN_BEFORE" "$CLEAN_AFTER" \
+  "clean 后执行计数精确增加一次" || {
+  stop_daemon "$S2"
+  exit 1
+}
 
 # ---------- S5: artifact has_key 规则 ----------
 echo "--- S5: artifact has_key ---"

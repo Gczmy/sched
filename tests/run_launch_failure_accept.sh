@@ -4,17 +4,19 @@
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
+PY=${PY:-python3}
 sched_accept_make_root SCHED_STATE "sched-launch-failure"
 export SCHED_STATE
+export SCHED_CONFIG="$SCHED_STATE/config.json"
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
-  "schema_version": 1, "user": "t", "node": "$NODE", "state_dir": "$SCHED_STATE",
-  "default_project": "p", "gpus": [], "venvs": {"k": "/bin"},
+  "schema_version": 1, "user": "$(whoami)", "node": "$NODE", "state_dir": "$SCHED_STATE",
+  "default_project": "p", "gpus": [0], "venvs": {"k": "$PY"},
   "projects": {"p": {"root": "/tmp", "git": false}}
 }
 EOF
-python3 - <<'PY'
+"$PY" - <<'PY'
 import json, os
 from gsched import state
 from gsched.dispatcher import Dispatcher
@@ -97,3 +99,35 @@ finally:
 assert not e._procs, e._procs
 print("L17 launch DB failure kills orphan process group and retains durable recovery claim")
 PY
+
+if ! SCHED_FAKE_GPUS=0:24 "$PY" -m gsched.cli daemon start --fake >/dev/null 2>&1; then
+  echo "failed to start isolated daemon for launch-failure recovery" >&2
+  exit 1
+fi
+settled=0
+for _ in $(seq 1 120); do
+  if "$PY" -m gsched.cli status launch-failure --json 2>/dev/null | "$PY" -c '
+import json, sys
+d = json.load(sys.stdin)
+batches = d.get("batches", [])
+jobs = d.get("jobs", [])
+ok = (
+    len(batches) == 1
+    and batches[0].get("batch_id") == "launch-failure"
+    and batches[0].get("status") == "blocked"
+    and len(jobs) == 1
+    and jobs[0].get("status") == "blocked"
+)
+raise SystemExit(0 if ok else 1)' \
+    && [ -f "$SCHED_STATE/$NODE/markers/launch_failure.blocked" ] \
+    && [ ! -e "$SCHED_STATE/$NODE/markers/launch_failure.done" ]; then
+    settled=1
+    break
+  fi
+  sleep 1
+done
+if [ "$settled" != "1" ]; then
+  echo "launch-failure recovery claim did not fully converge" >&2
+  exit 1
+fi
+"$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1

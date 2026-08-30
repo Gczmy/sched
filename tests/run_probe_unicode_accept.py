@@ -55,7 +55,15 @@ with state.connect() as conn:
         running["kill_reason"],
     ) == ("running", "probe", "probe_failed"), dict(running)
     d.executor.alive = lambda _pgid: False
-    Dispatcher._handle_job_done(d, conn, running, 137)
+    cleanup_actions = Dispatcher._handle_job_done(d, conn, running, 137)
+# Mirror the real _reap_finished_jobs post-commit cleanup instead of leaving an
+# artificial unresolved launch marker for the acceptance cleanup trap.
+assert [kind for kind, _job in cleanup_actions] == ["launch", "profile"]
+for kind, job in cleanup_actions:
+    if kind == "launch":
+        d._drop_launch_marker(job)
+    else:
+        d._drop_profile(job)
 with state.connect() as conn:
     row = conn.execute(
         "SELECT status, failure FROM jobs WHERE id=?",

@@ -3,15 +3,13 @@
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
+PY=${PY:-python3}
 sched_accept_make_root SCHED_STATE "sched-submit-health"
 export SCHED_STATE
-CUSTOM_STATE="$SCHED_STATE/custom-state"
-mkdir -p "$CUSTOM_STATE/compute-node"
-touch "$CUSTOM_STATE/compute-node/daemon.heartbeat" "$CUSTOM_STATE/compute-node/daemon.tick_ok"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
-  "schema_version": 1, "user": "t", "node": "compute-node", "state_dir": "$CUSTOM_STATE",
-  "default_project": "p", "gpus": [], "venvs": {"k": "/bin"},
+  "schema_version": 1, "user": "$(whoami)", "node": "compute-node", "state_dir": "$SCHED_STATE",
+  "default_project": "p", "gpus": [], "venvs": {"k": "$PY"},
   "projects": {"p": {"root": "/tmp", "git": false}}
 }
 EOF
@@ -24,7 +22,7 @@ cat > "$SCHED_STATE/batch.json" <<'EOF'
   "tasks": [{"id": "t1", "cmd": ["echo", "ok"]}]
 }
 EOF
-python3 - <<'PY'
+"$PY" - <<'PY'
 import os, subprocess, sys
 result = subprocess.run(
     [sys.executable, "-m", "gsched.cli", "submit", os.path.join(os.environ["SCHED_STATE"], "batch.json")],

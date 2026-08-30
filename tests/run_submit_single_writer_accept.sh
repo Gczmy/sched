@@ -61,3 +61,6 @@ assert row and row[0] == "queued", row
 assert not os.path.exists(files[0]), "daemon did not consume inbox payload"
 print("C2 gateway submit writes payload only; daemon owns request rows")
 PY
+# 上面的断言必须在 gateway 写守卫开启时完成；断言后仅为清理这个本机
+# fixture 允许公共 daemon stop/status 路径访问其 compute-node 状态。
+export SCHED_ALLOW_FOREIGN_WRITE=1

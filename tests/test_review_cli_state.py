@@ -307,6 +307,206 @@ class ReviewLifecycleRaceTests(TempStateCase):
         self.assertIn("SIGTERM 发送失败", message)
         signal.assert_called_once_with(4242, daemon.signal.SIGTERM)
 
+    def test_stop_rejects_symlink_lease_directory_before_pid_probe(self) -> None:
+        owner = {
+            "schema_version": 1,
+            "lease_id": "lease-symlink",
+            "pid": 4242,
+            "start_token": "proc:lease",
+            "physical_host": "local-host",
+        }
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+        redirected = os.path.join(self.tmp.name, "redirected-lease")
+        os.makedirs(redirected, mode=0o700)
+        os.chmod(redirected, 0o700)
+        with open(
+            os.path.join(redirected, "owner.json"),
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump(owner, stream)
+        os.symlink(redirected, lock_dir)
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="local-host",
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            side_effect=AssertionError("symlink lease PID must not be probed"),
+        ) as pid_probe, mock.patch.object(
+            daemon,
+            "process_start_token",
+            side_effect=AssertionError("symlink lease identity must not be read"),
+        ) as identity_probe, mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=AssertionError("symlink lease PID must not be signalled"),
+        ) as signal:
+            message = daemon.stop()
+
+        self.assertIn("拒绝", message)
+        self.assertTrue(os.path.islink(lock_dir))
+        pid_probe.assert_not_called()
+        identity_probe.assert_not_called()
+        signal.assert_not_called()
+
+    def test_stop_rejects_symlink_host_directory_before_pid_probe(self) -> None:
+        owner = {
+            "schema_version": 1,
+            "lease_id": "lease-symlink-host",
+            "pid": 4242,
+            "start_token": "proc:lease",
+            "physical_host": "local-host",
+        }
+        host_dir = daemon._host_dir()
+        original_host = os.path.join(self.tmp.name, "original-host")
+        # Keep the redirect inside state_dir so state.host_dir()'s containment
+        # check passes; _read_lease_owner itself must still reject the symlink.
+        redirected_host = os.path.join(self.state_root, "redirected-host")
+        os.rename(host_dir, original_host)
+        lock_dir = os.path.join(redirected_host, "dispatcher.lock")
+        os.makedirs(lock_dir, mode=0o700)
+        os.chmod(redirected_host, 0o700)
+        os.chmod(lock_dir, 0o700)
+        with open(
+            os.path.join(lock_dir, "owner.json"),
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump(owner, stream)
+        os.symlink(redirected_host, host_dir)
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="local-host",
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            side_effect=AssertionError("symlink host PID must not be probed"),
+        ) as pid_probe, mock.patch.object(
+            daemon,
+            "process_start_token",
+            side_effect=AssertionError("symlink host identity must not be read"),
+        ) as identity_probe, mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=AssertionError("symlink host PID must not be signalled"),
+        ) as signal:
+            message = daemon.stop()
+
+        self.assertIn("拒绝", message)
+        self.assertTrue(os.path.islink(host_dir))
+        pid_probe.assert_not_called()
+        identity_probe.assert_not_called()
+        signal.assert_not_called()
+
+    def test_stop_rejects_writable_owner_before_pid_probe(self) -> None:
+        owner = {
+            "schema_version": 1,
+            "lease_id": "lease-writable-owner",
+            "pid": 4242,
+            "start_token": "proc:lease",
+            "physical_host": "local-host",
+        }
+        os.makedirs(os.path.dirname(daemon._owner_file()), mode=0o700)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(owner, stream)
+        for mode in (0o620, 0o602):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(daemon._owner_file(), mode)
+                with mock.patch(
+                    "socket.gethostname",
+                    return_value="local-host",
+                ), mock.patch.object(
+                    daemon,
+                    "_pid_alive",
+                    side_effect=AssertionError(
+                        "writable owner PID must not be probed"
+                    ),
+                ) as pid_probe, mock.patch.object(
+                    daemon,
+                    "process_start_token",
+                    side_effect=AssertionError(
+                        "writable owner identity must not be read"
+                    ),
+                ) as identity_probe, mock.patch.object(
+                    daemon.os,
+                    "kill",
+                    side_effect=AssertionError(
+                        "writable owner PID must not be signalled"
+                    ),
+                ) as signal:
+                    message = daemon.stop()
+
+                self.assertIn("拒绝", message)
+                self.assertTrue(os.path.exists(daemon._owner_file()))
+                pid_probe.assert_not_called()
+                identity_probe.assert_not_called()
+                signal.assert_not_called()
+
+    def test_daemon_owner_reader_closes_outer_fds_after_open_failures(self) -> None:
+        os.makedirs(os.path.dirname(daemon._owner_file()), mode=0o700)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "lease_id": "lease-fd-open",
+                    "pid": 4242,
+                    "start_token": "proc:lease",
+                    "physical_host": "local-host",
+                },
+                stream,
+            )
+        real_open = os.open
+        for fail_call in (2, 3):
+            with self.subTest(fail_call=fail_call):
+                opened = []
+
+                def failing_open(path, flags, *args, **kwargs):
+                    if len(opened) + 1 == fail_call:
+                        raise OSError("injected open failure")
+                    fd = real_open(path, flags, *args, **kwargs)
+                    opened.append(fd)
+                    return fd
+
+                with mock.patch.object(daemon.os, "open", side_effect=failing_open):
+                    self.assertIsNone(daemon._read_lease_owner())
+                for fd in opened:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+
+    def test_daemon_owner_reader_closes_outer_fds_after_close_failure(self) -> None:
+        os.makedirs(os.path.dirname(daemon._owner_file()), mode=0o700)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "lease_id": "lease-fd-close",
+                    "pid": 4242,
+                    "start_token": "proc:lease",
+                    "physical_host": "local-host",
+                },
+                stream,
+            )
+        real_close = os.close
+        closed = []
+
+        def close_then_fail_once(fd):
+            real_close(fd)
+            closed.append(fd)
+            if len(closed) == 1:
+                raise OSError("injected close failure")
+
+        with mock.patch.object(daemon.os, "close", side_effect=close_then_fail_once):
+            self.assertIsNone(daemon._read_lease_owner())
+
+        self.assertEqual(3, len(closed))
+        for fd in closed:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
     def test_fifo_launch_marker_is_bounded_and_fails_closed(self) -> None:
         child_state = os.path.join(self.tmp.name, "fifo-state")
         child_config = os.path.join(self.tmp.name, "fifo-config.json")
@@ -502,12 +702,261 @@ class ReviewLifecycleRaceTests(TempStateCase):
         with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
             stream.write("successor\n")
 
-        daemon._cleanup(observed)
+        self.assertFalse(daemon._cleanup(observed))
 
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(successor, json.load(stream))
         with open(daemon._pid_file(), encoding="utf-8") as stream:
             self.assertEqual("202", stream.read().strip())
         with open(daemon._heartbeat_file(), encoding="utf-8") as stream:
             self.assertEqual("successor", stream.read().strip())
+
+    def test_daemon_cleanup_accepts_completed_graceful_self_cleanup(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "graceful",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        os.makedirs(daemon._host_dir(), exist_ok=True)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write("101\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+
+        self.assertFalse(os.path.lexists(daemon._owner_file()))
+        self.assertFalse(os.path.lexists(os.path.dirname(daemon._owner_file())))
+        self.assertTrue(daemon._cleanup(observed))
+        self.assertFalse(os.path.lexists(daemon._pid_file()))
+        self.assertFalse(os.path.lexists(daemon._heartbeat_file()))
+        self.assertTrue(daemon._cleanup(observed))
+
+    def test_daemon_cleanup_rejects_incomplete_ownerless_lock(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "graceful",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        os.makedirs(os.path.dirname(daemon._owner_file()), exist_ok=True)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write("101\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+
+        self.assertFalse(daemon._cleanup(observed))
+        self.assertTrue(os.path.isdir(os.path.dirname(daemon._owner_file())))
+        self.assertTrue(os.path.isfile(daemon._pid_file()))
+        self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+    def test_daemon_cleanup_rejects_invalid_owner_and_symlink_lock(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "graceful",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            stream.write("{invalid")
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write("101\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+
+        self.assertFalse(daemon._cleanup(observed))
+        self.assertTrue(os.path.isfile(daemon._pid_file()))
+        self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+        os.unlink(daemon._owner_file())
+        os.rmdir(lock_dir)
+        redirected_lock = os.path.join(daemon._host_dir(), "redirected.lock")
+        os.makedirs(redirected_lock)
+        with open(
+            os.path.join(redirected_lock, "owner.json"),
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump(observed, stream)
+        os.symlink(redirected_lock, lock_dir)
+
+        self.assertFalse(daemon._cleanup(observed))
+        self.assertTrue(os.path.islink(lock_dir))
+        self.assertTrue(os.path.isfile(daemon._pid_file()))
+        self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+    def test_daemon_cleanup_exact_owner_removes_only_sidecars(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "exact",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(observed, stream)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write("101\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+
+        self.assertTrue(daemon._cleanup(observed))
+
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(observed, json.load(stream))
+        self.assertTrue(os.path.isdir(lock_dir))
+        self.assertFalse(os.path.lexists(daemon._pid_file()))
+        self.assertFalse(os.path.lexists(daemon._heartbeat_file()))
+
+    def test_daemon_cleanup_fails_closed_on_sidecar_or_guard_error(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "exact",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(observed, stream)
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+        real_unlink = os.unlink
+
+        def reject_heartbeat(path: str) -> None:
+            if os.fspath(path) == daemon._heartbeat_file():
+                raise PermissionError("review unlink refusal")
+            real_unlink(path)
+
+        with mock.patch.object(
+            daemon.os,
+            "unlink",
+            side_effect=reject_heartbeat,
+        ):
+            self.assertFalse(daemon._cleanup(observed))
+
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(observed, json.load(stream))
+        self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+        with mock.patch.object(
+            state,
+            "open_private_text",
+            side_effect=state.StateError("review guard refusal"),
+        ):
+            self.assertFalse(daemon._cleanup(observed))
+
+    def test_expected_owner_cleanup_serializes_with_self_cleanup(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "graceful",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(observed, stream)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write("101\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+        guard_path = f"{lock_dir}.guard"
+        started = threading.Event()
+        results: list[bool] = []
+
+        def cleanup_observed() -> None:
+            started.set()
+            results.append(daemon._cleanup(observed))
+
+        with state.open_private_text(guard_path, "a+") as guard:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+            thread = threading.Thread(target=cleanup_observed)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            self.assertTrue(thread.is_alive())
+            os.unlink(daemon._owner_file())
+            os.rmdir(lock_dir)
+            os.unlink(daemon._pid_file())
+            os.unlink(daemon._heartbeat_file())
+            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([True], results)
+
+    def test_stop_accepts_dispatcher_graceful_self_cleanup(self) -> None:
+        observed = {
+            "schema_version": 1,
+            "lease_id": "graceful",
+            "pid": 101,
+            "start_token": "proc:old",
+            "physical_host": socket.gethostname(),
+        }
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(observed, stream)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write("101\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("old\n")
+
+        identity_calls = 0
+
+        def process_identity(_pid: int) -> str | None:
+            nonlocal identity_calls
+            identity_calls += 1
+            if identity_calls < 3:
+                return observed["start_token"]
+            os.unlink(daemon._owner_file())
+            os.rmdir(lock_dir)
+            os.unlink(daemon._pid_file())
+            os.unlink(daemon._heartbeat_file())
+            return None
+
+        alive = iter((True, False))
+        with mock.patch.object(
+            daemon,
+            "_pid_alive",
+            side_effect=lambda _pid: next(alive),
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            side_effect=process_identity,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+        ) as signal, mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            state,
+            "submission_lock",
+            return_value=contextlib.nullcontext(),
+        ), mock.patch.object(
+            state,
+            "mark_idle_shutdown",
+            return_value="stop-token",
+        ):
+            rc, stdout, stderr = self.capture(
+                cli.cmd_daemon,
+                argparse.Namespace(action="stop"),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual("daemon 已停止 (pid=101)\n", stdout)
+        self.assertEqual("", stderr)
+        signal.assert_called_once_with(101, daemon.signal.SIGTERM)
 
     def test_stop_refuses_success_when_sidecar_cleanup_loses_lease(self) -> None:
         observed = {
@@ -529,7 +978,7 @@ class ReviewLifecycleRaceTests(TempStateCase):
             ):
                 text = daemon.stop()
             self.assertIn("拒绝", text)
-            self.assertIn("替换", text)
+            self.assertIn("状态", text)
 
         with self.subTest(case="ownerless-replaced"):
             with mock.patch.object(
@@ -541,7 +990,7 @@ class ReviewLifecycleRaceTests(TempStateCase):
             ):
                 text = daemon.stop()
             self.assertIn("拒绝", text)
-            self.assertIn("替换", text)
+            self.assertIn("状态", text)
 
     def test_ownerless_cleanup_is_serialized_with_successor_publish(self) -> None:
         successor = {
@@ -559,11 +1008,12 @@ class ReviewLifecycleRaceTests(TempStateCase):
         guard_path = f"{os.path.dirname(daemon._owner_file())}.guard"
         started = threading.Event()
         errors: list[BaseException] = []
+        results: list[bool] = []
 
         def cleanup_ownerless() -> None:
             started.set()
             try:
-                daemon._cleanup(None)
+                results.append(daemon._cleanup(None))
             except BaseException as error:
                 errors.append(error)
 
@@ -584,6 +1034,7 @@ class ReviewLifecycleRaceTests(TempStateCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual([], errors)
+        self.assertEqual([False], results)
         with open(daemon._pid_file(), encoding="utf-8") as stream:
             self.assertEqual("303", stream.read().strip())
         with open(daemon._heartbeat_file(), encoding="utf-8") as stream:
@@ -1681,12 +2132,88 @@ class ReviewIdempotentRequestTests(TempStateCase):
             deleted = conn.execute(
                 "SELECT revision FROM gpus WHERE idx=1"
             ).fetchone()["revision"]
+            ignore_before = conn.execute(
+                "SELECT revision FROM gpus WHERE idx=0"
+            ).fetchone()["revision"]
+            conn.execute(
+                "UPDATE gpus SET ignore_until='2026-08-30 20:00:00'"
+                " WHERE idx=0"
+            )
+            ignored = conn.execute(
+                "SELECT revision FROM gpus WHERE idx=0"
+            ).fetchone()["revision"]
 
         self.assertGreater(assigned, before[0])
         self.assertGreater(inserted, assigned)
         self.assertGreater(moved[0], inserted)
         self.assertGreater(moved[1], before[1])
         self.assertGreater(deleted, moved[1])
+        self.assertEqual(ignore_before + 1, ignored)
+
+    def test_gpu_ignore_request_invalidates_the_old_revision(self) -> None:
+        with state.connect() as conn:
+            state.init_gpus(conn, [0])
+            gpu = state.get_gpu(conn, 0)
+
+        def request_args(request_id: str) -> argparse.Namespace:
+            return argparse.Namespace(
+                request_id=request_id,
+                command=["gpu-ignore", "0"],
+                expect_kind="gpu",
+                expect_id="0",
+                expect_status=gpu["status"],
+                expect_version=None,
+                expect_quarantined=gpu["quarantined"],
+                expect_revision=gpu["revision"],
+                expect_assignments_json="[]",
+            )
+
+        rc, stdout, stderr = self.capture(
+            cli.cmd_request,
+            request_args("req-ignore-first"),
+        )
+        self.assertEqual(0, rc, stderr)
+        self.assertIn("已忽略告警", stdout)
+        with state.connect() as conn:
+            after = state.get_gpu(conn, 0)
+        self.assertEqual(gpu["revision"] + 1, after["revision"])
+        self.assertIsNotNone(after["ignore_until"])
+
+        rc, stdout, stderr = self.capture(
+            cli.cmd_request,
+            request_args("req-ignore-stale"),
+        )
+        self.assertEqual(65, rc)
+        self.assertEqual("", stdout)
+        self.assertIn("revision changed", stderr)
+
+    def test_legacy_database_installs_gpu_ignore_revision_trigger(self) -> None:
+        with state.connect() as conn:
+            conn.execute("DROP TRIGGER IF EXISTS revision_gpu_ignore")
+            state.init_gpus(conn, [0])
+            before = state.get_gpu(conn, 0)["revision"]
+
+        state.init_db()
+        state.init_db()
+
+        with state.connect() as conn:
+            trigger_rows = conn.execute(
+                "SELECT sql FROM sqlite_master"
+                " WHERE type='trigger' AND name='revision_gpu_ignore'"
+            ).fetchall()
+            self.assertEqual(1, len(trigger_rows))
+            conn.execute(
+                "UPDATE gpus SET ignore_until='2026-08-30 20:00:00'"
+                " WHERE idx=0"
+            )
+            after = state.get_gpu(conn, 0)["revision"]
+            conn.execute(
+                "UPDATE gpus SET ignore_until='2026-08-30 20:00:00'"
+                " WHERE idx=0"
+            )
+            unchanged = state.get_gpu(conn, 0)["revision"]
+        self.assertEqual(before + 1, after)
+        self.assertEqual(after, unchanged)
 
     def test_gpu_request_binds_revision_and_exact_assignment_snapshot(self) -> None:
         with state.connect() as conn:
@@ -1715,6 +2242,58 @@ class ReviewIdempotentRequestTests(TempStateCase):
         self.assertEqual("", stdout)
         self.assertIn("assignments changed", stderr)
         nested.assert_not_called()
+
+    def test_request_gpu_mutation_allowlist_is_explicit(self) -> None:
+        with state.connect() as conn:
+            state.init_gpus(conn, [0])
+            gpu = state.get_gpu(conn, 0)
+
+        cases = (
+            (["gpu-free", "0", "--yes"], True),
+            (["gpu-ignore", "0"], True),
+            (["gpu-ok", "0"], True),
+            (["gpu-set-mem", "0", "24"], False),
+        )
+        for command, allowed in cases:
+            request_id = f"req-allow-{command[0]}"
+            args = argparse.Namespace(
+                request_id=request_id,
+                command=command,
+                expect_kind="gpu",
+                expect_id="0",
+                expect_status=gpu["status"],
+                expect_version=None,
+                expect_quarantined=gpu["quarantined"],
+                expect_revision=gpu["revision"],
+                expect_assignments_json="[]",
+            )
+
+            with self.subTest(command=command), mock.patch.object(
+                cli,
+                "main",
+                return_value=0,
+            ) as nested:
+                rc, stdout, stderr = self.capture(cli.cmd_request, args)
+                with state.connect() as conn:
+                    ledger = conn.execute(
+                        "SELECT status, code FROM operation_requests"
+                        " WHERE request_id=?",
+                        (request_id,),
+                    ).fetchone()
+                if allowed:
+                    self.assertEqual(0, rc, stderr)
+                    self.assertEqual("", stdout)
+                    nested.assert_called_once_with(command)
+                    self.assertEqual(("done", 0), tuple(ledger))
+                else:
+                    self.assertEqual(64, rc)
+                    self.assertEqual("", stdout)
+                    self.assertIn(
+                        "request 只允许调度器 mutation 子命令",
+                        stderr,
+                    )
+                    nested.assert_not_called()
+                    self.assertIsNone(ledger)
 
     def test_bound_request_acquires_reentrant_submission_lease_before_db(
         self,
@@ -2757,6 +3336,12 @@ class ReviewAcceptanceCleanupTests(unittest.TestCase):
             record = os.path.join(temp, "removed.txt")
             os.mkdir(state_root)
             os.mkdir(auxiliary_root)
+            os.mkdir(os.path.join(state_root, "runtime"))
+            with open(
+                os.path.join(state_root, "runtime", "state.db"),
+                "wb",
+            ):
+                pass
             with open(
                 os.path.join(state_root, "config.json"),
                 "w",
@@ -2774,6 +3359,9 @@ SCHED_ACCEPT_CLEANUP_ROOTS=("$auxiliary_root" "$state_root")
 SCHED_ACCEPT_CLEANUP_TOKENS=("aux-token" "state-token")
 SCHED_ACCEPT_CLEANUP_DEVS=("1" "1")
 SCHED_ACCEPT_CLEANUP_INOS=("1" "1")
+SCHED_ACCEPT_CLEANUP_ANCHORS=("aux-anchor" "state-anchor")
+SCHED_ACCEPT_CLEANUP_MARKER_DEVS=("2" "2")
+SCHED_ACCEPT_CLEANUP_MARKER_INOS=("2" "2")
 sched_accept_root_owned() { return 0; }
 sched_accept_stop_daemon() { return 1; }
 sched_accept_verify_quiescent() { return 0; }

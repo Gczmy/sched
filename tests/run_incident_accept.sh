@@ -21,6 +21,10 @@ PY=${PY:-$(command -v python3 || echo python3)}
 source tests/acceptance_cleanup.sh
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+# submit may perform the first daemon-health check, so fake capacity must be
+# visible before any CLI call in this acceptance test.
+export SCHED_FAKE_GPUS=0:24
+unset SCHED_FAKE_COMPUTE_APPS
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -29,44 +33,66 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   $PY -m gsched.cli daemon stop >/dev/null 2>&1
-  sleep 1
 }
 
-count_status() { # $1=state_dir $2=batch_name $3=status -> 数量
-  local st=$1 bn=$2 want=$3
-  export SCHED_STATE=$st SCHED_CONFIG=$st/config.json
-  $PY -m gsched.cli status --json 2>/dev/null | \
-    $PY -c "
+latest_batch_id() { # $1=state_dir $2=batch_name
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli status "$2" --json 2>/dev/null | \
+    "$PY" -c '
 import json, sys
-d = json.load(sys.stdin)
-bn = '$bn'; want = '$want'
-n = 0
-for j in d['jobs']:
-    if j['batch_name'] == bn and j['status'] == want:
-        n += 1
-print(n)
-"
+try:
+    batches = json.load(sys.stdin).get("batches", [])
+except Exception:
+    batches = []
+print(batches[0].get("batch_id", "") if batches else "")'
 }
 
-wait_status() { # $1=state_dir $2=batch_name $3=status $4=期望数 $5=超时秒(默认60)
-  local st=$1 bn=$2 want=$3 exp=$4 timeout=${5:-60}
-  for _ in $(seq 1 $timeout); do
-    [ "$(count_status $st $bn $want)" = "$exp" ] && return 0
+task_status() { # $1=state_dir $2=<batch id>:<task>
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli task "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    jobs = json.load(sys.stdin).get("jobs", [])
+except Exception:
+    jobs = []
+print(jobs[-1].get("status", "") if jobs else "")'
+}
+
+wait_task_status() { # $1=state_dir $2=<batch id>:<task> $3=status $4=timeout
+  for _ in $(seq 1 ${4:-120}); do
+    [ "$(task_status "$1" "$2")" = "$3" ] && return 0
     sleep 1
   done
   return 1
 }
 
-incident_count() { # $1=state_dir -> 行数
-  SCHED_STATE=$1 $PY -c "
-from gsched import state
-import sqlite3, os
-p = state.db_path()
-if not os.path.exists(p):
-    print(0); raise SystemExit
-conn = sqlite3.connect(p)
-print(conn.execute('SELECT COUNT(*) FROM incidents').fetchone()[0])
-"
+batch_status() { # $1=state_dir $2=batch id
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli status "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    batches = json.load(sys.stdin).get("batches", [])
+except Exception:
+    batches = []
+print(batches[0].get("status", "") if batches else "")'
+}
+
+wait_batch_status() { # $1=state_dir $2=batch id $3=status $4=timeout
+  for _ in $(seq 1 ${4:-120}); do
+    [ "$(batch_status "$1" "$2")" = "$3" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_marker() { # $1=marker path $2=timeout
+  for _ in $(seq 1 ${2:-120}); do
+    [ -f "$1" ] && return 0
+    sleep 1
+  done
+  return 1
 }
 
 mk_config() { # $1=state_dir  (co_locate 开启)
@@ -88,17 +114,19 @@ echo "=== F2 事故快照验收 (fake-gpu) ==="
 echo "--- 场景 1: 共享装箱 OOM -> 快照 (co_runners 非空) ---"
 sched_accept_make_root S1 "sched-incident-oom"
 mk_config $S1
+OOM_RELEASE=$S1/oom.release
+NEIGHBOR_RELEASE=$S1/neighbor.release
 cat > $S1/batch.json << EOF
 {
   "name": "inc", "mode": "mix",
   "project": "default",
   "tasks": [
     {"id": "oomer",
-     "cmd": ["{VENV:k}", "-c", "import time; time.sleep(1); print('CUDA out of memory. Tried to allocate 2.50 GiB', flush=True); raise SystemExit(1)"],
+     "cmd": ["/bin/sh", "-c", "while [ ! -e '$OOM_RELEASE' ]; do sleep 0.1; done; echo 'CUDA out of memory. Tried to allocate 2.50 GiB'; exit 1"],
      "duration_min": 5, "max_retry": 0,
      "resources": {"gpu_share": true, "vram_gib": 1.0}},
     {"id": "neighbor",
-     "cmd": ["{VENV:k}", "-c", "import time; time.sleep(90)"],
+     "cmd": ["/bin/sh", "-c", "while [ ! -e '$NEIGHBOR_RELEASE' ]; do sleep 0.1; done"],
      "duration_min": 5,
      "resources": {"gpu_share": true, "vram_gib": 1.0}}
   ]
@@ -106,14 +134,35 @@ cat > $S1/batch.json << EOF
 EOF
 export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
 $PY -m gsched.cli submit $S1/batch.json >/dev/null 2>&1 || { bad "submit 失败"; exit 1; }
-SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-sleep 3
-[ "$(count_status $S1 inc running)" = "2" ] && ok "两任务同卡共享 running" \
-  || bad "未双 running (running=$(count_status $S1 inc running))"
-wait_status $S1 inc blocked 1 && ok "oomer 进入 blocked (max_retry=0)" || bad "oomer 未 blocked"
+INC_BID=$(latest_batch_id "$S1" inc)
+[ -n "$INC_BID" ] && ok "获取精确 batch id" || bad "未获取 inc batch id"
+$PY -m gsched.cli daemon start --fake >/dev/null 2>&1
 
-# 等 reap 完成后查快照
-SNAP=$(SCHED_STATE=$S1 $PY -c "
+SNAP=NONE
+BOTH_RUNNING=0
+if [ -n "$INC_BID" ] \
+  && wait_task_status "$S1" "$INC_BID:oomer" running 120 \
+  && wait_task_status "$S1" "$INC_BID:neighbor" running 120 \
+  && [ "$(task_status "$S1" "$INC_BID:oomer")" = "running" ] \
+  && [ "$(task_status "$S1" "$INC_BID:neighbor")" = "running" ]; then
+  BOTH_RUNNING=1
+  ok "精确批次的两任务同卡共享 running"
+else
+  bad "精确批次未同时 running (oomer=$(task_status "$S1" "$INC_BID:oomer"), neighbor=$(task_status "$S1" "$INC_BID:neighbor"))"
+fi
+
+if [ "$BOTH_RUNNING" = "1" ]; then
+  touch "$OOM_RELEASE"
+  wait_task_status "$S1" "$INC_BID:oomer" blocked 120 \
+    && ok "oomer 进入 blocked (max_retry=0)" \
+    || bad "oomer 未在 120s 内进入 blocked"
+
+  [ "$(task_status "$S1" "$INC_BID:neighbor")" = "running" ] \
+    && ok "OOM 未终止共享邻居" \
+    || bad "OOM 后 neighbor 未保持 running"
+
+# reap 提交 blocked 后查快照，neighbor gate 保证采集时仍是 co-runner.
+  SNAP=$(SCHED_STATE=$S1 $PY -c "
 from gsched import state
 import json, sqlite3, os
 conn = sqlite3.connect(state.db_path())
@@ -134,6 +183,18 @@ checks = {
 }
 print(json.dumps(checks))
 ")
+
+  touch "$NEIGHBOR_RELEASE"
+  wait_task_status "$S1" "$INC_BID:neighbor" done 120 \
+    && ok "neighbor 独立收敛 done" \
+    || bad "neighbor 未在 120s 内收敛 done"
+  wait_batch_status "$S1" "$INC_BID" blocked 120 \
+    && ok "精确批次收敛 blocked" \
+    || bad "精确批次未在 120s 内收敛 blocked"
+  wait_marker "$S1/testnode/markers/inc.blocked" 120 \
+    && ok "blocked marker 已生成" \
+    || bad "blocked marker 未在 120s 内生成"
+fi
 stop_daemon $S1
 
 [ "$SNAP" != "NONE" ] && ok "快照已生成" || bad "无 oom 快照"

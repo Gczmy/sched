@@ -3,17 +3,19 @@
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
+PY=${PY:-python3}
 sched_accept_make_root SCHED_STATE "sched-cancel-project"
 export SCHED_STATE
+export SCHED_CONFIG="$SCHED_STATE/config.json"
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
-  "schema_version": 1, "user": "t", "node": "$NODE", "state_dir": "$SCHED_STATE",
-  "default_project": "p", "gpus": [], "venvs": {"k": "/bin"},
+  "schema_version": 1, "user": "$(whoami)", "node": "$NODE", "state_dir": "$SCHED_STATE",
+  "default_project": "p", "gpus": [0], "venvs": {"k": "$PY"},
   "projects": {"p": {"root": "/tmp", "git": false}}
 }
 EOF
-python3 - <<'PY'
+"$PY" - <<'PY'
 import argparse, contextlib, io, os, sqlite3, sys
 sys.path.insert(0, ".")
 from gsched import cli, state
@@ -29,7 +31,7 @@ with state.connect() as conn:
         state.insert_task(conn, bid, "t1", 1, spec, 0, "p")
         state.insert_job(conn, jid, bid, "t1", 1, "fp", None, "p")
         conn.execute("UPDATE batches SET status='active' WHERE id=?", (bid,))
-        conn.execute("UPDATE jobs SET status='running', pgid=? WHERE id=?", (4242 if n == "old" else 4243, jid))
+        conn.execute("UPDATE jobs SET status='running', pgid=NULL WHERE id=?", (jid,))
 args = argparse.Namespace(batch="", yes=True, project=None, bulk_project="p")
 out = io.StringIO()
 with contextlib.redirect_stdout(out):
@@ -41,3 +43,34 @@ reqs = conn.execute("SELECT job_id FROM control_requests ORDER BY id").fetchall(
 assert {r[0] for r in reqs} == {"same-name-old-t1-v1", "same-name-new-t1-v1"}, reqs
 print("L9 cancel --project forwards every same-name batch instance")
 PY
+
+if ! SCHED_FAKE_GPUS=0:24 "$PY" -m gsched.cli daemon start --fake >/dev/null 2>&1; then
+  echo "failed to start isolated daemon for project-cancel convergence" >&2
+  exit 1
+fi
+settled=0
+for _ in $(seq 1 120); do
+  if "$PY" -m gsched.cli status --json 2>/dev/null | "$PY" -c '
+import json, os, sys
+d = json.load(sys.stdin)
+batches = {b["batch_id"]: b["status"] for b in d.get("batches", [])}
+jobs = {(j["batch_id"], j["task"]): j["status"] for j in d.get("jobs", [])}
+ok = (
+    batches.get("same-name-old") == "blocked"
+    and batches.get("same-name-new") == "blocked"
+    and jobs.get(("same-name-old", "t1")) == "blocked"
+    and jobs.get(("same-name-new", "t1")) == "blocked"
+)
+raise SystemExit(0 if ok else 1)' \
+    && [ -f "$SCHED_STATE/$NODE/markers/same_name.blocked" ] \
+    && [ ! -e "$SCHED_STATE/$NODE/markers/same_name.done" ]; then
+    settled=1
+    break
+  fi
+  sleep 1
+done
+if [ "$settled" != "1" ]; then
+  echo "project cancel requests did not fully converge" >&2
+  exit 1
+fi
+"$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1

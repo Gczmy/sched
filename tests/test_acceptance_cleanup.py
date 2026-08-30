@@ -33,6 +33,11 @@ class AcceptanceCleanupTests(unittest.TestCase):
             check=False,
         )
 
+    def make_python_hook(self, source: str) -> Path:
+        hook_dir = Path(tempfile.mkdtemp(prefix="python-hook-", dir=self.temp_path))
+        (hook_dir / "sitecustomize.py").write_text(source, encoding="utf-8")
+        return hook_dir
+
     def make_successful_stop_cli(self) -> Path:
         fake_python = self.temp_path / "fake-sched-python"
         fake_python.write_text(
@@ -44,6 +49,10 @@ case "$*" in
   *"status"*"--json"*)
     printf '%s\n' "$SCHED_FAKE_STATUS_JSON"
     exit "${SCHED_FAKE_STATUS_RC:-0}"
+    ;;
+  *"task"*"--json"*)
+    printf '%s\n' "$SCHED_FAKE_TASK_JSON"
+    exit "${SCHED_FAKE_TASK_RC:-0}"
     ;;
 esac
 exit 97
@@ -87,6 +96,8 @@ exit 97
 source {HELPER}
 sched_accept_make_root TEST_ROOT sched-cleanup-stop-failure
 printf '{{}}\n' > "$TEST_ROOT/config.json"
+mkdir "$TEST_ROOT/runtime"
+: > "$TEST_ROOT/runtime/state.db"
 printf '%s\n' "$TEST_ROOT"
 sched_accept_cleanup
 """,
@@ -111,6 +122,8 @@ sched_accept_cleanup
 source {HELPER}
 sched_accept_make_root TEST_ROOT sched-cleanup-stop-timeout
 printf '{{}}\n' > "$TEST_ROOT/config.json"
+mkdir "$TEST_ROOT/runtime"
+: > "$TEST_ROOT/runtime/state.db"
 printf '%s\n' "$TEST_ROOT"
 sched_accept_cleanup
 """,
@@ -165,6 +178,8 @@ sched_accept_cleanup
 source {HELPER}
 sched_accept_make_root TEST_ROOT sched-cleanup-running
 printf '{{"node":"review-node"}}\n' > "$TEST_ROOT/config.json"
+mkdir "$TEST_ROOT/review-node"
+: > "$TEST_ROOT/review-node/state.db"
 printf '%s\n' "$TEST_ROOT"
 sched_accept_cleanup
 """,
@@ -201,6 +216,8 @@ sched_accept_cleanup
 source {HELPER}
 sched_accept_make_root TEST_ROOT sched-cleanup-status-{label}
 printf '{{"node":"review-node"}}\n' > "$TEST_ROOT/config.json"
+mkdir "$TEST_ROOT/review-node"
+: > "$TEST_ROOT/review-node/state.db"
 printf '%s\n' "$TEST_ROOT"
 sched_accept_cleanup
 """,
@@ -216,6 +233,43 @@ sched_accept_cleanup
                     f"cleanup removed a root after {label} status",
                 )
                 self.assertTrue(result.stderr)
+
+    def test_invalid_config_without_runtime_is_safe_to_remove(self) -> None:
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-invalid-config
+printf '{{"node":"review-node"}}\n' > "$TEST_ROOT/config.json"
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+"""
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertFalse(root.exists(), "runtime-free invalid config root was retained")
+        self.assertEqual([], list(self.roots.iterdir()))
+
+    def test_cleanup_leaves_claimed_working_directory_before_removal(self) -> None:
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-current-directory
+mkdir "$TEST_ROOT/work"
+printf 'root=%s\n' "$TEST_ROOT"
+cd "$TEST_ROOT/work"
+sched_accept_cleanup
+printf 'pwd=%s\n' "$PWD"
+"""
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertFalse(Path(values["root"]).exists())
+        self.assertTrue(
+            os.path.samefile(values["pwd"], REPO_ROOT),
+            f"cleanup moved to a different directory: {values['pwd']}",
+        )
 
     def test_successful_stop_with_unresolved_launch_marker_preserves_root(
         self,
@@ -241,6 +295,74 @@ sched_accept_cleanup
         root = Path(result.stdout.strip())
         self.assertTrue(root.is_dir(), "cleanup removed a root with a pending launch marker")
         self.assertIn("launch", result.stderr.lower())
+
+    def test_hidden_older_running_version_preserves_root(self) -> None:
+        fake_python = self.make_successful_stop_cli()
+        status = self.canonical_status(
+            batches=[
+                {
+                    "id": "versioned-batch",
+                    "name": "versioned",
+                    "batch_id": "versioned-batch",
+                    "batch_name": "versioned",
+                    "mode": "mix",
+                    "status": "done",
+                    "depends_on": [],
+                    "progress": "1/1",
+                    "project": "p",
+                    "revision": 1,
+                }
+            ],
+            jobs=[
+                {
+                    "id": "versioned-batch-task-v2",
+                    "batch_id": "versioned-batch",
+                    "batch_name": "versioned",
+                    "task": "task",
+                    "status": "done",
+                    "wait_reason": None,
+                    "gpu": None,
+                    "version": 2,
+                    "resources": {"gpu": 0},
+                    "retries": 0,
+                    "failure": None,
+                    "started_at": None,
+                    "finished_at": "2026-08-30 00:00:00",
+                    "progress": None,
+                }
+            ],
+        )
+        task = {
+            "schema_version": 1,
+            "batch_id": "versioned-batch",
+            "batch_name": "versioned",
+            "batch_revision": 1,
+            "task": "task",
+            "jobs": [
+                {"id": "versioned-batch-task-v1", "version": 1, "status": "running"},
+                {"id": "versioned-batch-task-v2", "version": 2, "status": "done"},
+            ],
+        }
+
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-hidden-running
+printf '{{"node":"review-node"}}\n' > "$TEST_ROOT/config.json"
+mkdir "$TEST_ROOT/review-node"
+: > "$TEST_ROOT/review-node/state.db"
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+""",
+            PY=str(fake_python),
+            SCHED_FAKE_STATUS_JSON=json.dumps(status),
+            SCHED_FAKE_TASK_JSON=json.dumps(task),
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertTrue(root.is_dir(), "cleanup removed a hidden running version")
+        self.assertIn("running version", result.stderr)
 
     def test_successful_stop_with_unsafe_launch_enumeration_preserves_root(
         self,
@@ -278,8 +400,9 @@ source {HELPER}
 sched_accept_make_root TEST_ROOT sched-cleanup-replaced
 owner_token=$(cat "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER")
 rm -rf -- "$TEST_ROOT"
-mkdir "$TEST_ROOT"
+mkdir -m 700 "$TEST_ROOT"
 printf '%s\n' "$owner_token" > "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
+chmod 600 "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
 printf '%s\n' "$TEST_ROOT"
 sched_accept_cleanup
 """
@@ -289,6 +412,160 @@ sched_accept_cleanup
         root = Path(result.stdout.strip())
         self.assertTrue(root.is_dir(), "cleanup removed a replacement root with a copied token")
         self.assertIn("identity changed", result.stderr)
+
+    def test_recreated_root_is_not_removed_when_root_identity_is_reused(self) -> None:
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-reused-identity
+owner_token=$(cat "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER")
+rm -rf -- "$TEST_ROOT"
+mkdir -m 700 "$TEST_ROOT"
+printf '%s\n' "$owner_token" > "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
+chmod 600 "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
+printf 'replacement\n' > "$TEST_ROOT/sentinel"
+replacement_identity=$("$SCHED_ACCEPT_SYSTEM_PYTHON" - "$TEST_ROOT" <<'PY'
+import os
+import sys
+
+observed = os.lstat(sys.argv[1])
+print(observed.st_dev, observed.st_ino)
+PY
+)
+IFS=' ' read -r replacement_dev replacement_ino <<< "$replacement_identity"
+SCHED_ACCEPT_CLEANUP_DEVS[0]=$replacement_dev
+SCHED_ACCEPT_CLEANUP_INOS[0]=$replacement_ino
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+"""
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertTrue(
+            (root / "sentinel").is_file(),
+            "cleanup trusted a copied marker after root identity reuse",
+        )
+        self.assertIn("identity changed", result.stderr)
+
+    def test_replaced_marker_is_not_authenticated_by_copied_token(self) -> None:
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-replaced-marker
+owner_token=$(cat "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER")
+rm -- "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
+printf '%s\n' "$owner_token" > "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
+chmod 600 "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER"
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+"""
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertTrue(root.is_dir(), "cleanup removed a root with a replaced marker")
+        self.assertIn("identity changed", result.stderr)
+
+    def test_missing_anchor_preserves_claimed_root(self) -> None:
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-missing-anchor
+rm -- "${{SCHED_ACCEPT_CLEANUP_ANCHORS[0]}}"
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+"""
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertTrue(root.is_dir(), "cleanup removed a root without its claim anchor")
+        self.assertIn("identity changed", result.stderr)
+
+    def test_symlink_anchor_preserves_claimed_root(self) -> None:
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-symlink-anchor
+anchor=${{SCHED_ACCEPT_CLEANUP_ANCHORS[0]}}
+rm -- "$anchor"
+ln -s "$TEST_ROOT/$SCHED_ACCEPT_OWNER_MARKER" "$anchor"
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+"""
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertTrue(root.is_dir(), "cleanup followed a replacement anchor symlink")
+        self.assertIn("identity changed", result.stderr)
+
+    def test_ambiguous_nfs_link_result_registers_the_created_anchor(self) -> None:
+        hook = self.make_python_hook(
+            """import errno
+import os
+
+_real_link = os.link
+
+
+def ambiguous_link(source, destination, *args, **kwargs):
+    result = _real_link(source, destination, *args, **kwargs)
+    if str(destination).startswith(".sched-accept-claim-"):
+        raise FileExistsError(errno.EEXIST, "simulated lost LINK reply")
+    return result
+
+
+os.link = ambiguous_link
+"""
+        )
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-ambiguous-link
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+""",
+            PYTHONPATH=str(hook),
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertFalse(root.exists(), "ambiguous LINK result left its root behind")
+        self.assertEqual([], list(self.roots.iterdir()), "ambiguous LINK leaked an anchor")
+
+    def test_ambiguous_nfs_rename_result_is_reconciled_by_open_fds(self) -> None:
+        hook = self.make_python_hook(
+            """import errno
+import os
+
+_real_rename = os.rename
+
+
+def ambiguous_rename(source, destination, *args, **kwargs):
+    result = _real_rename(source, destination, *args, **kwargs)
+    if ".sched-accept-quarantine-" in str(destination):
+        raise OSError(errno.EIO, "simulated lost RENAME reply")
+    return result
+
+
+os.rename = ambiguous_rename
+"""
+        )
+        result = self.run_helper(
+            f"""
+source {HELPER}
+sched_accept_make_root TEST_ROOT sched-cleanup-ambiguous-rename
+printf '%s\n' "$TEST_ROOT"
+sched_accept_cleanup
+""",
+            PYTHONPATH=str(hook),
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = Path(result.stdout.strip())
+        self.assertFalse(root.exists(), "ambiguous RENAME result left its root behind")
+        self.assertEqual([], list(self.roots.iterdir()), "ambiguous RENAME leaked an anchor")
 
     def test_changed_token_is_not_removed(self) -> None:
         result = self.run_helper(

@@ -1729,6 +1729,11 @@ class ReviewAcceptanceCleanupTests(unittest.TestCase):
             f"source {self.helper!r}; "
             "sched_accept_make_root STATE review-cleanup; "
             "touch \"$STATE/config.json\"; "
+            # Force the runtime-present branch: runtime-absent roots now skip
+            # needless CLI calls, while this legacy contract specifically
+            # verifies stop/status are the only scheduler operations used.
+            "mkdir -p \"$STATE/testnode\"; "
+            "touch \"$STATE/testnode/daemon.pid\"; "
             f"{ending}"
         )
         return subprocess.run(
@@ -2652,4 +2657,3 @@ class ReviewSignalDeliveryTests(unittest.TestCase):
             self.assertFalse(executor.kill_pgid(4242, signal.SIGTERM))
 if __name__ == "__main__":
     unittest.main()
-

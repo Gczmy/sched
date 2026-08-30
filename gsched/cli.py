@@ -3270,6 +3270,8 @@ def cmd_request(args: argparse.Namespace) -> int:
         "cancel",
         "retry",
         "resubmit",
+        # gpu-set-mem is intentionally excluded: mem_total_gib is a
+        # restart-ephemeral state/list-gpus value and is not revision/CAS-bound.
         "gpu-free",
         "gpu-ignore",
         "gpu-ok",

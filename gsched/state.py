@@ -759,6 +759,12 @@ def migrate_revisions(conn: sqlite3.Connection) -> None:
         BEGIN
           UPDATE gpus SET revision=revision+1 WHERE idx=NEW.idx;
         END;
+        CREATE TRIGGER IF NOT EXISTS revision_gpu_ignore
+        AFTER UPDATE OF ignore_until ON gpus
+        WHEN OLD.ignore_until IS NOT NEW.ignore_until
+        BEGIN
+          UPDATE gpus SET revision=revision+1 WHERE idx=NEW.idx;
+        END;
         CREATE TRIGGER IF NOT EXISTS revision_gpu_job_insert
         AFTER INSERT ON gpu_jobs
         BEGIN

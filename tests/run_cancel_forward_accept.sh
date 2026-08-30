@@ -25,6 +25,8 @@ PY=${PY:-$(command -v python3 || echo python3)}
 source tests/acceptance_cleanup.sh
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"   # sched 包零依赖, 无需 pip install
+# submit 会自动 ensure_running；独立运行本验收时也必须先进入 fake 模式。
+export SCHED_FAKE_GPUS=0:24
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
@@ -61,6 +63,86 @@ wait_status() { # $1=state_dir $2=batch_name $3=status $4=期望数 $5=超时秒
   return 1
 }
 
+latest_batch_id() { # $1=state_dir $2=batch_name
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli status "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    batches = json.load(sys.stdin).get("batches", [])
+except Exception:
+    batches = []
+print(batches[0].get("batch_id", "") if batches else "")'
+}
+
+task_status() { # $1=state_dir $2=<batch id>:<task>
+  SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+    "$PY" -m gsched.cli task "$2" --json 2>/dev/null | \
+    "$PY" -c '
+import json, sys
+try:
+    jobs = json.load(sys.stdin).get("jobs", [])
+except Exception:
+    jobs = []
+print(jobs[-1].get("status", "") if jobs else "")'
+}
+
+wait_task_status() { # $1=state_dir $2=<batch id>:<task> $3=status $4=timeout
+  for _ in $(seq 1 ${4:-120}); do
+    [ "$(task_status "$1" "$2")" = "$3" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_task_pending_like() { # $1=state_dir $2=<batch id>:<task> $3=timeout
+  local actual
+  for _ in $(seq 1 ${3:-120}); do
+    actual=$(task_status "$1" "$2")
+    case "$actual" in
+      pending|waiting_quota|waiting_dep) return 0 ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+wait_batch_status() { # $1=state_dir $2=batch id $3=status $4=timeout
+  local actual
+  for _ in $(seq 1 ${4:-120}); do
+    actual=$(SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+      "$PY" -m gsched.cli status "$2" --json 2>/dev/null | \
+      "$PY" -c '
+import json, sys
+try:
+    batches = json.load(sys.stdin).get("batches", [])
+except Exception:
+    batches = []
+print(batches[0].get("status", "") if batches else "")')
+    [ "$actual" = "$3" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_gpu_free() { # $1=state_dir $2=gpu index $3=timeout
+  local actual
+  for _ in $(seq 1 ${3:-120}); do
+    actual=$(SCHED_STATE=$1 SCHED_CONFIG=$1/config.json \
+      "$PY" -m gsched.cli status --json 2>/dev/null | \
+      "$PY" -c "
+import json, sys
+try:
+    gpus = json.load(sys.stdin).get('gpus', [])
+except Exception:
+    gpus = []
+print(next((g.get('status', '') for g in gpus if g.get('idx') == $2), ''))")
+    [ "$actual" = "free" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 mk_config() { # $1=state_dir
   cat > $1/config.json << EOF
 {
@@ -90,33 +172,48 @@ cat > $S1/batch.json << EOF
 EOF
 export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
 $PY -m gsched.cli submit $S1/batch.json >/dev/null 2>&1 || { bad "cf1 submit 失败"; exit 1; }
+CF1_BID=$(latest_batch_id "$S1" cf1)
+[ -n "$CF1_BID" ] || { bad "cf1 批次 ID 不可见"; exit 1; }
 SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-sleep 3  # 等 t1 running
-[ "$(count_status $S1 cf1 running)" = "1" ] && ok "t1 进入 running" || bad "t1 未 running"
-# 关键断言: CLI cancel 只写请求, 不本地杀进程 (进程仍存活直到 daemon 处理)
-PGID_BEFORE=$($PY -c "
-import sys; sys.path.insert(0, 'sched')
-from gsched import state
-with state.connect() as conn:
-    j = state.get_job(conn, state.all_jobs(conn)[0]['id']) if state.all_jobs(conn) else None
-    print(j['pgid'] if j and j['pgid'] else 0)
-")
-$PY -m gsched.cli cancel cf1 --yes > $S1/cancel_out.txt 2>&1
-sleep 1
-if [ "$PGID_BEFORE" != "0" ] && kill -0 "$PGID_BEFORE" 2>/dev/null; then
-  ok "CLI cancel 后进程仍存活 (未本地 killpg, 转发 daemon)"
-else
-  bad "CLI cancel 后进程已死 (本地 killpg 仍发生?)"
-fi
-grep -q "已转发取消" $S1/cancel_out.txt && ok "输出指明'已转发取消' (daemon 执行)" \
-  || bad "输出缺转发提示 (输出: $(cat $S1/cancel_out.txt))"
+wait_task_status "$S1" "$CF1_BID:t1" running 120 \
+  && ok "t1 进入 running" \
+  || { bad "t1 未在 120s 内进入 running"; stop_daemon "$S1"; exit 1; }
+PGID_BEFORE=$("$PY" -m gsched.cli task "$CF1_BID:t1" --json | "$PY" -c '
+import json, sys
+jobs = json.load(sys.stdin).get("jobs", [])
+print(jobs[-1].get("pgid") or 0 if jobs else 0)')
+[ "$PGID_BEFORE" != "0" ] || { bad "running 任务缺少 pgid"; stop_daemon "$S1"; exit 1; }
+# 在 CLI 进程内将 os.killpg 设为必定失败：这可以无竞态地证明
+# cancel 只写请求，而不依赖“daemon 刚好还没来得及处理”的时间窗。
+CANCEL_OUT=$(TEST_CANCEL_BID="$CF1_BID" "$PY" - <<'PY'
+import os
+from unittest import mock
+
+from gsched import cli
+
+with mock.patch("os.killpg", side_effect=AssertionError("CLI called local killpg")):
+    rc = cli.main(["cancel", os.environ["TEST_CANCEL_BID"], "--yes"])
+raise SystemExit(rc)
+PY
+)
+CANCEL_RC=$?
+[ "$CANCEL_RC" = "0" ] \
+  && ok "CLI cancel 未调用本地 killpg (仅转发 daemon)" \
+  || { bad "CLI cancel 触发了本地 killpg 或返回异常"; stop_daemon "$S1"; exit 1; }
+echo "$CANCEL_OUT" | grep -q "已转发取消" && ok "输出指明'已转发取消' (daemon 执行)" \
+  || bad "输出缺转发提示 (输出: $CANCEL_OUT)"
 # daemon 处理: killed -> cancelled (reap 收敛)
-wait_status $S1 cf1 cancelled 1 25 && ok "daemon killpg 生效, t1 -> cancelled" \
-  || bad "t1 未 cancelled (got running=$(count_status $S1 cf1 running) cancelled=$(count_status $S1 cf1 cancelled))"
-sleep 3  # 等 settle_releasing -> free
-GPUS_JSON=$($PY -m gsched.cli status --json 2>/dev/null)
-echo "$GPUS_JSON" | grep -q '"status": "free"' && ok "GPU 释放回 free (无孤儿占卡)" \
-  || bad "GPU 未回 free (residual: $(echo "$GPUS_JSON" | grep -o '"gpus":.*' | head -c 120))"
+wait_task_status "$S1" "$CF1_BID:t1" cancelled 120 \
+  && ok "daemon killpg 生效, t1 -> cancelled" \
+  || { bad "t1 未收敛 cancelled"; stop_daemon "$S1"; exit 1; }
+wait_gpu_free "$S1" 0 120 \
+  && ok "GPU 释放回 free (无孤儿占卡)" \
+  || { bad "GPU 未回 free"; stop_daemon "$S1"; exit 1; }
+wait_batch_status "$S1" "$CF1_BID" blocked 120 || {
+  bad "cf1 批次未收敛 blocked"
+  stop_daemon "$S1"
+  exit 1
+}
 stop_daemon $S1
 
 # ---------- 场景 2: SIGTERM 抗杀进程 -> SIGKILL 升级 ----------
@@ -139,13 +236,22 @@ cat > $S2/batch.json << EOF
 EOF
 export SCHED_STATE=$S2 SCHED_CONFIG=$S2/config.json
 $PY -m gsched.cli submit $S2/batch.json >/dev/null 2>&1 || { bad "cf2 submit 失败"; exit 1; }
+CF2_BID=$(latest_batch_id "$S2" cf2)
+[ -n "$CF2_BID" ] || { bad "cf2 批次 ID 不可见"; exit 1; }
 SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-sleep 3
-[ "$(count_status $S2 cf2 running)" = "1" ] && ok "t2 进入 running" || bad "t2 未 running"
-$PY -m gsched.cli cancel cf2 --yes >/dev/null 2>&1
+wait_task_status "$S2" "$CF2_BID:t1" running 120 \
+  && ok "t2 进入 running" \
+  || { bad "t2 未在 120s 内进入 running"; stop_daemon "$S2"; exit 1; }
+$PY -m gsched.cli cancel "$CF2_BID" --yes >/dev/null 2>&1
 # SIGTERM 被忽略 -> daemon 下轮 SIGKILL -> 仍收敛 cancelled (绝不静默)
-wait_status $S2 cf2 cancelled 1 25 && ok "SIGTERM 忽略仍收敛 cancelled (SIGKILL 升级)" \
-  || bad "SIGTERM 抗杀进程未收敛 (SIGKILL 升级失效)"
+wait_task_status "$S2" "$CF2_BID:t1" cancelled 120 \
+  && ok "SIGTERM 忽略仍收敛 cancelled (SIGKILL 升级)" \
+  || { bad "SIGTERM 抗杀进程未收敛 (SIGKILL 升级失效)"; stop_daemon "$S2"; exit 1; }
+wait_batch_status "$S2" "$CF2_BID" blocked 120 || {
+  bad "cf2 批次未收敛 blocked"
+  stop_daemon "$S2"
+  exit 1
+}
 stop_daemon $S2
 
 # ---------- 场景 3: 请求表干净 (处理后 done) ----------
@@ -164,14 +270,25 @@ cat > $S3/batch.json << EOF
 EOF
 export SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json
 $PY -m gsched.cli submit $S3/batch.json >/dev/null 2>&1 || { bad "cf3 submit 失败"; exit 1; }
+CF3_BID=$(latest_batch_id "$S3" cf3)
+[ -n "$CF3_BID" ] || { bad "cf3 批次 ID 不可见"; exit 1; }
 SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
-sleep 3  # t1 running, t2 pending (单卡)
-$PY -m gsched.cli cancel cf3 --yes >/dev/null 2>&1
-wait_status $S3 cf3 cancelled 2 25 && ok "t1 (转发) + t2 (pending 直标) 都 cancelled" \
-  || bad "cancelled 数 != 2 (got $(count_status $S3 cf3 cancelled))"
+wait_task_status "$S3" "$CF3_BID:t1" running 120 \
+  || { bad "cf3:t1 未进入 running"; stop_daemon "$S3"; exit 1; }
+wait_task_pending_like "$S3" "$CF3_BID:t2" 30 \
+  || { bad "cf3:t2 未保持 pending"; stop_daemon "$S3"; exit 1; }
+$PY -m gsched.cli cancel "$CF3_BID" --yes >/dev/null 2>&1
+if wait_task_status "$S3" "$CF3_BID:t1" cancelled 120 \
+  && wait_task_status "$S3" "$CF3_BID:t2" cancelled 120; then
+  ok "t1 (转发) + t2 (pending 直标) 都 cancelled"
+else
+  bad "cf3 两任务未全部收敛 cancelled"
+  stop_daemon "$S3"
+  exit 1
+fi
 # 请求处理是异步的 (job cancelled 后下一轮 tick 才 finish 请求), 轮询等待 pending=0
 PENDING_OK=0
-for _ in $(seq 1 20); do
+for _ in $(seq 1 120); do
   PENDING_REQ=$(SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json $PY -c "
 import sys; sys.path.insert(0, 'sched')
 from gsched import state
@@ -184,6 +301,11 @@ with state.connect() as conn:
 done
 [ "$PENDING_OK" = "1" ] && ok "control_requests 无残留 pending (全部处理完毕)" \
   || bad "control_requests 残留 pending=$PENDING_REQ"
+wait_batch_status "$S3" "$CF3_BID" blocked 120 || {
+  bad "cf3 批次未收敛 blocked"
+  stop_daemon "$S3"
+  exit 1
+}
 stop_daemon $S3
 
 echo

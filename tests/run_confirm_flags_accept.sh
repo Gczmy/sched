@@ -13,7 +13,9 @@ cat > "$SCHED_STATE/config.json" <<EOF
   "projects": {"p": {"root": "/tmp", "git": false}}
 }
 EOF
-python3 - <<'PY'
+# 本场景只测两个确认计数文件的隔离；显式关闭 runner 的 fake 短路，
+# 不调用任何 nvidia-smi/派发路径。
+env -u SCHED_FAKE_GPUS python3 - <<'PY'
 import os
 from gsched.allocator import Allocator
 

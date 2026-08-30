@@ -3,17 +3,19 @@
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
+PY=${PY:-python3}
 sched_accept_make_root SCHED_STATE "sched-dependency-versions"
 export SCHED_STATE
+export SCHED_CONFIG="$SCHED_STATE/config.json"
 NODE="$(uname -n)"
 cat > "$SCHED_STATE/config.json" <<EOF
 {
-  "schema_version": 1, "user": "t", "node": "$NODE", "state_dir": "$SCHED_STATE",
-  "default_project": "p", "gpus": [], "venvs": {"k": "/bin"},
+  "schema_version": 1, "user": "$(whoami)", "node": "$NODE", "state_dir": "$SCHED_STATE",
+  "default_project": "p", "gpus": [0], "venvs": {"k": "$PY"},
   "projects": {"p": {"root": "/tmp", "git": false}}
 }
 EOF
-python3 - <<'PY'
+"$PY" - <<'PY'
 import sqlite3, sys
 sys.path.insert(0, ".")
 from gsched import state
@@ -53,3 +55,36 @@ row = conn.execute("SELECT status FROM batches WHERE id='settle-batch'").fetchon
 assert row["status"] == "active", row
 print("H5 latest-version dependency unlock and stale-running settlement guard pass")
 PY
+
+if ! SCHED_FAKE_GPUS=0:24 "$PY" -m gsched.cli daemon start --fake >/dev/null 2>&1; then
+  echo "failed to start isolated daemon for stale-version convergence" >&2
+  exit 1
+fi
+settled=0
+for _ in $(seq 1 120); do
+  task_ok=1
+  batch_ok=1
+  "$PY" -m gsched.cli task settle-batch:t1 --json 2>/dev/null | "$PY" -c '
+import json, sys
+jobs = json.load(sys.stdin).get("jobs", [])
+observed = [(j.get("version"), j.get("status")) for j in jobs]
+raise SystemExit(0 if observed == [(1, "blocked"), (2, "done")] else 1)' || task_ok=0
+  "$PY" -m gsched.cli status settle-batch --json 2>/dev/null | "$PY" -c '
+import json, sys
+batches = json.load(sys.stdin).get("batches", [])
+ok = len(batches) == 1 and batches[0].get("status") == "done"
+raise SystemExit(0 if ok else 1)' || batch_ok=0
+  if [ "$task_ok" = "1" ] \
+    && [ "$batch_ok" = "1" ] \
+    && [ -f "$SCHED_STATE/$NODE/markers/settle_batch.done" ] \
+    && [ ! -e "$SCHED_STATE/$NODE/markers/settle_batch.blocked" ]; then
+    settled=1
+    break
+  fi
+  sleep 1
+done
+if [ "$settled" != "1" ]; then
+  echo "stale running version did not fully converge" >&2
+  exit 1
+fi
+"$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1

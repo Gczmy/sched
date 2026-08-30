@@ -17,6 +17,7 @@ import sys
 import socket
 import stat
 import time
+from contextlib import ExitStack
 from typing import Any
 
 from . import state
@@ -45,37 +46,60 @@ def _owner_file() -> str:
 
 
 def _read_lease_owner() -> dict[str, Any] | None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(_owner_file(), flags)
-    except OSError:
-        return None
-    try:
-        owner_stat = os.fstat(fd)
-        if (
-            not stat.S_ISREG(owner_stat.st_mode)
-            or owner_stat.st_uid != os.getuid()
-            or owner_stat.st_nlink != 1
-            or owner_stat.st_size > 4096
-        ):
-            return None
-        raw = os.read(fd, 4097)
-        if len(raw) > 4096:
-            return None
-        owner = json.loads(raw.decode("utf-8"))
+        # These flags are part of the safety boundary.  Do not silently fall
+        # back to path-following behavior on a platform that lacks them.
+        directory_flags = (
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        owner_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        with ExitStack() as stack:
+            # Pin and verify every mutable path component below state_dir
+            # before a PID read from the lease may authorize a signal.
+            host_fd = os.open(_host_dir(), directory_flags)
+            stack.callback(os.close, host_fd)
+            host_stat = os.fstat(host_fd)
+            if (
+                not stat.S_ISDIR(host_stat.st_mode)
+                or host_stat.st_uid != os.getuid()
+                or stat.S_IMODE(host_stat.st_mode) & 0o022
+            ):
+                return None
+            lock_fd = os.open("dispatcher.lock", directory_flags, dir_fd=host_fd)
+            stack.callback(os.close, lock_fd)
+            lock_stat = os.fstat(lock_fd)
+            if (
+                not stat.S_ISDIR(lock_stat.st_mode)
+                or lock_stat.st_uid != os.getuid()
+                or stat.S_IMODE(lock_stat.st_mode) & 0o022
+            ):
+                return None
+            owner_fd = os.open("owner.json", owner_flags, dir_fd=lock_fd)
+            stack.callback(os.close, owner_fd)
+            owner_stat = os.fstat(owner_fd)
+            if (
+                not stat.S_ISREG(owner_stat.st_mode)
+                or owner_stat.st_uid != os.getuid()
+                or owner_stat.st_nlink != 1
+                or stat.S_IMODE(owner_stat.st_mode) & 0o022
+                or owner_stat.st_size > 4096
+            ):
+                return None
+            raw = os.read(owner_fd, 4097)
+            if len(raw) > 4096:
+                return None
+            owner = json.loads(raw.decode("utf-8"))
     except (
+        AttributeError,
         OSError,
         UnicodeDecodeError,
         json.JSONDecodeError,
+        NotImplementedError,
         RecursionError,
         TypeError,
         ValueError,
     ):
         return None
-    finally:
-        os.close(fd)
     if not isinstance(owner, dict) or owner.get("schema_version") != 1:
         return None
     pid = owner.get("pid")
@@ -306,8 +330,8 @@ def stop() -> str:
             )
         if not _cleanup(None):
             return (
-                "daemon lease 在清理前已出现或被替换; "
-                "拒绝清理 sidecar"
+                "daemon lease/sidecar 状态在清理时不可验证、"
+                "已变化或清理失败; 拒绝报告未运行并保留 sidecar"
             )
         return "daemon 未运行 (无可验证 lease)"
     owner_physical_host = owner.get("physical_host")
@@ -339,8 +363,8 @@ def stop() -> str:
             )
         if not _cleanup(owner):
             return (
-                "daemon lease 在清理前已被替换; "
-                "拒绝清理 successor sidecar"
+                "daemon lease/sidecar 状态在清理前不可验证、"
+                "已变化或清理失败; 拒绝报告停止成功并保留 sidecar"
             )
         return f"daemon 已停止 (pid={pid})"
     actual_start = process_start_token(pid)
@@ -379,8 +403,8 @@ def stop() -> str:
         clear_stop_token()
         if not _cleanup(owner):
             return (
-                "daemon lease 在进程退出后已被替换; "
-                "拒绝清理 successor sidecar"
+                "daemon lease/sidecar 状态在进程退出后不可验证、"
+                "已变化或清理失败; 拒绝报告停止成功并保留 sidecar"
             )
         return f"daemon 已停止 (pid={pid})"
     except (PermissionError, OSError) as exc:
@@ -400,8 +424,8 @@ def stop() -> str:
             continue
         if not _cleanup(owner):
             return (
-                "daemon lease 在停止确认后已被替换; "
-                "拒绝清理 successor sidecar"
+                "daemon lease/sidecar 状态在停止确认后不可验证、"
+                "已变化或清理失败; 拒绝报告停止成功并保留 sidecar"
             )
         return f"daemon 已停止 (pid={pid})"
     return (
@@ -411,26 +435,60 @@ def stop() -> str:
 
 
 def _cleanup(expected_owner: dict[str, Any] | None) -> bool:
-    """Remove sidecars only while the observed lease still owns the guard."""
+    """Remove derived sidecars only for an exact or fully absent lease."""
     import fcntl
 
-    guard_path = f"{os.path.dirname(_owner_file())}.guard"
-    with state.open_private_text(guard_path, "a+") as guard:
-        fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
-        try:
-            current_owner = _read_lease_owner()
-            if current_owner != expected_owner:
-                return False
-            if expected_owner is None and os.path.lexists(_owner_file()):
-                return False
-            for path in (_pid_file(), _heartbeat_file()):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-            return True
-        finally:
-            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+    owner_path = _owner_file()
+    lock_dir = os.path.dirname(owner_path)
+    guard_path = f"{lock_dir}.guard"
+    try:
+        with state.open_private_text(guard_path, "a+") as guard:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+            try:
+                current_owner = _read_lease_owner()
+                if current_owner is None:
+                    # A graceful dispatcher removes its exact lease before the
+                    # process exits.  Under the shared guard, a fully absent
+                    # owner and lock directory therefore proves completed
+                    # self-cleanup rather than successor replacement.
+                    try:
+                        os.lstat(owner_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+                    else:
+                        return False
+                    try:
+                        os.lstat(lock_dir)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+                    else:
+                        return False
+                else:
+                    if current_owner != expected_owner:
+                        return False
+                    try:
+                        lock_stat = os.lstat(lock_dir)
+                    except OSError:
+                        return False
+                    if not stat.S_ISDIR(lock_stat.st_mode):
+                        return False
+
+                for path in (_pid_file(), _heartbeat_file()):
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+                return True
+            finally:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+    except (OSError, state.StateError):
+        return False
 
 
 # ---------- H2 前置检查 (M0) ----------
