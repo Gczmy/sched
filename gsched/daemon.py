@@ -299,17 +299,17 @@ def _wait_for_identity_to_disappear(
     expected_start: str,
     timeout: float,
 ) -> bool:
-    attempts = max(1, int(timeout / FORCE_STOP_POLL_SEC))
-    for _ in range(attempts):
-        time.sleep(FORCE_STOP_POLL_SEC)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
         actual_start = process_start_token(pid)
-        if actual_start == expected_start:
-            continue
-        if actual_start is None and _pid_alive(pid):
+        if actual_start != expected_start:
+            if actual_start is not None or not _pid_alive(pid):
+                return True
             # An unreadable token cannot prove that the original process died.
-            continue
-        return True
-    return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(FORCE_STOP_POLL_SEC, remaining))
 
 
 def stop(*, force: bool = False) -> str:
@@ -379,14 +379,31 @@ def stop(*, force: bool = False) -> str:
     except OSError:
         pass
 
-    def clear_stop_token() -> None:
+    def clear_stop_token() -> bool:
         if stop_token is None:
-            return
+            return True
         try:
             with state.submission_lock():
-                state.clear_idle_shutdown(stop_token)
+                if state.clear_idle_shutdown(stop_token):
+                    return True
+                try:
+                    with open(
+                        state.submission_shutdown_marker(),
+                        encoding="utf-8",
+                    ) as stream:
+                        current_token = stream.readline(129).strip()
+                except FileNotFoundError:
+                    return True
+                except OSError:
+                    return False
+                return current_token != stop_token
         except OSError:
-            pass
+            return False
+
+    def finish_force_success(message: str) -> str:
+        if not force or clear_stop_token():
+            return message
+        return f"{message}; daemon shutdown marker 清理失败"
 
     # Re-attest immediately before the destructive operation.
     if process_start_token(pid) != expected_start:
@@ -398,13 +415,14 @@ def stop(*, force: bool = False) -> str:
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        clear_stop_token()
+        if not force:
+            clear_stop_token()
         if not _cleanup(owner):
             return (
                 "daemon lease 在进程退出后已被替换; "
                 "拒绝清理 successor sidecar"
             )
-        return f"daemon 已停止 (pid={pid})"
+        return finish_force_success(f"daemon 已停止 (pid={pid})")
     except (PermissionError, OSError) as exc:
         clear_stop_token()
         return (
@@ -422,7 +440,9 @@ def stop(*, force: bool = False) -> str:
                     "daemon lease 在 force-stop SIGTERM 确认后已被替换; "
                     "拒绝清理 successor sidecar"
                 )
-            return f"daemon force-stop 已停止 (pid={pid}, SIGTERM)"
+            return finish_force_success(
+                f"daemon force-stop 已停止 (pid={pid}, SIGTERM)"
+            )
 
         current_owner = _read_lease_owner()
         if current_owner != owner:
@@ -443,7 +463,9 @@ def stop(*, force: bool = False) -> str:
                     "daemon lease 在 SIGKILL 前进程退出后已被替换; "
                     "拒绝清理 successor sidecar"
                 )
-            return f"daemon force-stop 已停止 (pid={pid}, SIGKILL 前已退出)"
+            return finish_force_success(
+                f"daemon force-stop 已停止 (pid={pid}, SIGKILL 前已退出)"
+            )
         except (PermissionError, OSError) as exc:
             return (
                 f"daemon pid={pid} SIGKILL 发送失败: {exc}; "
@@ -465,7 +487,9 @@ def stop(*, force: bool = False) -> str:
                 "daemon lease 在 SIGKILL 停止确认后已被替换; "
                 "拒绝清理 successor sidecar"
             )
-        return f"daemon force-stop 已停止 (pid={pid}, exact SIGKILL)"
+        return finish_force_success(
+            f"daemon force-stop 已停止 (pid={pid}, exact SIGKILL)"
+        )
 
     for _ in range(int(STOP_TIMEOUT_SEC / 0.5)):
         time.sleep(0.5)
@@ -489,26 +513,86 @@ def stop(*, force: bool = False) -> str:
 
 
 def _cleanup(expected_owner: dict[str, Any] | None) -> bool:
-    """Remove sidecars only while the observed lease still owns the guard."""
+    """Remove exact-owner sidecars and lease state under the dispatcher guard."""
     import fcntl
 
-    guard_path = f"{os.path.dirname(_owner_file())}.guard"
-    with state.open_private_text(guard_path, "a+") as guard:
-        fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
-        try:
-            current_owner = _read_lease_owner()
-            if current_owner != expected_owner:
-                return False
-            if expected_owner is None and os.path.lexists(_owner_file()):
-                return False
-            for path in (_pid_file(), _heartbeat_file()):
+    owner_path = _owner_file()
+    lock_dir = os.path.dirname(owner_path)
+    guard_path = f"{lock_dir}.guard"
+    try:
+        with state.open_private_text(guard_path, "a+") as guard:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+            try:
+                current_owner = _read_lease_owner()
+                if current_owner is None:
+                    try:
+                        os.lstat(owner_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+                    else:
+                        return False
+                    try:
+                        os.lstat(lock_dir)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+                    else:
+                        return False
+                    for path in (_pid_file(), _heartbeat_file()):
+                        try:
+                            os.unlink(path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            return False
+                    return True
+                if current_owner != expected_owner:
+                    return False
+
                 try:
-                    os.unlink(path)
+                    with os.scandir(lock_dir) as entries:
+                        names = [entry.name for entry in entries]
                 except OSError:
-                    pass
-            return True
-        finally:
-            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+                    return False
+                if names != [os.path.basename(owner_path)]:
+                    return False
+
+                for path in (_pid_file(), _heartbeat_file()):
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+
+                if _read_lease_owner() != expected_owner:
+                    return False
+                try:
+                    os.unlink(owner_path)
+                except OSError:
+                    return False
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    try:
+                        with state.open_private_text(
+                            owner_path,
+                            "x",
+                        ) as stream:
+                            json.dump(expected_owner, stream)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    except OSError:
+                        pass
+                    return False
+                return True
+            finally:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return False
 
 
 # ---------- H2 前置检查 (M0) ----------

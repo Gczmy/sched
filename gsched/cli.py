@@ -2999,6 +2999,21 @@ def cmd_gpu_free(args: argparse.Namespace) -> int:
 
 def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
+    force = bool(getattr(args, "force", False))
+    confirmed = bool(getattr(args, "yes", False))
+    if args.action != "stop" and (force or confirmed):
+        print(
+            "拒绝: --force 和 --yes 仅适用于 daemon stop",
+            file=sys.stderr,
+        )
+        return 1
+    if confirmed and not force:
+        print(
+            "拒绝: daemon stop --yes 必须与 --force 一起使用",
+            file=sys.stderr,
+        )
+        return 1
+
 
     try:
         if args.action == "start":
@@ -3009,7 +3024,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 for marker in ("拒绝", "失败", "错误", "超时", "请到计算节点")
             ) else 0
         if args.action == "stop":
-            force = getattr(args, "force", False)
+            force = bool(getattr(args, "force", False))
             if force and not getattr(args, "yes", False):
                 print(
                     "拒绝 force-stop: 此操作可能发送 SIGKILL，确认后加 --yes",
