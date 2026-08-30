@@ -2999,21 +2999,6 @@ def cmd_gpu_free(args: argparse.Namespace) -> int:
 
 def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
-    force = bool(getattr(args, "force", False))
-    confirmed = bool(getattr(args, "yes", False))
-    if args.action != "stop" and (force or confirmed):
-        print(
-            "拒绝: --force 和 --yes 仅适用于 daemon stop",
-            file=sys.stderr,
-        )
-        return 1
-    if confirmed and not force:
-        print(
-            "拒绝: daemon stop --yes 必须与 --force 一起使用",
-            file=sys.stderr,
-        )
-        return 1
-
 
     try:
         if args.action == "start":
@@ -3024,14 +3009,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 for marker in ("拒绝", "失败", "错误", "超时", "请到计算节点")
             ) else 0
         if args.action == "stop":
-            force = bool(getattr(args, "force", False))
-            if force and not getattr(args, "yes", False):
-                print(
-                    "拒绝 force-stop: 此操作可能发送 SIGKILL，确认后加 --yes",
-                    file=sys.stderr,
-                )
-                return 1
-            text = daemon.stop(force=True) if force else daemon.stop()
+            text = daemon.stop()
             print(text)
             return 1 if any(
                 marker in text
@@ -3806,12 +3784,6 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("daemon", help="daemon 生命周期")
     p.add_argument("action", choices=["start", "stop", "status", "check"])
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
-    p.add_argument(
-        "--force",
-        action="store_true",
-        help="短暂等待 SIGTERM 后对 exact daemon PID 升级 SIGKILL",
-    )
-    p.add_argument("--yes", action="store_true", help="确认 daemon force-stop")
     p.set_defaults(fn=cmd_daemon)
 
     p = sub.add_parser("notify-test", help="发测试通知验证 config.notify 配置")
