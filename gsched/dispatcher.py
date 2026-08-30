@@ -3381,6 +3381,12 @@ class Dispatcher:
         for _dk, _dv in (self.cfg.get("task_default_env") or {}).items():
             task_env.setdefault(str(_dk), str(_dv))
         task_env["SCHED_PROFILE_OUT"] = self._profile_path(j)
+        # Dispatcher-owned live identity: these values are derived from the
+        # persisted batch/job records and must override batch/task/default env.
+        task_env["SCHED_BATCH_ID"] = str(b["name"])
+        task_env["SCHED_TASK_ID"] = str(j["task_id"])
+        task_env["SCHED_RUN_ID"] = str(j["id"])
+        task_env["SCHED_PROJECT"] = str(b["project"])
         rc_dir = os.path.join(self.host_dir, "rc")
         state.ensure_private_directory(rc_dir)
         task_env["SCHED_RC_DIR"] = rc_dir
