@@ -590,6 +590,279 @@ class ReviewLifecycleRaceTests(TempStateCase):
             self.assertEqual("successor", stream.read().strip())
 
 
+class ReviewDaemonForceStopTests(TempStateCase):
+    @staticmethod
+    def owner() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "lease_id": "legacy-frozen",
+            "pid": 4242,
+            "start_token": "proc:424200",
+            "physical_host": socket.gethostname().strip(),
+        }
+
+    def test_cli_force_stop_requires_yes_before_calling_daemon(self) -> None:
+        with mock.patch.object(daemon, "stop") as stop:
+            rc, _stdout, stderr = self.capture(
+                cli.main,
+                ["daemon", "stop", "--force"],
+            )
+
+        self.assertNotEqual(0, rc)
+        self.assertIn("--yes", stderr)
+        stop.assert_not_called()
+
+    def test_cli_force_stop_passes_explicit_force_after_confirmation(self) -> None:
+        with mock.patch.object(
+            daemon,
+            "stop",
+            return_value="daemon force-stop 已成功",
+        ) as stop:
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["daemon", "stop", "--force", "--yes"],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertIn("成功", stdout)
+        stop.assert_called_once_with(force=True)
+
+    def test_cli_normal_stop_keeps_default_daemon_call(self) -> None:
+        with mock.patch.object(
+            daemon,
+            "stop",
+            return_value="daemon 未运行",
+        ) as stop:
+            rc, _stdout, stderr = self.capture(cli.main, ["daemon", "stop"])
+
+        self.assertEqual(0, rc, stderr)
+        stop.assert_called_once_with()
+
+    def test_force_stop_terms_then_kills_only_attested_pid_and_cleans_owner(
+        self,
+    ) -> None:
+        owner = self.owner()
+        sent: list[tuple[int, int]] = []
+
+        def current_start(_pid: int) -> str | None:
+            if sent and sent[-1][1] == daemon.signal.SIGKILL:
+                return None
+            return str(owner["start_token"])
+
+        with mock.patch.object(
+            daemon,
+            "_read_lease_owner",
+            return_value=owner,
+        ) as read_owner, mock.patch.object(
+            daemon,
+            "_pid_alive",
+            side_effect=lambda _pid: not (
+                sent and sent[-1][1] == daemon.signal.SIGKILL
+            ),
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            side_effect=current_start,
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=lambda pid, sig: sent.append((pid, sig)),
+        ), mock.patch.object(
+            daemon,
+            "_cleanup",
+            return_value=True,
+        ) as cleanup:
+            text = daemon.stop(force=True)
+
+        self.assertIn("SIGKILL", text)
+        self.assertIn("已停止", text)
+        self.assertEqual(
+            [
+                (owner["pid"], daemon.signal.SIGTERM),
+                (owner["pid"], daemon.signal.SIGKILL),
+            ],
+            sent,
+        )
+        self.assertGreaterEqual(read_owner.call_count, 2)
+        cleanup.assert_called_once_with(owner)
+
+    def test_force_stop_refuses_kill_when_exact_ownership_changes(self) -> None:
+        owner = self.owner()
+        successor = {
+            **owner,
+            "lease_id": "successor",
+            "start_token": "proc:successor",
+        }
+        reads = iter((owner, successor))
+        sent: list[tuple[int, int]] = []
+
+        with mock.patch.object(
+            daemon,
+            "_read_lease_owner",
+            side_effect=lambda: next(reads, successor),
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            return_value=True,
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            return_value=owner["start_token"],
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=lambda pid, sig: sent.append((pid, sig)),
+        ), mock.patch.object(
+            daemon,
+            "_cleanup",
+        ) as cleanup:
+            text = daemon.stop(force=True)
+
+        self.assertIn("ownership", text)
+        self.assertIn("拒绝 SIGKILL", text)
+        self.assertEqual([(owner["pid"], daemon.signal.SIGTERM)], sent)
+        cleanup.assert_not_called()
+
+    def test_force_stop_refuses_kill_when_start_token_becomes_unreadable(
+        self,
+    ) -> None:
+        owner = self.owner()
+        owner_reads = 0
+        sent: list[tuple[int, int]] = []
+
+        def read_owner() -> dict[str, object]:
+            nonlocal owner_reads
+            owner_reads += 1
+            return owner
+
+        def current_start(_pid: int) -> str | None:
+            if owner_reads >= 2:
+                return None
+            return str(owner["start_token"])
+
+        with mock.patch.object(
+            daemon,
+            "_read_lease_owner",
+            side_effect=read_owner,
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            return_value=True,
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            side_effect=current_start,
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=lambda pid, sig: sent.append((pid, sig)),
+        ), mock.patch.object(
+            daemon,
+            "_cleanup",
+        ) as cleanup:
+            text = daemon.stop(force=True)
+
+        self.assertIn("identity", text)
+        self.assertIn("拒绝 SIGKILL", text)
+        self.assertEqual([(owner["pid"], daemon.signal.SIGTERM)], sent)
+        cleanup.assert_not_called()
+
+    def test_force_stop_preserves_ownership_when_sigkill_fails(self) -> None:
+        owner = self.owner()
+        sent: list[tuple[int, int]] = []
+
+        def signal_pid(pid: int, sig: int) -> None:
+            sent.append((pid, sig))
+            if sig == daemon.signal.SIGKILL:
+                raise PermissionError("denied")
+
+        with mock.patch.object(
+            daemon,
+            "_read_lease_owner",
+            return_value=owner,
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            return_value=True,
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            return_value=owner["start_token"],
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=signal_pid,
+        ), mock.patch.object(
+            daemon,
+            "_cleanup",
+        ) as cleanup:
+            text = daemon.stop(force=True)
+
+        self.assertIn("SIGKILL 发送失败", text)
+        self.assertIn("保留 ownership", text)
+        self.assertEqual(
+            [
+                (owner["pid"], daemon.signal.SIGTERM),
+                (owner["pid"], daemon.signal.SIGKILL),
+            ],
+            sent,
+        )
+        cleanup.assert_not_called()
+
+    def test_force_stop_times_out_if_original_identity_survives_sigkill(
+        self,
+    ) -> None:
+        owner = self.owner()
+        sent: list[tuple[int, int]] = []
+
+        with mock.patch.object(
+            daemon,
+            "_read_lease_owner",
+            return_value=owner,
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            return_value=True,
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            return_value=owner["start_token"],
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=lambda pid, sig: sent.append((pid, sig)),
+        ), mock.patch.object(
+            daemon,
+            "_cleanup",
+        ) as cleanup:
+            text = daemon.stop(force=True)
+
+        self.assertIn("SIGKILL 后停止确认超时", text)
+        self.assertIn("保留 ownership", text)
+        self.assertEqual(daemon.signal.SIGKILL, sent[-1][1])
+        cleanup.assert_not_called()
+
+
 class ReviewLegacyJobStateTests(TempStateCase):
     def test_init_db_atomically_normalizes_legacy_waiting_statuses(self) -> None:
         jobs = {
