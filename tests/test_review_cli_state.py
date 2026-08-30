@@ -502,7 +502,11 @@ class ReviewLifecycleRaceTests(TempStateCase):
         with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
             stream.write("successor\n")
 
-        daemon._cleanup(observed)
+        cleaned = daemon._cleanup(observed)
+        self.assertFalse(cleaned)
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(successor, json.load(stream))
+        self.assertTrue(os.path.isdir(os.path.dirname(daemon._owner_file())))
 
         with open(daemon._pid_file(), encoding="utf-8") as stream:
             self.assertEqual("202", stream.read().strip())
@@ -601,6 +605,149 @@ class ReviewDaemonForceStopTests(TempStateCase):
             "physical_host": socket.gethostname().strip(),
         }
 
+    def test_cleanup_accepts_graceful_owner_self_cleanup_idempotently(
+        self,
+    ) -> None:
+        owner = self.owner()
+        lock_dir = os.path.dirname(daemon._owner_file())
+
+        self.assertFalse(os.path.lexists(daemon._owner_file()))
+        self.assertFalse(os.path.lexists(lock_dir))
+        self.assertTrue(daemon._cleanup(owner))
+        self.assertTrue(daemon._cleanup(owner))
+
+    def test_ownerless_cleanup_rejects_remaining_lock_state(self) -> None:
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+
+        self.assertFalse(daemon._cleanup(None))
+
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            stream.write("{invalid")
+        self.assertFalse(daemon._cleanup(None))
+
+    def test_cleanup_sidecar_unlink_failure_preserves_exact_owner(self) -> None:
+        owner = self.owner()
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(owner, stream)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write(f"{owner['pid']}\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("legacy\n")
+        real_unlink = os.unlink
+
+        def fail_heartbeat_unlink(path: str) -> None:
+            if os.fspath(path) == daemon._heartbeat_file():
+                raise PermissionError("review unlink refusal")
+            real_unlink(path)
+
+        with mock.patch.object(
+            daemon.os,
+            "unlink",
+            side_effect=fail_heartbeat_unlink,
+        ):
+            cleaned = daemon._cleanup(owner)
+
+        self.assertFalse(cleaned)
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(owner, json.load(stream))
+        self.assertTrue(os.path.isdir(lock_dir))
+        self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+    def test_force_stop_removes_exact_stale_owner_and_caller_token(
+        self,
+    ) -> None:
+        owner = self.owner()
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(owner, stream)
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write(f"{owner['pid']}\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("legacy\n")
+        sent: list[tuple[int, int]] = []
+
+        def current_start(_pid: int) -> str | None:
+            if sent and sent[-1][1] == daemon.signal.SIGKILL:
+                return None
+            return str(owner["start_token"])
+
+        with mock.patch.object(
+            daemon,
+            "_pid_alive",
+            side_effect=lambda _pid: not (
+                sent and sent[-1][1] == daemon.signal.SIGKILL
+            ),
+        ), mock.patch.object(
+            daemon,
+            "process_start_token",
+            side_effect=current_start,
+        ), mock.patch.object(
+            daemon.time,
+            "monotonic",
+            side_effect=(0.0, daemon.FORCE_STOP_GRACE_SEC, 10.0),
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+            return_value=None,
+        ), mock.patch.object(
+            daemon.os,
+            "kill",
+            side_effect=lambda pid, sig: sent.append((pid, sig)),
+        ):
+            text = daemon.stop(force=True)
+
+        self.assertIn("exact SIGKILL", text)
+        self.assertFalse(os.path.lexists(daemon._owner_file()))
+        self.assertFalse(os.path.lexists(lock_dir))
+        self.assertFalse(os.path.lexists(daemon._pid_file()))
+        self.assertFalse(os.path.lexists(daemon._heartbeat_file()))
+        self.assertFalse(os.path.lexists(state.submission_shutdown_marker()))
+
+    def test_identity_wait_uses_immediate_probe_and_monotonic_deadline(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            daemon,
+            "process_start_token",
+            return_value=None,
+        ), mock.patch.object(
+            daemon,
+            "_pid_alive",
+            return_value=False,
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+        ) as sleep:
+            self.assertTrue(
+                daemon._wait_for_identity_to_disappear(4242, "proc:old", 10.0)
+            )
+        sleep.assert_not_called()
+
+        with mock.patch.object(
+            daemon,
+            "process_start_token",
+            return_value="proc:old",
+        ) as identity, mock.patch.object(
+            daemon.time,
+            "monotonic",
+            side_effect=(5.0, 5.0, 5.075, 5.1),
+        ), mock.patch.object(
+            daemon.time,
+            "sleep",
+        ) as sleep:
+            self.assertFalse(
+                daemon._wait_for_identity_to_disappear(4242, "proc:old", 0.1)
+            )
+
+        self.assertEqual(3, identity.call_count)
+        self.assertEqual(2, sleep.call_count)
+        self.assertAlmostEqual(0.1, sleep.call_args_list[0].args[0])
+        self.assertAlmostEqual(0.025, sleep.call_args_list[1].args[0])
+
     def test_cli_force_stop_requires_yes_before_calling_daemon(self) -> None:
         with mock.patch.object(daemon, "stop") as stop:
             rc, _stdout, stderr = self.capture(
@@ -638,6 +785,38 @@ class ReviewDaemonForceStopTests(TempStateCase):
         self.assertEqual(0, rc, stderr)
         stop.assert_called_once_with()
 
+    def test_cli_rejects_force_confirmation_flags_for_other_actions(
+        self,
+    ) -> None:
+        cases = (
+            ["daemon", "start", "--force"],
+            ["daemon", "status", "--yes"],
+            ["daemon", "check", "--force", "--yes"],
+            ["daemon", "stop", "--yes"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), mock.patch.object(
+                daemon,
+                "start",
+            ) as start, mock.patch.object(
+                daemon,
+                "stop",
+            ) as stop, mock.patch.object(
+                daemon,
+                "status_str",
+            ) as status, mock.patch.object(
+                daemon,
+                "check",
+            ) as check:
+                rc, _stdout, stderr = self.capture(cli.main, argv)
+
+            self.assertNotEqual(0, rc)
+            self.assertIn("拒绝", stderr)
+            start.assert_not_called()
+            stop.assert_not_called()
+            status.assert_not_called()
+            check.assert_not_called()
+
     def test_force_stop_terms_then_kills_only_attested_pid_and_cleans_owner(
         self,
     ) -> None:
@@ -663,6 +842,10 @@ class ReviewDaemonForceStopTests(TempStateCase):
             daemon,
             "process_start_token",
             side_effect=current_start,
+        ), mock.patch.object(
+            daemon.time,
+            "monotonic",
+            side_effect=(0.0, daemon.FORCE_STOP_GRACE_SEC, 10.0),
         ), mock.patch.object(
             daemon.time,
             "sleep",
@@ -714,6 +897,10 @@ class ReviewDaemonForceStopTests(TempStateCase):
             return_value=owner["start_token"],
         ), mock.patch.object(
             daemon.time,
+            "monotonic",
+            side_effect=(0.0, daemon.FORCE_STOP_GRACE_SEC),
+        ), mock.patch.object(
+            daemon.time,
             "sleep",
             return_value=None,
         ), mock.patch.object(
@@ -762,6 +949,10 @@ class ReviewDaemonForceStopTests(TempStateCase):
             side_effect=current_start,
         ), mock.patch.object(
             daemon.time,
+            "monotonic",
+            side_effect=(0.0, daemon.FORCE_STOP_GRACE_SEC),
+        ), mock.patch.object(
+            daemon.time,
             "sleep",
             return_value=None,
         ), mock.patch.object(
@@ -800,6 +991,10 @@ class ReviewDaemonForceStopTests(TempStateCase):
             daemon,
             "process_start_token",
             return_value=owner["start_token"],
+        ), mock.patch.object(
+            daemon.time,
+            "monotonic",
+            side_effect=(0.0, daemon.FORCE_STOP_GRACE_SEC),
         ), mock.patch.object(
             daemon.time,
             "sleep",
@@ -843,6 +1038,15 @@ class ReviewDaemonForceStopTests(TempStateCase):
             daemon,
             "process_start_token",
             return_value=owner["start_token"],
+        ), mock.patch.object(
+            daemon.time,
+            "monotonic",
+            side_effect=(
+                0.0,
+                daemon.FORCE_STOP_GRACE_SEC,
+                10.0,
+                10.0 + daemon.FORCE_STOP_KILL_WAIT_SEC,
+            ),
         ), mock.patch.object(
             daemon.time,
             "sleep",
