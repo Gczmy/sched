@@ -610,10 +610,16 @@ class ReviewDaemonForceStopTests(TempStateCase):
     ) -> None:
         owner = self.owner()
         lock_dir = os.path.dirname(daemon._owner_file())
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write(f"{owner['pid']}\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("legacy\n")
 
         self.assertFalse(os.path.lexists(daemon._owner_file()))
         self.assertFalse(os.path.lexists(lock_dir))
         self.assertTrue(daemon._cleanup(owner))
+        self.assertFalse(os.path.lexists(daemon._pid_file()))
+        self.assertFalse(os.path.lexists(daemon._heartbeat_file()))
         self.assertTrue(daemon._cleanup(owner))
 
     def test_ownerless_cleanup_rejects_remaining_lock_state(self) -> None:
@@ -655,6 +661,48 @@ class ReviewDaemonForceStopTests(TempStateCase):
             self.assertEqual(owner, json.load(stream))
         self.assertTrue(os.path.isdir(lock_dir))
         self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+    def test_cleanup_refuses_nonexclusive_lock_dir_before_unlink(self) -> None:
+        owner = self.owner()
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(owner, stream)
+        extra_path = os.path.join(lock_dir, "crash.tmp")
+        with open(extra_path, "w", encoding="utf-8") as stream:
+            stream.write("partial\n")
+        with open(daemon._pid_file(), "w", encoding="utf-8") as stream:
+            stream.write(f"{owner['pid']}\n")
+        with open(daemon._heartbeat_file(), "w", encoding="utf-8") as stream:
+            stream.write("legacy\n")
+
+        self.assertFalse(daemon._cleanup(owner))
+
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(owner, json.load(stream))
+        self.assertTrue(os.path.isfile(extra_path))
+        self.assertTrue(os.path.isfile(daemon._pid_file()))
+        self.assertTrue(os.path.isfile(daemon._heartbeat_file()))
+
+    def test_cleanup_restores_exact_owner_when_lock_dir_removal_fails(
+        self,
+    ) -> None:
+        owner = self.owner()
+        lock_dir = os.path.dirname(daemon._owner_file())
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(daemon._owner_file(), "w", encoding="utf-8") as stream:
+            json.dump(owner, stream)
+
+        with mock.patch.object(
+            daemon.os,
+            "rmdir",
+            side_effect=PermissionError("review rmdir refusal"),
+        ):
+            self.assertFalse(daemon._cleanup(owner))
+
+        with open(daemon._owner_file(), encoding="utf-8") as stream:
+            self.assertEqual(owner, json.load(stream))
+        self.assertTrue(os.path.isdir(lock_dir))
 
     def test_force_stop_removes_exact_stale_owner_and_caller_token(
         self,
