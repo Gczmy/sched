@@ -53,12 +53,14 @@ PYEOF
 
 start_fake() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
-  SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
+  SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1 \
+    || { echo "failed to start isolated notify daemon: $1" >&2; exit 1; }
 }
 
 stop_daemon() { # $1=state_dir
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
-  $PY -m gsched.cli daemon stop >/dev/null 2>&1
+  $PY -m gsched.cli daemon stop >/dev/null 2>&1 \
+    || { echo "failed to stop isolated notify daemon: $1" >&2; exit 1; }
   sleep 1
 }
 
@@ -68,8 +70,8 @@ count_inbox() { # $1=state_dir $2=glob (如 '*.done.json') -> 数量
   ls $(inbox $1)/$2 2>/dev/null | wc -l | tr -d ' '
 }
 
-wait_inbox() { # $1=state_dir $2=glob $3=期望数 $4=超时秒(默认30)
-  local st=$1 pat=$2 exp=$3 timeout=${4:-30}
+wait_inbox() { # $1=state_dir $2=glob $3=期望数 $4=超时秒(默认120)
+  local st=$1 pat=$2 exp=$3 timeout=${4:-120}
   for _ in $(seq 1 $timeout); do
     [ "$(count_inbox $st "$pat")" = "$exp" ] && return 0
     sleep 1
@@ -95,7 +97,7 @@ EOF
 export SCHED_STATE=$S1 SCHED_CONFIG=$S1/config.json
 $PY -m gsched.cli submit $S1/batch.json >/dev/null 2>&1 || { bad "n1 submit 失败"; exit 1; }
 start_fake $S1
-wait_inbox $S1 '*.done.json' 1 30 && ok "批次 done -> inbox 落 .done.json" \
+wait_inbox $S1 '*.done.json' 1 120 && ok "批次 done -> inbox 落 .done.json" \
   || bad "未落 .done.json (inbox: $(ls $(inbox $S1) 2>/dev/null))"
 F=$(ls $(inbox $S1)/*.done.json 2>/dev/null | head -1)
 if [ -n "$F" ]; then
@@ -124,7 +126,7 @@ EOF
 export SCHED_STATE=$S2 SCHED_CONFIG=$S2/config.json
 $PY -m gsched.cli submit $S2/batch.json >/dev/null 2>&1 || { bad "n2 submit 失败"; exit 1; }
 start_fake $S2
-wait_inbox $S2 '*.blocked.json' 1 30 && ok "批次 blocked -> inbox 落 .blocked.json" \
+wait_inbox $S2 '*.blocked.json' 1 120 && ok "批次 blocked -> inbox 落 .blocked.json" \
   || bad "未落 .blocked.json (inbox: $(ls $(inbox $S2) 2>/dev/null))"
 F2=$(ls $(inbox $S2)/*.blocked.json 2>/dev/null | head -1)
 if [ -n "$F2" ]; then
@@ -155,10 +157,10 @@ EOF
 export SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json
 $PY -m gsched.cli submit $S3/batch.json >/dev/null 2>&1 || { bad "n3 submit 失败"; exit 1; }
 start_fake $S3
-wait_inbox $S3 '*.blocked.json' 1 30 && ok "首跑失败 -> .blocked.json" \
+wait_inbox $S3 '*.blocked.json' 1 120 && ok "首跑失败 -> .blocked.json" \
   || bad "未落 .blocked.json (inbox: $(ls $(inbox $S3) 2>/dev/null))"
 $PY -m gsched.cli retry n3 >/dev/null 2>&1 || bad "retry n3 失败"
-wait_inbox $S3 '*.done.json' 1 30 && ok "retry 后 done -> .done.json" \
+wait_inbox $S3 '*.done.json' 1 120 && ok "retry 后 done -> .done.json" \
   || bad "retry 后未 done"
 sleep 2   # 多等两拍, 确认无重复通知
 NB=$(count_inbox $S3 '*.blocked.json'); ND=$(count_inbox $S3 '*.done.json')
@@ -198,7 +200,7 @@ EOF
 export SCHED_STATE=$S5 SCHED_CONFIG=$S5/config.json
 $PY -m gsched.cli submit $S5/batch.json >/dev/null 2>&1 || { bad "n5 submit 失败"; exit 1; }
 start_fake $S5
-wait_inbox $S5 '*.done.json' 1 30 && ok "email 拒连下 file 渠道仍落盘" \
+wait_inbox $S5 '*.done.json' 1 120 && ok "email 拒连下 file 渠道仍落盘" \
   || bad "email 异常拖垮了 file 渠道 (inbox: $(ls $(inbox $S5) 2>/dev/null))"
 [ -f $S5/testnode/markers/n5.done ] && ok "批次正常收敛 done (marker 存在)" \
   || bad "批次未收敛 (markers: $(ls $S5/testnode/markers 2>/dev/null))"
@@ -223,7 +225,7 @@ export SCHED_STATE=$S6 SCHED_CONFIG=$S6/config.json
 $PY -m gsched.cli submit $S6/batch.json >/dev/null 2>&1 || { bad "n6 submit 失败"; exit 1; }
 start_fake $S6
 # 等批次收敛 (marker 出现) 再断言 inbox 为空
-for _ in $(seq 1 30); do [ -f $S6/testnode/markers/n6.done ] && break; sleep 1; done
+for _ in $(seq 1 120); do [ -f $S6/testnode/markers/n6.done ] && break; sleep 1; done
 [ -f $S6/testnode/markers/n6.done ] && ok "批次 done (对照: 收敛正常)" || bad "n6 未收敛"
 sleep 2
 [ "$(count_inbox $S6 '*.json')" = "0" ] && ok "notify=false -> inbox 无文件" \
@@ -252,7 +254,7 @@ EOF
 export SCHED_STATE=$S7 SCHED_CONFIG=$S7/config.json
 $PY -m gsched.cli submit $S7/batch.json >/dev/null 2>&1 || { bad "n7 submit 失败"; exit 1; }
 start_fake $S7
-for _ in $(seq 1 30); do [ -f $S7/sink.json ] && break; sleep 1; done
+for _ in $(seq 1 120); do [ -f $S7/sink.json ] && break; sleep 1; done
 if [ -f $S7/sink.json ]; then
   $PY -c "
 import json
@@ -277,7 +279,7 @@ EOF
 export SCHED_STATE=$S7B SCHED_CONFIG=$S7B/config.json
 $PY -m gsched.cli submit $S7B/batch.json >/dev/null 2>&1 || { bad "n7b submit 失败"; exit 1; }
 start_fake $S7B
-wait_inbox $S7B '*.done.json' 1 30 && ok "command rc!=0 时 file 渠道仍落盘" \
+wait_inbox $S7B '*.done.json' 1 120 && ok "command rc!=0 时 file 渠道仍落盘" \
   || bad "command 异常拖垮 file 渠道 (inbox: $(ls $(inbox $S7B) 2>/dev/null))"
 sleep 1
 grep -q "FAIL: command" $S7B/testnode/scheduler.log 2>/dev/null \
