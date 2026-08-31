@@ -56,6 +56,22 @@ status_count_is() { # $1=dir $2=batch $3=status $4=expected
   [ "$actual" = "$4" ]
 }
 
+gpu_is_free() { # $1=dir $2=gpu idx
+  local payload
+  export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
+  payload=$($PY -m gsched.cli status --json 2>/dev/null) || return 2
+  printf '%s\n' "$payload" | $PY -c '
+import json, sys
+idx = int(sys.argv[1])
+payload = json.load(sys.stdin)
+rows = [gpu for gpu in payload["gpus"] if gpu["idx"] == idx]
+if len(rows) != 1:
+    raise SystemExit(2)
+gpu = rows[0]
+raise SystemExit(0 if gpu["status"] == "free" and gpu["assignments"] == [] else 1)
+' "$2"
+}
+
 wait_for() { # $1=条件 $2=超时秒
   local rc
   for _ in $(seq 1 ${2:-25}); do
@@ -75,11 +91,11 @@ mk_batch() { # $1=dir $2=batch名 $3=项目(缺省 default); release 前持续 r
   "name": "$2", "project": "$proj", "mode": "mix",
   "tasks": [
     {"id": "t1", "cmd": ["/bin/bash", "-c", "while [ ! -f '$1/$2.release' ]; do sleep 1; done"],
-     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}},
+     "duration_min": 15, "resources": {"gpu_share": true, "vram_gib": 1.0}},
     {"id": "t2", "cmd": ["/bin/bash", "-c", "while [ ! -f '$1/$2.release' ]; do sleep 1; done"],
-     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}},
+     "duration_min": 15, "resources": {"gpu_share": true, "vram_gib": 1.0}},
     {"id": "t3", "cmd": ["/bin/bash", "-c", "while [ ! -f '$1/$2.release' ]; do sleep 1; done"],
-     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}}
+     "duration_min": 15, "resources": {"gpu_share": true, "vram_gib": 1.0}}
   ]
 }
 EOF
@@ -99,6 +115,8 @@ release_and_wait_done() { # $1=dir $2=batch $3=task数
   : > "$1/$2.release" || { bad "$2 release 失败"; return 1; }
   wait_for "status_count_is \"$1\" $2 done $3" 120 \
     || { bad "$2 释放后未全部 done"; return 1; }
+  wait_for "gpu_is_free \"$1\" 0" 120 \
+    || { bad "$2 释放后 GPU0 未回 free"; return 1; }
 }
 
 echo "=== B12-c 三级打包上限验收 ==="
@@ -124,7 +142,7 @@ P=$(count_status $S1 cap1 pending) || { bad "cap1 pending 查询失败"; exit 1;
 [ "$R" = "2" ] && [ "$P" = "1" ] \
   && ok "第 3 个排队: 装箱被全局上限约束" \
   || bad "running=$R pending=$P 并发越界"
-grep -q "等待自然排水" $S1/testnode/scheduler.log \
+wait_log "$S1/testnode/scheduler.log" "等待自然排水" 30 \
   && ok "warn-once 等待日志存在" || bad "缺等待日志"
 release_and_wait_done $S1 cap1 3 || exit 1
 stop_daemon $S1 || exit 1
@@ -179,7 +197,7 @@ cat > $S3/cb.json << EOF
   "name": "cb", "project": "heavyb", "mode": "mix",
   "tasks": [
     {"id": "b1", "cmd": ["/bin/bash", "-c", "while [ ! -f '$S3/cb.release' ]; do sleep 1; done"],
-     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}}
+     "duration_min": 15, "resources": {"gpu_share": true, "vram_gib": 1.0}}
   ]
 }
 EOF
@@ -210,6 +228,8 @@ wait_for 'status_count_is "$S3" ca done 3' 120 \
   || { bad "ca 释放后未全部 done"; exit 1; }
 wait_for 'status_count_is "$S3" cb done 1' 120 \
   || { bad "cb 释放后未 done"; exit 1; }
+wait_for 'gpu_is_free "$S3" 0' 120 \
+  || { bad "S3 释放后 GPU0 未回 free"; exit 1; }
 stop_daemon $S3 || exit 1
 
 # ---------- S4: 自然排水 (热更新调低上限, 不驱逐) ----------
@@ -240,9 +260,20 @@ R=$(count_status $S4 cd running) || { bad "cd running 查询失败"; exit 1; }
 [ "$R" = "3" ] && ok "上限调低后 3 个任务继续运行 (无驱逐)" || bad "发生驱逐 (running=$R)"
 release_and_wait_done $S4 cd 3 || exit 1
 ok "全部自然完成"
+mk_batch $S4 ce
+$PY -m gsched.cli submit $S4/ce.json >/dev/null 2>&1 \
+  || { bad "ce submit 失败"; exit 1; }
+wait_for 'status_count_is "$S4" ce running 1' 90 \
+  || { bad "热更新后新批次未按上限派发"; exit 1; }
+R=$(count_status $S4 ce running) || { bad "ce running 查询失败"; exit 1; }
+P=$(count_status $S4 ce pending) || { bad "ce pending 查询失败"; exit 1; }
+[ "$R" = "1" ] && [ "$P" = "2" ] \
+  && ok "新批次遵守热更新后上限 (1 running + 2 pending)" \
+  || bad "新批次上限异常 (running=$R pending=$P)"
+release_and_wait_done $S4 ce 3 || exit 1
 stop_daemon $S4 || exit 1
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
-[ "$PASS" -eq 13 ] || { echo "预期 PASS=13，实际 PASS=$PASS"; exit 1; }
+[ "$PASS" -eq 14 ] || { echo "预期 PASS=14，实际 PASS=$PASS"; exit 1; }
 [ $FAIL -eq 0 ] || exit 1
