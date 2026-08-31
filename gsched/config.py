@@ -184,6 +184,22 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         ):
             raise ConfigError(f"{p}: projects.{proj_name}.max_jobs 必须是正整数"
                               f" (该项目任务在单卡上的打包数上限)")
+    if "native_exec_profiles" in cfg:
+        from .native_exec import (
+            NativeExecProfileError,
+            validate_native_exec_profiles,
+        )
+
+        if cfg["native_exec_profiles"] is None:
+            raise ConfigError(f"{p}: native_exec_profiles 必须是对象映射")
+        try:
+            validate_native_exec_profiles(
+                cfg["native_exec_profiles"],
+                where=f"{p}: native_exec_profiles",
+                projects=cfg["projects"],
+            )
+        except NativeExecProfileError as exc:
+            raise ConfigError(str(exc)) from exc
     # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,8]), 不在此重复
     tde = cfg.get("task_default_env")
     if tde is not None:

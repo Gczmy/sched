@@ -111,7 +111,7 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU 任务
 {
   "name": "my_batch",                       // 1..128 位安全 ASCII 标识符
   "project": "vision",                      // 必填, 且须存在于 config.projects
-  "mode": "mix",                            // 当前唯一实现的批次模式
+  "mode": "mix",                            // 缺省；strict 仅限管理员冷 profile
   "priority": 5,                            // 项目内批次优先级 (可选)
   "cwd": "{PROJECT:vision}",                // 支持 {PROJECT:name}/{ROOT}/{VENV:key}
   "env": {"NN_NO_CUDNN": "1"},              // 字符串环境变量 (可选)
@@ -146,6 +146,30 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU 任务
 模板变量：`{ROOT}` = `default_project` 根目录；`{PROJECT:<name>}` = 指定项目根目录；`{VENV:<key>}` = config `venvs` 中的解释器。
 
 批次/任务/依赖标识符必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`（且不能是 `.`/`..`）。`runtime` 必须在 `venv_alias`、`conda_env`、`prefix` 中恰选一个，并在提交时解析成功。批次级 `gpus`、任务/阶段级 `retry_transform`、阶段级 `probes` 均拒绝；GPU 需求写 `resources.gpu`，probe 只写任务级。
+
+`mode: "strict"` 是部署级 direct-exec 通道。只有一个管理员冷配置
+`config.native_exec_profiles` 项与
+`(mode, project, batch_name, task_id, submitted_argv)` 五元组逐项精确匹配时才接受。
+任务必须只有一个 `cmd`，首项是规范化绝对可执行路径，effective cwd 等于当前项目根，
+resources 必须精确为 CPU-only `{"gpu":0,"cpus":1}`，batch/task `env` 必须为空；
+不得声明 `stages`、`sweep`、`runtime`、scheduler artifact skip/cleanup 规则或日志 probe，并须显式设置
+`git: false` 和 `max_retry: 0`。`git: false` 用于阻止 reviewed native verifier 之前通过
+daemon `PATH` 启动 Git 子进程；code-byte 绑定改由 external verifier 负责。profile 会对全部
+mix 入口（包括 `sched run`）保留其 batch name；
+该名称第一次 strict 耐久入库即永久消费，不论后来是 done、blocked 还是
+discarded，新 submit、retry、resubmit 与自动重放均拒绝。inbox 中同 batch id 的重投
+只有在耐久 batch/task/job 不可变绑定逐项精确一致时才幂等；同名预占或持久态漂移会被拒绝。
+
+scheduler 会持久化 profile digest 与 canonical project-root device/inode digest，将二者纳入
+fingerprint，并在 running claim 前重新认证。profile registry 及其引用的 project root 均为冷配置，
+热变更拒绝。native launch 不继承 daemon 环境，只加入 scheduler-owned identity/control 字段与空的
+`CUDA_VISIBLE_DEVICES`，随后绕过 Bash/RC supervisor 直接启动原 argv。只有当前 daemon 持有的
+exact `Popen` 退出码可形成成功；daemon 丢失权威后任务直接 blocked，不信任 RC sidecar，也不重放。
+
+该通道目前只是 launcher 基础，**尚未**做到 pathname execution 的 byte/FD exact，也未关闭
+reattest 到 `Popen` 的 TOCTOU 窗口。正式执行前仍必须完成 external retained-FD verifier/monitor 与
+七字段 attestation。当前 strict schema 还会拒绝全部用户 env，因此专用七字段 poison-overwrite
+probe 暂不可运行；其 cold-profile 精确例外须与 external verifier 一并实现。
 
 ## 状态机
 

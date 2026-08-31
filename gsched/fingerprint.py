@@ -260,12 +260,33 @@ def compute_fingerprint(
     git: bool | None,
     venv_paths: dict[str, str],
     runtime_prefix: str | None = None,
+    native_exec_profile_sha256: str | None = None,
+    native_exec_project_root_identity_sha256: str | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """Compute task and per-stage producer fingerprints.
 
     Git-enabled projects fail closed with a ``None`` task fingerprint whenever
     the revision or any dirty-content query cannot be established.
     """
+    if native_exec_profile_sha256 not in (None, "") and (
+        not isinstance(native_exec_profile_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", native_exec_profile_sha256) is None
+    ):
+        raise ValueError(
+            "native_exec_profile_sha256 must be a 64-hex digest"
+        )
+    if native_exec_project_root_identity_sha256 not in (None, "") and (
+        not isinstance(native_exec_project_root_identity_sha256, str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            native_exec_project_root_identity_sha256,
+        )
+        is None
+    ):
+        raise ValueError(
+            "native_exec_project_root_identity_sha256 must be a 64-hex digest"
+        )
+
     # venv 路径: 把 cmd 里的 {VENV:name} 解析为实际解释器路径入指纹
     def resolve_venv(tok: str) -> str:
         if tok.startswith("{VENV:") and tok.endswith("}"):
@@ -299,12 +320,21 @@ def compute_fingerprint(
 
     def fp_for(cmd_list: list[str]) -> str:
         resolved = [resolve_venv(t) for t in cmd_list]
-        payload = json.dumps({
+        fingerprint_payload = {
             "cmd": resolved,
             "rev": rev if use_code else None,
             "dirty": dirty_hash,   # None = 干净树 (与历史指纹兼容)
             "runtime": runtime_prefix,   # B15: 声明了才参与哈希 (环境漂移可审计)
-        })
+        }
+        if native_exec_profile_sha256 not in (None, ""):
+            fingerprint_payload["native_exec_profile_sha256"] = (
+                native_exec_profile_sha256
+            )
+        if native_exec_project_root_identity_sha256 not in (None, ""):
+            fingerprint_payload[
+                "native_exec_project_root_identity_sha256"
+            ] = native_exec_project_root_identity_sha256
+        payload = json.dumps(fingerprint_payload)
         return hashlib.sha256(payload.encode()).hexdigest()
 
     if stages is not None:

@@ -17,6 +17,7 @@ import sqlite3
 import math
 import stat
 import os
+import re
 import secrets
 import socket
 import signal
@@ -24,6 +25,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime
+from typing import Any
 
 from . import notify, state
 from .artifacts import (
@@ -42,6 +44,12 @@ from .executor import (
     stage_checkpoint_valid,
 )
 from .fingerprint import compute_fingerprint
+from .native_exec import (
+    NativeExecProfileError,
+    native_exec_project_roots,
+    native_exec_project_root_identity_sha256,
+    reattest_native_exec_profile,
+)
 from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template
 from .schema import SchemaError, validate_batch
 from .templates import expand_cmd
@@ -65,10 +73,41 @@ PROBE_READ_MAX_BYTES = 1024 * 1024
 PROFILE_MAX_BYTES = 64 * 1024
 PROFILE_MAX_PEAK_GIB = 1024.0
 RC_MAX_BYTES = 32
+INBOX_BID_MAX_LENGTH = 256
+_INBOX_BID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 _SIGNAL_SENT = "sent"
 _SIGNAL_DEAD = "dead_or_mismatch"
 _SIGNAL_UNKNOWN = "unknown_or_error"
+
+
+def _native_root_identities(
+    roots: dict[str, str],
+) -> dict[str, tuple[int, int]]:
+    identities: dict[str, tuple[int, int]] = {}
+    for project, root in roots.items():
+        root_stat = os.stat(root)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise NativeExecProfileError(
+                f"native project root is not a directory: {project!r}"
+            )
+        identities[project] = (root_stat.st_dev, root_stat.st_ino)
+    return identities
+
+
+def _validate_inbox_bid(value: object, batch_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("inbox bid must be a non-empty string")
+    if (
+        len(value) > INBOX_BID_MAX_LENGTH
+        or value in (".", "..")
+        or _INBOX_BID_RE.fullmatch(value) is None
+        or not value.startswith(batch_name + "-")
+    ):
+        raise ValueError(
+            "inbox bid must be a bounded safe identifier prefixed by batch name"
+        )
+    return value
 
 
 def _load_bounded_submit_json(fd: int) -> object:
@@ -130,6 +169,168 @@ def _profile_cache_key(project: object, profile_key: object) -> str:
     )
 
 _FINGERPRINT_UNSET = object()
+_NATIVE_EXEC_METADATA_KEYS = (
+    "_native_exec_profile_id",
+    "_native_exec_profile_sha256",
+    "_native_exec_project_root_identity_sha256",
+    "_native_exec_submitted_argv",
+)
+
+
+def _native_exec_metadata(spec: dict) -> dict[str, Any] | None:
+    """Return a complete persisted tuple, rejecting partial internal state."""
+    present = [key for key in _NATIVE_EXEC_METADATA_KEYS if key in spec]
+    if not present:
+        return None
+    if len(present) != len(_NATIVE_EXEC_METADATA_KEYS):
+        raise NativeExecProfileError(
+            "persisted native execution metadata is incomplete"
+        )
+    return {key: spec[key] for key in _NATIVE_EXEC_METADATA_KEYS}
+
+
+def _native_exec_fingerprint_kwargs(spec: dict) -> dict[str, str]:
+    """Bind complete native profile/root identity into fingerprints."""
+    digest = spec.get("_native_exec_profile_sha256")
+    root_digest = spec.get("_native_exec_project_root_identity_sha256")
+    if digest in (None, "") or root_digest in (None, ""):
+        return {}
+    return {
+        "native_exec_profile_sha256": digest,
+        "native_exec_project_root_identity_sha256": root_digest,
+    }
+
+
+def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
+    """Copy only a complete schema-issued native tuple into task storage."""
+    metadata = _native_exec_metadata(source)
+    if metadata is not None:
+        destination.update(metadata)
+
+
+def _inbox_task_spec(
+    task: dict,
+    expanded_cmd: list[str] | None,
+    expanded_stages: list[dict] | None,
+) -> dict[str, Any]:
+    """Build the exact durable task payload used by inbox insertion."""
+    persisted = {
+        "id": task["id"],
+        "cmd": expanded_cmd,
+        "stages": expanded_stages,
+        "cwd_abs": task["cwd_abs"],
+        "git": task["git"],
+        "env": task["env"],
+        "resources": task["resources"],
+        "duration_min": task["duration_min"],
+        "max_retry": task["max_retry"],
+        "artifacts": task["artifacts"],
+        "paths_escape": task.get("paths_escape", False),
+        "probes": task.get("probes"),
+        "max_parallel": task.get("max_parallel"),
+        "_force_rerun": task.get("_force_rerun"),
+        "progress_regex": task.get("progress_regex"),
+        "runtime": task.get("runtime"),
+        "runtime_prefix": task.get("runtime_prefix"),
+    }
+    _persist_native_exec_metadata(task, persisted)
+    return persisted
+
+
+def _strict_inbox_delivery_matches(
+    conn: sqlite3.Connection,
+    bid: str,
+    norm: dict,
+    prepared_tasks: list[tuple],
+) -> bool:
+    """Prove an existing strict bid is the exact same durable delivery.
+
+    Runtime/terminal columns are intentionally ignored.  Every immutable
+    batch/task/job binding is compared, so a replay can be idempotent without
+    treating a same-name preclaim or persisted tamper as a successful submit.
+    """
+    if norm.get("mode") != "strict":
+        return False
+    batch = conn.execute(
+        "SELECT * FROM batches WHERE id=?",
+        (bid,),
+    ).fetchone()
+    if batch is None:
+        return False
+    try:
+        depends_on = json.loads(batch["depends_on"] or "[]")
+        batch_env = json.loads(batch["env"] or "{}")
+        batch_notify = (
+            json.loads(batch["notify"])
+            if batch["notify"] is not None
+            else None
+        )
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if (
+        batch["name"] != norm["name"]
+        or batch["mode"] != "strict"
+        or depends_on != norm["depends_on"]
+        or batch["gpus"] is not None
+        or batch["cwd"] != norm["cwd"]
+        or batch_env != norm["env"]
+        or batch_notify != norm.get("notify")
+        or batch["project"] != norm.get("project")
+        or batch["priority"] != norm.get("priority", 0)
+    ):
+        return False
+
+    task_rows = conn.execute(
+        "SELECT * FROM tasks WHERE batch_id=? ORDER BY order_idx, id, version",
+        (bid,),
+    ).fetchall()
+    job_rows = conn.execute(
+        "SELECT * FROM jobs WHERE batch_id=? ORDER BY task_id, version, id",
+        (bid,),
+    ).fetchall()
+    if len(task_rows) != len(prepared_tasks) or len(job_rows) != len(
+        prepared_tasks
+    ):
+        return False
+
+    for prepared, task_row, job_row in zip(
+        prepared_tasks,
+        task_rows,
+        job_rows,
+    ):
+        index, task, cmd_e, stages_e, fingerprint, stage_fingerprints = prepared
+        expected_spec = _inbox_task_spec(task, cmd_e, stages_e)
+        try:
+            persisted_spec = json.loads(task_row["spec"])
+            persisted_stage_fingerprints = (
+                json.loads(job_row["stage_fingerprints"])
+                if job_row["stage_fingerprints"] is not None
+                else None
+            )
+        except (json.JSONDecodeError, TypeError):
+            return False
+        expected_stage_fingerprints = (
+            stage_fingerprints if stage_fingerprints else None
+        )
+        expected_job_id = f"{bid}-{task['id']}-v1"
+        if (
+            task_row["id"] != task["id"]
+            or task_row["version"] != 1
+            or task_row["order_idx"] != index
+            or task_row["project"] != norm.get("project")
+            or persisted_spec != expected_spec
+            or job_row["id"] != expected_job_id
+            or job_row["batch_id"] != bid
+            or job_row["task_id"] != task["id"]
+            or job_row["version"] != 1
+            or job_row["project"] != norm.get("project")
+            or job_row["fingerprint"] != fingerprint
+            or persisted_stage_fingerprints != expected_stage_fingerprints
+        ):
+            return False
+    return True
+
+
 # B12-a: 配置冷键 —— 变更拒绝热更新, 必须重启 daemon (调研 §2.3).
 
 
@@ -170,12 +371,22 @@ def _validate_inbox_dependencies(conn, norm: dict) -> None:
 
     visit(norm["name"])
 # gpus 卡集/容量另经 parse_gpus 结构比对, 不在本列表.
-CONFIG_COLD_KEYS = ("node", "state_dir", "user", "schema_version")
+CONFIG_COLD_KEYS = (
+    "node",
+    "state_dir",
+    "user",
+    "schema_version",
+    "native_exec_profiles",
+)
 
 
 class Dispatcher:
     def __init__(self, cfg: dict, fake: bool = False):
         self.cfg = cfg
+        self._native_exec_project_roots = native_exec_project_roots(cfg)
+        self._native_exec_project_root_identities = _native_root_identities(
+            self._native_exec_project_roots
+        )
         self.fake = fake
         self.state_dir = state.default_state_dir()
         self.host_dir = state.ensure_private_directory(state.host_dir())
@@ -1446,6 +1657,17 @@ class Dispatcher:
         finally:
             os.close(fd)
 
+    def _job_uses_native_exec(self, conn, job) -> bool:
+        """Conservatively identify strict/native jobs from durable state."""
+        batch = state.get_batch(conn, job["batch_id"])
+        if batch is not None and batch["mode"] == "strict":
+            return True
+        try:
+            spec = self._load_task_spec(conn, job)
+        except (TypeError, ValueError):
+            return False
+        return any(key in spec for key in _NATIVE_EXEC_METADATA_KEYS)
+
     def _drop_rc_path(self, path: str | None) -> None:
         if path is None:
             return
@@ -1466,6 +1688,7 @@ class Dispatcher:
                 "SELECT * FROM jobs WHERE status='running'"
             ).fetchall()
             for j in rows:
+                native_exec = self._job_uses_native_exec(conn, j)
                 if not j["pgid"] and self._prepare_launch_marker(j):
                     self.log_line(
                         f"A3: job {j['id']} pgid 未回写且 launch marker 未决; "
@@ -1490,6 +1713,40 @@ class Dispatcher:
                             f"A3: job {j['id']} 原 process identity 已退出; "
                             "检测到 PGID 复用，绝不信号新进程"
                         )
+                if native_exec:
+                    rc_path = self._job_rc_path(j)
+                    if j["kill_reason"] in ("cancelled", "timed_out"):
+                        state.update_job(conn, j["id"], rc=137)
+                        cleanup_jobs.extend(
+                            self._handle_job_done(conn, j, 137)
+                        )
+                    else:
+                        # A restarted daemon no longer owns the exact Popen and
+                        # a same-uid child can forge the legacy Bash RC sidecar.
+                        # Preserve the one-shot evidence and fail closed.
+                        state.update_job(
+                            conn,
+                            j["id"],
+                            status="failed",
+                            rc=137,
+                            failure="native_rc_authority_lost",
+                            finished_at=state.now(),
+                        )
+                        self._release_gpu_for_job(conn, j)
+                        self._maybe_retry(conn, j)
+                        cleanup_jobs.extend(
+                            (
+                                ("launch", dict(j)),
+                                ("profile", dict(j)),
+                            )
+                        )
+                        self.log_line(
+                            f"A3: native job {j['id']} 已失去 Popen "
+                            "退出码权威 -> blocked"
+                        )
+                    if rc_path is not None:
+                        drop_paths.append(rc_path)
+                    continue
                 rc = self._read_job_rc(j)
                 if rc is not None:
                     rc_path = self._job_rc_path(j)
@@ -1624,6 +1881,13 @@ class Dispatcher:
             )
             old_gpu_list, old_mem, _ = parse_gpus(self.cfg)
             new_gpu_list, new_mem, new_mj = parse_gpus(new_cfg)
+            old_native_roots = getattr(
+                self, "_native_exec_project_roots", None
+            )
+            if old_native_roots is None:
+                old_native_roots = native_exec_project_roots(self.cfg)
+            new_native_roots = native_exec_project_roots(new_cfg)
+            new_native_identities = _native_root_identities(new_native_roots)
         except Exception as e:  # ConfigError/json/OSError — 半写或非法
             self.log_line(f"⚠️ 配置热更新失败 (保留旧配置): {e}")
             return False
@@ -1631,6 +1895,19 @@ class Dispatcher:
                      if self.cfg.get(k) != new_cfg.get(k)]
         if (old_gpu_list, old_mem) != (new_gpu_list, new_mem):
             cold_diff.append("gpus(卡集或容量覆盖)")  # max_jobs 是热键, 不参与冷键比对
+        if old_native_roots != new_native_roots:
+            cold_diff.append("native_exec_project_roots")
+        else:
+            frozen_identities = getattr(
+                self,
+                "_native_exec_project_root_identities",
+                {},
+            )
+            if (
+                frozen_identities
+                and frozen_identities != new_native_identities
+            ):
+                cold_diff.append("native_exec_project_root_identity")
         if cold_diff:
             self.log_line(
                 f"⚠️ 配置含冷键变更 {cold_diff} —— 拒绝热更新, 请重启 daemon 生效"
@@ -1815,19 +2092,26 @@ class Dispatcher:
                         bid = envelope.get("bid")
                         if not isinstance(bid, str) or not bid:
                             bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
+                        bid = _validate_inbox_bid(bid, norm["name"])
 
                         existing_bid = conn.execute(
-                            "SELECT name FROM batches WHERE id=?", (bid,)
+                            "SELECT name, mode FROM batches WHERE id=?", (bid,)
                         ).fetchone()
                         if existing_bid:
                             if existing_bid["name"] != norm["name"]:
                                 raise SchemaError(f"批次 id 已存在且名称不同: '{bid}'")
-                            state.finish_control_request(
-                                conn, r["id"], f"已入队 {bid} (重复投递, 已存在)"
-                            )
-                            discard_payload()
-                            safe_log(f"batch_submit req {r['id']}: 重复投递 {bid}, 已跳过")
-                            continue
+                            if norm["mode"] != "strict":
+                                state.finish_control_request(
+                                    conn,
+                                    r["id"],
+                                    f"已入队 {bid} (重复投递, 已存在)",
+                                )
+                                discard_payload()
+                                safe_log(
+                                    f"batch_submit req {r['id']}: "
+                                    f"重复投递 {bid}, 已跳过"
+                                )
+                                continue
 
                         prepared_tasks = []
                         for i2, t in enumerate(norm["tasks"]):
@@ -1847,6 +2131,21 @@ class Dispatcher:
                                             "paths_escape": stage.get("paths_escape", False),
                                         }
                                     )
+                            native_metadata = _native_exec_metadata(t)
+                            if native_metadata is not None:
+                                if stages_e is not None:
+                                    raise NativeExecProfileError(
+                                        "native execution profile forbids stages"
+                                    )
+                                if (
+                                    native_metadata[
+                                        "_native_exec_submitted_argv"
+                                    ]
+                                    != cmd_e
+                                ):
+                                    raise NativeExecProfileError(
+                                        "native submitted argv differs from expanded command"
+                                    )
                             fp, stage_fps, _rev = compute_fingerprint(
                                 cmd_e,
                                 stages_e,
@@ -1854,70 +2153,129 @@ class Dispatcher:
                                 t["git"],
                                 cfg_now.get("venvs", {}),
                                 runtime_prefix=t.get("runtime_prefix"),
+                                **_native_exec_fingerprint_kwargs(t),
                             )
                             prepared_tasks.append((i2, t, cmd_e, stages_e, fp, stage_fps))
 
-                        conn.execute(f"SAVEPOINT {savepoint}")
-                        savepoint_active = True
-                        existing = conn.execute(
-                            "SELECT status FROM batches WHERE name=?", (norm["name"],)
-                        ).fetchall()
-                        if any(
-                            x["status"] not in ("done", "blocked", "discarded")
-                            for x in existing
-                        ):
-                            raise SchemaError(
-                                f"同名批次 '{norm['name']}' 已有未终态批次 (定案 6), 未入队"
-                            )
-                        state.insert_batch(
-                            conn,
-                            bid,
-                            norm["name"],
-                            norm["mode"],
-                            norm["depends_on"],
-                            None,
-                            norm["cwd"],
-                            norm["env"],
-                            norm.get("notify"),
-                            norm.get("project"),
-                            norm.get("priority", 0),
-                        )
-                        for i2, t, cmd_e, stages_e, fp, stage_fps in prepared_tasks:
-                            spec_json = {
-                                "id": t["id"],
-                                "cmd": cmd_e,
-                                "stages": stages_e,
-                                "cwd_abs": t["cwd_abs"],
-                                "git": t["git"],
-                                "env": t["env"],
-                                "resources": t["resources"],
-                                "duration_min": t["duration_min"],
-                                "max_retry": t["max_retry"],
-                                "artifacts": t["artifacts"],
-                                "paths_escape": t.get("paths_escape", False),
-                                "probes": t.get("probes"),
-                                "max_parallel": t.get("max_parallel"),
-                                "_force_rerun": t.get("_force_rerun"),
-                                "progress_regex": t.get("progress_regex"),
-                                "runtime": t.get("runtime"),
-                                "runtime_prefix": t.get("runtime_prefix"),
-                            }
-                            state.insert_task(
-                                conn, bid, t["id"], 1, spec_json, i2, norm.get("project")
-                            )
-                            state.insert_job(
-                                conn,
-                                f"{bid}-{t['id']}-v1",
-                                bid,
-                                t["id"],
-                                1,
-                                fp,
-                                stage_fps,
-                                norm.get("project"),
-                            )
-                        state.finish_control_request(conn, r["id"], f"已入队 {bid}")
-                        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                        savepoint_active = False
+                        # Serialize the durable name-consumption check and all
+                        # batch writes with local CLI submissions.  Validation,
+                        # git probes, and fingerprinting remain outside the lock.
+                        with state.submission_lock():
+                            try:
+                                # Recheck bid under the shared submit lock.  An
+                                # identical delivery stays idempotent and wins
+                                # over strict one-shot name rejection.
+                                existing_bid = conn.execute(
+                                    "SELECT name, mode FROM batches WHERE id=?",
+                                    (bid,),
+                                ).fetchone()
+                                if existing_bid:
+                                    if existing_bid["name"] != norm["name"]:
+                                        raise SchemaError(
+                                            f"批次 id 已存在且名称不同: '{bid}'"
+                                        )
+                                    if norm["mode"] == "strict" and not (
+                                        _strict_inbox_delivery_matches(
+                                            conn,
+                                            bid,
+                                            norm,
+                                            prepared_tasks,
+                                        )
+                                    ):
+                                        raise SchemaError(
+                                            "strict 重复批次 id 的耐久绑定与"
+                                            "当前 exact delivery 不一致"
+                                        )
+                                    state.finish_control_request(
+                                        conn,
+                                        r["id"],
+                                        f"已入队 {bid} (重复投递, 已存在)",
+                                    )
+                                    discard_payload()
+                                    safe_log(
+                                        f"batch_submit req {r['id']}: "
+                                        f"重复投递 {bid}, 已跳过"
+                                    )
+                                    continue
+
+                                conn.execute(f"SAVEPOINT {savepoint}")
+                                savepoint_active = True
+                                existing = conn.execute(
+                                    "SELECT status FROM batches WHERE name=?",
+                                    (norm["name"],),
+                                ).fetchall()
+                                strict_consumed = (
+                                    norm["mode"] == "strict" and bool(existing)
+                                )
+                                ordinary_conflict = any(
+                                    x["status"]
+                                    not in ("done", "blocked", "discarded")
+                                    for x in existing
+                                )
+                                if strict_consumed:
+                                    raise SchemaError(
+                                        f"strict 批次名 '{norm['name']}' 已消费；"
+                                        "必须配置新的 native profile/batch name "
+                                        "并重启 daemon"
+                                    )
+                                if ordinary_conflict:
+                                    raise SchemaError(
+                                        f"同名批次 '{norm['name']}' 已有未终态批次 "
+                                        "(定案 6), 未入队"
+                                    )
+                                state.insert_batch(
+                                    conn,
+                                    bid,
+                                    norm["name"],
+                                    norm["mode"],
+                                    norm["depends_on"],
+                                    None,
+                                    norm["cwd"],
+                                    norm["env"],
+                                    norm.get("notify"),
+                                    norm.get("project"),
+                                    norm.get("priority", 0),
+                                )
+                                for (
+                                    i2,
+                                    t,
+                                    cmd_e,
+                                    stages_e,
+                                    fp,
+                                    stage_fps,
+                                ) in prepared_tasks:
+                                    spec_json = _inbox_task_spec(
+                                        t,
+                                        cmd_e,
+                                        stages_e,
+                                    )
+                                    state.insert_task(
+                                        conn,
+                                        bid,
+                                        t["id"],
+                                        1,
+                                        spec_json,
+                                        i2,
+                                        norm.get("project"),
+                                    )
+                                    state.insert_job(
+                                        conn,
+                                        f"{bid}-{t['id']}-v1",
+                                        bid,
+                                        t["id"],
+                                        1,
+                                        fp,
+                                        stage_fps,
+                                        norm.get("project"),
+                                    )
+                                state.finish_control_request(
+                                    conn, r["id"], f"已入队 {bid}"
+                                )
+                                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                                savepoint_active = False
+                            except Exception:
+                                rollback_savepoint()
+                                raise
                         discard_payload()
                         safe_log(
                             f"batch_submit req {r['id']}: 已入队 {bid} "
@@ -2242,36 +2600,93 @@ class Dispatcher:
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
-                process_state = self._job_process_state(j)
-                if process_state == "unknown":
-                    self.log_line(
-                        f"reap 保留 job {j['id']}: process identity 无法确认"
-                    )
-                    continue
+                native_exec = self._job_uses_native_exec(conn, j)
                 known_proc = self.executor.has_process(j["pgid"])
-                marker_rc = self._read_job_rc(j)
-                if process_state == "mismatch":
-                    # The immutable leader identity proves our process exited.
-                    # Never poll or signal the unrelated replacement group.
-                    rc = marker_rc if marker_rc is not None else 137
-                else:
+                if native_exec and known_proc:
+                    # Native execution never writes a trusted Bash RC sidecar.
+                    # poll_rc is authoritative only while this daemon retains
+                    # the exact Popen object and proves the group is empty.
                     rc = self.executor.poll_rc(j["pgid"])
                     if rc is None:
                         continue
-                    final_state = self._job_process_state(j)
-                    if final_state in {"alive", "group_alive", "unknown"}:
+                else:
+                    process_state = self._job_process_state(j)
+                    if process_state == "unknown":
                         self.log_line(
-                            f"reap 延后 job {j['id']}: "
-                            f"post-poll identity={final_state}"
+                            f"reap 保留 job {j['id']}: "
+                            "process identity 无法确认"
                         )
                         continue
-                    if marker_rc is not None:
-                        rc = marker_rc
-                    elif not known_proc and process_state == "dead":
-                        rc = 137
+                    if native_exec:
+                        if process_state in {"alive", "group_alive"}:
+                            continue
+                        if j["kill_reason"] in ("cancelled", "timed_out"):
+                            rc = 137
+                        else:
+                            # After daemon restart there is no trusted Popen.
+                            # Ignore any child-authored sidecar and block the
+                            # consumed one-shot execution.
+                            rc_path = self._job_rc_path(j)
+                            state.update_job(
+                                conn,
+                                j["id"],
+                                status="failed",
+                                rc=137,
+                                failure="native_rc_authority_lost",
+                                finished_at=state.now(),
+                            )
+                            self._release_gpu_for_job(conn, j)
+                            self._maybe_retry(conn, j)
+                            cleanup_jobs.extend(
+                                (
+                                    ("launch", dict(j)),
+                                    ("profile", dict(j)),
+                                )
+                            )
+                            if rc_path is not None:
+                                drop_paths.append(rc_path)
+                            self.log_line(
+                                f"reap native job {j['id']}: "
+                                "Popen authority lost -> blocked"
+                            )
+                            continue
+                    else:
+                        marker_rc = self._read_job_rc(j)
+                        if process_state == "mismatch":
+                            # The immutable leader identity proves our process
+                            # exited. Never poll or signal the replacement.
+                            rc = marker_rc if marker_rc is not None else 137
+                        else:
+                            rc = self.executor.poll_rc(j["pgid"])
+                            if rc is None:
+                                continue
+                            final_state = self._job_process_state(j)
+                            if final_state in {
+                                "alive",
+                                "group_alive",
+                                "unknown",
+                            }:
+                                self.log_line(
+                                    f"reap 延后 job {j['id']}: "
+                                    f"post-poll identity={final_state}"
+                                )
+                                continue
+                            if marker_rc is not None:
+                                rc = marker_rc
+                            elif not known_proc and process_state == "dead":
+                                rc = 137
                 rc_path = self._job_rc_path(j)
                 state.update_job(conn, j["id"], rc=rc)
-                cleanup_jobs.extend(self._handle_job_done(conn, j, rc))
+                cleanup_jobs.extend(
+                    self._handle_job_done(
+                        conn,
+                        j,
+                        rc,
+                        process_exit_authoritative=(
+                            native_exec and known_proc
+                        ),
+                    )
+                )
                 if rc_path is not None:
                     drop_paths.append(rc_path)
         for kind, job in cleanup_jobs:
@@ -2287,10 +2702,12 @@ class Dispatcher:
         conn,
         j,
         rc: int | None = None,
+        *,
+        process_exit_authoritative: bool = False,
     ) -> list[tuple[str, dict]]:
         """Settle after exact exit and return cleanup actions for commit."""
         reason = j["kill_reason"]
-        if j["pgid"]:
+        if j["pgid"] and not process_exit_authoritative:
             process_state = self._job_process_state(j)
             if process_state in {"alive", "group_alive", "unknown"}:
                 self.log_line(
@@ -2724,6 +3141,16 @@ class Dispatcher:
             return
         try:
             spec = self._load_task_spec(conn, j)
+            batch = state.get_batch(conn, j["batch_id"])
+            if (
+                (batch is not None and batch["mode"] == "strict")
+                or any(key in spec for key in _NATIVE_EXEC_METADATA_KEYS)
+            ):
+                state.update_job(conn, j["id"], status="blocked")
+                self.log_line(
+                    f"job {j['id']} native execution failed; replay denied"
+                )
+                return
             max_retry = int(spec.get("max_retry", DEFAULT_MAX_RETRY))
             if max_retry < 0:
                 raise ValueError("max_retry 必须非负")
@@ -2747,9 +3174,35 @@ class Dispatcher:
         H3 修复: 回队前必须释放 GPU 占用 (assigned -> releasing + 删 gpu_jobs
         行), 否则节点重启后卡仍 assigned 给已死 job, GPU 永久泄漏.
         """
+        batch = state.get_batch(conn, j["batch_id"])
+        native_exec = batch is not None and batch["mode"] == "strict"
+        if not native_exec:
+            try:
+                persisted_spec = self._load_task_spec(conn, j)
+            except ValueError:
+                persisted_spec = {}
+            native_exec = any(
+                key in persisted_spec for key in _NATIVE_EXEC_METADATA_KEYS
+            )
         # Launch marker cleanup is owned by _check_node_restart after commit.
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
+        if native_exec:
+            state.update_job(
+                conn,
+                j["id"],
+                status="blocked",
+                failure="interrupted_native_no_retry",
+                finished_at=state.now(),
+                pgid=None,
+                rc=None,
+                kill_reason=None,
+                gpu=None,
+            )
+            self.log_line(
+                f"job {j['id']} native execution interrupted; automatic replay denied"
+            )
+            return
         state.update_job(
             conn, j["id"], status="pending", pgid=None, rc=None,
             kill_reason=None, gpu=None,
@@ -3268,6 +3721,7 @@ class Dispatcher:
                 spec.get("git"),
                 getattr(self, "venv_paths", {}),
                 runtime_prefix=spec.get("runtime_prefix"),
+                **_native_exec_fingerprint_kwargs(spec),
             )
         except Exception as exc:
             self.log_line(
@@ -3278,6 +3732,129 @@ class Dispatcher:
             stage_fingerprints = {}
         return current_fp, stage_fingerprints, git_rev
 
+    def _reattest_native_launch(
+        self,
+        batch,
+        job,
+        spec: dict,
+        task_project: object,
+    ) -> dict[str, Any] | None:
+        """Re-attest one persisted native tuple before the running claim."""
+        metadata = _native_exec_metadata(spec)
+        if metadata is None:
+            if batch["mode"] == "strict":
+                raise NativeExecProfileError(
+                    "strict task is missing persisted native execution metadata"
+                )
+            return None
+        if spec.get("stages") is not None:
+            raise NativeExecProfileError("native execution profile forbids stages")
+        try:
+            batch_env = json.loads(batch["env"] or "{}")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise NativeExecProfileError(
+                "persisted native batch environment is invalid"
+            ) from exc
+        if batch_env or spec.get("env"):
+            raise NativeExecProfileError(
+                "persisted native execution must have empty batch/task env"
+            )
+        if spec.get("resources") != {
+            "gpu": 0,
+            "cpus": 1,
+            "gpu_share": False,
+        }:
+            raise NativeExecProfileError(
+                "persisted native execution resources must remain CPU-only"
+            )
+        configured_root = os.path.realpath(
+            os.path.expanduser(
+                resolve_template(f"{{PROJECT:{batch['project']}}}", self.cfg)
+            )
+        )
+        frozen_roots = getattr(self, "_native_exec_project_roots", None)
+        frozen_identities = getattr(
+            self, "_native_exec_project_root_identities", None
+        )
+        if not isinstance(frozen_roots, dict) or not isinstance(
+            frozen_identities, dict
+        ):
+            raise NativeExecProfileError(
+                "native project-root cold snapshot is unavailable"
+            )
+        frozen_root = frozen_roots.get(batch["project"])
+        frozen_identity = frozen_identities.get(batch["project"])
+        try:
+            current_stat = os.stat(configured_root)
+            current_identity = (current_stat.st_dev, current_stat.st_ino)
+        except OSError as exc:
+            raise NativeExecProfileError(
+                "current native project root cannot be attested"
+            ) from exc
+        if (
+            configured_root != frozen_root
+            or current_identity != frozen_identity
+            or spec.get("cwd_abs") != frozen_root
+        ):
+            raise NativeExecProfileError(
+                "persisted native cwd differs from frozen project-root identity"
+            )
+        current_root_identity_sha256 = (
+            native_exec_project_root_identity_sha256(configured_root)
+        )
+        if (
+            metadata["_native_exec_project_root_identity_sha256"]
+            != current_root_identity_sha256
+        ):
+            raise NativeExecProfileError(
+                "persisted native project-root identity digest drifted"
+            )
+        if (
+            spec.get("runtime") is not None
+            or spec.get("runtime_prefix") is not None
+        ):
+            raise NativeExecProfileError(
+                "persisted native execution unexpectedly declares a runtime"
+            )
+        if spec.get("git") is not False:
+            raise NativeExecProfileError(
+                "persisted native execution git binding must remain exactly false"
+            )
+        if spec.get("artifacts") or spec.get("paths_escape"):
+            raise NativeExecProfileError(
+                "persisted native execution declares artifact cleanup rules"
+            )
+        if spec.get("probes") is not None:
+            raise NativeExecProfileError(
+                "persisted native execution declares scheduler log probes"
+            )
+        if type(spec.get("max_retry")) is not int or spec["max_retry"] != 0:
+            raise NativeExecProfileError(
+                "persisted native execution max_retry must remain exactly zero"
+            )
+        submitted_argv = metadata["_native_exec_submitted_argv"]
+        if spec.get("cmd") != submitted_argv:
+            raise NativeExecProfileError(
+                "persisted native command differs from submitted argv"
+            )
+        if (
+            job["project"] != batch["project"]
+            or task_project != batch["project"]
+        ):
+            raise NativeExecProfileError(
+                "persisted native project binding is inconsistent"
+            )
+        return reattest_native_exec_profile(
+            self.cfg,
+            mode=batch["mode"],
+            project=batch["project"],
+            batch_name=batch["name"],
+            task_id=job["task_id"],
+            profile_id=metadata["_native_exec_profile_id"],
+            profile_sha256=metadata["_native_exec_profile_sha256"],
+            submitted_argv=submitted_argv,
+        )
+
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
         """启动任务; 返回是否真正启动 (调用方据此计 CPU/并发配额, D1)。
@@ -3285,6 +3862,52 @@ class Dispatcher:
         未启动的正常返回路径: M1 竞态 (已非 pending) 与产物指纹 skip ——
         二者都不该占用 CPU 配额 (skip 密集批次会人为压低并发)。
         """
+        live_job = state.get_job(conn, j["id"])
+        if live_job is None:
+            raise ValueError(f"job {j['id']} no longer exists")
+        for identity_key in ("batch_id", "task_id", "version"):
+            if j[identity_key] != live_job[identity_key]:
+                raise ValueError(
+                    f"job {j['id']} persisted {identity_key} drifted"
+                )
+        j = live_job
+        b = state.get_batch(conn, j["batch_id"])
+        if b is None:
+            raise ValueError(f"job {j['id']} batch no longer exists")
+
+        persisted_spec, task_project = self._load_task_launch_binding(conn, j)
+        spec_cache = getattr(self, "_ready_task_specs", {})
+        cached_spec = spec_cache.pop(j["id"], None)
+        native_candidate = (
+            b["mode"] == "strict"
+            or any(key in persisted_spec for key in _NATIVE_EXEC_METADATA_KEYS)
+            or (
+                cached_spec is not None
+                and any(
+                    key in cached_spec for key in _NATIVE_EXEC_METADATA_KEYS
+                )
+            )
+        )
+        if (
+            native_candidate
+            and cached_spec is not None
+            and cached_spec != persisted_spec
+        ):
+            raise NativeExecProfileError(
+                "persisted native task spec drifted after fingerprint snapshot"
+            )
+        spec = persisted_spec if native_candidate else (cached_spec or persisted_spec)
+        native_binding = self._reattest_native_launch(
+            b,
+            j,
+            spec,
+            task_project,
+        )
+        if native_binding is not None and gpu is not None:
+            raise NativeExecProfileError(
+                "native CPU-only execution received a GPU assignment"
+            )
+
         if self._prepare_launch_marker(j):
             self.log_line(
                 f"job {j['id']} 存在未决 launch marker; 本轮不派发"
@@ -3292,10 +3915,6 @@ class Dispatcher:
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
-        spec_cache = getattr(self, "_ready_task_specs", {})
-        spec = spec_cache.pop(j["id"], None)
-        if spec is None:
-            spec = self._load_task_spec(conn, j)
         cwd = spec.get("cwd_abs") or resolve_template(
             self.cfg.get("default_project", "{ROOT}"), self.cfg
         )
@@ -3372,14 +3991,19 @@ class Dispatcher:
 
         # The scheduler-owned profile path is a reserved control channel.
         # Batch, task, and deployment defaults may not redirect it.
-        b = state.get_batch(conn, j["batch_id"])
         batch_env = json.loads(b["env"]) if b and b["env"] else {}
-        task_env = {**batch_env, **dict(spec.get("env", {}))}
-        # B18: 部署级环境缺省值 (config.task_default_env) —— setdefault 语义,
-        # batch/task env 声明优先。本机用它注入 PYTHONNOUSERSITE=1 隔离
-        # ~/.local 用户站点污染 (策略在配置, 不在代码)。
-        for _dk, _dv in (self.cfg.get("task_default_env") or {}).items():
-            task_env.setdefault(str(_dk), str(_dv))
+        if native_binding is not None:
+            # The native verifier starts from a clean executor environment.
+            # User/default env is not part of the five-field cold profile and
+            # therefore cannot cross this boundary.
+            task_env = {}
+        else:
+            task_env = {**batch_env, **dict(spec.get("env", {}))}
+            # B18: 部署级环境缺省值 (config.task_default_env) —— setdefault 语义,
+            # batch/task env 声明优先。本机用它注入 PYTHONNOUSERSITE=1 隔离
+            # ~/.local 用户站点污染 (策略在配置, 不在代码)。
+            for _dk, _dv in (self.cfg.get("task_default_env") or {}).items():
+                task_env.setdefault(str(_dk), str(_dv))
         task_env["SCHED_PROFILE_OUT"] = self._profile_path(j)
         # Dispatcher-owned live identity: these values are derived from the
         # persisted batch/job records and must override batch/task/default env.
@@ -3397,20 +4021,33 @@ class Dispatcher:
         state.ensure_private_directory(
             os.path.dirname(task_env["SCHED_PROFILE_OUT"])
         )
-        pgid = self.executor.launch(
-            cmd=spec.get("cmd"),
-            stages=spec.get("stages"),
-            cwd=cwd,
-            env=task_env,
-            gpu=gpu,
-            log_path=log_path,
-            conda_env_dir=spec.get("runtime_prefix"),
-            stage_fingerprints=stage_fingerprints,
-            stage_checkpoint_dir=os.path.join(
+        launch_kwargs = {
+            "cmd": spec.get("cmd"),
+            "stages": spec.get("stages"),
+            "cwd": cwd,
+            "env": task_env,
+            "gpu": gpu,
+            "log_path": log_path,
+            "conda_env_dir": spec.get("runtime_prefix"),
+            "stage_fingerprints": stage_fingerprints,
+            "stage_checkpoint_dir": os.path.join(
                 self.host_dir, "stage_checkpoints", j["id"]
             ),
-            force_rerun=bool(spec.get("_force_rerun")),
-        )
+            "force_rerun": bool(spec.get("_force_rerun")),
+        }
+        if native_binding is not None:
+            launch_kwargs.update(
+                {
+                    "native_exec_profile_id": native_binding["profile_id"],
+                    "native_exec_profile_sha256": native_binding[
+                        "profile_sha256"
+                    ],
+                    "native_exec_submitted_argv": list(
+                        native_binding["submitted_argv"]
+                    ),
+                }
+            )
+        pgid = self.executor.launch(**launch_kwargs)
         inflight = getattr(self, "_launch_inflight", None)
         if isinstance(inflight, dict):
             inflight[j["id"]] = pgid
@@ -3506,6 +4143,7 @@ class Dispatcher:
                     spec.get("cmd"), spec.get("stages"),
                     spec.get("cwd_abs") or ".", spec.get("git"), self.venv_paths,
                     runtime_prefix=spec.get("runtime_prefix"),
+                    **_native_exec_fingerprint_kwargs(spec),
                 )
             except Exception:
                 return False
@@ -3652,6 +4290,23 @@ class Dispatcher:
             (j["batch_id"], j["task_id"], j["version"]),
         ).fetchone()
         return row["spec"] if row else None
+
+    def _load_task_launch_binding(self, conn, job) -> tuple[dict, object]:
+        """Load the exact persisted task row used for a launch decision."""
+        row = conn.execute(
+            "SELECT spec, project FROM tasks"
+            " WHERE batch_id=? AND id=? AND version=?",
+            (job["batch_id"], job["task_id"], job["version"]),
+        ).fetchone()
+        if row is None:
+            raise ValueError("任务 spec 不存在")
+        try:
+            spec = json.loads(row["spec"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("任务 spec 不是合法 JSON") from exc
+        if not isinstance(spec, dict):
+            raise ValueError("任务 spec 顶层必须是对象")
+        return spec, row["project"]
 
     def _load_task_spec(self, conn, job) -> dict:
         raw = self._get_task_spec(conn, job)

@@ -39,7 +39,7 @@
 |---|---|---|---|
 | `name` | str | ✅ | 批次名（1..128 位安全 ASCII 标识符；id 自动追加时间戳）|
 | `project` | str | ✅ | 项目名，必须在 config.projects 注册 |
-| `mode` | str | ✗ | `mix`（缺省；当前唯一实现的批次模式）|
+| `mode` | str | ✗ | `mix`（缺省）或管理员冷 profile 精确授权的 `strict` |
 | `priority` | int | ✗ | 项目内派发优先级，大者先 |
 | `cwd` | str | ✗ | 缺省为该批次的 project root；支持 `{ROOT}`/`{PROJECT:name}`/`{VENV:key}` 模板 |
 | `env` | obj | ✗ | 字符串环境变量映射（最终覆盖，优先级高于自动注入）；变量名/值必须安全，shell bootstrap 与动态加载注入变量会被拒绝 |
@@ -74,6 +74,26 @@
 
 标识符必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`，且不能是 `.`/`..`。已移除或未实现的输入会拒绝：批次级 `gpus`、任务/阶段级 `retry_transform`、阶段级 `probes`；GPU 需求写 `resources.gpu`，probe 只写在任务级。
 
+`strict` 不是普通用户可自由选择的模式。它只允许一个单 `cmd` 任务，并要求：管理员冷配置
+`native_exec_profiles` 与 `(strict, project, batch name, task id, submitted argv)` 唯一精确匹配；
+`cmd[0]` 为规范化绝对路径；effective cwd 为当前项目根；不含 `stages`、`sweep`、`runtime`
+或 scheduler artifact skip/cleanup 规则、日志 probe；batch/task env 为空；resources 精确为
+`gpu=0, cpus=1, gpu_share=false`；显式 `git=false` 与 `max_retry=0`。`git=false` 阻止 reviewed
+native verifier 之前启动 PATH-resolved Git 子进程，code-byte 绑定由 external verifier 负责。四项 scheduler-owned metadata
+（profile id/digest、project-root identity digest、submitted argv）会落库，两个 digest 共同参与
+指纹。profile 对全部 mix 入口（包括 `sched run`）保留 batch name，第一次 strict 耐久入库后该名称永久消费；任何终态后的 fresh submit、
+retry/resubmit、失败重试或节点重启重放均拒绝。同 batch id 的 inbox 重投仅在耐久
+batch/task/job 不可变绑定精确一致时幂等，同名预占或持久态漂移会 fail-closed。
+
+dispatcher 在 running claim 前复核 cold profile、当前/持久 project-root canonical path 与
+device/inode identity、空 env、CPU-only resources。通过后从空继承环境构造 scheduler-owned
+control/identity 字段并 exact argv 直接 Popen，不走 Bash/RC supervisor。只有当前 daemon 持有的
+Popen rc 可成功结算；权威丢失时 fail-closed blocked，RC sidecar 对 native 无成功权威。
+
+边界：该实现仍按路径打开 executable/cwd，reattest→Popen 存在 TOCTOU；它不是 byte/FD-exact
+执行证明。external retained-FD verifier/monitor、七字段 attestation 与专用 poison-overwrite probe
+尚未实现，正式任务不得据此运行。
+
 ### config.json 相关（代理只读，调参报告用户）
 
 | 键 | 说明 |
@@ -81,7 +101,8 @@
 | `projects[P].colocate / max_jobs` | 项目级共享开关 / 每卡打包密度上限（热更新）|
 | `gpus[i].max_jobs` | 异构卡每卡打包上限（热更新）|
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
-| `task_default_env` | 部署级任务环境缺省值 `{k:v}`；batch/task env 可覆盖。典型用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
+| `task_default_env` | 部署级普通任务环境缺省值 `{k:v}`；batch/task env 可覆盖。strict/native 忽略该键并从空继承环境启动。典型普通任务用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
+| `native_exec_profiles` | 管理员持有的 strict exact-profile 映射；每项 exact keys 为 `mode/project/batch_name/task_id/submitted_argv`，batch_name 在 registry 内唯一且保留。profile registry 与引用项目的 root 均为冷配置；热更新拒绝，必须重启 daemon |
 
 ⚠️ config.json 为双项目共享配置，修改须经用户确认。
 

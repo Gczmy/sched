@@ -129,7 +129,7 @@ assert check.execute(
 assert not os.path.exists(malformed)
 print("✅ S5b daemon rejects malformed inbox envelope")
 
-transient = queue_payload("transient_submit", [], "transient-submit-1")
+transient = queue_payload("transient_submit", [], "transient_submit-submit-1")
 original_insert_batch = st2.insert_batch
 failed_once = [False]
 def fail_once(*args, **kwargs):

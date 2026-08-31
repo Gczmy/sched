@@ -111,7 +111,7 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU-only ta
 {
   "name": "my_batch",                       // safe ASCII identifier, 1..128 chars
   "project": "vision",                      // required; must exist in config.projects
-  "mode": "mix",                            // the only implemented batch mode
+  "mode": "mix",                            // default; strict is admin-profile-only
   "priority": 5,                            // batch priority within its project (optional)
   "cwd": "{PROJECT:vision}",                // supports {PROJECT:name}/{ROOT}/{VENV:key}
   "env": {"NN_NO_CUDNN": "1"},              // string-valued batch environment (optional)
@@ -146,6 +146,40 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU-only ta
 Template variables: `{ROOT}` = `default_project` root; `{PROJECT:<name>}` = explicit project root; `{VENV:<key>}` = interpreter from config `venvs`.
 
 Batch/task/dependency identifiers must match `[A-Za-z0-9][A-Za-z0-9._-]*` (not `.` or `..`). A `runtime` selects exactly one of `venv_alias`, `conda_env`, or `prefix`, and must resolve at submission. Unsupported batch `gpus`, task/stage `retry_transform`, and stage-level `probes` are rejected; put GPU demand in `resources.gpu` and probes at task level.
+
+`mode: "strict"` is a deployment-only direct-exec path. It is accepted only
+when one cold `config.native_exec_profiles` entry exactly matches
+`(mode, project, batch_name, task_id, submitted_argv)`. The task must contain
+one `cmd`, use a normalized absolute executable, run from the configured
+project root, use exactly CPU-only `resources: {"gpu":0,"cpus":1}`, have empty
+batch/task `env`, omit `stages`, `sweep`, and `runtime`, and explicitly set
+`git: false` and `max_retry: 0`; scheduler artifact skip/cleanup rules and log
+probes are forbidden. Requiring `git: false` prevents a PATH-resolved Git
+subprocess from running before the reviewed native verifier; code-byte binding
+belongs to that verifier instead.
+The profile reserves its batch name from every mix path, including `sched run`,
+and consumes it permanently on the first durable strict insert, regardless of
+terminal status. A fresh submit, retry, resubmit, or automatic restart replay
+is rejected. An inbox redelivery with the same batch id is idempotent only when
+the durable immutable batch/task/job binding is an exact match; a same-name
+preclaim or persisted drift is rejected.
+
+The scheduler persists both the profile digest and a canonical project-root
+device/inode digest, includes both in the fingerprint, and re-attests them
+before claiming the job. Referenced project roots and the profile registry are
+cold; hot changes are rejected. Native launch starts from an empty inherited
+environment, adds scheduler-owned identity/control keys and an empty
+`CUDA_VISIBLE_DEVICES`, and invokes the argv directly without the Bash/RC
+supervisor. Only an exit code from the exact `Popen` retained by the current
+daemon can complete successfully; after daemon authority is lost, the consumed
+job blocks instead of trusting an RC sidecar or replaying.
+
+This path is deliberately only a launcher foundation. It does **not** make
+pathname execution byte/FD exact or close the re-attestation-to-`Popen` TOCTOU
+window. The external retained-FD verifier/monitor and seven-field attestation
+are still required before formal execution. The current strict schema also
+rejects all user env, so the dedicated seven-field poison-overwrite probe is not
+yet runnable; its exact cold-profile exception belongs with that verifier.
 
 ## State Machine
 
