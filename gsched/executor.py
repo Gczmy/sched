@@ -23,6 +23,7 @@ from typing import Any, Callable
 from . import state
 
 from .artifacts import all_pass, check_artifacts
+from .native_launch import NativeLaunchPlan, NativeLaunchUnavailable
 
 # 常见进度行: "Epoch 5/30", "epoch: 5, loss: 0.12", "trial 3/20"
 PROGRESS_RE = re.compile(
@@ -365,6 +366,26 @@ class Executor:
         ldl = merged_env.get("LD_LIBRARY_PATH", "")
         merged_env["LD_LIBRARY_PATH"] = f"{lib}:{ldl}" if ldl else lib
 
+    def launch_native(self, plan: NativeLaunchPlan) -> int:
+        """Consume one retained native plan or fail without a fallback.
+
+        The actual entry argv and empty environment are properties of the
+        scheduler-owned plan.  This interface intentionally accepts no public
+        ``cmd``, pathname executable, environment, cwd, or shell input.  The
+        reviewed Linux FD-exec backend is a later step, so the current method
+        closes every plan-owned descriptor and raises before process creation.
+        """
+        if not isinstance(plan, NativeLaunchPlan):
+            raise TypeError("launch_native requires a NativeLaunchPlan")
+        try:
+            plan.validate_live_fds()
+            raise NativeLaunchUnavailable(
+                "native FD-exec backend is not connected; no pathname or logical-argv "
+                "fallback is allowed"
+            )
+        finally:
+            plan.close()
+
     def launch(
         self,
         cmd: list[str] | None,
@@ -390,8 +411,9 @@ class Executor:
         - CPU-only 任务 (gpu=None): 注入 CUDA_VISIBLE_DEVICES="" 禁 GPU ——
           XGB 等库启动时会初始化 CUDA context (即使 CPU 训练), 空串禁用
         - 一律注入 PYTHONUNBUFFERED=1 (日志即时性)
-        - native-exec 三字段必须同时缺席或同时有效；启用时只允许
-          单一 exact argv 并直接 Popen，不经 bash supervisor/RC shell
+        - legacy V1 native-exec 三字段必须同时缺席或同时有效；启用时只允许
+          单一 exact argv 并直接 Popen，不经 bash supervisor/RC shell。该路径
+          仍是非正式 foundation；V2 retained-FD 接口只允许走 launch_native。
         """
         native_values = (
             native_exec_profile_id,

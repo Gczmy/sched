@@ -192,6 +192,24 @@ name consumption, running claim, or process creation. V2 currently persists
 nothing, has no launch-time re-attestation, and does not authorize `Popen`;
 those properties remain work for the retained/bootstrap launcher step.
 
+The next interface is present only as a fail-closed plan foundation. A private
+one-shot `NativeLaunchPlan` owns revalidated copies of a retained launcher FD,
+fully sealed request memfd, connected AF_UNIX stream control FD, retained
+project-root directory FD, and append-only log FD. The request copy has an
+independent zero offset; the root must be `O_RDONLY` and not `O_PATH`; and the
+single-link log FD must match a symlink-free relative path below the retained
+root's `logs/` directory. Its actual entry contract is fixed to argv
+`("m2b-exec-monitor[native-entry-v1]", "--native-entry-v1")`, an empty
+environment, and child request/control/root descriptors 3/4/5; the logical
+submitted argv is evidence inside the plan and is never appended to or used as
+the actual argv. The request body remains opaque and non-authoritative, and the
+duplicated control endpoint does not establish an authenticated or exclusive
+peer. `Executor.launch_native(plan)` currently closes the plan and fails before
+process creation because the Linux FD-exec backend is not yet connected. V2
+submission remains blocked as described above; exclusive control-endpoint
+construction and atomic final validate/map/FD-exec are hard prerequisites for
+connecting that backend.
+
 ## State Machine
 
 ```text

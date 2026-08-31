@@ -101,6 +101,18 @@ root/task 公共 keyset，以及 raw `{PROJECT:...}` cwd、空依赖、`_protoco
 批次或名称耐久写入、running claim、进程创建之前 fail-closed。V2 当前不落库、不做 launch-time
 reattest，也不授权 Popen；retained/bootstrap launcher 接入是后续独立步骤。
 
+后续接口目前也仅是 fail-closed plan foundation：scheduler 私有的一次性
+`NativeLaunchPlan` 持有并复核 retained launcher FD、全封印 request memfd、已连接
+AF_UNIX stream control FD、retained project-root dirfd 与 append-only log FD。request
+副本具有独立的零 offset；root 必须是非 `O_PATH` 的 `O_RDONLY` FD；单链接 log FD 必须
+匹配 retained root 下 `logs/` 内由逐级 `O_NOFOLLOW` 解析的相对路径。actual argv 固定为
+`m2b-exec-monitor[native-entry-v1] --native-entry-v1`，actual env 固定为空，child
+request/control/root FD 固定为 3/4/5；logical submitted argv 只作证据，不会拼入 actual
+argv。request body 仍 opaque 且无权威，复制出的 control endpoint 也不证明 peer 已认证或
+独占。`Executor.launch_native(plan)` 在 Linux FD-exec backend 接入前会关闭 plan 并在创建
+进程前拒绝，V2 提交闸门因此仍未解除；接入前还必须完成独占 control endpoint 构造以及原子的
+final validate/map/FD-exec。
+
 ### config.json 相关（代理只读，调参报告用户）
 
 | 键 | 说明 |
