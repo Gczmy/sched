@@ -58,8 +58,8 @@ jobs = {(j["batch_id"], j["task"]): j["status"] for j in d.get("jobs", [])}
 ok = (
     batches.get("same-name-old") == "blocked"
     and batches.get("same-name-new") == "blocked"
-    and jobs.get(("same-name-old", "t1")) == "blocked"
-    and jobs.get(("same-name-new", "t1")) == "blocked"
+    and jobs.get(("same-name-old", "t1")) == "cancelled"
+    and jobs.get(("same-name-new", "t1")) == "cancelled"
 )
 raise SystemExit(0 if ok else 1)' \
     && [ -f "$SCHED_STATE/$NODE/markers/same_name.blocked" ] \
@@ -70,7 +70,7 @@ raise SystemExit(0 if ok else 1)' \
   sleep 1
 done
 if [ "$settled" != "1" ]; then
-  echo "project cancel requests did not fully converge" >&2
+  echo "project cancel requests did not converge to task=cancelled/batch=blocked" >&2
   exit 1
 fi
 "$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1
