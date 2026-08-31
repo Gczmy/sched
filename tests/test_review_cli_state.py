@@ -1671,6 +1671,131 @@ class ReviewResubmitStateTests(TempStateCase):
 
 
 class ReviewLocalQueryOnlyTests(TempStateCase):
+    def test_run_dry_run_routes_through_main_without_mutating_state(self) -> None:
+        configured = dict(self.cfg)
+        configured["venvs"] = {"python": sys.executable}
+        with open(self.config_path, "w", encoding="utf-8") as stream:
+            json.dump(configured, stream)
+
+        rc, stdout, stderr = self.capture(
+            cli.main,
+            [
+                "run",
+                "--project",
+                "p",
+                "--cpu-only",
+                "--venv",
+                "python",
+                "--dry-run",
+                "--",
+                sys.executable,
+                "-c",
+                "print('ok')",
+            ],
+        )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertIn("=== dry-run:", stdout)
+        with state.connect() as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0])
+
+    def test_run_remainder_does_not_overwrite_subcommand_routing(self) -> None:
+        observed = []
+
+        def capture_run(args):
+            observed.append(list(args.cmd))
+            return 0
+
+        with mock.patch.object(
+            cli,
+            "cmd_run",
+            side_effect=capture_run,
+        ) as run_command, mock.patch.object(
+            state,
+            "init_db",
+            side_effect=AssertionError("run --dry-run must not initialize DB"),
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.main,
+                [
+                    "run",
+                    "--project",
+                    "p",
+                    "--dry-run",
+                    "--",
+                    "python",
+                    "-c",
+                    "print('ok')",
+                ],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        run_command.assert_called_once()
+        self.assertEqual(
+            [["--", "python", "-c", "print('ok')"]],
+            observed,
+        )
+
+    def test_request_payload_does_not_overwrite_subcommand_routing(self) -> None:
+        observed = []
+
+        def capture_request(args):
+            observed.append((args._subcommand, list(args.command)))
+            return 0
+
+        with mock.patch.object(
+            cli,
+            "cmd_request",
+            side_effect=capture_request,
+        ) as request_command:
+            rc, _stdout, stderr = self.capture(
+                cli.main,
+                [
+                    "request",
+                    "routing-regression",
+                    "--expect-revision",
+                    "0",
+                    "--",
+                    "cancel",
+                    "batch-id",
+                    "--yes",
+                ],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        request_command.assert_called_once()
+        self.assertEqual(
+            [("request", ["cancel", "batch-id", "--yes"])],
+            observed,
+        )
+
+    def test_run_remains_a_protected_write_on_foreign_hosts(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SCHED_ALLOW_FOREIGN_WRITE": ""},
+        ), mock.patch(
+            "socket.gethostname",
+            return_value="login-node",
+        ), mock.patch(
+            "gsched.config.load_config",
+            return_value=self.cfg,
+        ), mock.patch.object(
+            state,
+            "init_db",
+        ) as init_db, mock.patch.object(
+            cli,
+            "cmd_run",
+        ) as run_command:
+            rc, _stdout, stderr = self.capture(
+                cli.main,
+                ["run", "--project", "p", "--", "echo", "ok"],
+            )
+
+        self.assertEqual(2, rc)
+        self.assertIn("写操作 (run)", stderr)
+        init_db.assert_not_called()
+        run_command.assert_not_called()
+
     def test_file_only_local_queries_do_not_touch_state_database(self) -> None:
         for argv in (
             ["markers"],

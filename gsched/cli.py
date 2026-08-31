@@ -3797,7 +3797,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
     )
-    sub = ap.add_subparsers(dest="cmd")
+    # Keep the parser's routing key separate from subcommand payload fields.
+    # `run` intentionally exposes a positional `cmd` remainder; reusing that
+    # name for the selected subcommand replaces "run" with a list and breaks
+    # every set-membership check below before cmd_run can execute.
+    sub = ap.add_subparsers(dest="_subcommand")
 
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
@@ -4002,7 +4006,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_help()
         return 1
 
-    command = getattr(args, "cmd", None)
+    command = getattr(args, "_subcommand", None)
     daemon_action = getattr(args, "action", None) if command == "daemon" else None
     config_get = (
         command == "config" and getattr(args, "config_cmd", None) == "get"
