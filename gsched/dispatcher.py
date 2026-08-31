@@ -1700,10 +1700,16 @@ class Dispatcher:
                 # writer wins, a later cancel observes the published terminal.
                 if not conn.in_transaction:
                     conn.execute("BEGIN IMMEDIATE")
+                rc = self._read_job_rc(j)
+                if rc is not None:
+                    # Preserve the wrapper's durable exit evidence even when a
+                    # concurrent cancel intent wins the terminal status.
+                    state.update_job(conn, j["id"], rc=rc)
                 if self._consume_pending_cancel_before_requeue(
                     conn,
                     j,
                     context="daemon adoption settlement",
+                    rc_if_missing=137,
                 ):
                     cleanup_jobs.extend(
                         (
@@ -1715,13 +1721,11 @@ class Dispatcher:
                     if rc_path is not None:
                         drop_paths.append(rc_path)
                     continue
-                rc = self._read_job_rc(j)
                 if rc is not None:
                     rc_path = self._job_rc_path(j)
                     self.log_line(
                         f"A3: job {j['id']} pgid 已死, 读取持久退出码 rc={rc}"
                     )
-                    state.update_job(conn, j["id"], rc=rc)
                     cleanup_jobs.extend(self._handle_job_done(conn, j, rc))
                     if rc_path is not None:
                         drop_paths.append(rc_path)
@@ -3050,6 +3054,7 @@ class Dispatcher:
         j,
         *,
         context: str,
+        rc_if_missing: int | None = None,
     ) -> bool:
         """Consume durable cancellation before terminal/requeue publication.
 
@@ -3079,15 +3084,16 @@ class Dispatcher:
             return False
         if current["gpu"] is not None:
             self._release_in_tx(conn, current["id"])
-        state.update_job(
-            conn,
-            current["id"],
-            status="cancelled",
-            gpu=None,
-            pgid=None,
-            kill_reason="cancelled",
-            finished_at=state.now(),
-        )
+        fields = {
+            "status": "cancelled",
+            "gpu": None,
+            "pgid": None,
+            "kill_reason": "cancelled",
+            "finished_at": state.now(),
+        }
+        if current["rc"] is None and rc_if_missing is not None:
+            fields["rc"] = rc_if_missing
+        state.update_job(conn, current["id"], **fields)
         for request in requests:
             state.finish_control_request(
                 conn,

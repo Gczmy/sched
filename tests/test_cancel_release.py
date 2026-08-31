@@ -350,8 +350,37 @@ class CancelReleaseRegressionTests(unittest.TestCase):
                 (request_id,),
             ).fetchone()
         self.assertEqual("cancelled", job["status"])
+        self.assertEqual(137, job["rc"])
         self.assertEqual("done", request["status"])
-        dispatcher._read_job_rc.assert_not_called()
+        dispatcher._read_job_rc.assert_called_once()
+        dispatcher._should_skip.assert_not_called()
+        dispatcher._consume_profile.assert_not_called()
+
+    def test_d_adoption_cancel_preserves_durable_exit_code(self) -> None:
+        job_id = self.seed_job("running", pgid=4242)
+        with state.connect() as conn:
+            request_id = state.insert_control_request(conn, job_id)
+        dispatcher = self.dispatcher()
+        dispatcher._prepare_launch_marker = mock.Mock(return_value=False)
+        dispatcher._job_process_state = mock.Mock(return_value="dead")
+        dispatcher._read_job_rc = mock.Mock(return_value=23)
+        dispatcher._should_skip = mock.Mock(return_value=True)
+        dispatcher._consume_profile = mock.Mock()
+        dispatcher._drop_launch_marker = mock.Mock()
+        dispatcher._drop_profile = mock.Mock()
+        dispatcher._drop_rc_path = mock.Mock()
+
+        dispatcher._adopt_running()
+
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE id=?",
+                (request_id,),
+            ).fetchone()
+        self.assertEqual("cancelled", job["status"])
+        self.assertEqual(23, job["rc"])
+        self.assertEqual("done", request["status"])
         dispatcher._should_skip.assert_not_called()
         dispatcher._consume_profile.assert_not_called()
 
