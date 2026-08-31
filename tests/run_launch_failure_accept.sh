@@ -31,6 +31,7 @@ spec = {
 }
 with state.connect() as conn:
     state.insert_batch(conn, "launch-failure", "launch_failure", "mix", [], None, "/tmp", None, project="p")
+    conn.execute("UPDATE batches SET status='active' WHERE id='launch-failure'")
     state.insert_task(conn, "launch-failure", "t1", 1, spec, 0, "p")
     state.insert_job(conn, "launch-failure-t1-v1", "launch-failure", "t1", 1, "fp", None, "p")
     job = conn.execute("SELECT * FROM jobs WHERE id='launch-failure-t1-v1'").fetchone()
