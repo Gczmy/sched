@@ -4,6 +4,8 @@ set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
 PY=${PY:-python3}
+unset SCHED_ALLOW_FOREIGN_WRITE || true
+export SCHED_FAKE_GPUS=0
 sched_accept_make_root SCHED_STATE "sched-submit-health"
 export SCHED_STATE
 cat > "$SCHED_STATE/config.json" <<EOF

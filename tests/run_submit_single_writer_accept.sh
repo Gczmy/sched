@@ -6,6 +6,7 @@ source tests/acceptance_cleanup.sh
 sched_accept_make_root SCHED_STATE "sched-submit-writer"
 export SCHED_STATE
 unset SCHED_ALLOW_FOREIGN_WRITE || true
+export SCHED_FAKE_GPUS=0
 cat > "$SCHED_STATE/config.json" <<'EOF'
 {
   "schema_version": 1,
