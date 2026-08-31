@@ -13,6 +13,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 set -u
 cd "$(dirname "$0")/.."
 PY=${PY:-$(command -v python3 || echo python3)}
+export SCHED_FAKE_GPUS=0:24
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 

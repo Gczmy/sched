@@ -16,6 +16,7 @@ set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
 PY=${PY:-$(command -v python3 || echo python3)}
+export SCHED_FAKE_GPUS=0:24
 ROOT=$(pwd)
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
