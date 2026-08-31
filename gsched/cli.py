@@ -3793,6 +3793,7 @@ def cmd_request(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     state.set_read_only(False)
+    state.set_query_only(False)
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
     )
@@ -4085,12 +4086,18 @@ def main(argv: list[str] | None = None) -> int:
         "notify-inbox",
         "project",
     }
+    db_read_commands = read_commands - {"markers", "notify-inbox"}
     foreign_submit = command == "submit" and foreign and not allow_foreign_write
     foreign_read = foreign and (
         command in read_commands
         or dry_run
         or (command == "daemon" and daemon_action == "status")
     )
+    local_read = not foreign and (
+        command in read_commands
+        or (command == "daemon" and daemon_action == "status")
+    )
+    local_db_read = not foreign and command in db_read_commands
     state.set_read_only(foreign_read or dry_run)
 
     should_init = (
@@ -4100,17 +4107,26 @@ def main(argv: list[str] | None = None) -> int:
         and not foreign_submit
         and not foreign_read
         and not dry_run
+        and (not local_read or local_db_read)
     )
     if should_init:
         try:
-            state.init_db()
+            if local_db_read:
+                state.ensure_db_initialized()
+            else:
+                state.init_db()
         except Exception as error:
             print(
                 f"错误: state DB 初始化或迁移失败 ({error}); 拒绝执行命令",
                 file=sys.stderr,
             )
             state.set_read_only(False)
+            state.set_query_only(False)
             return 1
+    # Local query commands use a coherent private WAL snapshot and never open
+    # the NFS-backed source through SQLite.  Initialization above still creates
+    # or migrates a fresh/legacy DB before query-only mode is enabled.
+    state.set_query_only(local_db_read and not dry_run)
     try:
         return args.fn(args)
     except state.SubmissionBlocked as error:
@@ -4123,6 +4139,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     finally:
         state.set_read_only(False)
+        state.set_query_only(False)
 
 
 if __name__ == "__main__":

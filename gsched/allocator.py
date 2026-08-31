@@ -30,6 +30,13 @@ _UNSET = object()  # P3: by_card 预取参数哨兵 (区分"未传"与"查询失
 
 RELEASE_TIMEOUT_SEC = 300  # releasing 冷却上限 5 分钟 (B5, 原 dispatcher.py:28 死常量迁此)
 
+# A compute-apps hit or an indeterminate physical probe is always fail-closed.
+# Only a positive utilization sample with a complete, empty compute-apps probe
+# is noisy enough to debounce.  Three daemon ticks (~20s from first to third at
+# the default cadence) filters the observed idle-L4 1-2% spikes without making
+# a sustained non-compute workload invisible forever.
+FREE_UTIL_CONFIRM_SAMPLES = 3
+
 
 class Allocator:
     def __init__(
@@ -45,6 +52,10 @@ class Allocator:
         # B26: GPU 健康自愈 —— nvidia-smi 连续异常计数 -> 自动熔断 (2026-08-26 幽灵卡事故)
         self._probe_fail_streak: dict[int, int] = {}
         self._auto_quarantine_threshold = 5  # 连续 5 次探测失败 (~50s) 即熔断
+        # Util-only debounce is intentionally not a persistent GPU status.
+        # While a streak is below threshold, suppress this card in every
+        # allocation path until a clean physical sample clears it.
+        self._dispatch_suppressed: set[int] = set()
         self._mem_cache: dict[int, float] = {}  # 容量进程内缓存 (P3: 静态值, 不重复开 DB 连接)
         if self.fake:
             # 模拟 GPU 数 (0,1,2,3 语义); 支持 "idx:mem" 形式带容量 (GiB, 验收用)
@@ -442,6 +453,20 @@ class Allocator:
 
     # ---------- 注册表状态机 (唯一权威) ----------
 
+    def is_dispatch_suppressed(self, idx: int) -> bool:
+        """Whether a noisy free-card sample suppresses allocation for now.
+
+        ``vars`` keeps this safe for narrow ``Allocator.__new__`` test doubles
+        created before all runtime fields are initialized.
+        """
+        return idx in vars(self).get("_dispatch_suppressed", ())
+
+    def _suppress_dispatch(self, idx: int) -> None:
+        vars(self).setdefault("_dispatch_suppressed", set()).add(idx)
+
+    def _allow_dispatch(self, idx: int) -> None:
+        vars(self).setdefault("_dispatch_suppressed", set()).discard(idx)
+
     def assign(self, job_id: str, want_idx: int | None = None) -> int | None:
         """派发: free 卡原子转 assigned. 返回分配到的卡号或 None."""
         with connect() as conn:
@@ -461,6 +486,8 @@ class Allocator:
             else:
                 cands = available
             for idx in cands:
+                if self.is_dispatch_suppressed(idx):
+                    continue
                 row = conn.execute(
                     "SELECT status FROM gpus WHERE idx=?", (idx,)
                 ).fetchone()
@@ -563,16 +590,34 @@ class Allocator:
 
         by_card 可传入本轮预取结果；None 表示查询失败。
         """
+        sample = self._card_occupancy_sample(idx, by_card)
+        if sample == "indeterminate":
+            return None
+        return sample != "clean"
+
+    def _card_occupancy_sample(
+        self, idx: int, by_card: Any = _UNSET
+    ) -> str:
+        """Classify one physical occupancy sample without losing its cause.
+
+        Results are ``compute``, ``util``, ``clean``, or ``indeterminate``.
+        A complete compute-apps probe is evaluated before utilization so probe
+        uncertainty can never be mistaken for a debouncable utilization-only
+        sample.  ``util`` therefore means exactly: topology/compute probe was
+        complete, no compute PID was present, and utilization was positive.
+        """
         if by_card is _UNSET:
             by_card = self._compute_pids_by_card()
-        if self.fake:
-            return bool((by_card or {}).get(idx))  # fake: util 恒 0, 只看模拟进程
-        util = self._util_opt(idx)
-        if util is not None and util > 0:
-            return True
         if by_card is None:
-            return None  # util=0/未知 且 compute-apps 查不出: 无法排除驻留进程
-        return bool(by_card.get(idx))
+            return "indeterminate"
+        if by_card.get(idx):
+            return "compute"
+        if self.fake:
+            return "clean"
+        util = self._util_opt(idx)
+        if util is None:
+            return "indeterminate"
+        return "util" if util > 0 else "clean"
 
     def _card_has_compute(
         self, idx: int, by_card: Any = _UNSET, known: set[int] | None = None
@@ -633,6 +678,35 @@ class Allocator:
         flag = self._confirm_flag("unmanaged_confirm", idx)
         if os.path.exists(flag):
             os.unlink(flag)
+
+    def _confirm_free_util_occupied(self, idx: int) -> bool:
+        """Confirm consecutive utilization-only positives for a free card.
+
+        One private ``O_EXCL`` marker represents each pre-confirmation sample.
+        The markers are deliberately left saturated once the threshold is met:
+        if the following DB update cannot commit, the next positive sample is
+        still confirmed instead of reopening a dispatchable window.  A clean
+        physical sample resets the sequence.
+        """
+        base = self._confirm_flag("free_util_confirm", idx)
+        ensure_private_directory(os.path.dirname(base))
+        for sample_no in range(1, FREE_UTIL_CONFIRM_SAMPLES):
+            flag = f"{base}.{sample_no}"
+            try:
+                open_private_text(flag, "x").close()
+            except FileExistsError:
+                continue
+            return False
+        return True
+
+    def _reset_free_util_confirm(self, idx: int) -> None:
+        """Reset the utilization-only streak after any clean sample."""
+        base = self._confirm_flag("free_util_confirm", idx)
+        for sample_no in range(1, FREE_UTIL_CONFIRM_SAMPLES):
+            try:
+                os.unlink(f"{base}.{sample_no}")
+            except FileNotFoundError:
+                pass
 
     # ── B26: GPU 健康自愈 (2026-08-26 幽灵卡事故: nvidia-smi 对掉线卡挂起) ──
 
@@ -699,6 +773,10 @@ class Allocator:
                 if occ is None or occ:
                     self._reset_unmanaged_confirm(idx)
                     continue
+                # A genuinely clean sample also invalidates any saturated
+                # util-only sequence which originally moved the card here.
+                self._allow_dispatch(idx)
+                self._reset_free_util_confirm(idx)
                 # 与 settle_releasing 同确认 (M7): 连续 2 次采样才回 free (防抖动)
                 if self._confirm_unmanaged(idx):
                     conn.execute(
@@ -713,7 +791,14 @@ class Allocator:
         return moved
 
     def probe_free(self) -> list[int]:
-        """Remove physically occupied or indeterminate cards from the free pool."""
+        """Remove physically occupied or indeterminate cards from the free pool.
+
+        Compute PIDs and indeterminate probes move immediately (fail-closed).
+        Only utilization without a compute PID is debounced, because idle GPUs
+        can report short 1-2% utilization spikes.  On the confirming sample the
+        DB transition is completed before this method returns, and dispatcher
+        calls this method before selecting any GPU for launch.
+        """
         if self.fake:
             return []
         moved: list[int] = []
@@ -724,10 +809,22 @@ class Allocator:
             by_card = self._compute_pids_by_card() if rows else {}
             for row in rows:
                 idx = row["idx"]
-                occ = self._card_any_occupied(idx, by_card)
-                if occ is not False:
-                    # There must never be a dispatchable confirmation window:
-                    # both observed occupancy and probe uncertainty fail closed.
+                sample = self._card_occupancy_sample(idx, by_card)
+                if sample == "clean":
+                    self._allow_dispatch(idx)
+                    self._reset_free_util_confirm(idx)
+                    continue
+                self._suppress_dispatch(idx)
+                if sample == "util":
+                    if not self._confirm_free_util_occupied(idx):
+                        continue
+                # There must never be a dispatchable confirmation window:
+                # compute occupancy and probe uncertainty fail closed on their
+                # first sample; sustained util-only occupancy does so on its
+                # confirming sample, before dispatcher selects a card.
+                if sample != "util":
+                    self._reset_free_util_confirm(idx)
+                if sample in {"compute", "indeterminate", "util"}:
                     self._set_unmanaged(conn, idx)
                     moved.append(idx)
         return moved
@@ -738,4 +835,8 @@ class Allocator:
             rows = conn.execute(
                 "SELECT idx FROM gpus WHERE status='free' AND quarantined=0"
             ).fetchall()
-            return [r["idx"] for r in rows]
+            return [
+                r["idx"]
+                for r in rows
+                if not self.is_dispatch_suppressed(r["idx"])
+            ]

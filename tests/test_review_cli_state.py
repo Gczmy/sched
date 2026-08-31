@@ -1061,6 +1061,10 @@ class ReviewLegacyJobStateTests(TempStateCase):
                     "UPDATE jobs SET status=? WHERE id=?",
                     (legacy_status, job_id),
                 )
+            # A legacy producer necessarily predates the transactional schema
+            # completion marker.  Current-schema databases intentionally avoid
+            # rescanning all jobs on every read-only CLI invocation.
+            conn.execute("PRAGMA user_version=0")
 
         state.init_db()
 
@@ -1666,6 +1670,404 @@ class ReviewResubmitStateTests(TempStateCase):
         self.assertTrue(os.path.exists(done_marker))
 
 
+class ReviewLocalQueryOnlyTests(TempStateCase):
+    def test_file_only_local_queries_do_not_touch_state_database(self) -> None:
+        for argv in (
+            ["markers"],
+            ["notify-inbox", "--json"],
+            ["daemon", "status"],
+        ):
+            with self.subTest(argv=argv), mock.patch.object(
+                state,
+                "ensure_db_initialized",
+                side_effect=AssertionError("file-only query must not inspect DB"),
+            ), mock.patch.object(
+                state,
+                "init_db",
+                side_effect=AssertionError("file-only query must not initialize DB"),
+            ), mock.patch.object(
+                state,
+                "connect",
+                side_effect=AssertionError("file-only query must not connect DB"),
+            ):
+                rc, _stdout, stderr = self.capture(cli.main, list(argv))
+
+            self.assertEqual(0, rc, stderr)
+            self.assertFalse(state.query_only())
+
+    def test_local_status_recovers_after_four_writer_snapshot_collisions(self) -> None:
+        self.seed_batch(job_status="pending")
+        database = state.db_path()
+        request_write = threading.Event()
+        write_done = threading.Event()
+        release_writer = threading.Event()
+        writer_errors = []
+
+        def churn_writer():
+            try:
+                with contextlib.closing(sqlite3.connect(database, timeout=2.0)) as conn:
+                    for index in range(4):
+                        if not request_write.wait(timeout=2.0):
+                            raise AssertionError("snapshot test writer was not released")
+                        request_write.clear()
+                        conn.execute(
+                            "UPDATE batches SET name=? WHERE id=?",
+                            (f"batch-{index}", "batch-20260829-000000"),
+                        )
+                        conn.commit()
+                        write_done.set()
+                    if not release_writer.wait(timeout=3.0):
+                        raise AssertionError("snapshot test writer was not released")
+            except BaseException as error:
+                writer_errors.append(error)
+                write_done.set()
+
+        writer = threading.Thread(target=churn_writer, daemon=True)
+        writer.start()
+        real_copyfile = state.shutil.copyfile
+        main_db_copies = 0
+
+        def copy_with_controlled_churn(source, destination, *args, **kwargs):
+            nonlocal main_db_copies
+            result = real_copyfile(source, destination, *args, **kwargs)
+            if os.path.abspath(source) == os.path.abspath(database):
+                main_db_copies += 1
+                if main_db_copies <= 4:
+                    write_done.clear()
+                    request_write.set()
+                    if not write_done.wait(timeout=2.0):
+                        raise AssertionError("snapshot test writer did not commit")
+            return result
+
+        try:
+            with mock.patch(
+                "socket.gethostname",
+                return_value="review-node",
+            ), mock.patch.object(
+                state,
+                "init_db",
+                wraps=state.init_db,
+            ) as init_db, mock.patch.object(
+                state.shutil,
+                "copyfile",
+                side_effect=copy_with_controlled_churn,
+            ), mock.patch(
+                "gsched.state.time.sleep",
+            ) as sleep:
+                rc, stdout, stderr = self.capture(
+                    cli.main,
+                    ["status", "--json"],
+                )
+        finally:
+            request_write.set()
+            release_writer.set()
+            writer.join(timeout=3.0)
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual([], writer_errors)
+        self.assertEqual(0, rc, stderr)
+        json.loads(stdout)
+        init_db.assert_not_called()
+        self.assertGreaterEqual(main_db_copies, 6)
+        self.assertEqual(
+            [mock.call(delay) for delay in state._SNAPSHOT_RETRY_DELAYS[1:5]],
+            sleep.call_args_list,
+        )
+
+    def test_snapshot_retry_is_bounded_when_source_never_stabilizes(self) -> None:
+        database = state.db_path()
+        signature_counter = 0
+
+        def changing_signature(_path):
+            nonlocal signature_counter
+            signature_counter += 1
+            stamp = signature_counter
+            return ((1, 1, 1, stamp, stamp), None)
+
+        with mock.patch.object(
+            state,
+            "_snapshot_signature",
+            side_effect=changing_signature,
+        ), mock.patch("gsched.state.time.sleep") as sleep:
+            with self.assertRaisesRegex(
+                state.StateError,
+                rf"after {len(state._SNAPSHOT_RETRY_DELAYS)} attempts",
+            ):
+                with state._read_only_database(database):
+                    self.fail("an unstable snapshot must not be yielded")
+
+        self.assertEqual(2 * len(state._SNAPSHOT_RETRY_DELAYS), signature_counter)
+        self.assertEqual(
+            [mock.call(delay) for delay in state._SNAPSHOT_RETRY_DELAYS[1:]],
+            sleep.call_args_list,
+        )
+
+    def test_current_local_status_is_read_only_during_writer_transaction(self) -> None:
+        self.seed_batch(job_status="pending")
+        database = state.db_path()
+        writer = sqlite3.connect(database, timeout=0.2)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE batches SET name=name WHERE id=?",
+            ("batch-20260829-000000",),
+        )
+
+        real_connect = sqlite3.connect
+        opened = []
+        statements = []
+
+        def recording_connect(target, *args, **kwargs):
+            conn = real_connect(target, *args, **kwargs)
+            opened.append((str(target), dict(kwargs)))
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="review-node",
+        ), mock.patch.object(
+            state,
+            "init_db",
+            wraps=state.init_db,
+        ) as init_db, mock.patch(
+            "sqlite3.connect",
+            side_effect=recording_connect,
+        ):
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        json.loads(stdout)
+        init_db.assert_not_called()
+        self.assertGreaterEqual(len(opened), 2)
+        self.assertTrue(
+            all("mode=ro" in target and options.get("uri") for target, options in opened),
+            opened,
+        )
+        normalized = [statement.strip().lower() for statement in statements]
+        self.assertFalse(
+            any("journal_mode" in statement for statement in normalized),
+            statements,
+        )
+        self.assertFalse(
+            any(
+                statement.startswith(
+                    ("begin immediate", "insert ", "update ", "delete ",
+                     "create ", "alter ", "drop ")
+                )
+                for statement in normalized
+            ),
+            statements,
+        )
+        self.assertFalse(state.query_only())
+
+        # The CLI reader neither commits, rolls back, nor poisons the live
+        # writer; its original transaction remains usable.
+        writer.execute(
+            "UPDATE batches SET status=status WHERE id=?",
+            ("batch-20260829-000000",),
+        )
+        self.assertTrue(writer.in_transaction)
+        writer.rollback()
+
+    def test_fresh_local_status_initializes_then_reopens_query_only(self) -> None:
+        database = state.db_path()
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(database + suffix)
+
+        with mock.patch("socket.gethostname", return_value="review-node"):
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual([], json.loads(stdout)["batches"])
+        self.assertFalse(state.query_only())
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(
+                state.DB_SCHEMA_VERSION,
+                conn.execute("PRAGMA user_version").fetchone()[0],
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master"
+                    " WHERE type='table' AND name='operation_requests'"
+                ).fetchone()
+            )
+
+    def test_current_local_status_does_not_create_missing_source_sidecars(self) -> None:
+        database = state.db_path()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        for suffix in ("-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(database + suffix)
+            self.assertFalse(os.path.exists(database + suffix))
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="review-node",
+        ), mock.patch.object(
+            state,
+            "init_db",
+            wraps=state.init_db,
+        ) as init_db:
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        json.loads(stdout)
+        init_db.assert_not_called()
+        for suffix in ("-wal", "-shm"):
+            self.assertFalse(os.path.exists(database + suffix))
+
+    def test_stale_schema_marker_runs_migration_before_local_query(self) -> None:
+        database = state.db_path()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            conn.execute("PRAGMA user_version=0")
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="review-node",
+        ), mock.patch.object(
+            state,
+            "init_db",
+            wraps=state.init_db,
+        ) as init_db:
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        json.loads(stdout)
+        init_db.assert_called_once_with()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(
+                state.DB_SCHEMA_VERSION,
+                conn.execute("PRAGMA user_version").fetchone()[0],
+            )
+
+    def test_rollback_journal_database_is_converted_before_local_query(self) -> None:
+        database = state.db_path()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(
+                "delete",
+                conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+            )
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="review-node",
+        ), mock.patch.object(
+            state,
+            "init_db",
+            wraps=state.init_db,
+        ) as init_db:
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(0, rc, stderr)
+        json.loads(stdout)
+        init_db.assert_called_once_with()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(
+                "wal",
+                conn.execute("PRAGMA journal_mode").fetchone()[0],
+            )
+
+    def test_newer_schema_marker_fails_closed_without_downgrade(self) -> None:
+        database = state.db_path()
+        newer = state.DB_SCHEMA_VERSION + 1
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            conn.execute(f"PRAGMA user_version={newer}")
+
+        with mock.patch(
+            "socket.gethostname",
+            return_value="review-node",
+        ), mock.patch.object(state, "init_db") as init_db:
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(1, rc)
+        self.assertEqual("", stdout)
+        self.assertIn("schema is newer", stderr)
+        init_db.assert_not_called()
+        self.assertFalse(state.query_only())
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(newer, conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def test_init_retry_closes_connection_when_wal_pragma_fails(self) -> None:
+        database = state.db_path()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            conn.execute("PRAGMA user_version=0")
+
+        real_connect = sqlite3.connect
+        failed_connections = []
+
+        class FailingJournalConnection:
+            def __init__(self, raw):
+                self.raw = raw
+                self.closed = False
+
+            def __getattr__(self, name):
+                return getattr(self.raw, name)
+
+            @property
+            def row_factory(self):
+                return self.raw.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value):
+                self.raw.row_factory = value
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.strip().lower() == "pragma journal_mode=wal":
+                    raise sqlite3.OperationalError("locking protocol")
+                return self.raw.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self.closed = True
+                self.raw.close()
+
+        failed_once = False
+
+        def flaky_connect(target, *args, **kwargs):
+            nonlocal failed_once
+            raw = real_connect(target, *args, **kwargs)
+            if not kwargs.get("uri") and not failed_once:
+                failed_once = True
+                wrapped = FailingJournalConnection(raw)
+                failed_connections.append(wrapped)
+                return wrapped
+            return raw
+
+        with mock.patch("sqlite3.connect", side_effect=flaky_connect), mock.patch(
+            "gsched.state.time.sleep",
+        ) as sleep:
+            state.init_db()
+
+        self.assertEqual(1, len(failed_connections))
+        self.assertTrue(failed_connections[0].closed)
+        sleep.assert_called_once_with(state._INIT_DB_RETRY_DELAYS[0])
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(
+                state.DB_SCHEMA_VERSION,
+                conn.execute("PRAGMA user_version").fetchone()[0],
+            )
+
+
 class ReviewForeignReadTests(TempStateCase):
     def _filesystem_snapshot(self):
         snapshot = {}
@@ -1740,6 +2142,72 @@ class ReviewForeignReadTests(TempStateCase):
             self.assertNotIn("Traceback", stderr)
             init_db.assert_not_called()
             self.assertEqual(before, self._filesystem_snapshot())
+
+    def test_foreign_query_rejects_newer_schema_without_migration(self) -> None:
+        database = state.db_path()
+        newer = state.DB_SCHEMA_VERSION + 1
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            conn.execute(f"PRAGMA user_version={newer}")
+
+        before = self._filesystem_snapshot()
+        with mock.patch.dict(
+            os.environ,
+            {"SCHED_ALLOW_FOREIGN_WRITE": ""},
+        ), mock.patch(
+            "socket.gethostname",
+            return_value="login-node",
+        ), mock.patch.object(
+            state,
+            "init_db",
+        ) as init_db, mock.patch.object(
+            cli,
+            "_daemon_health",
+            return_value={},
+        ):
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(1, rc)
+        self.assertEqual("", stdout)
+        self.assertIn("schema is newer", stderr)
+        init_db.assert_not_called()
+        self.assertEqual(before, self._filesystem_snapshot())
+
+    def test_foreign_query_rejects_rollback_journal_snapshot(self) -> None:
+        database = state.db_path()
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(
+                "delete",
+                conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+            )
+
+        before = self._filesystem_snapshot()
+        with mock.patch.dict(
+            os.environ,
+            {"SCHED_ALLOW_FOREIGN_WRITE": ""},
+        ), mock.patch(
+            "socket.gethostname",
+            return_value="login-node",
+        ), mock.patch.object(
+            state,
+            "init_db",
+        ) as init_db, mock.patch.object(
+            cli,
+            "_daemon_health",
+            return_value={},
+        ):
+            rc, stdout, stderr = self.capture(
+                cli.main,
+                ["status", "--json"],
+            )
+
+        self.assertEqual(1, rc)
+        self.assertEqual("", stdout)
+        self.assertIn("not in WAL mode", stderr)
+        init_db.assert_not_called()
+        self.assertEqual(before, self._filesystem_snapshot())
 
     def test_read_only_connection_without_sidecars_uses_private_stable_snapshot(self) -> None:
         self.seed_batch()
@@ -4492,7 +4960,9 @@ class ReviewCleanMigrationAndConfigTests(TempStateCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(set(), tables)
+        self.assertEqual(0, version)
 
     def test_main_fails_closed_when_database_migration_fails(self) -> None:
         with mock.patch.object(

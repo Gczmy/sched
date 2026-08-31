@@ -3496,6 +3496,13 @@ class Dispatcher:
                 used += int(self.cfg.get("gpu_job_cpus", DEFAULT_GPU_JOB_CPUS))
         return used
 
+    def _gpu_dispatch_suppressed(self, idx: int) -> bool:
+        """Share Allocator's util-debounce gate across every packing path."""
+        # Use the concrete implementation as an unbound method so narrow Mock
+        # allocators in state-machine tests default to an empty suppression set
+        # instead of fabricating a truthy ``is_dispatch_suppressed`` method.
+        return Allocator.is_dispatch_suppressed(self.allocator, idx)
+
     def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None, project: str | None = None) -> int | None:
         """事务内 assign (定案 39 L2 共享装箱).
 
@@ -3560,6 +3567,8 @@ class Dispatcher:
             else:
                 gpu_order = list(affinity) + [i for i in self.allocator.gpu_list if i not in affinity]
             for idx in gpu_order:
+                if self._gpu_dispatch_suppressed(idx):
+                    continue
                 row = conn.execute(
                     "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
                 ).fetchone()
@@ -3609,6 +3618,8 @@ class Dispatcher:
         else:
             gpu_order_s = list(affinity_s) + [i for i in self.allocator.gpu_list if i not in affinity_s]
         for idx in gpu_order_s:
+            if self._gpu_dispatch_suppressed(idx):
+                continue
             row = conn.execute(
                 "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
             ).fetchone()

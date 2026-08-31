@@ -223,6 +223,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 - `task --json` 固定 `schema_version:1`，输出 `batch_id`、`batch_name`、`batch_revision`、`task` 与 `jobs` 版本时间线；每个版本含状态、运行结果/时间、resources、规范化 spec 与 log 路径。stdout 只含这一份 JSON。
 - `history --json` 固定 `schema_version:1`，`limit` 缺省 50、钳制 1..200；顶层含 `history`、`truncated` 与 `next_cursor`，每项含 `batch_id`、`batch_name`、`task`、`status`、`version` 及运行结果/时间。
 - 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check` 默认拒绝。
+- 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以只读方式核验 schema 版本、必需对象/列与 WAL 文件头；schema 已是当前版本时，查询连接固定使用私有快照上的 `mode=ro + query_only`，不再对源库执行 `journal_mode=WAL`、`BEGIN IMMEDIATE` 或幂等迁移。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、旧 schema、非 WAL 库或权限漂移才进入带有界锁重试的 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 不检查或打开数据库。
 - `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop` 与 `config set`；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
 - 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒只在提交后发生，marker 由 daemon 按数据库权威状态协调。`retry`/`resubmit` 的最终事务、`clean` 的发布重跑阶段以及 `cancel` 的任务分类与写入，都会在读取权威状态前取得 SQLite writer claim，防止 daemon 在状态校验与首个 job/task mutation 之间收敛或派发任务。daemon 的节点重启恢复、接管终态判定与重试发布也使用同一 writer 顺序；已落库的 cancel request 或 `kill_reason=cancelled` 永远优先于自动重试/恢复回队。`daemon start/stop` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。
 - 本地 `submit` 与网关 inbox payload 都可在 submission gate 外做预览校验和计算指纹，但最终写入前必须在同一 gate 内按最新同名代际重验依赖存在性、完整依赖图、批次 ID 与同名终态，并原子提交批次/任务/job（inbox 同时提交请求回执）。因此并发提交不能分别基于旧快照发布 `A → B`、`B → A` 环，也不会在 `clean` 两阶段之间或 `retry`/`resubmit` 事务中途插入第二个同名非终态批次；反向顺序会在重开旧批次前拒绝已有的同名非终态实例，`clean` 在删产物前和发布重跑前各重验一次。daemon 退出门禁生效时 payload 与 pending 请求保留供恢复后重试。
@@ -240,6 +241,13 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
        discarded (退役终态, 不可 retry/resubmit)
 GPU:   free ⇄ assigned ⇄ releasing; 外部占用 → unmanaged; 人工 → quarantined
 ```
+
+空闲 GPU 的物理探测区分信号来源：发现 compute PID 或 compute/topology 探测不确定时，
+仍在首次采样立即转 `unmanaged`（fail-closed）；只有“compute 列表完整且为空、但
+`utilization.gpu > 0`”这一类易受驱动底噪影响的信号才做连续 3 次确认。确认期间该卡
+保持 `free` 展示但从所有派发路径临时排除，任一干净采样立即清零并恢复派发；连续确认
+成立后才持久转 `unmanaged`。因此 1–2% 的单次/短时空闲抖动不会制造状态和日志风暴，
+也不存在把确认中的可疑卡分给新任务的窗口。
 
 daemon 只派发 `active` 批次中每个 task 的最新版本；终态/queued 批次和旧版本即使因
 历史数据遗留为 pending，也不会在 daemon 重启后重新执行，且不会阻塞批次收敛、

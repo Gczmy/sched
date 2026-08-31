@@ -13,6 +13,7 @@ import shutil
 import stat
 import tempfile
 import secrets
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta
@@ -138,6 +139,58 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 );
 """
 
+# SQLite's user_version is the durable, transactional completion marker for the
+# state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
+# gains a new persistent change.  The marker is written last in init_db(), so a
+# reader may trust it only after the whole migration transaction committed.
+DB_SCHEMA_VERSION = 1
+
+_REQUIRED_SCHEMA_OBJECTS = {
+    "table": {
+        "batches",
+        "tasks",
+        "jobs",
+        "gpus",
+        "gpu_jobs",
+        "profile_cache",
+        "incidents",
+        "control_requests",
+        "operation_requests",
+    },
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu"},
+    "trigger": {
+        "revision_batch_status",
+        "revision_task_insert",
+        "revision_task_delete",
+        "revision_task_membership",
+        "revision_job_insert",
+        "revision_job_delete",
+        "revision_job_state",
+        "revision_gpu_state",
+        "revision_gpu_ignore",
+        "revision_gpu_job_insert",
+        "revision_gpu_job_delete",
+        "revision_gpu_job_update",
+    },
+}
+
+# Columns added outside the base CREATE TABLE statements.  Checking these
+# protects the fast path against a falsely stamped or partially copied DB.
+_REQUIRED_MIGRATED_COLUMNS = {
+    "batches": {"notify", "project", "priority", "revision"},
+    "tasks": {"project"},
+    "jobs": {"project", "progress"},
+    "gpus": {"mem_total_gib", "revision"},
+    "operation_requests": {"output_compacted"},
+}
+
+_INIT_DB_RETRY_DELAYS = (0.05, 0.15, 0.3)
+
+# A daemon tick can replace/extend the WAL while a CLI copies it.  Four
+# immediate attempts tend to collide with the same write burst on NFS, so use
+# short exponential-ish backoff while retaining a hard latency bound (1.585s).
+_SNAPSHOT_RETRY_DELAYS = (0.0, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8)
+
 
 class StateError(Exception):
     pass
@@ -237,6 +290,7 @@ def touch_private_file(path: str) -> None:
         os.close(fd)
 
 _read_only = False
+_query_only = False
 
 
 class _CommitNeutralConnection:
@@ -316,6 +370,32 @@ def set_read_only(enabled: bool) -> None:
 
 def read_only() -> bool:
     return _read_only
+
+
+def set_query_only(enabled: bool) -> None:
+    """Use a private SQLite read-only snapshot for local query commands.
+
+    Foreign-host reads keep using ``set_read_only`` and a private snapshot so
+    they never join the compute node's WAL locking domain.  Query-only mode
+    applies the same isolation to a CLI on the configured compute node after
+    init_db() has safely initialized/migrated the database.
+    """
+    global _query_only
+    _query_only = bool(enabled)
+
+
+def query_only() -> bool:
+    return _query_only
+
+
+def _require_supported_schema(conn: sqlite3.Connection) -> None:
+    """Reject a snapshot produced by a newer sched build."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version > DB_SCHEMA_VERSION:
+        raise StateError(
+            "state database schema is newer than this sched build: "
+            f"{version} > {DB_SCHEMA_VERSION}"
+        )
 
 
 def hostname() -> str:
@@ -605,14 +685,159 @@ def _execute_sql_statements(conn: sqlite3.Connection, script: str) -> None:
         raise StateError("incomplete SQL migration statement")
 
 
-def init_db() -> str:
-    """建目录 + 建表 + 迁移, 返回 db 路径. 幂等."""
-    if _read_only:
-        raise StateError("read-only state mode cannot initialize or migrate the database")
-    p = db_path()
-    if _bound_connection.get() is not None:
-        return p
-    ensure_private_directory(os.path.dirname(p))
+def _private_state_paths_current(database: str) -> bool:
+    """Return whether the existing DB tree already has its required modes.
+
+    The old init_db() repaired these modes on every invocation.  The schema
+    fast path must retain that behavior when repair is actually needed, while
+    avoiding chmod/open-for-write work in the normal query path.
+    """
+    root = os.path.normpath(os.path.abspath(default_state_dir()))
+    host = os.path.normpath(os.path.abspath(os.path.dirname(database)))
+    try:
+        relative = os.path.relpath(host, root)
+    except ValueError:
+        return False
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return False
+
+    directories = [root]
+    if relative != ".":
+        current = root
+        for component in relative.split(os.sep):
+            current = os.path.join(current, component)
+            directories.append(current)
+    for path in directories:
+        try:
+            entry = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        if (
+            stat.S_ISLNK(entry.st_mode)
+            or not stat.S_ISDIR(entry.st_mode)
+            or stat.S_IMODE(entry.st_mode) != 0o700
+        ):
+            return False
+
+    for path in (database, database + "-wal", database + "-shm"):
+        try:
+            entry = os.lstat(path)
+        except FileNotFoundError:
+            if path == database:
+                return False
+            continue
+        if (
+            stat.S_ISLNK(entry.st_mode)
+            or not stat.S_ISREG(entry.st_mode)
+            or stat.S_IMODE(entry.st_mode) != 0o600
+        ):
+            return False
+    return True
+
+
+def _database_schema_is_current(database: str) -> bool:
+    """Inspect schema readiness without opening the state DB for writing."""
+    if not _private_state_paths_current(database):
+        return False
+    # Inspect a stable private copy.  Even SQLite mode=ro may need a source
+    # -shm file for WAL, so opening the NFS-backed production DB directly would
+    # not meet the no-side-effect/no-lock promise of this probe.
+    with _read_only_database(database) as (read_path, immutable):
+        # The persistent SQLite header bytes at offsets 18/19 are the file
+        # write/read versions: 2/2 means WAL, while 1/1 is rollback-journal
+        # mode.  Check them before opening SQLite because ``immutable=1``
+        # intentionally reports ``delete`` when an idle WAL database has no
+        # sidecar, and a non-immutable read-only open may try to create private
+        # WAL/SHM files.  A rollback-journal hot copy is unsafe here because we
+        # deliberately do not copy its ``-journal`` file.
+        if not _snapshot_uses_wal(read_path):
+            return False
+        uri = Path(read_path).absolute().as_uri() + "?mode=ro"
+        if immutable:
+            uri += "&immutable=1"
+        conn = sqlite3.connect(uri, timeout=5.0, uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version > DB_SCHEMA_VERSION:
+                raise StateError(
+                    "state database schema is newer than this sched build: "
+                    f"{version} > {DB_SCHEMA_VERSION}"
+                )
+            if version != DB_SCHEMA_VERSION:
+                return False
+
+            objects: dict[str, set[str]] = {
+                kind: set() for kind in _REQUIRED_SCHEMA_OBJECTS
+            }
+            for kind, name in conn.execute(
+                "SELECT type, name FROM sqlite_master"
+                " WHERE type IN ('table','index','trigger')"
+            ):
+                if kind in objects:
+                    objects[kind].add(name)
+            if any(
+                not required.issubset(objects[kind])
+                for kind, required in _REQUIRED_SCHEMA_OBJECTS.items()
+            ):
+                return False
+
+            for table, required in _REQUIRED_MIGRATED_COLUMNS.items():
+                columns = {
+                    row[1]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if not required.issubset(columns):
+                    return False
+            return True
+        finally:
+            conn.close()
+
+
+def _retryable_init_error(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_LOCKED", 6),
+        getattr(sqlite3, "SQLITE_PROTOCOL", 15),
+    }:
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+            "locking protocol",
+            "database is busy",
+        )
+    )
+
+
+def _snapshot_uses_wal(database: str) -> bool:
+    """Read SQLite's persistent file-format journal bytes from a private copy."""
+    with open(database, "rb") as stream:
+        header = stream.read(20)
+    return (
+        len(header) >= 20
+        and header[:16] == b"SQLite format 3\x00"
+        and header[18:20] == b"\x02\x02"
+    )
+
+
+def _require_wal_snapshot(database: str) -> None:
+    if not _snapshot_uses_wal(database):
+        raise StateError(
+            "state database is not in WAL mode; refusing an unsafe "
+            "rollback-journal snapshot"
+        )
+
+
+def _initialize_database() -> None:
+    """Run one atomic schema initialization/migration attempt."""
+    ensure_private_directory(os.path.dirname(db_path()))
     with connect() as conn:
         conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
         migrate_gpu_jobs(conn)
@@ -622,7 +847,60 @@ def init_db() -> str:
         migrate_operation_requests(conn)
         migrate_revisions(conn)
         migrate_legacy_job_statuses(conn)
-    return p
+        conn.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+
+
+def ensure_db_initialized() -> str:
+    """Initialize only when the read-only schema probe finds work to do.
+
+    Query commands use this entry point so an already-current database never
+    enters init_db() and therefore never requests ``BEGIN IMMEDIATE``.  A
+    fresh, stale, partially copied, or permission-drifted state still takes the
+    full atomic migration path.
+    """
+    if _read_only or _query_only:
+        raise StateError("read-only state mode cannot initialize or migrate the database")
+    p = db_path()
+    if _bound_connection.get() is not None:
+        return p
+    delays = (0.0, *_INIT_DB_RETRY_DELAYS)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            current = _database_schema_is_current(p)
+        except sqlite3.OperationalError as error:
+            if attempt == len(delays) - 1 or not _retryable_init_error(error):
+                raise
+            continue
+        if current:
+            return p
+        break
+    else:
+        raise AssertionError("unreachable ensure_db_initialized retry loop")
+    return init_db()
+
+
+def init_db() -> str:
+    """建目录 + 建表 + 迁移, 返回 db 路径. 幂等且当前 schema 只读快返."""
+    if _read_only or _query_only:
+        raise StateError("read-only state mode cannot initialize or migrate the database")
+    p = db_path()
+    if _bound_connection.get() is not None:
+        return p
+    delays = (0.0, *_INIT_DB_RETRY_DELAYS)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            if _database_schema_is_current(p):
+                return p
+            _initialize_database()
+            return p
+        except sqlite3.OperationalError as error:
+            if attempt == len(delays) - 1 or not _retryable_init_error(error):
+                raise
+    raise AssertionError("unreachable init_db retry loop")
 
 
 def migrate_legacy_job_statuses(conn: sqlite3.Connection) -> None:
@@ -924,7 +1202,9 @@ def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
     snapshot_db = os.path.join(snapshot_dir, os.path.basename(path))
     snapshot_wal = snapshot_db + "-wal"
     try:
-        for _ in range(4):
+        for delay in _SNAPSHOT_RETRY_DELAYS:
+            if delay:
+                time.sleep(delay)
             before = _snapshot_signature(path)
             if before[0] is None:
                 raise StateError(f"state database does not exist: {path}")
@@ -945,7 +1225,10 @@ def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
             if before == _snapshot_signature(path):
                 yield snapshot_db, before[1] is None
                 return
-        raise StateError("state database changed while creating read-only snapshot")
+        raise StateError(
+            "state database changed while creating read-only snapshot"
+            f" after {len(_SNAPSHOT_RETRY_DELAYS)} attempts"
+        )
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
 
@@ -960,12 +1243,31 @@ def connect() -> Iterator[sqlite3.Connection]:
     p = db_path()
     if _read_only:
         with _read_only_database(p) as (read_path, immutable):
+            _require_wal_snapshot(read_path)
             uri = Path(read_path).absolute().as_uri() + "?mode=ro"
             if immutable:
                 uri += "&immutable=1"
             conn = sqlite3.connect(uri, timeout=5.0, uri=True)
             conn.row_factory = sqlite3.Row
             try:
+                _require_supported_schema(conn)
+                yield conn
+            finally:
+                conn.close()
+        return
+
+    if _query_only:
+        with _read_only_database(p) as (read_path, immutable):
+            _require_wal_snapshot(read_path)
+            uri = Path(read_path).absolute().as_uri() + "?mode=ro"
+            if immutable:
+                uri += "&immutable=1"
+            conn = sqlite3.connect(uri, timeout=5.0, uri=True)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("PRAGMA busy_timeout=5000")
+                _require_supported_schema(conn)
                 yield conn
             finally:
                 conn.close()
@@ -974,18 +1276,19 @@ def connect() -> Iterator[sqlite3.Connection]:
     ensure_private_directory(os.path.dirname(p))
     ensure_private_file(p)
     conn = sqlite3.connect(p, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    for sidecar in (p + "-wal", p + "-shm"):
-        if os.path.exists(sidecar):
-            ensure_private_file(sidecar)
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        for sidecar in (p + "-wal", p + "-shm"):
+            if os.path.exists(sidecar):
+                ensure_private_file(sidecar)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
         for sidecar in (p + "-wal", p + "-shm"):
