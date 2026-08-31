@@ -53,14 +53,33 @@ PYEOF
 }
 
 start_fake() { # $1=state_dir
+  local payload
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
   SCHED_FAKE_GPUS=0 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1 \
     || { echo "failed to start isolated notify daemon: $1" >&2; exit 1; }
   for _ in $(seq 1 30); do
-    grep -q "fake=True" "$1/testnode/scheduler.log" 2>/dev/null && return 0
+    grep -q "fake=True" "$1/testnode/scheduler.log" 2>/dev/null && break
     sleep 1
   done
-  echo "isolated notify daemon did not confirm fake mode: $1" >&2
+  grep -q "fake=True" "$1/testnode/scheduler.log" 2>/dev/null || {
+    echo "isolated notify daemon did not confirm fake mode: $1" >&2
+    exit 1
+  }
+  for _ in $(seq 1 60); do
+    payload=$($PY -m gsched.cli status --json 2>/dev/null) || {
+      sleep 1
+      continue
+    }
+    if printf '%s\n' "$payload" | $PY -c '
+import json, sys
+age = (json.load(sys.stdin).get("daemon_health") or {}).get("tick_ok_age_s")
+raise SystemExit(0 if isinstance(age, (int, float)) and age < 60 else 1)
+'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "isolated notify daemon did not complete a healthy tick: $1" >&2
   exit 1
 }
 
