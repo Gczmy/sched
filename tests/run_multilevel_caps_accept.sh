@@ -4,7 +4,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # run_multilevel_caps_accept.sh — B12-c 三级打包上限验收 (fake-gpu)
 # =============================================================================
 # 覆盖场景:
-#   S1 全局上限: co_locate_max_jobs=1 -> 两个共享任务串行 (显存再宽也不叠)
+#   S1 全局上限: co_locate_max_jobs=2 -> 并发 2 个, 第 3 个排队
 #   S2 卡级上限: gpus[{idx,max_jobs}] 异构形态 -> 覆盖全局缺省密度
 #   S3 项目级上限: 只数该项目在此卡的任务; 其他项目不受影响
 #   S4 自然排水: 上限调低不驱逐已 pack 任务, 退出后新 pack 遵守新上限
@@ -25,8 +25,17 @@ bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 
 stop_daemon() {
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
-  $PY -m gsched.cli daemon stop >/dev/null 2>&1
+  $PY -m gsched.cli daemon stop >/dev/null 2>&1 \
+    || { bad "daemon stop 失败 ($1)"; return 1; }
   sleep 1
+}
+
+wait_log() { # $1=log $2=pattern $3=超时秒
+  for _ in $(seq 1 ${3:-60}); do
+    grep -q "$2" "$1" 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
 }
 
 count_status() { # $1=dir $2=batch $3=status
@@ -59,35 +68,43 @@ wait_for() { # $1=条件 $2=超时秒
   return 1
 }
 
-mk_batch() { # $1=dir $2=batch名 $3=sleep秒 $4=项目(缺省 default)
-  local proj=${4:-default}
+mk_batch() { # $1=dir $2=batch名 $3=项目(缺省 default); release 前持续 running
+  local proj=${3:-default}
   cat > $1/$2.json << EOF
 {
   "name": "$2", "project": "$proj", "mode": "mix",
   "tasks": [
-    {"id": "t1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep($3)"],
-     "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 1.0}},
-    {"id": "t2", "cmd": ["{VENV:k}", "-c", "import time; time.sleep($3)"],
-     "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 1.0}},
-    {"id": "t3", "cmd": ["{VENV:k}", "-c", "import time; time.sleep($3)"],
-     "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 1.0}}
+    {"id": "t1", "cmd": ["/bin/bash", "-c", "while [ ! -f '$1/$2.release' ]; do sleep 1; done"],
+     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}},
+    {"id": "t2", "cmd": ["/bin/bash", "-c", "while [ ! -f '$1/$2.release' ]; do sleep 1; done"],
+     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}},
+    {"id": "t3", "cmd": ["/bin/bash", "-c", "while [ ! -f '$1/$2.release' ]; do sleep 1; done"],
+     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}}
   ]
 }
 EOF
 }
 
-submit_and_start() { # $1=dir $2=batch名
+start_and_submit() { # $1=dir $2=batch名
   export SCHED_STATE=$1 SCHED_CONFIG=$1/config.json
-  $PY -m gsched.cli submit $1/$2.json >/dev/null 2>&1 || { bad "$2 submit 失败"; exit 1; }
   SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1 \
     || { bad "$2 daemon start 失败"; exit 1; }
-  sleep 2
+  wait_log "$1/testnode/scheduler.log" "fake=True" 30 \
+    || { bad "$2 daemon 未进入 fake 模式"; exit 1; }
+  $PY -m gsched.cli submit $1/$2.json >/dev/null 2>&1 \
+    || { bad "$2 submit 失败"; exit 1; }
+}
+
+release_and_wait_done() { # $1=dir $2=batch $3=task数
+  : > "$1/$2.release" || { bad "$2 release 失败"; return 1; }
+  wait_for "status_count_is \"$1\" $2 done $3" 120 \
+    || { bad "$2 释放后未全部 done"; return 1; }
 }
 
 echo "=== B12-c 三级打包上限验收 ==="
 
 # ---------- S1: 全局上限 ----------
-echo "--- S1: 全局 co_locate_max_jobs=1 -> 串行 ---"
+echo "--- S1: 全局 co_locate_max_jobs=2 -> 2 并发 + 1 排队 ---"
 sched_accept_make_root S1 "sched-caps-global"
 cat > $S1/config.json << EOF
 {
@@ -98,11 +115,10 @@ cat > $S1/config.json << EOF
   "default_project": "default", "venvs": {"k": "$PY"}
 }
 EOF
-mk_batch $S1 cap1 20
-submit_and_start $S1 cap1
-wait_for 'status_count_is "$S1" cap1 running 2' 25 \
+mk_batch $S1 cap1
+start_and_submit $S1 cap1
+wait_for 'status_count_is "$S1" cap1 running 2' 90 \
   && ok "全局上限=2: 2 个并发" || bad "running=$(count_status $S1 cap1 running)"
-sleep 3
 R=$(count_status $S1 cap1 running) || { bad "cap1 running 查询失败"; exit 1; }
 P=$(count_status $S1 cap1 pending) || { bad "cap1 pending 查询失败"; exit 1; }
 [ "$R" = "2" ] && [ "$P" = "1" ] \
@@ -110,7 +126,8 @@ P=$(count_status $S1 cap1 pending) || { bad "cap1 pending 查询失败"; exit 1;
   || bad "running=$R pending=$P 并发越界"
 grep -q "等待自然排水" $S1/testnode/scheduler.log \
   && ok "warn-once 等待日志存在" || bad "缺等待日志"
-stop_daemon $S1
+release_and_wait_done $S1 cap1 3 || exit 1
+stop_daemon $S1 || exit 1
 
 # ---------- S2: 卡级上限 (对象形态 max_jobs) ----------
 echo "--- S2: 卡级 max_jobs=2 -> 并发 2, 第 3 个排队 ---"
@@ -124,9 +141,9 @@ cat > $S2/config.json << EOF
   "default_project": "default", "venvs": {"k": "$PY"}
 }
 EOF
-mk_batch $S2 cap2 20
-submit_and_start $S2 cap2
-wait_for 'status_count_is "$S2" cap2 running 2' 25 \
+mk_batch $S2 cap2
+start_and_submit $S2 cap2
+wait_for 'status_count_is "$S2" cap2 running 2' 90 \
   && ok "卡级上限=2: 2 个并发" || bad "running=$(count_status $S2 cap2 running)"
 sleep 3
 R=$(count_status $S2 cap2 running) || { bad "cap2 running 查询失败"; exit 1; }
@@ -138,7 +155,8 @@ GPUVIEW=$(SCHED_STATE=$S2 SCHED_CONFIG=$S2/config.json $PY -m gsched.cli list-gp
   || { bad "list-gpus 查询失败"; exit 1; }
 GPUVIEW=${GPUVIEW%%$'\n'*}
 echo "$GPUVIEW" | grep -q "packed=" && ok "list-gpus 显示 packed 标注 ($GPUVIEW)" || bad "缺 packed 标注"
-stop_daemon $S2
+release_and_wait_done $S2 cap2 3 || exit 1
+stop_daemon $S2 || exit 1
 
 # ---------- S3: 项目级上限 + 跨项目隔离 ----------
 echo "--- S3: 项目级 max_jobs=1, 跨项目不受影响 ---"
@@ -154,24 +172,26 @@ cat > $S3/config.json << EOF
   "default_project": "lighta", "venvs": {"k": "$PY"}
 }
 EOF
-mk_batch $S3 ca 20 lighta     # lighta 的 3 个任务, 上限 1 -> 串行
+mk_batch $S3 ca lighta     # lighta 的 3 个任务, 上限 1 -> 串行
 export SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json
-$PY -m gsched.cli submit $S3/ca.json >/dev/null 2>&1 \
-  || { bad "ca submit 失败"; exit 1; }
 cat > $S3/cb.json << EOF
 {
   "name": "cb", "project": "heavyb", "mode": "mix",
   "tasks": [
-    {"id": "b1", "cmd": ["{VENV:k}", "-c", "import time; time.sleep(20)"],
-     "duration_min": 1, "resources": {"gpu_share": true, "vram_gib": 1.0}}
+    {"id": "b1", "cmd": ["/bin/bash", "-c", "while [ ! -f '$S3/cb.release' ]; do sleep 1; done"],
+     "duration_min": 5, "resources": {"gpu_share": true, "vram_gib": 1.0}}
   ]
 }
 EOF
 SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1 \
   || { bad "S3 daemon start 失败"; exit 1; }
+wait_log "$S3/testnode/scheduler.log" "fake=True" 30 \
+  || { bad "S3 daemon 未进入 fake 模式"; exit 1; }
+$PY -m gsched.cli submit $S3/ca.json >/dev/null 2>&1 \
+  || { bad "ca submit 失败"; exit 1; }
 $PY -m gsched.cli submit $S3/cb.json >/dev/null 2>&1 \
   || { bad "cb submit 失败"; exit 1; }
-wait_for 'status_count_is "$S3" cb running 1' 30 \
+wait_for 'status_count_is "$S3" cb running 1' 90 \
   && ok "heavyb (无上限) 正常运行" || bad "heavyb 未跑"
 RA=$(count_status $S3 ca running) || { bad "ca running 查询失败"; exit 1; }
 [ "$RA" = "1" ] && ok "lighta 上限=1 生效" || bad "lighta 并发异常 (running=$RA)"
@@ -184,7 +204,13 @@ PLIST=$(SCHED_STATE=$S3 SCHED_CONFIG=$S3/config.json $PY -m gsched.cli project l
   || { bad "project list 查询失败"; exit 1; }
 echo "$PLIST" | grep -q "lighta" && echo "$PLIST" | grep "lighta" | grep -q "1" \
   && ok "project list 展示项目上限" || bad "project list 缺上限列"
-stop_daemon $S3
+: > "$S3/ca.release" || { bad "ca release 失败"; exit 1; }
+: > "$S3/cb.release" || { bad "cb release 失败"; exit 1; }
+wait_for 'status_count_is "$S3" ca done 3' 120 \
+  || { bad "ca 释放后未全部 done"; exit 1; }
+wait_for 'status_count_is "$S3" cb done 1' 120 \
+  || { bad "cb 释放后未 done"; exit 1; }
+stop_daemon $S3 || exit 1
 
 # ---------- S4: 自然排水 (热更新调低上限, 不驱逐) ----------
 echo "--- S4: 热更新调低上限 -> 已 pack 不驱逐 ---"
@@ -197,25 +223,24 @@ cat > $S4/config.json << EOF
   "default_project": "default", "venvs": {"k": "$PY"}
 }
 EOF
-mk_batch $S4 cd 25
-submit_and_start $S4 cd
-wait_for 'status_count_is "$S4" cd running 3' 25 \
+mk_batch $S4 cd
+start_and_submit $S4 cd
+wait_for 'status_count_is "$S4" cd running 3' 90 \
   && ok "初始 3 个并发装箱" || bad "未 3 并发"
-$PY - << PYEOF
-import json
-p = "$S4/config.json"
-cfg = json.load(open(p))
-# 热更新调低卡级上限 (整数形态 -> 对象形态; 卡集/容量不变 -> 热键变更)
-cfg["gpus"] = [{"idx": 0, "max_jobs": 1}]
-json.dump(cfg, open(p, "w"), indent=2)
-PYEOF
-[ $? -eq 0 ] || { bad "S4 config 热更新失败"; exit 1; }
-sleep 13   # >= 1 tick + 余量: 若有驱逐逻辑此时 running 会掉
+cat > "$S4/cap-patch.json" << EOF
+{"gpus": [{"idx": 0, "max_jobs": 1}]}
+EOF
+$PY -m gsched.cli config set -f "$S4/cap-patch.json" --yes >/dev/null 2>&1 \
+  || { bad "S4 config set 热更新失败"; exit 1; }
+wait_log "$S4/testnode/scheduler.log" "config_reload req" 60 \
+  || { bad "S4 daemon 未消费 config_reload"; exit 1; }
+wait_log "$S4/testnode/scheduler.log" "配置已热更新" 60 \
+  || { bad "S4 卡级上限未热生效"; exit 1; }
 R=$(count_status $S4 cd running) || { bad "cd running 查询失败"; exit 1; }
 [ "$R" = "3" ] && ok "上限调低后 3 个任务继续运行 (无驱逐)" || bad "发生驱逐 (running=$R)"
-wait_for 'status_count_is "$S4" cd done 3' 60 \
-  && ok "全部自然完成" || bad "任务未收敛"
-stop_daemon $S4
+release_and_wait_done $S4 cd 3 || exit 1
+ok "全部自然完成"
+stop_daemon $S4 || exit 1
 
 echo
 echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
