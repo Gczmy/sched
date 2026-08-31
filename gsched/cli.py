@@ -38,6 +38,7 @@ from .schema import (
     check_dependency_cycle,
     parse_shell_cmd,
     validate_batch,
+    validate_persisted_dependencies,
 )
 from .templates import expand_cmd
 
@@ -489,62 +490,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # Foreign-host or first-run dry-run cannot create/migrate/write state.db.
     # Dependency and producer state is UNAVAILABLE; the daemon rechecks on submit.
     if not stateless_dry_run:
-        # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
         with state.connect() as conn:
-            for dep in norm["depends_on"]:
-                row = conn.execute(
-                    "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                    (dep,),
-                ).fetchone()
-                if not row:
-                    print(f"错误: depends_on 引用的批次不存在: '{dep}' (O1)", file=sys.stderr)
-                    return 1
-
-        # 依赖环检测 (§3.4e B3): 按 name 拓扑 DFS (当前批次 + 已存在批次全图)
-        def _dep_graph() -> dict[str, list[str]]:
-            """name -> latest batch's depends_on names (including current batch)."""
-            g: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
-            latest: dict[str, tuple[str, int, list[str]]] = {}
-            with state.connect() as conn:
-                rows = conn.execute(
-                    "SELECT rowid, name, depends_on, created_at FROM batches"
-                ).fetchall()
-                for row in rows:
-                    key = (row["created_at"] or "", row["rowid"])
-                    current = latest.get(row["name"])
-                    if current is None or key > current[:2]:
-                        latest[row["name"]] = (
-                            key[0],
-                            key[1],
-                            json.loads(row["depends_on"] or "[]"),
-                        )
-            for name, (_created_at, _rowid, depends_on) in latest.items():
-                g.setdefault(name, depends_on)
-            return g
-
-        g = _dep_graph()
-        visited: set[str] = set()
-        stack: list[str] = []
-
-        def _has_cycle(name: str) -> bool:
-            if name in stack:
-                cycle = " -> ".join(stack[stack.index(name):] + [name])
-                raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
-            if name in visited:
-                return False
-            visited.add(name)
-            stack.append(name)
-            for d in g.get(name, []):
-                if _has_cycle(d):
-                    return True
-            stack.pop()
-            return False
-
-        try:
-            _has_cycle(norm["name"])
-        except SchemaError as e:
-            print(f"校验失败: {e}", file=sys.stderr)
-            return 1
+            try:
+                validate_persisted_dependencies(
+                    conn,
+                    norm["name"],
+                    norm["depends_on"],
+                )
+            except SchemaError as e:
+                print(f"校验失败: {e}", file=sys.stderr)
+                return 1
 
     from .fingerprint import compute_fingerprint
     prepared_tasks = []
@@ -584,6 +539,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     db_context = state.connect() if dry_run else state.submission_connect()
     with db_context as conn:
+        if not dry_run:
+            try:
+                # Fingerprint expansion above may take long enough for another
+                # submit to replace a dependency name.  The submission gate is
+                # the commit-time authority, so validate the latest graph again.
+                validate_persisted_dependencies(
+                    conn,
+                    norm["name"],
+                    norm["depends_on"],
+                )
+            except SchemaError as e:
+                print(f"校验失败: {e}", file=sys.stderr)
+                return 1
         # 同名批次未全部终态 -> 拒绝 (定案 6)
         # 决策 7A: dry-run 跳过该检查 —— 纯只读预览不产生副作用, 拦截反而
         # 挡住"现有批次终态后要提交什么"的预览场景; 预览中降级为提示
@@ -1665,6 +1633,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         print(f"确认取消 {ref}? 加 --yes 执行 (转发 daemon: 先写 kill_reason 再 killpg)")
         return 1
     with state.submission_connect() as conn:
+        # Classification and mutation must be one writer transaction.  Without
+        # this early claim the daemon can launch a selected pending job before
+        # we mark it cancelled, leaving an untracked process and GPU lease.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         if ":" in ref:
             # R1: <batch_name>:<task> — batch 段是 name, 解析为最新 id
             b_name, t = _parse_task_ref(ref)
@@ -1715,10 +1688,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             n += 1
         for j in pendings:
             # 排队中未启动: 无进程可杀, 直接标终态 (daemon 不再派发)
-            state.update_job(
-                conn, j["id"], status="cancelled", kill_reason="cancelled",
-                finished_at=state.now(),
-            )
+            changed = conn.execute(
+                "UPDATE jobs SET status='cancelled', kill_reason='cancelled',"
+                " finished_at=? WHERE id=?"
+                " AND status IN ('pending','waiting_quota','waiting_dep')",
+                (state.now(), j["id"]),
+            ).rowcount
+            if changed != 1:
+                continue
             print(f"已取消排队任务 {j['id']} (pending, 未启动)")
             n += 1
         if n == 0:
@@ -1763,6 +1740,32 @@ def _resolve_task_ref(ref: str, conn=None) -> tuple[str, str]:
     return batch, task
 
 
+def _same_name_nonterminal_conflict(conn, batch_id: str):
+    """Return another same-name batch that already owns runnable lifecycle.
+
+    All callers hold the submission gate.  This is the reverse half of the
+    submit-side same-name check: an older terminal instance must not be reopened
+    after a newer instance was accepted first.
+    """
+    return conn.execute(
+        "SELECT other.id, other.status FROM batches target"
+        " JOIN batches other ON other.name=target.name AND other.id<>target.id"
+        " WHERE target.id=?"
+        " AND other.status NOT IN ('done','blocked','discarded')"
+        " ORDER BY other.created_at DESC, other.rowid DESC LIMIT 1",
+        (batch_id,),
+    ).fetchone()
+
+
+def _print_same_name_reopen_conflict(action: str, conflict) -> None:
+    print(
+        f"错误: {action} 拒绝重开旧批次；同名批次 "
+        f"{conflict['id']} 已处于非终态 {conflict['status']}"
+        "，请先等待其收敛或取消/退役后重试",
+        file=sys.stderr,
+    )
+
+
 def _rev_diff_warn(conn, j) -> str | None:
     """P3: job.git_rev vs 当前仓库 rev (任务 cwd) 不一致 -> 返回警告文本.
 
@@ -1802,8 +1805,12 @@ def cmd_retry(args: argparse.Namespace) -> int:
     """
     ref = args.task
     reopened = False
-    batch_name = ""
     with state.submission_connect() as conn:
+        # Prevent daemon settlement from changing the batch between the status
+        # snapshot below and the first job mutation.  request-bound commands
+        # already own an IMMEDIATE outer transaction, so do not nest BEGIN.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         if ":" in ref:
             batch, task = _resolve_task_ref(ref, conn)
         else:
@@ -1813,7 +1820,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
                 return 1
             task = None
         batch_row = conn.execute(
-            "SELECT status, name FROM batches WHERE id=?",
+            "SELECT status FROM batches WHERE id=?",
             (batch,),
         ).fetchone()
         if not batch_row:
@@ -1825,7 +1832,6 @@ def cmd_retry(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        batch_name = batch_row["name"]
         if task is not None:
             targets = conn.execute(
                 "SELECT * FROM jobs WHERE batch_id=? AND task_id=?"
@@ -1860,6 +1866,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        conflict = _same_name_nonterminal_conflict(conn, batch)
+        if conflict is not None:
+            _print_same_name_reopen_conflict("retry", conflict)
+            return 1
         n = 0
         for j in targets:
             if j["status"] not in ("blocked", "cancelled", "timed_out", "failed"):
@@ -1893,28 +1903,11 @@ def cmd_retry(args: argparse.Namespace) -> int:
             reopened = True
         print(f"({n} 个任务)")
 
-    def remove_blocked_marker() -> None:
-        marker = os.path.join(
-            default_state_dir(),
-            state.hostname(),
-            "markers",
-            f"{batch_name}.blocked",
-        )
-        try:
-            os.remove(marker)
-        except OSError:
-            pass
-
-    marker_deferred = (
-        state.defer_after_commit(remove_blocked_marker) if reopened else False
-    )
     wake_deferred = state.defer_after_commit(_ensure_running_locked)
-    if reopened and not marker_deferred:
-        remove_blocked_marker()
     if not wake_deferred:
         print(_ensure_running_locked())
     if reopened:
-        print("批次已回 active (blocked marker 已清除)")
+        print("批次已回 active (终态 marker 将由 daemon 在派发前协调)")
     return 0
 
 
@@ -2039,9 +2032,12 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
         active = [
             row
             for row in conn.execute(
-                "SELECT task_id, status, version FROM jobs WHERE batch_id=?"
-                " AND status IN"
-                " ('running','pending','waiting_quota','waiting_dep')",
+                "SELECT j.task_id, j.status, j.version FROM jobs j"
+                " WHERE j.batch_id=? AND (j.status='running' OR ("
+                "   j.status IN ('pending','waiting_quota','waiting_dep')"
+                "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+                "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id)"
+                " ))",
                 (batch,),
             ).fetchall()
             if row["task_id"] in target_tasks
@@ -2057,7 +2053,15 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        marked = [job for job in jobs if state.launch_marker_active(job["id"])]
+        marked = [
+            job
+            for job in conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=?",
+                (batch,),
+            ).fetchall()
+            if job["task_id"] in target_tasks
+            and state.launch_marker_active(job["id"])
+        ]
         if marked:
             labels = ", ".join(
                 f"{job['task_id']}v{job['version']}" for job in marked
@@ -2134,6 +2138,12 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     dependency_names: list[str] = []
     labels: list[str] = []
     with state.submission_connect() as conn:
+        # The final status/version checks and publication are one write
+        # transaction.  Without this early writer claim, daemon settlement can
+        # commit active->done after our SELECT but before insert_task, leaving
+        # a terminal batch with a new pending generation.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         current_batch = conn.execute(
             "SELECT status FROM batches WHERE id=?", (batch,)
         ).fetchone()
@@ -2142,6 +2152,10 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 "错误: fingerprint 准备期间批次状态已变化，请重试",
                 file=sys.stderr,
             )
+            return 1
+        conflict = _same_name_nonterminal_conflict(conn, batch)
+        if conflict is not None:
+            _print_same_name_reopen_conflict("resubmit", conflict)
             return 1
         for prepared in prepared_specs:
             latest = conn.execute(
@@ -2196,23 +2210,8 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 (f'%"{batch_name}"%',),
             ).fetchall()
         ]
-    def remove_terminal_markers() -> None:
-        for suffix in ("done", "blocked"):
-            marker = os.path.join(
-                default_state_dir(),
-                state.hostname(),
-                "markers",
-                f"{batch_name}.{suffix}",
-            )
-            try:
-                os.remove(marker)
-            except (FileNotFoundError, OSError):
-                pass
-
-    effects_deferred = state.defer_after_commit(remove_terminal_markers)
-    state.defer_after_commit(_ensure_running_locked)
-    if not effects_deferred:
-        remove_terminal_markers()
+    wake_deferred = state.defer_after_commit(_ensure_running_locked)
+    if not wake_deferred:
         wake_result = _ensure_running_locked()
 
     for dependency in dependency_names:
@@ -2221,9 +2220,9 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             " 上游已更新, 请重提下游 (Q4)"
         )
     if reopened:
-        print("批次已回 active (旧终态不再遮蔽新版本)")
+        print("批次已回 active (终态 marker 将由 daemon 在派发前协调)")
     print(f"已 resubmit {len(labels)} 个任务: {', '.join(labels)}")
-    if not effects_deferred:
+    if not wake_deferred:
         print(wake_result)
     return 0
 
@@ -2276,11 +2275,13 @@ def _warn_colocate_disabled(
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    """Clear fingerprints and remove the latest task/stage declared artifacts.
+    """Clear fingerprints and remove artifacts of latest skipped generations.
 
-    Database state is committed before artifact deletion.  Confined artifact
-    paths are removed through the same descriptor-relative policy used by the
-    runtime; ``paths_escape`` remains an explicit opt-in at each declaration.
+    This is a two-phase mutation.  Fingerprints are committed while the batch
+    remains terminal, artifacts are then removed, and only afterwards are the
+    latest skipped generations published as runnable work.  Confined artifact
+    paths use the runtime's descriptor-relative policy; ``paths_escape``
+    remains an explicit opt-in at each declaration.
     """
     b = _resolve_batch_ref(args.batch)
     if not b:
@@ -2291,74 +2292,252 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return 1
 
     deletions: list[tuple[str, str, Any]] = []
-    with state.connect() as conn:
-        trows = conn.execute(
-            "SELECT t.spec FROM tasks t"
-            " JOIN (SELECT id, MAX(version) AS mv FROM tasks"
-            "       WHERE batch_id=? GROUP BY id) latest"
-            "   ON t.batch_id=? AND t.id=latest.id AND t.version=latest.mv",
-            (b, b),
-        ).fetchall()
-        for tr in trows:
-            try:
-                spec = json.loads(tr["spec"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(spec, dict):
-                continue
-            cwd = spec.get("cwd_abs") or "."
-            if not isinstance(cwd, str):
-                continue
+    n = 0
+    requeued = 0
+    reopened = False
+    removed: list[str] = []
 
-            def collect(group: Any, paths_escape: Any) -> None:
-                if not isinstance(group, dict):
-                    return
-                for rule in group.values():
-                    if not isinstance(rule, dict):
-                        continue
-                    path = rule.get("path")
-                    if isinstance(path, str) and path:
+    # Hold the global submission gate across both database phases and artifact
+    # deletion.  This deliberately favors correctness over clean throughput:
+    # no submit/retry/resubmit or idle-shutdown handshake may interleave while
+    # external outputs are being removed.  The daemon may still settle state,
+    # so phase 2 revalidates the terminal batch before publishing runnable work.
+    with state.submission_lock():
+        with state.submission_connect() as conn:
+            batch_row = conn.execute(
+                "SELECT status FROM batches WHERE id=?",
+                (b,),
+            ).fetchone()
+            if not batch_row:
+                print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+                return 1
+            if batch_row["status"] not in ("done", "blocked"):
+                print(
+                    "错误: clean 仅允许 done/blocked 终态批次；"
+                    "请先等待任务收敛或取消运行任务",
+                    file=sys.stderr,
+                )
+                return 1
+            conflict = _same_name_nonterminal_conflict(conn, b)
+            if conflict is not None:
+                _print_same_name_reopen_conflict("clean", conflict)
+                return 1
+            jobs = conn.execute(
+                "SELECT id, status FROM jobs WHERE batch_id=?",
+                (b,),
+            ).fetchall()
+            unsafe = [
+                job["id"]
+                for job in jobs
+                if job["status"] == "running"
+                or state.launch_marker_active(job["id"])
+            ]
+            if unsafe:
+                print(
+                    "错误: clean 拒绝仍在运行或有未决进程组的任务: "
+                    + ", ".join(unsafe),
+                    file=sys.stderr,
+                )
+                return 1
+            # Artifact declarations may intentionally alias paths across batch
+            # generations.  Without producer ownership metadata we cannot
+            # prove that deleting this batch's paths is harmless to an already
+            # running writer, so clean is conservatively a node-idle operation.
+            # New launches are excluded by the surrounding submission gate.
+            other_running = conn.execute(
+                "SELECT id FROM jobs WHERE status='running' ORDER BY rowid LIMIT 10"
+            ).fetchall()
+            if other_running:
+                print(
+                    "错误: clean 在节点仍有运行任务时拒绝删除共享产物路径: "
+                    + ", ".join(row["id"] for row in other_running),
+                    file=sys.stderr,
+                )
+                return 1
+            other_active = conn.execute(
+                "SELECT id FROM batches WHERE id<>? AND status='active'"
+                " ORDER BY rowid LIMIT 10",
+                (b,),
+            ).fetchall()
+            if other_active:
+                print(
+                    "错误: clean 拒绝在其他 active 批次可能继续使用共享产物时删除: "
+                    + ", ".join(row["id"] for row in other_active),
+                    file=sys.stderr,
+                )
+                return 1
+
+            trows = conn.execute(
+                "SELECT t.id, t.version, t.spec FROM jobs j"
+                " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
+                "       WHERE batch_id=? GROUP BY task_id) latest"
+                "   ON j.task_id=latest.task_id AND j.version=latest.mv"
+                " JOIN tasks t ON t.batch_id=j.batch_id"
+                "   AND t.id=j.task_id AND t.version=j.version"
+                " WHERE j.batch_id=? AND j.status='skip'",
+                (b, b),
+            ).fetchall()
+            for tr in trows:
+                task_label = f"{tr['id']}v{tr['version']}"
+                try:
+                    spec = json.loads(tr["spec"] or "{}")
+                except (json.JSONDecodeError, TypeError) as error:
+                    raise state.StateError(
+                        f"clean 拒绝无效任务规格 {task_label}: {error}"
+                    ) from error
+                if not isinstance(spec, dict):
+                    raise state.StateError(
+                        f"clean 拒绝无效任务规格 {task_label}: spec 必须是对象"
+                    )
+                cwd = spec.get("cwd_abs") or "."
+                if not isinstance(cwd, str):
+                    raise state.StateError(
+                        f"clean 拒绝无效任务规格 {task_label}: cwd_abs 必须是字符串"
+                    )
+
+                def collect(
+                    group: Any,
+                    paths_escape: Any,
+                    group_label: str,
+                ) -> None:
+                    if group is None:
+                        return
+                    if not isinstance(group, dict):
+                        raise state.StateError(
+                            f"clean 拒绝无效任务规格 {task_label}:"
+                            f" {group_label} 必须是对象"
+                        )
+                    if not isinstance(paths_escape, bool):
+                        raise state.StateError(
+                            f"clean 拒绝无效任务规格 {task_label}:"
+                            f" {group_label}.paths_escape 必须是布尔值"
+                        )
+                    for artifact_name, rule in group.items():
+                        if not isinstance(rule, dict):
+                            raise state.StateError(
+                                f"clean 拒绝无效任务规格 {task_label}:"
+                                f" {group_label}.{artifact_name} 必须是对象"
+                            )
+                        path = rule.get("path")
+                        if not isinstance(path, str) or not path or "\0" in path:
+                            raise state.StateError(
+                                f"clean 拒绝无效任务规格 {task_label}:"
+                                f" {group_label}.{artifact_name}.path 无效"
+                            )
                         deletions.append((cwd, path, paths_escape))
 
-            collect(spec.get("artifacts"), spec.get("paths_escape", False))
-            stages = spec.get("stages")
-            if isinstance(stages, list):
-                for stage in stages:
-                    if isinstance(stage, dict):
-                        collect(
-                            stage.get("artifacts"),
-                            stage.get("paths_escape", False),
+                collect(
+                    spec.get("artifacts"),
+                    spec.get("paths_escape", False),
+                    "artifacts",
+                )
+                stages = spec.get("stages")
+                if stages is not None and not isinstance(stages, list):
+                    raise state.StateError(
+                        f"clean 拒绝无效任务规格 {task_label}: stages 必须是数组"
+                    )
+                for stage_index, stage in enumerate(stages or []):
+                    if not isinstance(stage, dict):
+                        raise state.StateError(
+                            f"clean 拒绝无效任务规格 {task_label}:"
+                            f" stages[{stage_index}] 必须是对象"
                         )
+                    collect(
+                        stage.get("artifacts"),
+                        stage.get("paths_escape", False),
+                        f"stages[{stage_index}].artifacts",
+                    )
 
-        cur = conn.execute(
-            "UPDATE jobs SET fingerprint=NULL, stage_fingerprints=NULL"
-            " WHERE batch_id=?",
-            (b,),
-        )
-        n = cur.rowcount
-        conn.execute(
-            "UPDATE jobs SET status='pending' WHERE batch_id=? AND status='skip'",
-            (b,),
-        )
+            # Phase 1 commits before any external deletion.  A commit failure
+            # therefore leaves both artifacts and terminal state untouched.
+            n = conn.execute(
+                "UPDATE jobs SET fingerprint=NULL, stage_fingerprints=NULL"
+                " WHERE batch_id=?",
+                (b,),
+            ).rowcount
 
-    removed = []
-    for cwd, path, paths_escape in deletions:
-        if artifacts.unlink_artifact(
-            cwd,
-            path,
-            paths_escape=paths_escape,
-        ):
-            removed.append(
-                path
-                if os.path.isabs(path)
-                else os.path.normpath(os.path.join(cwd, path))
-            )
+        # Jobs remain skip/done/failed in a terminal batch throughout artifact
+        # removal, so an already-running daemon has nothing it may dispatch.
+        for cwd, path, paths_escape in deletions:
+            try:
+                deleted = artifacts.unlink_artifact(
+                    cwd,
+                    path,
+                    paths_escape=paths_escape,
+                    raise_on_error=True,
+                )
+            except artifacts.ArtifactError as error:
+                raise state.StateError(
+                    "clean 产物删除失败；可能已删除部分产物，phase 1 已清除"
+                    "指纹但批次仍保持终态。修复路径或存储问题后可安全重试: "
+                    f"{error}"
+                ) from error
+            if deleted:
+                removed.append(
+                    path
+                    if os.path.isabs(path)
+                    else os.path.normpath(os.path.join(cwd, path))
+                )
+
+        with state.submission_connect() as conn:
+            # Phase 2 publishes runnable state.  Claim the SQLite writer before
+            # reading the terminal batch so daemon settlement cannot change
+            # blocked->done between our snapshot and the requeue DML.
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            current_batch = conn.execute(
+                "SELECT status FROM batches WHERE id=?",
+                (b,),
+            ).fetchone()
+            if (
+                not current_batch
+                or current_batch["status"] not in ("done", "blocked")
+            ):
+                raise state.StateError(
+                    "clean 清理产物期间批次状态已变化；"
+                    "指纹已清但未重新排队，请确认终态后重试"
+                )
+            conflict = _same_name_nonterminal_conflict(conn, b)
+            if conflict is not None:
+                raise state.StateError(
+                    "clean 清理产物期间出现同名非终态批次 "
+                    f"{conflict['id']} ({conflict['status']}); "
+                    "指纹已清但未重新排队"
+                )
+            requeued = conn.execute(
+                "UPDATE jobs SET status='pending'"
+                " WHERE batch_id=? AND status='skip'"
+                " AND version=(SELECT MAX(latest.version) FROM jobs latest"
+                "   WHERE latest.batch_id=jobs.batch_id"
+                "     AND latest.task_id=jobs.task_id)",
+                (b,),
+            ).rowcount
+            if requeued and current_batch["status"] == "done":
+                changed = conn.execute(
+                    "UPDATE batches SET status='active'"
+                    " WHERE id=? AND status='done'",
+                    (b,),
+                ).rowcount
+                if changed != 1:
+                    raise state.StateError(
+                        "clean 无法原子重开 done 批次；请重试"
+                    )
+                reopened = True
+
     for artifact_path in removed[:10]:
         print(f"  已删产物: {artifact_path}")
     print(
         f"✅ 已清除 {n} 个任务的指纹并删除 {len(removed)} 个产物"
-        f" ({b}); 后续将重跑"
+        f" ({b}); "
+        + (
+            f"已重新排队 {requeued} 个最新 skip 任务"
+            if requeued
+            else "未发现最新 skip，未发布新任务"
+        )
     )
+    if reopened:
+        print("批次已回 active (终态 marker 将由 daemon 在派发前协调)")
+        print(_ensure_running_locked())
     return 0
 
 
@@ -2376,7 +2555,12 @@ def cmd_discard(args: argparse.Namespace) -> int:
     if not args.yes:
         print("确认退役? 加 --yes 执行", file=sys.stderr)
         return 1
-    with state.connect() as conn:
+    with state.submission_connect() as conn:
+        # Serialize the queued/blocked precondition with daemon dependency
+        # unlock.  Either discard wins and unlock sees no queued row, or unlock
+        # wins and this command re-reads active and refuses.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         batch_id = _resolve_batch_ref(args.batch, conn)
         batch = conn.execute(
             "SELECT * FROM batches WHERE id=?", (batch_id,)
@@ -2419,9 +2603,15 @@ def cmd_discard(args: argparse.Namespace) -> int:
             " ('failed','blocked','timed_out','interrupted','cancelled')",
             (batch_id,),
         ).fetchone()[0]
-        conn.execute(
-            "UPDATE batches SET status='discarded' WHERE id=?", (batch_id,)
-        )
+        changed = conn.execute(
+            "UPDATE batches SET status='discarded' WHERE id=?"
+            " AND status IN ('blocked','queued')",
+            (batch_id,),
+        ).rowcount
+        if changed != 1:
+            raise state.StateError(
+                "discard 终态发布竞态：批次已不再是 blocked/queued"
+            )
         dependencies = conn.execute(
             "SELECT name FROM batches WHERE depends_on LIKE ?",
             (f'%"{batch["name"]}"%',),

@@ -213,6 +213,401 @@ class ReviewHeadOfLineTests(DispatcherStateCase):
         )
 
 
+class ReviewDispatchGenerationTests(DispatcherStateCase):
+    def _capture_cpu_launches(self) -> list[str]:
+        dispatcher = self.dispatcher()
+        launched: list[str] = []
+        dispatcher._assign_in_tx = mock.Mock()
+        dispatcher._launch_job = mock.Mock(
+            side_effect=lambda _conn, job, _gpu: launched.append(job["id"]) or True
+        )
+        dispatcher._dispatch_ready_jobs()
+        dispatcher._assign_in_tx.assert_not_called()
+        return launched
+
+    def _insert_second_version(self, status: str) -> None:
+        with state.connect() as conn:
+            row = conn.execute(
+                "SELECT spec, order_idx FROM tasks"
+                " WHERE batch_id='batch' AND id='task' AND version=1"
+            ).fetchone()
+            state.insert_task(
+                conn,
+                "batch",
+                "task",
+                2,
+                json.loads(row["spec"]),
+                row["order_idx"],
+                "p",
+            )
+            state.insert_job(
+                conn,
+                "task-v2",
+                "batch",
+                "task",
+                2,
+                "task-v2-fp",
+                None,
+                "p",
+            )
+            state.update_job(conn, "task-v2", status=status)
+
+    def _insert_queued_downstream(self) -> None:
+        with state.connect() as conn:
+            state.insert_batch(
+                conn,
+                "downstream",
+                "downstream",
+                "mix",
+                ["batch"],
+                None,
+                self.tmp.name,
+                {},
+                project="p",
+            )
+
+    def test_done_batch_pending_job_is_never_dispatched(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        with state.connect() as conn:
+            conn.execute("UPDATE batches SET status='done' WHERE id='batch'")
+
+        self.assertEqual([], self._capture_cpu_launches())
+
+    def test_blocked_batch_pending_history_is_not_reopened_or_dispatched(
+        self,
+    ) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        with state.connect() as conn:
+            conn.execute("UPDATE batches SET status='blocked' WHERE id='batch'")
+
+        dispatcher = self.dispatcher()
+        dispatcher._notify_threads = []
+        dispatcher._write_marker = mock.Mock()
+        dispatcher._notify_batch = mock.Mock()
+        dispatcher._settle_batch_status()
+        dispatcher._dispatch_ready_jobs()
+
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch")
+            job = state.get_job(conn, "task")
+        self.assertEqual("blocked", batch["status"])
+        self.assertEqual("pending", job["status"])
+        self.assertIsNone(job["started_at"])
+        dispatcher.executor.launch.assert_not_called()
+
+    def test_settle_claims_writer_before_retry_can_invalidate_failure_snapshot(
+        self,
+    ) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "failed")])
+        dispatcher = self.dispatcher()
+        dispatcher._notify_threads = []
+        dispatcher._write_marker = mock.Mock()
+        dispatcher._remove_marker = mock.Mock()
+        dispatcher._notify_batch = mock.Mock()
+        original_connect = state.connect
+        contender_results: list[str] = []
+
+        @contextlib.contextmanager
+        def traced_connect():
+            with original_connect() as conn:
+                attempted = False
+
+                def trace(statement: str) -> None:
+                    nonlocal attempted
+                    if attempted or "SET status='blocked'" not in statement:
+                        return
+                    attempted = True
+                    contender = sqlite3.connect(state.db_path(), timeout=0)
+                    try:
+                        contender.execute(
+                            "UPDATE jobs SET status='pending' WHERE id='task'"
+                        )
+                        contender.commit()
+                        contender_results.append("committed")
+                    except sqlite3.OperationalError as error:
+                        self.assertIn("locked", str(error).lower())
+                        contender_results.append("locked")
+                    finally:
+                        contender.rollback()
+                        contender.close()
+
+                conn.set_trace_callback(trace)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        with mock.patch.object(state, "connect", side_effect=traced_connect):
+            dispatcher._settle_batch_status()
+
+        self.assertEqual(["locked"], contender_results)
+        with original_connect() as conn:
+            batch = state.get_batch(conn, "batch")
+            job = state.get_job(conn, "task")
+        self.assertEqual("blocked", batch["status"])
+        self.assertEqual("failed", job["status"])
+
+    def test_settle_terminal_cas_does_not_revive_discarded_batch(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "done")])
+        dispatcher = self.dispatcher()
+        dispatcher._notify_threads = []
+        dispatcher._write_marker = mock.Mock()
+        dispatcher._remove_marker = mock.Mock()
+        dispatcher._notify_batch = mock.Mock()
+
+        def discard_before_terminal_publish(conn, _batch_id):
+            conn.execute(
+                "UPDATE batches SET status='discarded' WHERE id='batch'"
+            )
+            return False
+
+        dispatcher._batch_has_unresolved_launch_marker = mock.Mock(
+            side_effect=discard_before_terminal_publish
+        )
+        dispatcher._settle_batch_status()
+
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch")
+        self.assertEqual("discarded", batch["status"])
+        dispatcher._write_marker.assert_not_called()
+        dispatcher._notify_batch.assert_not_called()
+
+    def test_active_batch_dispatches_only_latest_pending_version(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        self._insert_second_version("pending")
+
+        self.assertEqual(["task-v2"], self._capture_cpu_launches())
+
+    def test_active_batch_ignores_old_pending_when_latest_is_done(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        self._insert_second_version("done")
+
+        self.assertEqual([], self._capture_cpu_launches())
+
+    def _dispatch_across_claim_race(self, mutate) -> Dispatcher:
+        dispatcher = self.dispatcher()
+        dispatcher._snapshot_fingerprint = mock.Mock(
+            return_value=("current-fp", {}, None)
+        )
+        dispatcher._prepare_launch_marker = mock.Mock(return_value=False)
+        dispatcher._launch_marker_alive = mock.Mock(
+            side_effect=lambda _job: mutate() or False
+        )
+        dispatcher.executor.launch.side_effect = AssertionError(
+            "non-dispatchable stale candidate reached executor"
+        )
+
+        dispatcher._dispatch_ready_jobs()
+        return dispatcher
+
+    def test_final_claim_rechecks_batch_active_after_candidate_snapshot(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+
+        def finish_batch() -> None:
+            with state.connect() as conn:
+                conn.execute("UPDATE batches SET status='done' WHERE id='batch'")
+
+        dispatcher = self._dispatch_across_claim_race(finish_batch)
+
+        with state.connect() as conn:
+            job = state.get_job(conn, "task")
+        self.assertEqual("pending", job["status"])
+        self.assertIsNone(job["started_at"])
+        dispatcher.executor.launch.assert_not_called()
+
+    def test_final_claim_rechecks_latest_version_after_candidate_snapshot(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+
+        dispatcher = self._dispatch_across_claim_race(
+            lambda: self._insert_second_version("pending")
+        )
+
+        with state.connect() as conn:
+            jobs = conn.execute(
+                "SELECT id, status, started_at FROM jobs"
+                " WHERE batch_id='batch' ORDER BY version"
+            ).fetchall()
+        self.assertEqual(
+            [("task", "pending", None), ("task-v2", "pending", None)],
+            [
+                (job["id"], job["status"], job["started_at"])
+                for job in jobs
+            ],
+        )
+        dispatcher.executor.launch.assert_not_called()
+
+    def test_final_claim_blocks_old_generation_marker_created_after_scan(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        self._insert_second_version("pending")
+
+        def publish_old_marker() -> None:
+            marker = state.launch_marker_path("task")
+            state.ensure_private_directory(os.path.dirname(marker))
+            with state.open_private_text(marker, "w") as stream:
+                stream.write("unknown identity")
+
+        dispatcher = self._dispatch_across_claim_race(publish_old_marker)
+
+        with state.connect() as conn:
+            jobs = conn.execute(
+                "SELECT id, status, started_at FROM jobs"
+                " WHERE batch_id='batch' ORDER BY version"
+            ).fetchall()
+        self.assertEqual(
+            [("task", "pending", None), ("task-v2", "pending", None)],
+            [
+                (job["id"], job["status"], job["started_at"])
+                for job in jobs
+            ],
+        )
+        dispatcher.executor.launch.assert_not_called()
+
+    def test_launch_log_failure_is_nonfatal_after_pgid_writeback(self) -> None:
+        self.seed_jobs([("task", {"gpu": 1}, "pending")])
+        dispatcher = self.dispatcher()
+        dispatcher._snapshot_fingerprint = mock.Mock(
+            return_value=("current-fp", {}, None)
+        )
+        dispatcher._should_skip = mock.Mock(return_value=False)
+        dispatcher._clean_stale_artifacts = mock.Mock()
+        dispatcher.executor.launch.return_value = 4242
+
+        def fail_only_launch_record(message: str) -> None:
+            if message.startswith("LAUNCH job"):
+                raise OSError("injected log sink failure")
+
+        dispatcher.log_line.side_effect = fail_only_launch_record
+        with state.connect() as conn:
+            conn.execute(
+                "UPDATE gpus SET status='assigned', job_id='task' WHERE idx=0"
+            )
+            conn.execute(
+                "INSERT INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
+                " VALUES (0, 'task', NULL, ?)",
+                (state.now(),),
+            )
+            job = state.get_job(conn, "task")
+            self.assertTrue(dispatcher._launch_job(conn, job, 0))
+
+        with state.connect() as conn:
+            current = state.get_job(conn, "task")
+            gpu = state.get_gpu(conn, 0)
+            assignment = conn.execute(
+                "SELECT job_id FROM gpu_jobs WHERE gpu_id=0"
+            ).fetchone()
+        self.assertEqual("running", current["status"])
+        self.assertEqual(0, current["gpu"])
+        self.assertEqual(4242, current["pgid"])
+        self.assertEqual("assigned", gpu["status"])
+        self.assertEqual("task", assignment["job_id"])
+        dispatcher.executor.kill_pgid.assert_not_called()
+
+    def test_obsolete_pending_does_not_prevent_idle_shutdown(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        self._insert_second_version("done")
+        with state.connect() as conn:
+            conn.execute("UPDATE batches SET status='done' WHERE id='batch'")
+        dispatcher = self.dispatcher()
+        dispatcher.idle_timeout_min = 1
+        dispatcher.last_activity = time.time() - 61
+        dispatcher._submit_inbox_pending = mock.Mock(return_value=False)
+        dispatcher.log_line = mock.Mock()
+
+        with mock.patch.object(state, "mark_idle_shutdown") as mark_shutdown:
+            self.assertTrue(dispatcher._idle_check())
+
+        mark_shutdown.assert_called_once_with()
+
+    def test_obsolete_pending_launch_marker_blocks_settle_dependency_and_idle(
+        self,
+    ) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "pending")])
+        self._insert_second_version("done")
+        dispatcher = self.dispatcher()
+        marker = dispatcher._launch_marker_path({"id": "task"})
+        state.ensure_private_directory(os.path.dirname(marker))
+        with state.open_private_text(marker, "w") as stream:
+            stream.write("unknown identity")
+
+        with state.connect() as conn:
+            self.assertFalse(dispatcher._batch_successful(conn, "batch"))
+        dispatcher._write_marker = mock.Mock()
+        dispatcher._notify_batch = mock.Mock()
+        dispatcher._settle_batch_status()
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch")
+        self.assertEqual("active", batch["status"])
+        dispatcher._write_marker.assert_not_called()
+
+        dispatcher.idle_timeout_min = 1
+        dispatcher.last_activity = time.time() - 61
+        dispatcher._submit_inbox_pending = mock.Mock(return_value=False)
+        with mock.patch.object(state, "mark_idle_shutdown") as mark_shutdown:
+            self.assertFalse(dispatcher._idle_check())
+        mark_shutdown.assert_not_called()
+
+    def test_dependency_unlock_claims_writer_before_upstream_can_change(
+        self,
+    ) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "done")])
+        self._insert_queued_downstream()
+        dispatcher = self.dispatcher()
+        real_successful = dispatcher._batch_successful
+        contender_results: list[str] = []
+
+        def successful_then_competing_resubmit(conn, batch_name):
+            successful = real_successful(conn, batch_name)
+            contender = sqlite3.connect(state.db_path(), timeout=0)
+            try:
+                contender.execute(
+                    "UPDATE jobs SET status='pending' WHERE id='task'"
+                )
+                contender.commit()
+                contender_results.append("committed")
+            except sqlite3.OperationalError as error:
+                self.assertIn("locked", str(error).lower())
+                contender_results.append("locked")
+            finally:
+                contender.rollback()
+                contender.close()
+            return successful
+
+        dispatcher._batch_successful = mock.Mock(
+            side_effect=successful_then_competing_resubmit
+        )
+        dispatcher._unlock_dependent_batches()
+
+        self.assertEqual(["locked"], contender_results)
+        with state.connect() as conn:
+            upstream = state.get_job(conn, "task")
+            downstream = state.get_batch(conn, "downstream")
+        self.assertEqual("done", upstream["status"])
+        self.assertEqual("active", downstream["status"])
+
+    def test_dependency_unlock_cas_does_not_revive_discarded_batch(self) -> None:
+        self.seed_jobs([("task", {"gpu": 0, "cpus": 1}, "done")])
+        self._insert_queued_downstream()
+        dispatcher = self.dispatcher()
+
+        def discard_before_activation(conn, _batch_name):
+            conn.execute(
+                "UPDATE batches SET status='discarded' WHERE id='downstream'"
+            )
+            return True
+
+        dispatcher._batch_successful = mock.Mock(
+            side_effect=discard_before_activation
+        )
+        dispatcher._unlock_dependent_batches()
+
+        with state.connect() as conn:
+            downstream = state.get_batch(conn, "downstream")
+        self.assertEqual("discarded", downstream["status"])
+        self.assertFalse(
+            any("依赖解锁" in str(call) for call in dispatcher.log_line.call_args_list)
+        )
+
+
 class ReviewExternalOccupancyTests(DispatcherStateCase):
     def test_s_h08_external_pid_during_release_never_creates_dispatchable_free_window(self) -> None:
         self.cfg["projects"]["p"]["gpu_quota"] = 0
@@ -1059,6 +1454,35 @@ class ReviewSignalIdentityTests(DispatcherStateCase):
 
 
 class ReviewSubmitInboxBoundsTests(DispatcherStateCase):
+    def queue_valid_payload(
+        self,
+        *,
+        name: str = "gated-submit",
+        bid: str = "gated-submit-1",
+    ) -> tuple[Dispatcher, str]:
+        dispatcher = self.dispatcher()
+        dispatcher.cfg = self.cfg
+        inbox_dir = os.path.join(self.tmp.name, "review-node", "submit_inbox")
+        os.makedirs(inbox_dir, mode=0o700, exist_ok=True)
+        payload_path = os.path.join(inbox_dir, f"submit-{bid}.json")
+        spec = {
+            "schema_version": 1,
+            "name": name,
+            "project": "p",
+            "cwd": self.tmp.name,
+            "tasks": [
+                {
+                    "id": "task",
+                    "cmd": ["/bin/true"],
+                    "resources": {"gpu": 0, "cpus": 1},
+                }
+            ],
+        }
+        with open(payload_path, "w", encoding="utf-8") as stream:
+            json.dump({"spec": spec, "bid": bid}, stream)
+        dispatcher._drain_submit_inbox()
+        return dispatcher, payload_path
+
     def consume_payload(self, content: bytes) -> tuple[str, str]:
         dispatcher = self.dispatcher()
         dispatcher.cfg = self.cfg
@@ -1113,6 +1537,122 @@ class ReviewSubmitInboxBoundsTests(DispatcherStateCase):
 
         self.assertEqual("done", status)
         self.assertIn("节点过多", result)
+
+    def test_valid_submit_rechecks_and_commits_inside_submission_gate(self) -> None:
+        dispatcher, payload_path = self.queue_valid_payload()
+        observed: list[tuple[str, int]] = []
+        real_dependencies = dispatcher_module._validate_inbox_dependencies
+        real_insert_batch = state.insert_batch
+
+        def checked_dependencies(conn, norm):
+            observed.append(("dependencies", state._submission_lock_depth.get()))
+            return real_dependencies(conn, norm)
+
+        def checked_insert(*args, **kwargs):
+            observed.append(("insert", state._submission_lock_depth.get()))
+            return real_insert_batch(*args, **kwargs)
+
+        with mock.patch.object(
+            dispatcher_module,
+            "_validate_inbox_dependencies",
+            side_effect=checked_dependencies,
+        ), mock.patch.object(
+            state,
+            "insert_batch",
+            side_effect=checked_insert,
+        ):
+            dispatcher._process_control_requests()
+
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "gated-submit-1")
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE job_id=?",
+                (payload_path,),
+            ).fetchone()
+        self.assertIsNotNone(batch)
+        self.assertEqual("done", request["status"])
+        self.assertFalse(os.path.exists(payload_path))
+        self.assertEqual(
+            [("dependencies", 1), ("insert", 1)],
+            observed,
+        )
+
+    def test_shutdown_fence_keeps_prepared_submit_pending(self) -> None:
+        dispatcher, payload_path = self.queue_valid_payload(
+            name="shutdown-gated-submit",
+            bid="shutdown-gated-submit-1",
+        )
+        observed_depths: list[int] = []
+
+        def shutdown_active() -> bool:
+            observed_depths.append(state._submission_lock_depth.get())
+            return True
+
+        with mock.patch.object(
+            state,
+            "submission_shutdown_active",
+            side_effect=shutdown_active,
+        ):
+            dispatcher._process_control_requests()
+
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "shutdown-gated-submit-1")
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE job_id=?",
+                (payload_path,),
+            ).fetchone()
+        self.assertIsNone(batch)
+        self.assertEqual("pending", request["status"])
+        self.assertTrue(os.path.exists(payload_path))
+        self.assertEqual([1], observed_depths)
+
+    def test_duplicate_bid_is_finalized_inside_submission_gate(self) -> None:
+        with state.connect() as conn:
+            state.insert_batch(
+                conn,
+                "duplicate-submit-1",
+                "duplicate-submit",
+                "mix",
+                [],
+                None,
+                self.tmp.name,
+                {},
+                project="p",
+            )
+            conn.execute(
+                "UPDATE batches SET status='done' WHERE id='duplicate-submit-1'"
+            )
+        dispatcher, payload_path = self.queue_valid_payload(
+            name="duplicate-submit",
+            bid="duplicate-submit-1",
+        )
+        observed_depths: list[int] = []
+        real_finish = state.finish_control_request
+
+        def checked_finish(conn, request_id, result):
+            if "重复投递" in result:
+                observed_depths.append(state._submission_lock_depth.get())
+            return real_finish(conn, request_id, result)
+
+        with mock.patch.object(
+            state,
+            "finish_control_request",
+            side_effect=checked_finish,
+        ):
+            dispatcher._process_control_requests()
+
+        with state.connect() as conn:
+            batches = conn.execute(
+                "SELECT id FROM batches WHERE name='duplicate-submit'"
+            ).fetchall()
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE job_id=?",
+                (payload_path,),
+            ).fetchone()
+        self.assertEqual(["duplicate-submit-1"], [row["id"] for row in batches])
+        self.assertEqual("done", request["status"])
+        self.assertFalse(os.path.exists(payload_path))
+        self.assertEqual([1], observed_depths)
 
 
 class ReviewProgressRegexTests(DispatcherStateCase):

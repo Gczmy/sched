@@ -11,7 +11,12 @@ import unittest
 from unittest import mock
 
 from gsched import state
-from gsched.artifacts import check_artifact, check_declared_artifacts, unlink_artifact
+from gsched.artifacts import (
+    ArtifactError,
+    check_artifact,
+    check_declared_artifacts,
+    unlink_artifact,
+)
 from gsched.dispatcher import Dispatcher
 from gsched.executor import Executor, process_start_token
 from gsched.fingerprint import compute_fingerprint
@@ -148,6 +153,47 @@ class ReviewSchemaTests(SchemaFixture):
 
         self.assertFalse(check_declared_artifacts(spec, root_link))
         self.assertFalse(unlink_artifact(root_link, "result.txt"))
+        with self.assertRaises(ArtifactError):
+            unlink_artifact(
+                root_link,
+                "result.txt",
+                raise_on_error=True,
+            )
+        self.assertTrue(os.path.isfile(artifact))
+
+    def test_strict_unlink_distinguishes_deleted_absent_and_io_failure(self) -> None:
+        artifact = os.path.join(self.root, "strict-result.txt")
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("result")
+
+        self.assertTrue(
+            unlink_artifact(
+                self.root,
+                "strict-result.txt",
+                raise_on_error=True,
+            )
+        )
+        self.assertFalse(
+            unlink_artifact(
+                self.root,
+                "strict-result.txt",
+                raise_on_error=True,
+            )
+        )
+
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("result")
+        with mock.patch(
+            "gsched.artifacts.os.unlink",
+            side_effect=PermissionError("denied"),
+        ):
+            self.assertFalse(unlink_artifact(self.root, "strict-result.txt"))
+            with self.assertRaisesRegex(ArtifactError, "denied"):
+                unlink_artifact(
+                    self.root,
+                    "strict-result.txt",
+                    raise_on_error=True,
+                )
         self.assertTrue(os.path.isfile(artifact))
 
 

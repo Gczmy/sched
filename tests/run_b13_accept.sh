@@ -410,15 +410,25 @@ if [ "$CLEAN_RC" -ne 0 ]; then
   bad "clean 异常 (rc=$CLEAN_RC): $CLEANOUT"
   exit 1
 fi
-[ -f "$OUT/res.json" ] && {
-  bad "产物未被 clean 删除"
+if echo "$CLEANOUT" | grep -Fq "已删产物: $OUT/res.json"; then
+  ok "clean 在发布重跑前删除旧产物"
+else
+  bad "clean 未报告删除旧产物: $CLEANOUT"
   exit 1
-} || ok "clean 已删除产物文件"
-SCHED_FAKE_GPUS=0:24 "$PY" -m gsched.cli daemon start --fake >/dev/null 2>&1 || {
-  bad "clean 后 daemon 重启失败"
+fi
+if echo "$CLEANOUT" | grep -Fq "批次已回 active (终态 marker 将由 daemon 在派发前协调)"; then
+  ok "clean 原子重开 done 批次并委托 marker 派发前协调"
+else
+  bad "clean 未报告重开批次: $CLEANOUT"
+  exit 1
+fi
+if "$PY" -m gsched.cli daemon status 2>/dev/null | grep -q "运行中"; then
+  ok "clean 自动确保 daemon 运行"
+else
+  bad "clean 后 daemon 未自动恢复"
   stop_daemon "$S2"
   exit 1
-}
+fi
 assert_task_status "$S2" "$S4_SKIP_BID" done "clean 后同一任务重跑 (不再 SKIP)" || {
   stop_daemon "$S2"
   exit 1
@@ -426,6 +436,11 @@ assert_task_status "$S2" "$S4_SKIP_BID" done "clean 后同一任务重跑 (不�
 CLEAN_AFTER=$(run_count "$OUT/run_count")
 assert_count_increment "$CLEAN_BEFORE" "$CLEAN_AFTER" \
   "clean 后执行计数精确增加一次" || {
+  stop_daemon "$S2"
+  exit 1
+}
+wait_batch_done "$S2" "$S4_SKIP_BID" 120 || {
+  bad "clean 后批次未重新收敛 done"
   stop_daemon "$S2"
   exit 1
 }

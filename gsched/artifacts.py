@@ -278,10 +278,35 @@ def unlink_artifact(
     path: str,
     *,
     paths_escape: bool = False,
+    raise_on_error: bool = False,
 ) -> bool:
-    """Unlink one artifact without traversing symlinks below a confined cwd."""
-    if not isinstance(paths_escape, bool):
+    """Unlink one artifact without traversing symlinks below a confined cwd.
+
+    The default remains best-effort for runtime cleanup.  Strict callers may
+    set ``raise_on_error``: ``False`` then means only that the target is
+    already absent, while invalid paths and non-ENOENT I/O failures raise
+    :class:`ArtifactError`.
+    """
+
+    def rejected(message: str, exc: BaseException | None = None) -> bool:
+        if raise_on_error:
+            error = ArtifactError(message)
+            if exc is not None:
+                raise error from exc
+            raise error
         return False
+
+    if (
+        not isinstance(cwd, str)
+        or not cwd
+        or "\0" in cwd
+        or not isinstance(path, str)
+        or not path
+        or "\0" in path
+    ):
+        return rejected("产物路径必须是非空、无 NUL 的字符串")
+    if not isinstance(paths_escape, bool):
+        return rejected("paths_escape 必须是布尔值")
     if paths_escape:
         target = path
         if not os.path.isabs(target):
@@ -289,12 +314,14 @@ def unlink_artifact(
         try:
             os.unlink(target)
             return True
-        except OSError:
+        except FileNotFoundError:
             return False
+        except OSError as exc:
+            return rejected(f"无法删除产物 {target!r}: {exc}", exc)
 
     location = _beneath_parts(cwd, path)
     if location is None:
-        return False
+        return rejected(f"产物路径无效或逃出任务 cwd: {path!r}")
     root, parts = location
     directory_flags = (
         os.O_RDONLY
@@ -317,8 +344,10 @@ def unlink_artifact(
             parent_fd = child_fd
         os.unlink(parts[-1], dir_fd=parent_fd)
         return True
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError as exc:
+        return rejected(f"无法安全删除产物 {path!r}: {exc}", exc)
     finally:
         for opened_fd in reversed(opened):
             os.close(opened_fd)

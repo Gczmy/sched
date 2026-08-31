@@ -114,7 +114,20 @@ sched resubmit <batch-ref>:<task>        # batch-ref: 完整 id 优先，否则�
 ### R4 强制全部重跑（跳过 SKIP）
 
 batch.json 加 `"force_rerun": true` 后重新 submit；或清指纹：
-`sched clean <batch-ref> --yes`（同时删除声明产物）。
+`sched clean <batch-ref> --yes`（删除每个最新 `skip` task spec 声明的产物）。
+clean 会清除该批所有版本的指纹，但只把每个 task 的最新 `skip` 版本重新排队；
+仅允许 `done/blocked` 终态批次，并且节点上不能有任何 running 任务或其他 `active`
+批次（不同批次也可能声明同一路径，在尚无 producer/path ownership 元数据前按
+fail-closed 处理）；依赖等待中的 `queued` 批次可以保留。
+命令先提交指纹栅栏、再删除
+这些 skip 产物，最后才公开可运行状态；最新 `done` 等未重排任务的产物不会删除。
+若批次已 `done`，会原子恢复为 `active` 并确保 daemon 运行；daemon 在派发前根据
+最新同名批次身份协调旧 `.done` marker。删除期间会持有全局提交栅栏；daemon 的
+依赖解锁、终态 skip 产物复核和最终 skip/cleanup/Popen 派发也使用该栅栏，因此不会
+在删除窗口启动或复用任务。若 phase 2 失败，`skip + fingerprint=NULL` 是持久
+fail-closed 栅栏，不能解锁下游或重新发布 done。不存在的产物
+视为已清理，路径策略、权限或 I/O 错误则 fail-closed，批次保持终态（此前已成功
+删除的产物不回滚，修复后可重试）。历史版本不会复活。
 
 ### R5 重跑失败/全部任务
 
@@ -125,7 +138,7 @@ sched resubmit <batch-ref> --all           # 全部任务重跑
 sched resubmit <batch-ref> --failed --dry-run   # 预览将重跑的清单
 sched resubmit <batch-ref>:<task>           # 单任务精确定位
 ```
-选择建议：想按原 spec 重跑失败终态用 retry；想生成带当前代码/runtime 新指纹的新版本用 resubmit。单任务只能在该任务所有版本均为终态时 resubmit；`done` 或 `blocked` 批次都会自动重开为 `active`，并清除旧终态 marker。
+选择建议：想按原 spec 重跑失败终态用 retry；想生成带当前代码/runtime 新指纹的新版本用 resubmit。单任务只能在该任务所有版本均为终态时 resubmit；`done` 或 `blocked` 批次都会自动重开为 `active`，终态 marker 由 daemon 在派发前按最新同名实例协调。
 历史落库 spec 在 resubmit 时会剥离任务/阶段 `retry_transform` 与阶段级 `probes`；新 batch.json 直接拒绝这些字段。
 
 ### R6 退役被取代的旧批次
@@ -189,11 +202,11 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |
 | `diag <batch-ref>[:task]` | 失败诊断（首选）| |
 | `incidents [id] [--json] [--job --gpu]` | OOM 事故快照（--json 供看板/脚本）| |
-| `retry <batch-ref>[:task]` | 解锁失败终态重跑（同 spec）| blocked 批次原子回 active 并在提交后清 `.blocked` marker；discarded 拒绝 |
+| `retry <batch-ref>[:task]` | 解锁失败终态重跑（同 spec）| blocked 批次原子回 active；marker 由 daemon 派发前协调；discarded 拒绝 |
 | `resubmit <batch-ref>:<task>` / `<batch-ref> [--failed\|--all] [--dry-run]` | 新版本排队尾；支持批次级批量 | discarded/queued 守卫；done/blocked 自动回 active |
 | `cancel <batch-ref>[:task] --yes` / `cancel --project P --yes` | 取消 | 后者连带 blocked 批次的 pending |
 | `discard <batch-ref> --yes` | 退役 blocked/queued 批次 | 仅拒 running；证据保留 |
-| `clean <batch-ref> --yes` | 清指纹+删产物 | 配合强制重跑 |
+| `clean <batch-ref> --yes` | 清全部指纹+删最新 skip spec 产物 | 仅终态批次；仅重排最新 skip；done 自动回 active |
 | `list-gpus` | GPU 视图（packed=n/cap）| |
 | `config get` / `config set -f patch --yes` / `config reload` | 配置读取/补丁写入/立即热更 | 冷键拒绝；双项目共享需谨慎 |
 | `request <request-id> --expect-revision N [--expect-kind ...] ... -- <mutation>` | 持久化幂等 mutation | revision 必填；request-id 与完整命令/前置条件永久绑定；GPU 还必须绑定完整 assignments JSON |
@@ -211,7 +224,8 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 - `history --json` 固定 `schema_version:1`，`limit` 缺省 50、钳制 1..200；顶层含 `history`、`truncated` 与 `next_cursor`，每项含 `batch_id`、`batch_name`、`task`、`status`、`version` 及运行结果/时间。
 - 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check` 默认拒绝。
 - `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop` 与 `config set`；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
-- 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒与 resubmit marker 删除只在提交后发生。`daemon start/stop` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。
+- 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒只在提交后发生，marker 由 daemon 按数据库权威状态协调。`retry`/`resubmit` 的最终事务、`clean` 的发布重跑阶段以及 `cancel` 的任务分类与写入，都会在读取权威状态前取得 SQLite writer claim，防止 daemon 在状态校验与首个 job/task mutation 之间收敛或派发任务。daemon 的节点重启恢复、接管终态判定与重试发布也使用同一 writer 顺序；已落库的 cancel request 或 `kill_reason=cancelled` 永远优先于自动重试/恢复回队。`daemon start/stop` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。
+- 本地 `submit` 与网关 inbox payload 都可在 submission gate 外做预览校验和计算指纹，但最终写入前必须在同一 gate 内按最新同名代际重验依赖存在性、完整依赖图、批次 ID 与同名终态，并原子提交批次/任务/job（inbox 同时提交请求回执）。因此并发提交不能分别基于旧快照发布 `A → B`、`B → A` 环，也不会在 `clean` 两阶段之间或 `retry`/`resubmit` 事务中途插入第二个同名非终态批次；反向顺序会在重开旧批次前拒绝已有的同名非终态实例，`clean` 在删产物前和发布重跑前各重验一次。daemon 退出门禁生效时 payload 与 pending 请求保留供恢复后重试。
 - state 根目录优先级：`SCHED_STATE` > 已加载的 `config.state_dir` > `~/.sched`。相对 `config.state_dir` 以 bootstrap config 所在目录为基准解析；`node` 必须是安全的单一路径分量。共享 state 上的登录节点查询仍定位 `config.node` 的节点目录。
 
 ---
@@ -226,6 +240,40 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
        discarded (退役终态, 不可 retry/resubmit)
 GPU:   free ⇄ assigned ⇄ releasing; 外部占用 → unmanaged; 人工 → quarantined
 ```
+
+daemon 只派发 `active` 批次中每个 task 的最新版本；终态/queued 批次和旧版本即使因
+历史数据遗留为 pending，也不会在 daemon 重启后重新执行，且不会阻塞批次收敛、
+依赖解锁或 idle 退出。候选扫描后仍会在最终 `pending → running` 抢占时原子重验
+批次状态与最新版本。旧版本若仍为 `running`，或任一代际还有未决 launch marker，
+仍会 fail-closed 阻止批次收敛、依赖解锁及 daemon idle 退出。
+每次真实启动会在 `Popen` 前先原子发布并锁定版本化 launch intent；优先使用
+no-replace rename，共享文件系统不支持该 capability 时退回同目录 hard-link
+no-replace，并验证目标与锁定 FD 的 inode 一致。hard-link 的 link→unlink 崩溃窗
+允许 intent 暂时有两个名字，但 identity marker 始终只接受单链接。wrapper 继承该锁，
+在执行任何用户命令前把 intent 替换为强进程身份 marker。daemon 崩溃时，只有能够
+非阻塞取得原 inode 锁并再次证明路径/nonce 未变化的 abandoned intent 才可删除；
+锁仍由 launcher/wrapper 持有或 marker 内容未知时一律保留 running 与资源，禁止二次启动。
+周期 tick 会重新接管所有 `running + pgid=NULL` 行；即使某轮已 claim intent 后数据库
+收敛失败，下一轮也会消费 cancel 或安全回队并释放 GPU，不依赖 daemon 再次重启。
+`blocked` 批次不会因历史 pending/waiting 行被 daemon 自动重开；只有成功提交的
+`retry`/`resubmit`/`clean` 能显式将目标批次改回 `active`。
+依赖解锁在 submission gate 内的同一 SQLite writer 事务中读取上游最新代际并以
+`status='queued'` CAS 发布 `active`；并发的上游 resubmit 与下游 discard
+因此都有唯一串行化顺序，不会用陈旧成功快照解锁或复活已退役批次。上游 `done/skip`
+都要现场复核该代所有声明产物仍有效，且 `skip` 还要求 fingerprint 非空，才算依赖
+成功；共享路径被另一次 clean 删除后，原 producer 或其他 skip 别名都不会继续解锁
+下游。尚未发布批次终态时发现名义 done/skip 的产物已失效，会把批次 fail-closed 为
+`blocked`，避免留下无法恢复的 active 批次。
+SQLite 状态是终态 marker 的权威来源；marker 属派生视图，daemon 只对本轮实际
+可派发且确为最新同名实例的批次，在派发前清理旧 `.done/.blocked` marker，不扫描
+无界历史，也不会误删较新同名终态批次的 marker。终态写入同样会在提交后持短
+submission lock 重验最新同名实例与状态，并先删除相反 suffix，避免旧实例覆盖或
+`.done/.blocked` 并存。终态通知的事件快照与 marker 所有权检查共享这一次
+submission gate；批次已被 retry/resubmit 重开时不会把 `active` 误报为 blocked。
+
+回滚到不认识 `intent-v1` 的旧 daemon 前，必须先用当前版本成功停止/收敛 daemon，
+确认没有 `running + pgid=NULL`、没有 unresolved launch marker，也没有仍持锁的 wrapper；
+条件不满足时禁止直接启动旧 daemon，否则旧恢复逻辑可能删除在途 intent 并重复执行任务。
 
 ## 6. 常见误区 TOP5
 

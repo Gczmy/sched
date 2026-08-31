@@ -11,15 +11,18 @@
 from __future__ import annotations
 
 import ctypes
+import errno
+import fcntl
 import json
 import os
 import re
 import secrets
 import shlex
 import signal
+import stat
 import subprocess
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from . import state
 
 from .artifacts import all_pass, check_artifacts
@@ -28,6 +31,361 @@ from .artifacts import all_pass, check_artifacts
 PROGRESS_RE = re.compile(
     r"(?i)(?:epoch|trial|iter|step)\s*[:/#= ]\s*(\d+)\s*(?:/|of\s+)?\s*(\d+)?"
 )
+
+LAUNCH_INTENT_TAG = "intent-v1"
+LAUNCH_INTENT_NONCE_BYTES = 24
+_LAUNCH_INTENT_NONCE_RE = re.compile(
+    rf"\A[0-9a-f]{{{LAUNCH_INTENT_NONCE_BYTES * 2}}}\Z"
+)
+_LAUNCH_MARKER_MAX_BYTES = 4096
+
+
+class _LaunchIntent(NamedTuple):
+    fd: int
+    nonce: str
+
+
+def parse_launch_intent_payload(raw: bytes) -> str | None:
+    """Return the nonce from one exact scheduler launch intent payload."""
+    if not isinstance(raw, bytes):
+        return None
+    prefix = f"{LAUNCH_INTENT_TAG} ".encode("ascii")
+    if not raw.startswith(prefix) or not raw.endswith(b"\n"):
+        return None
+    nonce_bytes = raw[len(prefix):-1]
+    try:
+        nonce = nonce_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not _LAUNCH_INTENT_NONCE_RE.fullmatch(nonce):
+        return None
+    if raw != f"{LAUNCH_INTENT_TAG} {nonce}\n".encode("ascii"):
+        return None
+    return nonce
+
+
+def _launch_intent_payload(nonce: str) -> bytes:
+    if not _LAUNCH_INTENT_NONCE_RE.fullmatch(nonce):
+        raise ValueError("invalid launch intent nonce")
+    return f"{LAUNCH_INTENT_TAG} {nonce}\n".encode("ascii")
+
+
+def _secure_marker_stat(entry: os.stat_result) -> bool:
+    return bool(
+        stat.S_ISREG(entry.st_mode)
+        and entry.st_uid == os.getuid()
+        and entry.st_nlink == 1
+        and entry.st_size <= _LAUNCH_MARKER_MAX_BYTES
+    )
+
+
+def _secure_intent_stat(entry: os.stat_result) -> bool:
+    """Validate an intent inode, including a hard-link fallback crash window.
+
+    The portable no-replace fallback briefly gives the private intent inode two
+    names in the same directory.  A launcher crash between ``link`` and
+    ``unlink`` therefore leaves ``st_nlink == 2``.  Identity markers never use
+    that fallback representation and remain restricted to exactly one link.
+    """
+    return bool(
+        stat.S_ISREG(entry.st_mode)
+        and entry.st_uid == os.getuid()
+        and entry.st_nlink in (1, 2)
+        and entry.st_size <= _LAUNCH_MARKER_MAX_BYTES
+    )
+
+
+def _pread_bounded(fd: int) -> bytes | None:
+    try:
+        raw = os.pread(fd, _LAUNCH_MARKER_MAX_BYTES + 1, 0)
+    except OSError:
+        return None
+    return raw if len(raw) <= _LAUNCH_MARKER_MAX_BYTES else None
+
+
+def _path_still_names_fd(path: str, fd: int) -> bool:
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path)
+    except OSError:
+        return False
+    return bool(
+        _secure_intent_stat(opened)
+        and _secure_intent_stat(current)
+        and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+    )
+
+
+def _intent_fd_matches(path: str, fd: int, nonce: str) -> bool:
+    if not _LAUNCH_INTENT_NONCE_RE.fullmatch(nonce):
+        return False
+    if not _path_still_names_fd(path, fd):
+        return False
+    raw = _pread_bounded(fd)
+    return raw == _launch_intent_payload(nonce)
+
+
+def _atomic_rename_noreplace(source: str, destination: str) -> None:
+    """Atomically publish *source* without replacing an existing marker."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable", destination)
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,  # AT_FDCWD
+            source_bytes,
+            -100,
+            destination_bytes,
+            1,  # RENAME_NOREPLACE
+        )
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(errno.ENOTSUP, "renamex_np is unavailable", destination)
+        renamex_np.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(
+            source_bytes,
+            destination_bytes,
+            0x00000004,  # RENAME_EXCL
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace rename is unavailable",
+            destination,
+        )
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
+_RENAME_NOREPLACE_UNSUPPORTED = {
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    errno.EINVAL,
+}
+
+
+def _hardlink_noreplace(source: str, destination: str, intent_fd: int) -> None:
+    """Atomically publish an owned same-directory inode without replacement.
+
+    ``link(2)`` is the portable shared-filesystem fallback for kernels/filesystems
+    that do not implement a no-replace rename flag.  The destination creation is
+    atomic and returns EEXIST rather than replacing another launcher's marker.
+    Every path is re-attested against the already locked descriptor before the
+    temporary name is removed.
+    """
+    source_dir = os.path.abspath(os.path.dirname(source) or ".")
+    destination_dir = os.path.abspath(os.path.dirname(destination) or ".")
+    if source_dir != destination_dir:
+        raise OSError(
+            errno.EXDEV,
+            "launch intent hard-link fallback requires one directory",
+            destination,
+        )
+    raw = _pread_bounded(intent_fd)
+    nonce = parse_launch_intent_payload(raw) if raw is not None else None
+    if nonce is None:
+        raise OSError(
+            errno.EIO,
+            "launch intent descriptor payload is invalid",
+            source,
+        )
+    os.link(source, destination, follow_symlinks=False)
+    opened = os.fstat(intent_fd)
+    source_entry = os.lstat(source)
+    destination_entry = os.lstat(destination)
+    identity = (opened.st_dev, opened.st_ino)
+    if (
+        not _secure_intent_stat(opened)
+        or not _secure_intent_stat(source_entry)
+        or not _secure_intent_stat(destination_entry)
+        or (source_entry.st_dev, source_entry.st_ino) != identity
+        or (destination_entry.st_dev, destination_entry.st_ino) != identity
+        or opened.st_nlink != 2
+        or source_entry.st_nlink != 2
+        or destination_entry.st_nlink != 2
+    ):
+        raise OSError(
+            errno.EIO,
+            "launch intent hard-link publication could not be attested",
+            destination,
+        )
+    os.unlink(source)
+    final_entry = os.fstat(intent_fd)
+    if final_entry.st_nlink != 1 or not _intent_fd_matches(
+        destination,
+        intent_fd,
+        nonce,
+    ):
+        raise OSError(
+            errno.EIO,
+            "launch intent hard-link finalization could not be verified",
+            destination,
+        )
+
+
+def _atomic_publish_noreplace(
+    source: str,
+    destination: str,
+    intent_fd: int,
+) -> None:
+    """Prefer no-replace rename, safely falling back to a same-dir hard link."""
+    try:
+        _atomic_rename_noreplace(source, destination)
+        return
+    except OSError as error:
+        if error.errno not in _RENAME_NOREPLACE_UNSUPPORTED:
+            raise
+    _hardlink_noreplace(source, destination, intent_fd)
+
+
+def _create_launch_intent(path: str) -> _LaunchIntent:
+    """Publish and lock the pre-Popen half of the launch marker protocol."""
+    state.ensure_private_directory(os.path.dirname(path) or ".")
+    nonce = secrets.token_hex(LAUNCH_INTENT_NONCE_BYTES)
+    intent_tmp = (
+        f"{path}.intent.{os.getpid()}.{nonce}.{secrets.token_hex(8)}.tmp"
+    )
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(intent_tmp, flags, 0o600)
+    intent = _LaunchIntent(fd=fd, nonce=nonce)
+    try:
+        entry = os.fstat(fd)
+        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.getuid():
+            raise OSError("launch intent is not a scheduler-owned regular file")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        payload = _launch_intent_payload(nonce)
+        written = 0
+        while written < len(payload):
+            nbytes = os.write(fd, payload[written:])
+            if nbytes <= 0:
+                raise OSError("short write while publishing launch intent")
+            written += nbytes
+        os.fsync(fd)
+        if not _intent_fd_matches(intent_tmp, fd, nonce):
+            raise OSError("launch intent publication could not be verified")
+        _atomic_publish_noreplace(intent_tmp, path, fd)
+        if not _intent_fd_matches(path, fd, nonce):
+            raise OSError("launch intent atomic publication could not be verified")
+        return intent
+    except BaseException:
+        try:
+            if _intent_fd_matches(path, fd, nonce):
+                os.unlink(path)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            os.unlink(intent_tmp)
+        except OSError:
+            pass
+
+
+def _read_published_launch_identity(path: str) -> tuple[int, str] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        entry = os.fstat(fd)
+        if not _secure_marker_stat(entry):
+            return None
+        raw = _pread_bounded(fd)
+    finally:
+        os.close(fd)
+    if raw is None:
+        return None
+    try:
+        fields = raw.decode("utf-8").split()
+    except UnicodeDecodeError:
+        return None
+    if len(fields) != 2:
+        return None
+    try:
+        pgid = int(fields[0])
+    except (TypeError, ValueError):
+        return None
+    token = fields[1]
+    if pgid <= 0 or pgid > 2**31 - 1 or not _is_strong_start_token(token):
+        return None
+    return pgid, token
+
+
+def _unlink_owned_launch_intent(path: str, intent: _LaunchIntent) -> bool:
+    """Remove only the unchanged inode and nonce created by this launcher."""
+    if not _intent_fd_matches(path, intent.fd, intent.nonce):
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
+
+
+def _claim_abandoned_launch_intent(path: str) -> bool | None:
+    """Claim and remove an exact unlocked intent.
+
+    True means a proven-abandoned intent was removed. False means the payload is
+    an intent but its inherited lock is busy or safety could not be proved.
+    None means the path is missing or is not an intent marker.
+    """
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        entry = os.fstat(fd)
+        if not _secure_intent_stat(entry):
+            return None
+        raw = _pread_bounded(fd)
+        nonce = parse_launch_intent_payload(raw) if raw is not None else None
+        if nonce is None:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            return False
+        intent = _LaunchIntent(fd=fd, nonce=nonce)
+        if not _intent_fd_matches(path, fd, nonce):
+            return False
+        return _unlink_owned_launch_intent(path, intent)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 class _DarwinProcBsdInfo(ctypes.Structure):
@@ -251,28 +609,74 @@ def _artifact_validation_command(
     ]
     return " ".join(shlex.quote(argument) for argument in argv)
 
-def _launch_marker_command(marker_path: str) -> str:
+def _publish_launch_identity(
+    marker_path: str,
+    pid: int,
+    intent_fd: int,
+    intent_nonce: str,
+) -> tuple[int, str]:
+    """Replace an exact owned intent with the wrapper's strong identity."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise OSError("invalid launch marker pid")
+    if not _LAUNCH_INTENT_NONCE_RE.fullmatch(intent_nonce):
+        raise OSError("invalid launch intent nonce")
+
+    marker_tmp = (
+        f"{marker_path}.identity.{os.getpid()}.{pid}."
+        f"{secrets.token_hex(8)}.tmp"
+    )
+    try:
+        with state.open_private_text(marker_tmp, "x") as marker:
+            marker_token = process_start_token(pid)
+            if not _is_strong_start_token(marker_token):
+                raise OSError(
+                    "strong process identity unavailable for launch marker"
+                )
+            expected = (pid, marker_token)
+            current = _read_published_launch_identity(marker_path)
+            if current == expected:
+                return expected
+            if not _intent_fd_matches(
+                marker_path,
+                intent_fd,
+                intent_nonce,
+            ):
+                # The parent and wrapper publish concurrently.  Re-read after
+                # the inode check so a winning peer with the same identity is
+                # accepted, while every other replacement remains fail-closed.
+                if _read_published_launch_identity(marker_path) == expected:
+                    return expected
+                raise OSError("launch intent ownership changed before publication")
+            marker.write(f"{pid} {marker_token}\n")
+            marker.flush()
+            os.fsync(marker.fileno())
+        os.replace(marker_tmp, marker_path)
+        if _read_published_launch_identity(marker_path) != expected:
+            raise OSError("launch identity publication could not be verified")
+        return expected
+    finally:
+        try:
+            os.unlink(marker_tmp)
+        except OSError:
+            pass
+
+
+def _launch_marker_command(
+    marker_path: str,
+    intent_fd: int,
+    intent_nonce: str,
+) -> str:
     """Build the wrapper-side strong-identity marker publisher."""
     package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     program = (
         "import os,sys\n"
         "sys.path.insert(0,sys.argv[1])\n"
-        "from gsched import state\n"
-        "from gsched.executor import process_start_token\n"
+        "from gsched.executor import _publish_launch_identity\n"
         "path=sys.argv[2]\n"
-        "pid=int(sys.argv[3])\n"
-        "token=process_start_token(pid)\n"
-        "if token is None: raise SystemExit(1)\n"
-        "tmp=f'{path}.child.{pid}.{os.getpid()}.tmp'\n"
-        "try:\n"
-        " with state.open_private_text(tmp,'x') as stream:\n"
-        "  stream.write(f'{pid} {token}\\n')\n"
-        "  stream.flush()\n"
-        "  os.fsync(stream.fileno())\n"
-        " os.replace(tmp,path)\n"
-        "finally:\n"
-        " try: os.unlink(tmp)\n"
-        " except OSError: pass\n"
+        "intent_fd=int(sys.argv[3])\n"
+        "nonce=sys.argv[4]\n"
+        "pid=int(sys.argv[5])\n"
+        "_publish_launch_identity(path,pid,intent_fd,nonce)\n"
     )
     argv = [
         sys.executable,
@@ -281,6 +685,8 @@ def _launch_marker_command(marker_path: str) -> str:
         program,
         package_root,
         marker_path,
+        str(intent_fd),
+        intent_nonce,
     ]
     return " ".join(shlex.quote(argument) for argument in argv) + ' "$$"'
 
@@ -391,11 +797,9 @@ class Executor:
         rc_dir = merged_env.get("SCHED_RC_DIR")
         rc_prefix = merged_env.get("SCHED_RC_PREFIX")
         launch_marker = merged_env.get("SCHED_LAUNCH_MARKER")
-        launch_script = ""
         if launch_marker:
             launch_marker = str(launch_marker)
             state.ensure_private_directory(os.path.dirname(launch_marker) or ".")
-            launch_script = _launch_marker_command(launch_marker) + " && "
         if self.sanitize_env:
             self._sanitize_conda_env(
                 merged_env,
@@ -493,89 +897,102 @@ class Executor:
                     "/bin/rm -f "
                     + " ".join(shlex.quote(path) for path in stale_sidecars),
                 )
-            wrapper_cmd = [
-                "/bin/bash",
-                "--noprofile",
-                "--norc",
-                "-c",
-                supervisor_script + launch_script + " && ".join(parts) + rc_script,
-            ]
-        elif rc_script or launch_script:
-            command = launch_script + "__sched_run " + " ".join(
+            shell_body = " && ".join(parts) + rc_script
+            wrapper_cmd = None
+        elif rc_script or launch_marker:
+            shell_body = "__sched_run " + " ".join(
                 shlex.quote(str(t)) for t in (cmd or [])
-            )
-            wrapper_cmd = [
-                "/bin/bash",
-                "--noprofile",
-                "--norc",
-                "-c",
-                supervisor_script + command + rc_script,
-            ]
+            ) + rc_script
+            wrapper_cmd = None
         else:
+            shell_body = None
             wrapper_cmd = [str(t) for t in (cmd or [])]
 
+        intent: _LaunchIntent | None = None
+        proc: subprocess.Popen | None = None
+        marker_token: str | None = None
         try:
-            proc = subprocess.Popen(
-                wrapper_cmd,
+            launch_script = ""
+            if launch_marker:
+                intent = _create_launch_intent(str(launch_marker))
+                launch_script = (
+                    _launch_marker_command(
+                        str(launch_marker),
+                        intent.fd,
+                        intent.nonce,
+                    )
+                    + f" && exec {intent.fd}>&- && "
+                )
+            if shell_body is not None:
+                wrapper_cmd = [
+                    "/bin/bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    supervisor_script + launch_script + shell_body,
+                ]
+            assert wrapper_cmd is not None
+            popen_kwargs = dict(
                 cwd=cwd,
                 env=merged_env,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,  # 新进程组, pgid = proc.pid
             )
-        except Exception:
-            try:
-                log_f.close()  # Popen 失败 (cwd/cmd 非法等)
-            except Exception:
-                pass
-            raise
-        self._dead_pgroups.discard(proc.pid)
-        try:
+            if intent is not None:
+                popen_kwargs["pass_fds"] = (intent.fd,)
+            proc = subprocess.Popen(wrapper_cmd, **popen_kwargs)
+            self._dead_pgroups.discard(proc.pid)
             if launch_marker:
-                marker_path = str(launch_marker)
-                marker_token = process_start_token(proc.pid)
-                marker_tmp = (
-                    f"{marker_path}.parent.{os.getpid()}.{proc.pid}."
-                    f"{secrets.token_hex(8)}.tmp"
+                assert intent is not None
+                _marker_pid, marker_token = _publish_launch_identity(
+                    str(launch_marker),
+                    proc.pid,
+                    intent.fd,
+                    intent.nonce,
                 )
-                try:
-                    with state.open_private_text(marker_tmp, "x") as marker:
-                        if not _is_strong_start_token(marker_token):
-                            raise OSError(
-                                "strong process identity unavailable for launch marker"
-                            )
-                        marker.write(f"{proc.pid} {marker_token}\n")
-                        marker.flush()
-                        os.fsync(marker.fileno())
-                    os.replace(marker_tmp, marker_path)
-                finally:
-                    try:
-                        os.unlink(marker_tmp)
-                    except OSError:
-                        pass
             log_f.close()
             self._procs[proc.pid] = proc
+            return proc.pid
         except Exception:
             try:
                 log_f.close()
             except Exception:
                 pass
-            marker_token = locals().get("marker_token")
-            if (
-                proc.poll() is None
-                and _is_strong_start_token(marker_token)
-                and process_start_token(proc.pid) == marker_token
-            ):
+            if proc is None:
+                # Popen did not return a child.  Only this launcher's unchanged
+                # inode+nonce may be removed; a concurrent replacement is kept.
+                if intent is not None and launch_marker:
+                    try:
+                        _unlink_owned_launch_intent(
+                            str(launch_marker),
+                            intent,
+                        )
+                    except Exception:
+                        pass
+            else:
+                if not _is_strong_start_token(marker_token):
+                    marker_token = process_start_token(proc.pid)
+                if (
+                    proc.poll() is None
+                    and _is_strong_start_token(marker_token)
+                    and process_start_token(proc.pid) == marker_token
+                ):
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (OSError, ProcessLookupError):
+                    proc.wait(timeout=1)
+                except Exception:
                     pass
-            try:
-                proc.wait(timeout=1)
-            except Exception:
-                pass
             raise
-        return proc.pid
+        finally:
+            if intent is not None:
+                try:
+                    os.close(intent.fd)
+                except OSError:
+                    pass
 
     def poll_rc(self, pgid: int) -> int | None:
         """查询进程退出码. 未退出返回 None; 已退出返回 rc (并清理记录)."""

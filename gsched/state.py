@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS batches (
   priority    INTEGER NOT NULL DEFAULT 0,
   revision    INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_batches_name_created
+  ON batches(name, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS tasks (
   batch_id  TEXT NOT NULL REFERENCES batches(id),

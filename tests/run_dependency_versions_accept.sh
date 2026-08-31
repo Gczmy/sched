@@ -40,19 +40,45 @@ def add_versions(batch_id, name, old_status, latest_status, batch_status="active
 
 add_versions("unlock-batch", "unlock_batch", "failed", "done")
 add_versions("settle-batch", "settle_batch", "running", "done")
+add_versions(
+    "active-stale-pending-batch",
+    "active_stale_pending",
+    "pending",
+    "done",
+)
+add_versions(
+    "done-stale-pending-batch",
+    "done_stale_pending",
+    "pending",
+    "pending",
+    batch_status="done",
+)
 
 conn = sqlite3.connect(state.db_path())
 conn.row_factory = sqlite3.Row
-assert Dispatcher._batch_successful(None, conn, "unlock_batch") is True
-assert Dispatcher._batch_successful(None, conn, "settle_batch") is False
-
 d = Dispatcher.__new__(Dispatcher)
+d.host_dir = state.host_dir()
 d.log_line = lambda _msg: None
 d._write_marker = lambda *_args: None
+d._remove_marker = lambda *_args: None
 d._notify_batch = lambda *_args: None
+assert d._batch_successful(conn, "unlock_batch") is True
+assert d._batch_successful(conn, "settle_batch") is False
+assert d._batch_successful(conn, "active_stale_pending") is True
 Dispatcher._settle_batch_status(d)
 row = conn.execute("SELECT status FROM batches WHERE id='settle-batch'").fetchone()
 assert row["status"] == "active", row
+row = conn.execute(
+    "SELECT status FROM batches WHERE id='active-stale-pending-batch'"
+).fetchone()
+assert row["status"] == "done", row
+# Let the real isolated daemon perform the same convergence so marker creation
+# is covered as well as the direct settlement predicate.
+conn.execute(
+    "UPDATE batches SET status='active'"
+    " WHERE id='active-stale-pending-batch'"
+)
+conn.commit()
 print("H5 latest-version dependency unlock and stale-running settlement guard pass")
 PY
 
@@ -85,6 +111,33 @@ raise SystemExit(0 if ok else 1)' || batch_ok=0
 done
 if [ "$settled" != "1" ]; then
   echo "stale running version did not fully converge" >&2
+  exit 1
+fi
+if ! "$PY" -m gsched.cli task active-stale-pending-batch:t1 --json 2>/dev/null \
+  | "$PY" -c '
+import json, sys
+jobs = json.load(sys.stdin).get("jobs", [])
+observed = [(j.get("version"), j.get("status"), j.get("started_at")) for j in jobs]
+raise SystemExit(0 if observed == [(1, "pending", None), (2, "done", None)] else 1)'; then
+  echo "active batch dispatched an obsolete pending version" >&2
+  exit 1
+fi
+if ! "$PY" -m gsched.cli status active-stale-pending-batch --json 2>/dev/null \
+  | "$PY" -c '
+import json, sys
+batches = json.load(sys.stdin).get("batches", [])
+raise SystemExit(0 if len(batches) == 1 and batches[0].get("status") == "done" else 1)' \
+  || [ ! -f "$SCHED_STATE/$NODE/markers/active_stale_pending.done" ]; then
+  echo "obsolete pending version blocked batch settlement or done marker" >&2
+  exit 1
+fi
+if ! "$PY" -m gsched.cli task done-stale-pending-batch:t1 --json 2>/dev/null \
+  | "$PY" -c '
+import json, sys
+jobs = json.load(sys.stdin).get("jobs", [])
+observed = [(j.get("version"), j.get("status"), j.get("started_at")) for j in jobs]
+raise SystemExit(0 if observed == [(1, "pending", None), (2, "pending", None)] else 1)'; then
+  echo "terminal batch dispatched a pending job" >&2
   exit 1
 fi
 "$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1

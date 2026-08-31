@@ -955,6 +955,102 @@ def check_dependency_cycle(depends_on: list[str], cfg: dict) -> None:
             raise SchemaError(f"depends_on 含非法 name: {d}")
 
 
+def validate_persisted_dependencies(
+    conn: Any,
+    batch_name: str,
+    depends_on: list[str],
+) -> None:
+    """Validate one proposed latest-name dependency graph on ``conn``.
+
+    Callers that publish a batch must run this check again while holding the
+    submission gate.  The earlier schema/preview check is intentionally not a
+    commit-time authority: another same-name generation may have been inserted
+    while fingerprints were being computed.
+    """
+    _validate_identifier(batch_name, "name")
+    for index, dependency in enumerate(depends_on):
+        _validate_identifier(dependency, f"depends_on[{index}]")
+        row = conn.execute(
+            "SELECT id FROM batches WHERE name=?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (dependency,),
+        ).fetchone()
+        if not row:
+            raise SchemaError(
+                f"depends_on 引用的批次不存在: '{dependency}' (O1)"
+            )
+
+    graph: dict[str, list[str]] = {batch_name: list(depends_on)}
+    latest: dict[str, tuple[str, int, Any]] = {}
+    rows = conn.execute(
+        "SELECT rowid, name, depends_on, created_at FROM batches"
+    ).fetchall()
+    for row in rows:
+        key = (row["created_at"] or "", row["rowid"])
+        current = latest.get(row["name"])
+        if current is not None and key <= current[:2]:
+            continue
+        latest[row["name"]] = (key[0], key[1], row["depends_on"])
+    for name, (_created_at, _rowid, raw_dependencies) in latest.items():
+        try:
+            stored_dependencies = json.loads(raw_dependencies or "[]")
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TypeError,
+            RecursionError,
+        ) as error:
+            raise SchemaError(
+                f"批次 '{name}' 的 depends_on 状态无效"
+            ) from error
+        if (
+            not isinstance(stored_dependencies, list)
+            or any(
+                not isinstance(item, str) or not item
+                for item in stored_dependencies
+            )
+        ):
+            raise SchemaError(
+                f"批次 '{name}' 的 depends_on 状态无效"
+            )
+        try:
+            for index, item in enumerate(stored_dependencies):
+                _validate_identifier(item, f"depends_on[{index}]")
+        except SchemaError as error:
+            raise SchemaError(
+                f"批次 '{name}' 的 depends_on 状态无效"
+            ) from error
+        graph.setdefault(name, stored_dependencies)
+
+    # Iterative DFS avoids turning a long but valid historical dependency chain
+    # into a Python recursion failure.  ``active`` also preserves a useful cycle
+    # path for the existing B3 diagnostic.
+    visited: set[str] = set()
+    active: dict[str, int] = {}
+    path: list[str] = []
+    stack: list[tuple[str, int]] = [(batch_name, 0)]
+    while stack:
+        name, child_index = stack[-1]
+        if child_index == 0 and name not in active:
+            active[name] = len(path)
+            path.append(name)
+        children = graph.get(name, [])
+        if child_index >= len(children):
+            stack.pop()
+            active.pop(name, None)
+            if path and path[-1] == name:
+                path.pop()
+            visited.add(name)
+            continue
+        dependency = children[child_index]
+        stack[-1] = (name, child_index + 1)
+        if dependency in active:
+            cycle = " -> ".join(path[active[dependency]:] + [dependency])
+            raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
+        if dependency not in visited:
+            stack.append((dependency, 0))
+
+
 def parse_shell_cmd(shell_str: str, where: str) -> list[str]:
     """Q1: sched run 的 shell 字符串 shlex.split 后做 sudo 词法检查."""
     try:

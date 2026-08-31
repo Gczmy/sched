@@ -35,6 +35,7 @@ from .artifacts import (
 from .allocator import Allocator
 from .executor import (
     Executor,
+    _claim_abandoned_launch_intent,
     _is_strong_start_token,
     pid_cmdline_matches,
     process_start_token,
@@ -43,7 +44,7 @@ from .executor import (
 )
 from .fingerprint import compute_fingerprint
 from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template
-from .schema import SchemaError, validate_batch
+from .schema import SchemaError, validate_batch, validate_persisted_dependencies
 from .templates import expand_cmd
 
 POLL_SEC = 10
@@ -135,40 +136,11 @@ _FINGERPRINT_UNSET = object()
 
 def _validate_inbox_dependencies(conn, norm: dict) -> None:
     """Recheck dependency existence and cycles on the daemon's DB connection."""
-    for dep in norm["depends_on"]:
-        row = conn.execute(
-            "SELECT id FROM batches WHERE name=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (dep,),
-        ).fetchone()
-        if not row:
-            raise SchemaError(f"depends_on 引用的批次不存在: '{dep}' (O1)")
-
-    graph: dict[str, list[str]] = {norm["name"]: list(norm["depends_on"])}
-    latest: dict[str, tuple[str, int, list[str]]] = {}
-    rows = conn.execute("SELECT rowid, name, depends_on, created_at FROM batches").fetchall()
-    for row in rows:
-        key = (row["created_at"] or "", row["rowid"])
-        current = latest.get(row["name"])
-        if current is None or key > current[:2]:
-            latest[row["name"]] = (key[0], key[1], json.loads(row["depends_on"] or "[]"))
-    for name, (_created_at, _rowid, depends_on) in latest.items():
-        graph.setdefault(name, depends_on)
-    visited: set[str] = set()
-    stack: list[str] = []
-
-    def visit(name: str) -> None:
-        if name in stack:
-            cycle = " -> ".join(stack[stack.index(name):] + [name])
-            raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
-        if name in visited:
-            return
-        visited.add(name)
-        stack.append(name)
-        for dep in graph.get(name, []):
-            visit(dep)
-        stack.pop()
-
-    visit(norm["name"])
+    validate_persisted_dependencies(
+        conn,
+        norm["name"],
+        norm["depends_on"],
+    )
 # gpus 卡集/容量另经 parse_gpus 结构比对, 不在本列表.
 CONFIG_COLD_KEYS = ("node", "state_dir", "user", "schema_version")
 
@@ -822,8 +794,10 @@ class Dispatcher:
     def _idle_check(self) -> bool:
         """定案 38: 连续 idle 超时优雅退出.
 
-        idle = jobs 表无 pending/running/waiting_dep 任务 (blocked/failed/cancelled
-        等人工态不计 activity —— 批次 blocked 时 daemon 不派发, 空转无意义).
+        idle = 没有 running，且 active/queued 批次没有最新代际的
+        pending/waiting 任务。终态批次和旧代际遗留的 pending 不可派发，
+        不能让 daemon 永久无法 idle 退出；但任一未决 launch marker 仍可能
+        代表 crash-window 进程，必须全局 fail-closed。
         返回 True = 触发退出 (主循环 break, 随后 _cleanup_lock).
         """
         if self.idle_timeout_min <= 0:
@@ -831,14 +805,21 @@ class Dispatcher:
         with state.submission_lock():
             with state.connect() as conn:
                 n = conn.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','running','waiting_dep')"
+                    "SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id=j.batch_id"
+                    " WHERE j.status='running' OR ("
+                    "   b.status IN ('active','queued')"
+                    "   AND j.status IN ('pending','waiting_quota','waiting_dep')"
+                    "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+                    "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id)"
+                    " )"
                 ).fetchone()[0]
                 pending_control = conn.execute(
                     "SELECT COUNT(*) FROM control_requests WHERE status='pending'"
                 ).fetchone()[0]
             now = time.time()
             inbox_pending = self._submit_inbox_pending()
-            if n > 0 or pending_control > 0 or inbox_pending:
+            unresolved_launch = self._unresolved_launch_markers()
+            if n > 0 or pending_control > 0 or inbox_pending or unresolved_launch:
                 self.last_activity = now
                 return False
             if now - self.last_activity >= self.idle_timeout_min * 60:
@@ -893,6 +874,12 @@ class Dispatcher:
         self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
         self._recover_launch_markers()
+        # Revisit every running row that still lacks a pgid on every tick, not
+        # only when a marker was claimed in this tick.  This also converges
+        # safely after "claim succeeded, DB settlement failed": on the next
+        # tick the marker is absent, and startup adoption already defines that
+        # state as a pre-Popen failure rather than a live process.
+        self._adopt_running(unidentified_only=True)
         self._reap_finished_jobs()
         _freed, _to = self.allocator.settle_releasing()
         for g in _to:
@@ -933,13 +920,46 @@ class Dispatcher:
             )
 
     def _settle_batch_status(self) -> None:
+        # Terminal success for skip rows depends on external artifacts.  Share
+        # clean's gate across validation, status publication, marker ownership,
+        # and event snapshot so a concurrent deletion cannot invalidate a
+        # success decision immediately after it is made.
+        with state.submission_lock():
+            self._settle_batch_status_serialized()
+
+    def _terminal_job_successful(self, conn, job) -> bool:
+        if job["status"] not in ("done", "skip"):
+            return False
+        if job["status"] == "skip" and (
+            not isinstance(job["fingerprint"], str)
+            or not job["fingerprint"]
+        ):
+            return False
+        try:
+            spec = self._load_task_spec(conn, job)
+        except ValueError as error:
+            self.log_line(
+                f"job {job['id']} skip 成功态校验失败: {error}"
+            )
+            return False
+        return check_declared_artifacts(
+            spec,
+            spec.get("cwd_abs") or ".",
+        )
+
+    def _settle_batch_status_serialized(self) -> None:
         """P1: 批次终态. done = 全部任务成功终态 (done/skip);
         任一 failed/blocked/cancelled/timed_out -> blocked (interrupted 除外 R4).
-        定案 37 (2026-08-15): blocked 批次人工 retry/resubmit 解除失败终态后
-        -> 自动回 active 继续派发 (本次事故需手动 UPDATE 的 gap)."""
-        marker_effects: list[tuple[str, str, str, str | None]] = []
-        notify_batches: list[dict] = []
+
+        终态批次只能由 retry/resubmit/clean 的提交事务显式重开；
+        daemon 不根据历史遗留的 pending/waiting 行猜测人工意图。"""
+        marker_effects: list[tuple[str, str, str, str, str | None]] = []
         with state.connect() as conn:
+            # Status snapshots and terminal publication must be one writer
+            # transaction.  Otherwise retry/resubmit/discard can commit after
+            # our read and be overwritten by a stale done/blocked decision.
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             batches = conn.execute(
                 "SELECT * FROM batches WHERE status IN ('active','blocked')"
             ).fetchall()
@@ -949,7 +969,7 @@ class Dispatcher:
                 # 新 pending 全部冻结 —— SelfDistOTS 实测踩坑)。与 C4/retry
                 # 的"每 task 取最新 version"口径一致。
                 jobs = conn.execute(
-                    "SELECT j.status FROM jobs j"
+                    "SELECT j.* FROM jobs j"
                     " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
                     "       WHERE batch_id=? GROUP BY task_id) t"
                     "   ON j.batch_id=? AND j.task_id=t.task_id AND j.version=t.mv",
@@ -958,40 +978,77 @@ class Dispatcher:
                 if not jobs:
                     continue
                 statuses = [j["status"] for j in jobs]
-                stale_live = conn.execute(
+                stale_running = conn.execute(
                     "SELECT 1 FROM jobs j"
                     " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
                     "       WHERE batch_id=? GROUP BY task_id) t"
                     "   ON j.batch_id=? AND j.task_id=t.task_id"
                     " WHERE j.version < t.mv"
-                    "   AND j.status IN ('running','pending','waiting_quota','waiting_dep')"
+                    "   AND j.status='running'"
                     " LIMIT 1",
                     (b["id"], b["id"]),
                 ).fetchone()
-                if stale_live and all(s in ("done", "skip") for s in statuses):
-                    # 老版本仍可能在跑: 最新版本虽成功, 批次不可提前收敛。
+                nominal_terminal_success = all(
+                    status in ("done", "skip") for status in statuses
+                )
+                terminal_success = nominal_terminal_success and all(
+                    self._terminal_job_successful(conn, j) for j in jobs
+                )
+                if nominal_terminal_success and not terminal_success:
+                    if b["status"] == "active":
+                        changed = conn.execute(
+                            "UPDATE batches SET status='blocked'"
+                            " WHERE id=? AND status='active'",
+                            (b["id"],),
+                        ).rowcount
+                        if changed:
+                            marker_effects.append(
+                                (
+                                    "write",
+                                    b["id"],
+                                    b["name"],
+                                    "blocked",
+                                    "done/skip 声明产物已缺失或失效",
+                                )
+                            )
                     continue
-                if all(s in ("done", "skip") for s in statuses):
-                    conn.execute(
-                        "UPDATE batches SET status='done' WHERE id=?", (b["id"],)
-                    )
+                unresolved_launch = (
+                    terminal_success
+                    and self._batch_has_unresolved_launch_marker(conn, b["id"])
+                )
+                if terminal_success and (stale_running or unresolved_launch):
+                    # 老版本仍在跑，或任一代际还留有未决 launch marker：
+                    # 最新版本虽成功，批次也不可提前收敛。
+                    continue
+                if terminal_success:
+                    changed = conn.execute(
+                        "UPDATE batches SET status='done' WHERE id=?"
+                        " AND status IN ('active','blocked')",
+                        (b["id"],),
+                    ).rowcount
+                    if changed != 1:
+                        continue
                     marker_effects.append(
                         (
                             "write",
+                            b["id"],
                             b["name"],
                             "done",
                             f"{len(statuses)} 任务全部成功终态 (done/skip)",
                         )
                     )
-                    notify_batches.append(dict(b))
                 elif any(
                     s in ("failed", "blocked", "cancelled", "timed_out")
                     for s in statuses
                 ):
                     if b["status"] == "active":
-                        conn.execute(
-                            "UPDATE batches SET status='blocked' WHERE id=?", (b["id"],)
-                        )
+                        changed = conn.execute(
+                            "UPDATE batches SET status='blocked'"
+                            " WHERE id=? AND status='active'",
+                            (b["id"],),
+                        ).rowcount
+                        if changed != 1:
+                            continue
                         fails = [
                             r["task_id"] for r in conn.execute(
                                 "SELECT task_id FROM jobs WHERE batch_id=? AND status IN"
@@ -1002,79 +1059,115 @@ class Dispatcher:
                         marker_effects.append(
                             (
                                 "write",
+                                b["id"],
                                 b["name"],
                                 "blocked",
                                 f"失败任务: {','.join(fails) if fails else '-'}",
                             )
                         )
-                        notify_batches.append(dict(b))
-                elif b["status"] == "blocked":
-                    # 人工 retry/resubmit 已解除全部失败终态 (只剩 pending/running 等)
-                    conn.execute(
-                        "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
-                    )
-                    marker_effects.append(("remove", b["name"], "blocked", None))
 
-        for operation, name, kind, detail in marker_effects:
-            if operation == "write":
-                assert detail is not None
-                self._write_marker(name, kind, detail)
-                self.log_line(
-                    f"批次 {name} {kind} "
-                    + (
-                        "(全部任务成功终态)"
-                        if kind == "done"
-                        else "(有失败任务, 等人工)"
+        for operation, batch_id, name, kind, detail in marker_effects:
+            # Marker ownership and event snapshot share one serialization
+            # interval: either this terminal generation publishes both, or a
+            # retry/resubmit/new same-name generation wins and both are skipped.
+            try:
+                with state.submission_lock():
+                    applied = self._apply_terminal_marker_effect(
+                        operation,
+                        batch_id,
+                        name,
+                        kind,
+                        detail,
                     )
+                    if not applied:
+                        continue
+                    if operation == "write":
+                        self.log_line(
+                            f"批次 {name} {kind} "
+                            + (
+                                "(全部任务成功终态)"
+                                if kind == "done"
+                                else "(有失败任务, 等人工)"
+                            )
+                        )
+                        self._notify_batch(batch_id, name, kind)
+            except (OSError, sqlite3.Error, state.StateError) as error:
+                self.log_line(
+                    f"批次 {name} terminal effect 序列化失败，保留状态: {error}"
                 )
-            else:
-                self._remove_marker(name, kind)
-                self.log_line(f"批次 {name} 失败终态解除 -> active (人工 retry 生效)")
-        for batch in notify_batches:
-            with state.connect() as conn:
-                self._notify_batch(conn, batch)
 
     # ---------- 批次终态通知 (设计 docs/sched_notify_design.md) ----------
 
-    def _notify_batch(self, conn, b) -> None:
+    def _notify_batch(
+        self,
+        batch_id: str,
+        batch_name: str,
+        expected_status: str,
+    ) -> bool:
         """批次进终态 -> 异步投递 (email/file 渠道). 故障只记日志, 绝不影响调度.
 
         - 一次性迁移点触发 (与 _write_marker 同处), 天然去重无需已发记录
         - 批次级覆盖 (设计 §3): batches.notify=false 关; {"email_to": [...]} 改收件人
-        - 调用方传入的 b 是 UPDATE 前的 Row 快照 —— 必须重读 (同 H1 教训)
+        - 构造前在 submission gate 内确认仍是同名最新的预期终态；批次若已
+          retry/resubmit 重开为 active，绝不能被 build_event 误编码为 blocked
         - 发送在 daemon 线程, 退出时 _cleanup_lock join 等发完 (定案 38 交互)
         """
         self._prune_notify_threads()
         try:
-            b = state.get_batch(conn, b["id"])  # 重读: 拿到刚写入的终态
-            bnf = json.loads(b["notify"]) if b["notify"] else None
-            if bnf is False:
-                return  # 批次级关闭
-            ncfg = self.cfg.get("notify") or {}
-            if not ncfg:
-                return  # 全局未配置 = 功能关闭
-            cfg = self.cfg
-            if isinstance(bnf, dict) and bnf.get("email_to") and ncfg.get("email"):
-                # 批次级改收件人: 浅拷覆盖, 不动全局 cfg
-                cfg = dict(self.cfg)
-                em = dict(ncfg["email"])
-                em["to"] = bnf["email_to"]
-                cfg["notify"] = dict(ncfg, email=em)
-            event = notify.build_event(conn, b, self.host_dir)
+            if expected_status not in ("done", "blocked"):
+                return False
+            with state.submission_lock():
+                with state.connect() as conn:
+                    if not conn.in_transaction:
+                        conn.execute("BEGIN")
+                    latest = conn.execute(
+                        "SELECT id, status FROM batches WHERE name=?"
+                        " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        (batch_name,),
+                    ).fetchone()
+                    if (
+                        latest is None
+                        or latest["id"] != batch_id
+                        or latest["status"] != expected_status
+                    ):
+                        return False
+                    b = state.get_batch(conn, batch_id)
+                    if b is None or b["status"] != expected_status:
+                        return False
+                    bnf = json.loads(b["notify"]) if b["notify"] else None
+                    if bnf is False:
+                        return False  # 批次级关闭
+                    ncfg = self.cfg.get("notify") or {}
+                    if not ncfg:
+                        return False  # 全局未配置 = 功能关闭
+                    cfg = self.cfg
+                    if (
+                        isinstance(bnf, dict)
+                        and bnf.get("email_to")
+                        and ncfg.get("email")
+                    ):
+                        # 批次级改收件人: 浅拷覆盖, 不动全局 cfg
+                        cfg = dict(self.cfg)
+                        em = dict(ncfg["email"])
+                        em["to"] = bnf["email_to"]
+                        cfg["notify"] = dict(ncfg, email=em)
+                    event = notify.build_event(conn, b, self.host_dir)
 
             def _send() -> None:
                 try:
                     for r in notify.send(event, cfg):
                         if not r.startswith("ok:"):
-                            self.log_line(f"notify [{b['name']}]: {r}")
+                            self.log_line(f"notify [{batch_name}]: {r}")
                 except Exception as e:  # noqa: BLE001 — 通知绝不影响调度 (§6)
-                    self.log_line(f"notify [{b['name']}] 线程异常: {e}")
+                    self.log_line(f"notify [{batch_name}] 线程异常: {e}")
 
             t = threading.Thread(target=_send, daemon=True)
             t.start()
             self._notify_threads.append(t)
+            return True
         except Exception as e:  # noqa: BLE001 — 构造事件失败也不影响批次收敛
-            self.log_line(f"notify [{b['name']}] 构造失败: {e}")
+            self.log_line(f"notify [{batch_name}] 构造失败: {e}")
+            return False
 
     # ---------- P7: 批次终态 marker (2026-08-15) ----------
     def _marker_dir(self) -> str:
@@ -1082,6 +1175,49 @@ class Dispatcher:
         # 时同名批次 marker 不再互相覆盖 (与 state.db/logs/profiles 一致)
         d = os.path.join(self.host_dir, "markers")
         return state.ensure_private_directory(d)
+
+    def _apply_terminal_marker_effect(
+        self,
+        operation: str,
+        batch_id: str,
+        name: str,
+        kind: str,
+        detail: str | None,
+    ) -> bool:
+        """Apply a marker effect only while its batch owns the shared name.
+
+        Submission mutations use the same short lock, so validation and file
+        replacement cannot race a newer same-name batch becoming authoritative.
+        """
+        try:
+            with state.submission_lock():
+                with state.connect() as conn:
+                    latest = conn.execute(
+                        "SELECT id, status FROM batches WHERE name=?"
+                        " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        (name,),
+                    ).fetchone()
+                if not latest or latest["id"] != batch_id:
+                    return False
+                if operation == "write":
+                    if latest["status"] != kind or detail is None:
+                        return False
+                    opposite = "blocked" if kind == "done" else "done"
+                    self._remove_marker(name, opposite)
+                    self._write_marker(name, kind, detail)
+                    return True
+                if (
+                    operation == "remove"
+                    and latest["status"] in ("active", "queued")
+                ):
+                    self._remove_marker(name, kind)
+                    return True
+                return False
+        except (OSError, sqlite3.Error, state.StateError) as error:
+            self.log_line(
+                f"批次 {name} marker 所有权校验失败，保留现状: {error}"
+            )
+            return False
 
     def _write_marker(self, name: str, kind: str, detail: str) -> None:
         """P7: 批次进入终态 (done/blocked) 写 marker 文件, 供一行查看 (sched markers).
@@ -1121,13 +1257,18 @@ class Dispatcher:
                 self.log_line("D4: 检测到节点重启, running 任务标 interrupted (不计 retries)")
                 cleanup_jobs: list[dict] = []
                 with state.connect() as conn:
+                    # A cancel command takes the same SQLite writer claim before
+                    # classifying jobs.  Whichever writer wins determines a
+                    # complete state transition; no stale running snapshot may
+                    # be republished as pending below.
+                    if not conn.in_transaction:
+                        conn.execute("BEGIN IMMEDIATE")
                     rows = conn.execute(
                         "SELECT * FROM jobs WHERE status='running'"
                     ).fetchall()
                     for j in rows:
                         state.update_job(
                             conn, j["id"], status="interrupted",
-                            kill_reason=None,
                         )
                         self._requeue_for_retry(conn, j)
                         cleanup_jobs.append(dict(j))
@@ -1148,6 +1289,41 @@ class Dispatcher:
     def _launch_marker_path(self, job) -> str:
         return os.path.join(
             self.host_dir, "launch", f"{self._job_rc_prefix(job)}.launch"
+        )
+
+    def _launch_marker_unresolved(self, job) -> bool:
+        """Fail closed while any marker object still exists for a job."""
+        try:
+            os.lstat(self._launch_marker_path(job))
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
+    def _batch_has_unresolved_launch_marker(self, conn, batch_id: str) -> bool:
+        jobs = conn.execute(
+            "SELECT id FROM jobs WHERE batch_id=?",
+            (batch_id,),
+        ).fetchall()
+        return any(self._launch_marker_unresolved(job) for job in jobs)
+
+    def _task_has_unresolved_launch_marker(
+        self,
+        conn,
+        batch_id: str,
+        task_id: str,
+        *,
+        exclude_job_id: str | None = None,
+    ) -> bool:
+        jobs = conn.execute(
+            "SELECT id FROM jobs WHERE batch_id=? AND task_id=?",
+            (batch_id, task_id),
+        ).fetchall()
+        return any(
+            job["id"] != exclude_job_id
+            and self._launch_marker_unresolved(job)
+            for job in jobs
         )
 
     def _drop_launch_marker(self, job) -> None:
@@ -1322,6 +1498,18 @@ class Dispatcher:
                 f"job {job['id']} launch marker 非普通文件; 阻止派发"
             )
             return True
+        intent_claim = _claim_abandoned_launch_intent(marker_path)
+        if intent_claim is True:
+            self.log_line(
+                f"job {job['id']} 清理未进入 Popen 的 abandoned launch intent"
+            )
+            return False
+        if intent_claim is False:
+            self.log_line(
+                f"job {job['id']} launch intent 仍被 launcher/wrapper 持有; "
+                "保留 running/资源并阻止派发"
+            )
+            return True
         identity = self._read_launch_marker_identity(job)
         if identity is None:
             self.log_line(
@@ -1360,7 +1548,8 @@ class Dispatcher:
 
 
 
-    def _recover_launch_markers(self) -> None:
+    def _recover_launch_markers(self) -> bool:
+        recovered_abandoned_intent = False
         marker_dir = os.path.join(self.host_dir, "launch")
         try:
             names = sorted(
@@ -1368,9 +1557,9 @@ class Dispatcher:
                 if name.endswith(".launch")
             )
         except FileNotFoundError:
-            return
+            return False
         except OSError:
-            return
+            return False
         with state.connect() as conn:
             rows = conn.execute("SELECT * FROM jobs").fetchall()
             by_prefix = {self._job_rc_prefix(row): row for row in rows}
@@ -1384,6 +1573,20 @@ class Dispatcher:
                     continue
                 if row["status"] != "running":
                     self._prepare_launch_marker(row)
+                    continue
+                intent_claim = _claim_abandoned_launch_intent(path)
+                if intent_claim is True:
+                    recovered_abandoned_intent = True
+                    self.log_line(
+                        f"job {row['id']} 周期恢复已清理 unlocked launch intent; "
+                        "立即重新执行 adoption 收敛"
+                    )
+                    continue
+                if intent_claim is False:
+                    self.log_line(
+                        f"job {row['id']} launch intent 仍被 launcher/wrapper 持有; "
+                        "保留 running/资源"
+                    )
                     continue
                 identity = self._read_launch_marker_identity(row)
                 process_state = (
@@ -1401,6 +1604,7 @@ class Dispatcher:
                         f"job {row['id']} launch identity=unknown; "
                         "保留 running/资源与 marker"
                     )
+        return recovered_abandoned_intent
 
 
     def _unresolved_launch_markers(self) -> bool:
@@ -1457,14 +1661,15 @@ class Dispatcher:
     def _drop_job_rc(self, job) -> None:
         self._drop_rc_path(self._job_rc_path(job))
 
-    def _adopt_running(self) -> None:
+    def _adopt_running(self, *, unidentified_only: bool = False) -> None:
         drop_paths: list[str] = []
         cleanup_jobs: list[tuple[str, dict]] = []
         with state.connect() as conn:
             # P1: SQL 层过滤 running
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE status='running'"
-            ).fetchall()
+            query = "SELECT * FROM jobs WHERE status='running'"
+            if unidentified_only:
+                query += " AND pgid IS NULL"
+            rows = conn.execute(query).fetchall()
             for j in rows:
                 if not j["pgid"] and self._prepare_launch_marker(j):
                     self.log_line(
@@ -1490,6 +1695,26 @@ class Dispatcher:
                             f"A3: job {j['id']} 原 process identity 已退出; "
                             "检测到 PGID 复用，绝不信号新进程"
                         )
+                # Serialize terminal/adoption publication with cmd_cancel.  If
+                # cancel committed first, consume its durable intent; if this
+                # writer wins, a later cancel observes the published terminal.
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                if self._consume_pending_cancel_before_requeue(
+                    conn,
+                    j,
+                    context="daemon adoption settlement",
+                ):
+                    cleanup_jobs.extend(
+                        (
+                            ("launch", dict(j)),
+                            ("profile", dict(j)),
+                        )
+                    )
+                    rc_path = self._job_rc_path(j)
+                    if rc_path is not None:
+                        drop_paths.append(rc_path)
+                    continue
                 rc = self._read_job_rc(j)
                 if rc is not None:
                     rc_path = self._job_rc_path(j)
@@ -1740,7 +1965,8 @@ class Dispatcher:
         CLI (登录节点) 看不到计算节点进程组 (PID namespace 跨节点, 定案 44 同类),
         本地 killpg 恒失败曾致孤儿占卡 13 分钟。现在 CLI 只写 control_requests 队列,
         本方法每轮 tick 拉取并在本地完成:
-          1. alive 预检 (O5): 进程已自然结束 -> 清 kill_reason 让 reap 按 rc 判
+          1. alive 预检 (O5): 即使进程刚自然退出也先持久化 cancel intent，
+             防止随后 reap/adopt 将任务成功结算或自动重试
           2. 写 kill_reason=cancelled (N2: 先写 reason 再 killpg)
           3. killpg SIGTERM; 下一轮仍存活 -> SIGKILL 升级 (绝不静默, 修复建议 2)
         GPU 释放交给 reap (_handle_job_done cancelled 分支), 与正常路径一致.
@@ -1763,23 +1989,14 @@ class Dispatcher:
                     # Release any earlier request's write transaction before
                     # doing file validation, git probes, and fingerprinting.
                     conn.commit()
-                    # B27: consume the file-only submit inbox on the daemon's
-                    # single state connection. Validate and fingerprint before
-                    # opening a write savepoint so git/NFS work never holds a
-                    # SQLite writer lock.
+                    # B27: consume the file-only submit inbox on the daemon.
+                    # Validate and fingerprint before taking the global
+                    # submission gate so git/NFS work never serializes CLI
+                    # mutations.  The final dependency/name checks, inserts,
+                    # request completion, and commit use a fresh connection
+                    # *inside* that gate; clean/retry/resubmit therefore cannot
+                    # reopen an old same-name batch between our check and commit.
                     payload_path = r["job_id"]
-                    savepoint = f"batch_submit_{int(r['id'])}"
-                    savepoint_active = False
-
-                    def rollback_savepoint() -> None:
-                        nonlocal savepoint_active
-                        if not savepoint_active:
-                            return
-                        try:
-                            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                        finally:
-                            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                            savepoint_active = False
 
                     def safe_log(message: str) -> None:
                         try:
@@ -1811,23 +2028,9 @@ class Dispatcher:
                             raise ValueError("payload 缺少合法 spec")
                         cfg_now = self.cfg
                         norm = validate_batch(spec, cfg_now)
-                        _validate_inbox_dependencies(conn, norm)
                         bid = envelope.get("bid")
                         if not isinstance(bid, str) or not bid:
                             bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-                        existing_bid = conn.execute(
-                            "SELECT name FROM batches WHERE id=?", (bid,)
-                        ).fetchone()
-                        if existing_bid:
-                            if existing_bid["name"] != norm["name"]:
-                                raise SchemaError(f"批次 id 已存在且名称不同: '{bid}'")
-                            state.finish_control_request(
-                                conn, r["id"], f"已入队 {bid} (重复投递, 已存在)"
-                            )
-                            discard_payload()
-                            safe_log(f"batch_submit req {r['id']}: 重复投递 {bid}, 已跳过")
-                            continue
 
                         prepared_tasks = []
                         for i2, t in enumerate(norm["tasks"]):
@@ -1857,79 +2060,125 @@ class Dispatcher:
                             )
                             prepared_tasks.append((i2, t, cmd_e, stages_e, fp, stage_fps))
 
-                        conn.execute(f"SAVEPOINT {savepoint}")
-                        savepoint_active = True
-                        existing = conn.execute(
-                            "SELECT status FROM batches WHERE name=?", (norm["name"],)
-                        ).fetchall()
-                        if any(
-                            x["status"] not in ("done", "blocked", "discarded")
-                            for x in existing
-                        ):
-                            raise SchemaError(
-                                f"同名批次 '{norm['name']}' 已有未终态批次 (定案 6), 未入队"
-                            )
-                        state.insert_batch(
-                            conn,
-                            bid,
-                            norm["name"],
-                            norm["mode"],
-                            norm["depends_on"],
-                            None,
-                            norm["cwd"],
-                            norm["env"],
-                            norm.get("notify"),
-                            norm.get("project"),
-                            norm.get("priority", 0),
-                        )
-                        for i2, t, cmd_e, stages_e, fp, stage_fps in prepared_tasks:
-                            spec_json = {
-                                "id": t["id"],
-                                "cmd": cmd_e,
-                                "stages": stages_e,
-                                "cwd_abs": t["cwd_abs"],
-                                "git": t["git"],
-                                "env": t["env"],
-                                "resources": t["resources"],
-                                "duration_min": t["duration_min"],
-                                "max_retry": t["max_retry"],
-                                "artifacts": t["artifacts"],
-                                "paths_escape": t.get("paths_escape", False),
-                                "probes": t.get("probes"),
-                                "max_parallel": t.get("max_parallel"),
-                                "_force_rerun": t.get("_force_rerun"),
-                                "progress_regex": t.get("progress_regex"),
-                                "runtime": t.get("runtime"),
-                                "runtime_prefix": t.get("runtime_prefix"),
-                            }
-                            state.insert_task(
-                                conn, bid, t["id"], 1, spec_json, i2, norm.get("project")
-                            )
-                            state.insert_job(
-                                conn,
-                                f"{bid}-{t['id']}-v1",
-                                bid,
-                                t["id"],
-                                1,
-                                fp,
-                                stage_fps,
-                                norm.get("project"),
-                            )
-                        state.finish_control_request(conn, r["id"], f"已入队 {bid}")
-                        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                        savepoint_active = False
+                        duplicate = False
+                        with state.submission_connect() as submit_conn:
+                            # submission_connect checks the daemon-shutdown
+                            # fence and commits before releasing the global
+                            # gate.  Do not replace this with the outer
+                            # long-lived control-request connection.
+                            existing_bid = submit_conn.execute(
+                                "SELECT name FROM batches WHERE id=?", (bid,)
+                            ).fetchone()
+                            if existing_bid:
+                                if existing_bid["name"] != norm["name"]:
+                                    raise SchemaError(
+                                        f"批次 id 已存在且名称不同: '{bid}'"
+                                    )
+                                state.finish_control_request(
+                                    submit_conn,
+                                    r["id"],
+                                    f"已入队 {bid} (重复投递, 已存在)",
+                                )
+                                duplicate = True
+                            else:
+                                _validate_inbox_dependencies(submit_conn, norm)
+                                existing = submit_conn.execute(
+                                    "SELECT status FROM batches WHERE name=?",
+                                    (norm["name"],),
+                                ).fetchall()
+                                if any(
+                                    x["status"]
+                                    not in ("done", "blocked", "discarded")
+                                    for x in existing
+                                ):
+                                    raise SchemaError(
+                                        f"同名批次 '{norm['name']}' 已有未终态批次 "
+                                        "(定案 6), 未入队"
+                                    )
+                                state.insert_batch(
+                                    submit_conn,
+                                    bid,
+                                    norm["name"],
+                                    norm["mode"],
+                                    norm["depends_on"],
+                                    None,
+                                    norm["cwd"],
+                                    norm["env"],
+                                    norm.get("notify"),
+                                    norm.get("project"),
+                                    norm.get("priority", 0),
+                                )
+                                for (
+                                    i2,
+                                    t,
+                                    cmd_e,
+                                    stages_e,
+                                    fp,
+                                    stage_fps,
+                                ) in prepared_tasks:
+                                    spec_json = {
+                                        "id": t["id"],
+                                        "cmd": cmd_e,
+                                        "stages": stages_e,
+                                        "cwd_abs": t["cwd_abs"],
+                                        "git": t["git"],
+                                        "env": t["env"],
+                                        "resources": t["resources"],
+                                        "duration_min": t["duration_min"],
+                                        "max_retry": t["max_retry"],
+                                        "artifacts": t["artifacts"],
+                                        "paths_escape": t.get(
+                                            "paths_escape", False
+                                        ),
+                                        "probes": t.get("probes"),
+                                        "max_parallel": t.get("max_parallel"),
+                                        "_force_rerun": t.get("_force_rerun"),
+                                        "progress_regex": t.get(
+                                            "progress_regex"
+                                        ),
+                                        "runtime": t.get("runtime"),
+                                        "runtime_prefix": t.get(
+                                            "runtime_prefix"
+                                        ),
+                                    }
+                                    state.insert_task(
+                                        submit_conn,
+                                        bid,
+                                        t["id"],
+                                        1,
+                                        spec_json,
+                                        i2,
+                                        norm.get("project"),
+                                    )
+                                    state.insert_job(
+                                        submit_conn,
+                                        f"{bid}-{t['id']}-v1",
+                                        bid,
+                                        t["id"],
+                                        1,
+                                        fp,
+                                        stage_fps,
+                                        norm.get("project"),
+                                    )
+                                state.finish_control_request(
+                                    submit_conn, r["id"], f"已入队 {bid}"
+                                )
                         discard_payload()
-                        safe_log(
-                            f"batch_submit req {r['id']}: 已入队 {bid} "
-                            f"({len(norm['tasks'])} 任务)"
-                        )
+                        if duplicate:
+                            safe_log(
+                                f"batch_submit req {r['id']}: "
+                                f"重复投递 {bid}, 已跳过"
+                            )
+                        else:
+                            safe_log(
+                                f"batch_submit req {r['id']}: 已入队 {bid} "
+                                f"({len(norm['tasks'])} 任务)"
+                            )
                     except (SchemaError, ConfigError, ValueError, TypeError, KeyError, FileNotFoundError, sqlite3.IntegrityError) as error:
-                        rollback_savepoint()
                         state.finish_control_request(conn, r["id"], f"失败: {error}")
                         discard_payload()
                         safe_log(f"⚠️ batch_submit req {r['id']} 拒绝: {error}")
                     except Exception as error:
-                        rollback_savepoint()
                         safe_log(
                             f"⚠️ batch_submit req {r['id']} 暂未完成，将重试: {error}"
                         )
@@ -1945,28 +2194,49 @@ class Dispatcher:
                         + ("✅ 配置已热更新" if ok else "⚠️ 未生效 (保留旧配置)"))
                     continue
                 j = state.get_job(conn, r["job_id"])
-                if j is None or j["status"] != "running" or not j["pgid"]:
-                    # 任务已不在 running (已 done/failed/cancelled 或 pgid 丢失)
+                if j is None:
+                    state.finish_control_request(conn, r["id"], "job 非 running, 无需 kill")
+                    self.log_line(f"cancel req {r['id']}: job {r['job_id']} 非 running, 跳过")
+                    continue
+                if j["status"] != "running" or not j["pgid"]:
+                    if j["status"] in (
+                        "pending",
+                        "waiting_quota",
+                        "waiting_dep",
+                        "interrupted",
+                        "failed",
+                        "blocked",
+                    ):
+                        self._consume_pending_cancel_before_requeue(
+                            conn,
+                            j,
+                            context="control request observed after state transition",
+                        )
+                        continue
+                    if j["status"] == "running":
+                        # A durable launch intent may represent a child between
+                        # Popen and pgid writeback.  Record cancellation but keep
+                        # the request pending until identity is recoverable.
+                        state.update_job(conn, j["id"], kill_reason="cancelled")
+                        self.log_line(
+                            f"cancel req {r['id']}: job {j['id']} running/pgid 未决; "
+                            "保留请求与 cancel intent"
+                        )
+                        continue
+                    # 已 done/skip/cancelled/timed_out 等成功或失败终态，不会重跑。
                     state.finish_control_request(conn, r["id"], "job 非 running, 无需 kill")
                     self.log_line(f"cancel req {r['id']}: job {r['job_id']} 非 running, 跳过")
                     continue
                 process_state = self._job_process_state(j)
                 if process_state in {"dead", "mismatch"}:
-                    # The owned leader is conclusively gone. Preserve a prior
-                    # cancel reason for reap; otherwise this was a natural exit.
-                    if j["kill_reason"] == "cancelled":
-                        state.finish_control_request(
-                            conn,
-                            r["id"],
-                            f"进程已退出 (identity={process_state})",
-                        )
-                    else:
-                        state.update_job(conn, j["id"], kill_reason=None)
-                        state.finish_control_request(
-                            conn,
-                            r["id"],
-                            f"进程已自然结束 (identity={process_state})",
-                        )
+                    # Cancellation still wins when the process exited just
+                    # before this scan: reap must not auto-retry it afterwards.
+                    state.update_job(conn, j["id"], kill_reason="cancelled")
+                    state.finish_control_request(
+                        conn,
+                        r["id"],
+                        f"进程已退出，取消意图已记录 (identity={process_state})",
+                    )
                     continue
                 if j["kill_reason"] == "cancelled":
                     if process_state == "alive":
@@ -2289,7 +2559,6 @@ class Dispatcher:
         rc: int | None = None,
     ) -> list[tuple[str, dict]]:
         """Settle after exact exit and return cleanup actions for commit."""
-        reason = j["kill_reason"]
         if j["pgid"]:
             process_state = self._job_process_state(j)
             if process_state in {"alive", "group_alive", "unknown"}:
@@ -2304,6 +2573,14 @@ class Dispatcher:
             ("launch", job_snapshot),
             ("profile", job_snapshot),
         ]
+        if self._consume_pending_cancel_before_requeue(
+            conn,
+            j,
+            context="finished job settlement",
+        ):
+            return cleanup_paths
+        current = state.get_job(conn, j["id"])
+        reason = current["kill_reason"] if current is not None else j["kill_reason"]
         if rc is None:
             rc = j["rc"]
         if reason == "cancelled":
@@ -2718,6 +2995,12 @@ class Dispatcher:
         j = state.get_job(conn, j["id"])
         if j is None or j["status"] != "failed":
             return
+        if self._consume_pending_cancel_before_requeue(
+            conn,
+            j,
+            context="failed job retry",
+        ):
+            return
         if j["failure"] == "perm":
             # H4: 权限错不重试
             state.update_job(conn, j["id"], status="blocked")
@@ -2748,6 +3031,12 @@ class Dispatcher:
         行), 否则节点重启后卡仍 assigned 给已死 job, GPU 永久泄漏.
         """
         # Launch marker cleanup is owned by _check_node_restart after commit.
+        if self._consume_pending_cancel_before_requeue(
+            conn,
+            j,
+            context="interrupted job recovery",
+        ):
+            return
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
         state.update_job(
@@ -2755,35 +3044,117 @@ class Dispatcher:
             kill_reason=None, gpu=None,
         )
 
+    def _consume_pending_cancel_before_requeue(
+        self,
+        conn,
+        j,
+        *,
+        context: str,
+    ) -> bool:
+        """Consume durable cancellation before terminal/requeue publication.
+
+        Intent is represented by either ``kill_reason=cancelled`` (the daemon
+        may already have acknowledged the request) or a still-pending request.
+        Callers invoke this only after the launched process is known absent (or
+        before any process was launched).  The surrounding writer transaction
+        makes request consumption, GPU release, and the cancelled state atomic
+        against CLI classification and dispatch.
+        """
+        requests = conn.execute(
+            "SELECT id FROM control_requests"
+            " WHERE job_id=? AND op='cancel' AND status='pending'"
+            " ORDER BY id",
+            (j["id"],),
+        ).fetchall()
+        current = state.get_job(conn, j["id"])
+        if current is None:
+            for request in requests:
+                state.finish_control_request(
+                    conn,
+                    request["id"],
+                    "job 已不存在，取消请求结束",
+                )
+            return bool(requests)
+        if current["kill_reason"] != "cancelled" and not requests:
+            return False
+        if current["gpu"] is not None:
+            self._release_in_tx(conn, current["id"])
+        state.update_job(
+            conn,
+            current["id"],
+            status="cancelled",
+            gpu=None,
+            pgid=None,
+            kill_reason="cancelled",
+            finished_at=state.now(),
+        )
+        for request in requests:
+            state.finish_control_request(
+                conn,
+                request["id"],
+                f"取消意图优先于重新排队 ({context})",
+            )
+        self.log_line(
+            f"job {current['id']} cancelled: pending cancel intent "
+            f"阻止重新排队 ({context})"
+        )
+        return True
+
     # ---------- 依赖解锁 ----------
 
     def _unlock_dependent_batches(self) -> None:
-        with state.connect() as conn:
-            batches = conn.execute("SELECT * FROM batches WHERE status='queued'").fetchall()
-            for b in batches:
-                try:
-                    deps = json.loads(b["depends_on"] or "[]")
-                    if (
-                        not isinstance(deps, list)
-                        or any(not isinstance(dep, str) or not dep for dep in deps)
-                    ):
-                        raise ValueError("depends_on 必须是非空字符串数组")
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    conn.execute(
-                        "UPDATE batches SET status='blocked' WHERE id=?", (b["id"],)
-                    )
-                    self.log_line(f"批次 {b['name']} 存量依赖规则非法, 已隔离: {exc}")
-                    continue
-                if not deps:
-                    conn.execute(
-                        "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
-                    )
-                    continue
-                if all(self._batch_successful(conn, d) for d in deps):
-                    conn.execute(
-                        "UPDATE batches SET status='active' WHERE id=?", (b["id"],)
-                    )
-                    self.log_line(f"批次 {b['name']} 依赖解锁 -> active")
+        # clean keeps a terminal upstream visible while deleting its artifacts,
+        # then atomically reopens it.  Dependency unlock must take the same gate
+        # before its SQLite writer so it cannot publish a downstream active in
+        # that external-deletion window.  This also standardizes lock ordering
+        # with submit/retry/resubmit/discard: submission gate -> DB writer.
+        with state.submission_lock():
+            with state.connect() as conn:
+                # Dependency snapshots and queued->active publication must have
+                # one serialization point against every upstream reopen/retire.
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                batches = conn.execute(
+                    "SELECT * FROM batches WHERE status='queued'"
+                ).fetchall()
+                for b in batches:
+                    try:
+                        deps = json.loads(b["depends_on"] or "[]")
+                        if (
+                            not isinstance(deps, list)
+                            or any(
+                                not isinstance(dep, str) or not dep
+                                for dep in deps
+                            )
+                        ):
+                            raise ValueError("depends_on 必须是非空字符串数组")
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        conn.execute(
+                            "UPDATE batches SET status='blocked'"
+                            " WHERE id=? AND status='queued'",
+                            (b["id"],),
+                        )
+                        self.log_line(
+                            f"批次 {b['name']} 存量依赖规则非法, 已隔离: {exc}"
+                        )
+                        continue
+                    if not deps:
+                        conn.execute(
+                            "UPDATE batches SET status='active'"
+                            " WHERE id=? AND status='queued'",
+                            (b["id"],),
+                        )
+                        continue
+                    if all(self._batch_successful(conn, d) for d in deps):
+                        changed = conn.execute(
+                            "UPDATE batches SET status='active'"
+                            " WHERE id=? AND status='queued'",
+                            (b["id"],),
+                        ).rowcount
+                        if changed:
+                            self.log_line(
+                                f"批次 {b['name']} 依赖解锁 -> active"
+                            )
 
     def _batch_successful(self, conn, batch_name: str) -> bool:
         """§2.4: depends_on 批次全部任务成功终态 (done/skip) 才解锁."""
@@ -2795,7 +3166,7 @@ class Dispatcher:
         if not b:
             return False
         jobs = conn.execute(
-            "SELECT j.status FROM jobs j"
+            "SELECT j.* FROM jobs j"
             " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
             "       WHERE batch_id=? GROUP BY task_id) latest"
             "   ON j.batch_id=? AND j.task_id=latest.task_id AND j.version=latest.mv",
@@ -2803,19 +3174,25 @@ class Dispatcher:
         ).fetchall()
         if not jobs:
             return False
-        stale_live = conn.execute(
+        if not all(job["status"] in ("done", "skip") for job in jobs):
+            return False
+        if not all(self._terminal_job_successful(conn, j) for j in jobs):
+            return False
+        stale_running = conn.execute(
             "SELECT 1 FROM jobs j"
             " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
             "       WHERE batch_id=? GROUP BY task_id) latest"
             "   ON j.batch_id=? AND j.task_id=latest.task_id"
             " WHERE j.version < latest.mv"
-            "   AND j.status IN ('running','pending','waiting_quota','waiting_dep')"
+            "   AND j.status='running'"
             " LIMIT 1",
             (b["id"], b["id"]),
         ).fetchone()
-        if stale_live:
+        if stale_running:
             return False
-        return all(j["status"] in ("done", "skip") for j in jobs)
+        if self._batch_has_unresolved_launch_marker(conn, b["id"]):
+            return False
+        return True
 
     # ---------- 派发 ----------
 
@@ -2848,17 +3225,54 @@ class Dispatcher:
             self._launch_inflight.clear()
             self._ready_task_specs = {}
             self._ready_fingerprint_snapshots = {}
+
+    def _reconcile_ready_batch_markers(self, conn, ready) -> None:
+        """Remove stale terminal markers only for dispatchable latest batches.
+
+        This heals a CLI death after its active/pending commit without scanning
+        unbounded batch history or touching a marker owned by a newer same-name
+        batch.
+        """
+        checked: set[str] = set()
+        for job in ready:
+            batch_id = str(job["batch_id"])
+            if batch_id in checked:
+                continue
+            checked.add(batch_id)
+            latest = conn.execute(
+                "SELECT id FROM batches WHERE name=?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (job["batch_name"],),
+            ).fetchone()
+            if latest and latest["id"] == batch_id:
+                self._remove_marker(job["batch_name"], "done")
+                self._remove_marker(job["batch_name"], "blocked")
+
     def _dispatch_ready_jobs(self) -> None:
+        # clean performs a two-phase database mutation around external artifact
+        # deletion.  The final skip/cleanup/Popen decision must share its gate:
+        # otherwise dispatch can validate a producer just before clean deletes
+        # that producer's output, or start a writer whose output clean removes.
+        # Keep the conservative whole-dispatch critical section for now; it
+        # also guarantees the global lock order is gate -> SQLite writer.
+        with state.submission_lock():
+            self._dispatch_ready_jobs_serialized()
+
+    def _dispatch_ready_jobs_serialized(self) -> None:
         with self._dispatch_connection() as conn:
-            # 只派发所属批次已解锁 (active/done) 的 pending job——
-            # queued 批次 (依赖未解锁) 的 job 不派发 (场景 2: 下游挂起)
+            # 只派发 active 批次中每个 task 的最新版本 pending job。
+            # queued 批次 (依赖未解锁) 与终态批次一律不派发；done/blocked
+            # 的 retry/resubmit 会在提交事务内先重开为 active。旧 state 可能
+            # 遗留非最新 pending，绝不能因 daemon 重启而把旧代际重新执行。
             # B11c: 显式带出 rowid 与两处 project; 排序在 Python 层做双键
             ready = conn.execute(
                 "SELECT j.*, j.rowid AS rid, b.project AS batch_project,"
-                " b.priority AS batch_priority"
+                " b.priority AS batch_priority, b.name AS batch_name"
                 " FROM jobs j JOIN batches b ON j.batch_id=b.id"
                 " WHERE j.status IN ('pending','waiting_quota')"
-                " AND b.status IN ('active','done')"
+                " AND b.status='active'"
+                " AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+                "   WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id)"
                 " ORDER BY j.rowid"
             ).fetchall()
             # 双键优先级排序: (-project_priority, -batch_priority, rid)。
@@ -2870,6 +3284,21 @@ class Dispatcher:
                 -r["batch_priority"],
                 r["rid"],
             ))
+            marker_safe_ready = []
+            for job in ready:
+                if self._task_has_unresolved_launch_marker(
+                    conn,
+                    job["batch_id"],
+                    job["task_id"],
+                ):
+                    self.log_line(
+                        f"job {job['id']} 同 task 任一代际仍有未决 launch marker;"
+                        " 本轮不派发"
+                    )
+                    continue
+                marker_safe_ready.append(job)
+            ready = marker_safe_ready
+            self._reconcile_ready_batch_markers(conn, ready)
             # Snapshot every ready job before this connection performs any DML.
             # Git/NFS probes must never hold a SQLite writer transaction, and
             # the exact same snapshot feeds skip, cleanup, and launch.
@@ -2890,9 +3319,17 @@ class Dispatcher:
             # B11c: waiting_quota 只是"配额不足被跳过"的可见标记, 不是终态;
             # 重新入候选前归一化回 pending, 否则 _launch_job 的 pending 条件
             # 更新 (M1 竞态防护) 会永远拒绝启动
-            if any(r["status"] == "waiting_quota" for r in ready):
-                conn.execute(
-                    "UPDATE jobs SET status='pending' WHERE status='waiting_quota'"
+            waiting_ids = [r["id"] for r in ready if r["status"] == "waiting_quota"]
+            if waiting_ids:
+                conn.executemany(
+                    "UPDATE jobs SET status='pending'"
+                    " WHERE id=? AND status='waiting_quota'"
+                    " AND EXISTS (SELECT 1 FROM batches b"
+                    "   WHERE b.id=jobs.batch_id AND b.status='active')"
+                    " AND jobs.version=(SELECT MAX(j2.version) FROM jobs j2"
+                    "   WHERE j2.batch_id=jobs.batch_id"
+                    "     AND j2.task_id=jobs.task_id)",
+                    ((job_id,) for job_id in waiting_ids),
                 )
             # CPU 配额制 (§5b B4 v2): config.cpus_total = 节点总核数;
             # running 任务 (GPU + CPU-only) 的 CPU 占用总和 + 新任务 <= 总核数 才派发.
@@ -2953,11 +3390,21 @@ class Dispatcher:
                         if mp <= 0:
                             raise ValueError("max_parallel 必须为正整数")
                 except (TypeError, ValueError) as exc:
-                    state.update_job(
-                        conn, j["id"], status="blocked", failure="invalid_spec",
-                        finished_at=state.now(),
+                    isolated = conn.execute(
+                        "UPDATE jobs SET status='blocked', failure='invalid_spec',"
+                        " finished_at=? WHERE id=?"
+                        " AND status IN ('pending','waiting_quota')"
+                        " AND EXISTS (SELECT 1 FROM batches b"
+                        "   WHERE b.id=jobs.batch_id AND b.status='active')"
+                        " AND jobs.version=(SELECT MAX(j2.version) FROM jobs j2"
+                        "   WHERE j2.batch_id=jobs.batch_id"
+                        "     AND j2.task_id=jobs.task_id)",
+                        (state.now(), j["id"]),
                     )
-                    self.log_line(f"job {j['id']} 存量 spec 非法, 已隔离: {exc}")
+                    if isolated.rowcount:
+                        self.log_line(
+                            f"job {j['id']} 存量 spec 非法, 已隔离: {exc}"
+                        )
                     continue
                 # GPU quota does not apply to CPU-only work.
                 if not is_cpu_only and not self._project_quota_available(conn, project):
@@ -3285,6 +3732,18 @@ class Dispatcher:
         未启动的正常返回路径: M1 竞态 (已非 pending) 与产物指纹 skip ——
         二者都不该占用 CPU 配额 (skip 密集批次会人为压低并发)。
         """
+        if self._task_has_unresolved_launch_marker(
+            conn,
+            j["batch_id"],
+            j["task_id"],
+            exclude_job_id=j["id"],
+        ):
+            self.log_line(
+                f"job {j['id']} 同 task 旧代际 launch marker 未决; 放弃启动"
+            )
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
         if self._prepare_launch_marker(j):
             self.log_line(
                 f"job {j['id']} 存在未决 launch marker; 本轮不派发"
@@ -3308,15 +3767,22 @@ class Dispatcher:
             fingerprint_snapshot = self._snapshot_fingerprint(spec, cwd, j["id"])
         current_fp, stage_fingerprints, git_rev = fingerprint_snapshot
 
-        # M1 修复: 条件更新抢占 —— SELECT 快照到 launch 之间可能已被 cancel;
-        # only a still-pending row may transition to running.
+        # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
+        # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验
+        # pending + active batch + latest task generation。
         cur = conn.execute(
             "UPDATE jobs SET status='running', started_at=?"
-            " WHERE id=? AND status='pending'",
+            " WHERE id=? AND status='pending'"
+            " AND EXISTS (SELECT 1 FROM batches b"
+            "   WHERE b.id=jobs.batch_id AND b.status='active')"
+            " AND jobs.version=(SELECT MAX(j2.version) FROM jobs j2"
+            "   WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)",
             (state.now(), j["id"]),
         )
         if cur.rowcount == 0:
-            self.log_line(f"job {j['id']} 派发竞态: 已非 pending (或被 cancel), 放弃启动")
+            self.log_line(
+                f"job {j['id']} 派发竞态: 已非 active/latest pending, 放弃启动"
+            )
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
@@ -3449,12 +3915,11 @@ class Dispatcher:
         try:
             self.log_line(f"LAUNCH job {j['id']} {tag} pgid={pgid}")
         except Exception:
-            try:
-                state.update_job(conn, j["id"], gpu=None, pgid=None)
-            except Exception:
-                pass
-            abort_launch()
-            raise
+            # Logging is not part of launch correctness.  At this point Popen
+            # succeeded and the durable running row has its exact pgid; rolling
+            # the job back for a log sink failure can detach a still-live group
+            # from its GPU lease and make the outer abort path leak gpu_jobs.
+            pass
         return True
 
     def _should_skip(

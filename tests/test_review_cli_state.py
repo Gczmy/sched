@@ -19,7 +19,7 @@ import time
 import unittest
 from unittest import mock
 
-from gsched import cli, config, daemon, state
+from gsched import artifacts, cli, config, daemon, state
 from gsched.dispatcher import Dispatcher
 
 
@@ -1108,6 +1108,54 @@ class ReviewLegacyJobStateTests(TempStateCase):
 
 
 class ReviewResubmitStateTests(TempStateCase):
+    def _insert_newer_same_name_batch(self, status: str) -> str:
+        newer_batch = "batch-20260830-000000"
+        with state.connect() as conn:
+            source = conn.execute(
+                "SELECT spec FROM tasks WHERE batch_id=? AND id='task' AND version=1",
+                ("batch-20260829-000000",),
+            ).fetchone()
+            state.insert_batch(
+                conn,
+                newer_batch,
+                "batch",
+                "mix",
+                [],
+                None,
+                self.tmp.name,
+                {},
+                project="p",
+            )
+            conn.execute(
+                "UPDATE batches SET status=? WHERE id=?",
+                (status, newer_batch),
+            )
+            state.insert_task(
+                conn,
+                newer_batch,
+                "task",
+                1,
+                json.loads(source["spec"]),
+                0,
+                "p",
+            )
+            state.insert_job(
+                conn,
+                f"{newer_batch}-task-v1",
+                newer_batch,
+                "task",
+                1,
+                "newer-fp",
+                None,
+                "p",
+            )
+            state.update_job(
+                conn,
+                f"{newer_batch}-task-v1",
+                status="done" if status == "done" else "failed",
+            )
+        return newer_batch
+
     def _resubmit_done(self):
         self.seed_batch(batch_status="done", job_status="done")
         marker_dir = os.path.join(self.state_root, "review-node", "markers")
@@ -1140,6 +1188,18 @@ class ReviewResubmitStateTests(TempStateCase):
             ).fetchone()
         self.assertEqual("active", batch["status"])
         self.assertEqual("pending", latest["status"])
+        self.assertTrue(os.path.exists(done_marker))
+        self.assertTrue(os.path.exists(blocked_marker))
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.host_dir = os.path.join(self.state_root, "review-node")
+        with state.connect() as conn:
+            ready = conn.execute(
+                "SELECT j.*, b.name AS batch_name FROM jobs j"
+                " JOIN batches b ON b.id=j.batch_id"
+                " WHERE j.batch_id=? AND j.status='pending'",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            dispatcher._reconcile_ready_batch_markers(conn, ready)
         self.assertFalse(os.path.exists(done_marker))
         self.assertFalse(os.path.exists(blocked_marker))
 
@@ -1172,7 +1232,388 @@ class ReviewResubmitStateTests(TempStateCase):
         dispatcher._write_marker.assert_called_once()
         dispatcher._notify_batch.assert_called_once()
 
-    def test_bound_resubmit_defers_marker_removal_and_wake_until_ledger_done(
+    def test_resubmit_ignores_obsolete_pending_but_still_creates_latest(self) -> None:
+        old_job_id = self.seed_batch(batch_status="done", job_status="pending")
+        with state.connect() as conn:
+            task = conn.execute(
+                "SELECT spec, order_idx FROM tasks"
+                " WHERE batch_id=? AND id=? AND version=1",
+                ("batch-20260829-000000", "task"),
+            ).fetchone()
+            state.insert_task(
+                conn,
+                "batch-20260829-000000",
+                "task",
+                2,
+                json.loads(task["spec"]),
+                task["order_idx"],
+                "p",
+            )
+            state.insert_job(
+                conn,
+                "batch-20260829-000000-task-v2",
+                "batch-20260829-000000",
+                "task",
+                2,
+                "fp-2",
+                None,
+                "p",
+            )
+            state.update_job(
+                conn,
+                "batch-20260829-000000-task-v2",
+                status="done",
+            )
+        args = argparse.Namespace(
+            task="batch-20260829-000000:task",
+            failed=False,
+            resubmit_all=False,
+            dry_run=False,
+        )
+
+        with mock.patch.object(
+            cli, "_load_cfg", return_value=self.cfg
+        ), mock.patch(
+            "gsched.fingerprint.compute_fingerprint",
+            return_value=("fp-3", None, None),
+        ), mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            cli, "_ensure_running_locked", return_value="awake"
+        ):
+            rc, _stdout, stderr = self.capture(cli.cmd_resubmit, args)
+
+        self.assertEqual(0, rc, stderr)
+        with state.connect() as conn:
+            jobs = conn.execute(
+                "SELECT id, version, status FROM jobs"
+                " WHERE batch_id=? ORDER BY version",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual(old_job_id, jobs[0]["id"])
+        self.assertEqual(
+            [(1, "pending"), (2, "done"), (3, "pending")],
+            [(job["version"], job["status"]) for job in jobs],
+        )
+        self.assertEqual("active", batch["status"])
+
+    def test_resubmit_rejects_launch_marker_on_obsolete_pending_version(self) -> None:
+        old_job_id = self.seed_batch(batch_status="done", job_status="pending")
+        with state.connect() as conn:
+            task = conn.execute(
+                "SELECT spec, order_idx FROM tasks"
+                " WHERE batch_id=? AND id=? AND version=1",
+                ("batch-20260829-000000", "task"),
+            ).fetchone()
+            state.insert_task(
+                conn,
+                "batch-20260829-000000",
+                "task",
+                2,
+                json.loads(task["spec"]),
+                task["order_idx"],
+                "p",
+            )
+            state.insert_job(
+                conn,
+                "batch-20260829-000000-task-v2",
+                "batch-20260829-000000",
+                "task",
+                2,
+                "fp-2",
+                None,
+                "p",
+            )
+            state.update_job(
+                conn,
+                "batch-20260829-000000-task-v2",
+                status="done",
+            )
+        args = argparse.Namespace(
+            task="batch-20260829-000000:task",
+            failed=False,
+            resubmit_all=False,
+            dry_run=False,
+        )
+
+        with mock.patch.object(
+            cli, "_load_cfg", return_value=self.cfg
+        ), mock.patch.object(
+            state,
+            "launch_marker_active",
+            side_effect=lambda job_id: job_id == old_job_id,
+        ), mock.patch.object(
+            cli, "_ensure_running_locked"
+        ) as ensure_running:
+            rc, _stdout, stderr = self.capture(cli.cmd_resubmit, args)
+
+        self.assertEqual(1, rc)
+        self.assertIn("进程组终止尚未确认完成", stderr)
+        self.assertIn("taskv1", stderr)
+        with state.connect() as conn:
+            jobs = conn.execute(
+                "SELECT version, status FROM jobs WHERE batch_id=?"
+                " ORDER BY version",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual(
+            [(1, "pending"), (2, "done")],
+            [(job["version"], job["status"]) for job in jobs],
+        )
+        self.assertEqual("done", batch["status"])
+        ensure_running.assert_not_called()
+
+    def test_resubmit_old_same_name_batch_preserves_newer_done_marker(self) -> None:
+        self.seed_batch(batch_status="done", job_status="done")
+        self._insert_newer_same_name_batch("done")
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("newer done")
+        args = argparse.Namespace(
+            task="batch-20260829-000000:task",
+            failed=False,
+            resubmit_all=False,
+            dry_run=False,
+        )
+
+        with mock.patch.object(
+            cli, "_load_cfg", return_value=self.cfg
+        ), mock.patch(
+            "gsched.fingerprint.compute_fingerprint",
+            return_value=("resubmit-fp", None, None),
+        ), mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            cli, "_ensure_running_locked", return_value="awake"
+        ):
+            rc, _stdout, stderr = self.capture(cli.cmd_resubmit, args)
+
+        self.assertEqual(0, rc, stderr)
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.host_dir = os.path.join(self.state_root, "review-node")
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            ready = conn.execute(
+                "SELECT j.*, b.name AS batch_name FROM jobs j"
+                " JOIN batches b ON b.id=j.batch_id"
+                " WHERE j.batch_id=? AND j.status='pending'",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            dispatcher._reconcile_ready_batch_markers(conn, ready)
+        self.assertEqual("active", old_batch["status"])
+        with open(done_marker, encoding="utf-8") as stream:
+            self.assertEqual("newer done", stream.read())
+
+    def test_retry_old_same_name_batch_preserves_newer_blocked_marker(self) -> None:
+        self.seed_batch(batch_status="blocked", job_status="failed")
+        self._insert_newer_same_name_batch("blocked")
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        blocked_marker = os.path.join(marker_dir, "batch.blocked")
+        with open(blocked_marker, "w", encoding="utf-8") as stream:
+            stream.write("newer blocked")
+
+        with mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            cli, "_rev_diff_warn", return_value=None
+        ), mock.patch.object(
+            cli, "_ensure_running_locked", return_value="awake"
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_retry,
+                argparse.Namespace(task="batch-20260829-000000:task"),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.host_dir = os.path.join(self.state_root, "review-node")
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            ready = conn.execute(
+                "SELECT j.*, b.name AS batch_name FROM jobs j"
+                " JOIN batches b ON b.id=j.batch_id"
+                " WHERE j.batch_id=? AND j.status='pending'",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            dispatcher._reconcile_ready_batch_markers(conn, ready)
+        self.assertEqual("active", old_batch["status"])
+        with open(blocked_marker, encoding="utf-8") as stream:
+            self.assertEqual("newer blocked", stream.read())
+
+    def test_retry_old_batch_rejects_newer_same_name_queued_owner(self) -> None:
+        old_job_id = self.seed_batch(batch_status="blocked", job_status="failed")
+        newer_batch_id = self._insert_newer_same_name_batch("queued")
+
+        with mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            cli, "_rev_diff_warn", return_value=None
+        ), mock.patch.object(
+            cli, "_ensure_running_locked"
+        ) as ensure_running:
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_retry,
+                argparse.Namespace(task="batch-20260829-000000:task"),
+            )
+
+        self.assertEqual(1, rc)
+        self.assertIn(newer_batch_id, stderr)
+        self.assertIn("拒绝重开旧批次", stderr)
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            old_job = state.get_job(conn, old_job_id)
+        self.assertEqual("blocked", old_batch["status"])
+        self.assertEqual("failed", old_job["status"])
+        ensure_running.assert_not_called()
+
+    def test_resubmit_old_batch_rejects_newer_same_name_active_owner(self) -> None:
+        self.seed_batch(batch_status="done", job_status="done")
+        newer_batch_id = self._insert_newer_same_name_batch("active")
+        args = argparse.Namespace(
+            task="batch-20260829-000000:task",
+            failed=False,
+            resubmit_all=False,
+            dry_run=False,
+        )
+
+        with mock.patch.object(
+            cli, "_load_cfg", return_value=self.cfg
+        ), mock.patch(
+            "gsched.fingerprint.compute_fingerprint",
+            return_value=("resubmit-fp", None, None),
+        ), mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            cli, "_ensure_running_locked"
+        ) as ensure_running:
+            rc, _stdout, stderr = self.capture(cli.cmd_resubmit, args)
+
+        self.assertEqual(1, rc)
+        self.assertIn(newer_batch_id, stderr)
+        self.assertIn("拒绝重开旧批次", stderr)
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            old_versions = conn.execute(
+                "SELECT version, status FROM jobs WHERE batch_id=?",
+                ("batch-20260829-000000",),
+            ).fetchall()
+        self.assertEqual("done", old_batch["status"])
+        self.assertEqual(
+            [(1, "done")],
+            [(row["version"], row["status"]) for row in old_versions],
+        )
+        ensure_running.assert_not_called()
+
+    def test_resubmit_claims_writer_before_daemon_can_settle_active_batch(
+        self,
+    ) -> None:
+        self.seed_batch(batch_status="active", job_status="done")
+        args = argparse.Namespace(
+            task="batch-20260829-000000:task",
+            failed=False,
+            resubmit_all=False,
+            dry_run=False,
+        )
+        real_insert_task = state.insert_task
+        contender_results: list[str] = []
+
+        def insert_after_competing_settle(conn, *insert_args, **insert_kwargs):
+            contender = sqlite3.connect(state.db_path(), timeout=0)
+            try:
+                contender.execute(
+                    "UPDATE batches SET status='done' WHERE id=?",
+                    ("batch-20260829-000000",),
+                )
+                contender.commit()
+                contender_results.append("committed")
+            except sqlite3.OperationalError as error:
+                self.assertIn("locked", str(error).lower())
+                contender_results.append("locked")
+            finally:
+                contender.rollback()
+                contender.close()
+            return real_insert_task(conn, *insert_args, **insert_kwargs)
+
+        with mock.patch.object(
+            cli, "_load_cfg", return_value=self.cfg
+        ), mock.patch(
+            "gsched.fingerprint.compute_fingerprint",
+            return_value=("resubmit-fp", None, None),
+        ), mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            state,
+            "insert_task",
+            side_effect=insert_after_competing_settle,
+        ), mock.patch.object(
+            cli, "_ensure_running_locked", return_value="awake"
+        ):
+            rc, _stdout, stderr = self.capture(cli.cmd_resubmit, args)
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual(["locked"], contender_results)
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch-20260829-000000")
+            latest = conn.execute(
+                "SELECT status FROM jobs WHERE batch_id=?"
+                " ORDER BY version DESC LIMIT 1",
+                ("batch-20260829-000000",),
+            ).fetchone()
+        self.assertEqual("active", batch["status"])
+        self.assertEqual("pending", latest["status"])
+
+    def test_retry_claims_writer_before_daemon_can_block_active_batch(self) -> None:
+        job_id = self.seed_batch(batch_status="active", job_status="failed")
+        real_update_job = state.update_job
+        contender_results: list[str] = []
+
+        def update_after_competing_settle(conn, target_job_id, **fields):
+            contender = sqlite3.connect(state.db_path(), timeout=0)
+            try:
+                contender.execute(
+                    "UPDATE batches SET status='blocked' WHERE id=?",
+                    ("batch-20260829-000000",),
+                )
+                contender.commit()
+                contender_results.append("committed")
+            except sqlite3.OperationalError as error:
+                self.assertIn("locked", str(error).lower())
+                contender_results.append("locked")
+            finally:
+                contender.rollback()
+                contender.close()
+            return real_update_job(conn, target_job_id, **fields)
+
+        with mock.patch.object(
+            state, "launch_marker_active", return_value=False
+        ), mock.patch.object(
+            cli, "_rev_diff_warn", return_value=None
+        ), mock.patch.object(
+            state,
+            "update_job",
+            side_effect=update_after_competing_settle,
+        ), mock.patch.object(
+            cli, "_ensure_running_locked", return_value="awake"
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_retry,
+                argparse.Namespace(task="batch-20260829-000000:task"),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual(["locked"], contender_results)
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch-20260829-000000")
+            job = state.get_job(conn, job_id)
+        self.assertEqual("active", batch["status"])
+        self.assertEqual("pending", job["status"])
+
+    def test_bound_resubmit_defers_wake_and_leaves_marker_for_daemon(
         self,
     ) -> None:
         self.seed_batch(batch_status="done", job_status="done")
@@ -1221,8 +1662,8 @@ class ReviewResubmitStateTests(TempStateCase):
 
         self.assertEqual(0, rc, stderr)
         self.assertIn("已 resubmit", stdout)
-        self.assertEqual([("done", False)], wake_observations)
-        self.assertFalse(os.path.exists(done_marker))
+        self.assertEqual([("done", True)], wake_observations)
+        self.assertTrue(os.path.exists(done_marker))
 
 
 class ReviewForeignReadTests(TempStateCase):
@@ -1947,7 +2388,7 @@ class ReviewIdempotentRequestTests(TempStateCase):
         self.assertEqual(0, rc, stderr)
         self.assertIn("已解锁重跑", stdout)
         self.assertEqual([True], commit_observations)
-        self.assertEqual([("done", "pending", "active", False)], wake_observations)
+        self.assertEqual([("done", "pending", "active", True)], wake_observations)
 
     def test_daemon_and_config_requests_execute_without_bound_connection(
         self,
@@ -2898,7 +3339,7 @@ class ReviewStatusAndTaskReferenceTests(TempStateCase):
                 "active",
                 state.get_batch(conn, "batch-20260829-000000")["status"],
             )
-        self.assertFalse(os.path.exists(blocked_marker))
+        self.assertTrue(os.path.exists(blocked_marker))
 
 
     def test_task_retry_rejects_discarded_batch(self) -> None:
@@ -2916,6 +3357,48 @@ class ReviewStatusAndTaskReferenceTests(TempStateCase):
         wake.assert_not_called()
         with state.connect() as conn:
             self.assertEqual("failed", state.get_job(conn, job_id)["status"])
+
+    def test_discard_claims_writer_before_dependency_unlock_can_activate(
+        self,
+    ) -> None:
+        job_id = self.seed_batch(batch_status="queued", job_status="pending")
+        real_update_job = state.update_job
+        contender_results: list[str] = []
+
+        def update_after_competing_unlock(conn, target_job_id, **fields):
+            contender = sqlite3.connect(state.db_path(), timeout=0)
+            try:
+                contender.execute(
+                    "UPDATE batches SET status='active' WHERE id=?",
+                    ("batch-20260829-000000",),
+                )
+                contender.commit()
+                contender_results.append("committed")
+            except sqlite3.OperationalError as error:
+                self.assertIn("locked", str(error).lower())
+                contender_results.append("locked")
+            finally:
+                contender.rollback()
+                contender.close()
+            return real_update_job(conn, target_job_id, **fields)
+
+        with mock.patch.object(
+            state,
+            "update_job",
+            side_effect=update_after_competing_unlock,
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_discard,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual(["locked"], contender_results)
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch-20260829-000000")
+            job = state.get_job(conn, job_id)
+        self.assertEqual("discarded", batch["status"])
+        self.assertEqual("cancelled", job["status"])
 
 
     def test_x_h02_resubmit_accepts_status_batch_id_reference(self) -> None:
@@ -3131,10 +3614,28 @@ class ReviewCleanMigrationAndConfigTests(TempStateCase):
                 ),
             )
 
+    def _insert_same_name_batch(self, batch_id: str, status: str) -> None:
+        with state.connect() as conn:
+            state.insert_batch(
+                conn,
+                batch_id,
+                "batch",
+                "mix",
+                [],
+                None,
+                self.tmp.name,
+                {},
+                project="p",
+            )
+            conn.execute(
+                "UPDATE batches SET status=? WHERE id=?",
+                (status, batch_id),
+            )
+
     def test_clean_deletes_latest_task_and_stage_artifacts_with_confined_policy(
         self,
     ) -> None:
-        self.seed_batch(job_status="skip")
+        self.seed_batch(batch_status="done", job_status="skip")
         work = os.path.join(self.tmp.name, "work")
         outside = os.path.join(self.tmp.name, "outside")
         os.makedirs(work)
@@ -3158,7 +3659,6 @@ class ReviewCleanMigrationAndConfigTests(TempStateCase):
                 "cwd_abs": work,
                 "artifacts": {
                     "task": {"path": "task.txt"},
-                    "escaped": {"path": os.path.join("redirect", "escaped.txt")},
                 },
                 "paths_escape": False,
                 "stages": [
@@ -3178,24 +3678,35 @@ class ReviewCleanMigrationAndConfigTests(TempStateCase):
             }
         )
 
-        rc, _stdout, stderr = self.capture(
-            cli.cmd_clean,
-            argparse.Namespace(batch="batch-20260829-000000", yes=True),
-        )
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            return_value="test daemon",
+        ) as ensure_running:
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
 
         self.assertEqual(0, rc, stderr)
         self.assertFalse(os.path.exists(task_artifact))
         self.assertFalse(os.path.exists(stage_artifact))
         self.assertTrue(os.path.isfile(escaped_artifact))
         self.assertFalse(os.path.exists(explicit_escape))
+        ensure_running.assert_called_once_with()
 
     def test_clean_commit_failure_preserves_artifacts_and_fingerprint_state(
         self,
     ) -> None:
-        job_id = self.seed_batch(job_status="skip")
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
         artifact = os.path.join(self.tmp.name, "result.txt")
         with open(artifact, "w", encoding="utf-8") as stream:
             stream.write("must survive")
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("terminal")
         self._replace_task_spec(
             {
                 "id": "task",
@@ -3238,8 +3749,722 @@ class ReviewCleanMigrationAndConfigTests(TempStateCase):
         self.assertTrue(os.path.isfile(artifact))
         with state.connect() as conn:
             job = state.get_job(conn, job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
         self.assertEqual("skip", job["status"])
         self.assertEqual("fp-1", job["fingerprint"])
+        self.assertEqual("done", batch["status"])
+        self.assertTrue(os.path.isfile(done_marker))
+
+    def test_clean_mixed_success_only_deletes_and_requeues_latest_skip(self) -> None:
+        skip_job_id = self.seed_batch(batch_status="done", job_status="skip")
+        skip_artifact = os.path.join(self.tmp.name, "skip.txt")
+        done_artifact = os.path.join(self.tmp.name, "done.txt")
+        for artifact_path in (skip_artifact, done_artifact):
+            with open(artifact_path, "w", encoding="utf-8") as stream:
+                stream.write("valid")
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "skip.txt"}},
+                "paths_escape": False,
+            }
+        )
+        done_job_id = "batch-20260829-000000-done-task-v1"
+        with state.connect() as conn:
+            done_spec = {
+                "id": "done-task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "done.txt"}},
+                "paths_escape": False,
+            }
+            state.insert_task(
+                conn,
+                "batch-20260829-000000",
+                "done-task",
+                1,
+                done_spec,
+                1,
+                "p",
+            )
+            state.insert_job(
+                conn,
+                done_job_id,
+                "batch-20260829-000000",
+                "done-task",
+                1,
+                "done-fp",
+                None,
+                "p",
+            )
+            state.update_job(conn, done_job_id, status="done")
+
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            return_value="test daemon",
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertFalse(os.path.exists(skip_artifact))
+        self.assertTrue(os.path.isfile(done_artifact))
+        with state.connect() as conn:
+            skip_job = state.get_job(conn, skip_job_id)
+            done_job = state.get_job(conn, done_job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("pending", skip_job["status"])
+        self.assertEqual("done", done_job["status"])
+        self.assertIsNone(skip_job["fingerprint"])
+        self.assertIsNone(done_job["fingerprint"])
+        self.assertEqual("active", batch["status"])
+
+    def test_clean_requeues_only_latest_skip_and_reopens_done_batch(self) -> None:
+        old_job_id = self.seed_batch(batch_status="done", job_status="skip")
+        latest_job_id = "batch-20260829-000000-task-v2"
+        with state.connect() as conn:
+            task = conn.execute(
+                "SELECT spec, order_idx FROM tasks"
+                " WHERE batch_id=? AND id=? AND version=1",
+                ("batch-20260829-000000", "task"),
+            ).fetchone()
+            state.insert_task(
+                conn,
+                "batch-20260829-000000",
+                "task",
+                2,
+                json.loads(task["spec"]),
+                task["order_idx"],
+                "p",
+            )
+            state.insert_job(
+                conn,
+                latest_job_id,
+                "batch-20260829-000000",
+                "task",
+                2,
+                "fp-2",
+                {"stage": "stage-fp-2"},
+                "p",
+            )
+            state.update_job(conn, latest_job_id, status="skip")
+
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("terminal")
+
+        wake_observations = []
+
+        def wake_after_publish() -> str:
+            with state.connect() as conn:
+                job = state.get_job(conn, latest_job_id)
+                batch = state.get_batch(conn, "batch-20260829-000000")
+            wake_observations.append(
+                (job["status"], batch["status"], os.path.exists(done_marker))
+            )
+            return "test daemon"
+
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            side_effect=wake_after_publish,
+        ) as ensure_running:
+            rc, stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertIn("批次已回 active", stdout)
+        with state.connect() as conn:
+            jobs = conn.execute(
+                "SELECT id, status, fingerprint, stage_fingerprints FROM jobs"
+                " WHERE batch_id=? ORDER BY version",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual([old_job_id, latest_job_id], [job["id"] for job in jobs])
+        self.assertEqual(["skip", "pending"], [job["status"] for job in jobs])
+        self.assertTrue(
+            all(
+                job["fingerprint"] is None and job["stage_fingerprints"] is None
+                for job in jobs
+            )
+        )
+        self.assertEqual("active", batch["status"])
+        self.assertTrue(os.path.exists(done_marker))
+        self.assertEqual([("pending", "active", True)], wake_observations)
+        ensure_running.assert_called_once_with()
+
+    def test_clean_does_not_requeue_obsolete_skip_when_latest_is_done(self) -> None:
+        old_job_id = self.seed_batch(batch_status="done", job_status="skip")
+        latest_job_id = "batch-20260829-000000-task-v2"
+        with state.connect() as conn:
+            task = conn.execute(
+                "SELECT spec, order_idx FROM tasks"
+                " WHERE batch_id=? AND id=? AND version=1",
+                ("batch-20260829-000000", "task"),
+            ).fetchone()
+            state.insert_task(
+                conn,
+                "batch-20260829-000000",
+                "task",
+                2,
+                json.loads(task["spec"]),
+                task["order_idx"],
+                "p",
+            )
+            state.insert_job(
+                conn,
+                latest_job_id,
+                "batch-20260829-000000",
+                "task",
+                2,
+                "fp-2",
+                None,
+                "p",
+            )
+            state.update_job(conn, latest_job_id, status="done")
+
+        with mock.patch.object(cli, "_ensure_running_locked") as ensure_running:
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        with state.connect() as conn:
+            jobs = conn.execute(
+                "SELECT id, status, fingerprint FROM jobs"
+                " WHERE batch_id=? ORDER BY version",
+                ("batch-20260829-000000",),
+            ).fetchall()
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual([old_job_id, latest_job_id], [job["id"] for job in jobs])
+        self.assertEqual(["skip", "done"], [job["status"] for job in jobs])
+        self.assertTrue(all(job["fingerprint"] is None for job in jobs))
+        self.assertEqual("done", batch["status"])
+        ensure_running.assert_not_called()
+
+    def test_clean_removes_artifact_before_publishing_runnable_work(self) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        artifact = os.path.join(self.tmp.name, "result.txt")
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("old")
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "result.txt"}},
+                "paths_escape": False,
+            }
+        )
+        real_unlink = artifacts.unlink_artifact
+        deletion_observations = []
+
+        def unlink_while_terminal(
+            cwd,
+            path,
+            *,
+            paths_escape=False,
+            raise_on_error=False,
+        ):
+            with state.connect() as conn:
+                job = state.get_job(conn, job_id)
+                batch = state.get_batch(conn, "batch-20260829-000000")
+            deletion_observations.append(
+                (job["status"], job["fingerprint"], batch["status"])
+            )
+            return real_unlink(
+                cwd,
+                path,
+                paths_escape=paths_escape,
+                raise_on_error=raise_on_error,
+            )
+
+        with mock.patch.object(
+            artifacts,
+            "unlink_artifact",
+            side_effect=unlink_while_terminal,
+        ), mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            return_value="test daemon",
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual([("skip", None, "done")], deletion_observations)
+        self.assertFalse(os.path.exists(artifact))
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("pending", job["status"])
+        self.assertEqual("active", batch["status"])
+
+    def test_clean_delete_error_never_publishes_partially_cleaned_batch(
+        self,
+    ) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        first_artifact = os.path.join(self.tmp.name, "first.txt")
+        outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(outside)
+        second_artifact = os.path.join(outside, "second.txt")
+        for artifact_path in (first_artifact, second_artifact):
+            with open(artifact_path, "w", encoding="utf-8") as stream:
+                stream.write("old")
+        os.symlink(outside, os.path.join(self.tmp.name, "redirect"))
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {
+                    "first": {"path": "first.txt"},
+                    "second": {"path": "redirect/second.txt"},
+                },
+                "paths_escape": False,
+            }
+        )
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("terminal")
+
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+        ) as ensure_running, self.assertRaisesRegex(
+            state.StateError,
+            "可能已删除部分产物",
+        ):
+            cli.cmd_clean(
+                argparse.Namespace(batch="batch-20260829-000000", yes=True)
+            )
+
+        self.assertFalse(os.path.exists(first_artifact))
+        self.assertTrue(os.path.isfile(second_artifact))
+        self.assertTrue(os.path.isfile(done_marker))
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("skip", job["status"])
+        self.assertIsNone(job["fingerprint"])
+        self.assertEqual("done", batch["status"])
+        ensure_running.assert_not_called()
+
+    def test_clean_second_commit_failure_preserves_marker_without_publication(
+        self,
+    ) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        with state.connect() as conn:
+            state.insert_batch(
+                conn,
+                "downstream-id",
+                "downstream",
+                "mix",
+                ["batch"],
+                None,
+                self.tmp.name,
+                {},
+                project="p",
+            )
+        artifact = os.path.join(self.tmp.name, "result.txt")
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("old")
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "result.txt"}},
+                "paths_escape": False,
+            }
+        )
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("terminal")
+        real_connect = state.connect
+        connect_count = 0
+
+        def fail_second_phase_commit():
+            nonlocal connect_count
+            connect_count += 1
+            if connect_count <= 2:
+                return real_connect()
+
+            @contextlib.contextmanager
+            def failed_commit():
+                conn = sqlite3.connect(state.db_path())
+                conn.row_factory = sqlite3.Row
+                try:
+                    yield conn
+                    conn.rollback()
+                    raise sqlite3.OperationalError("second commit failure")
+                finally:
+                    conn.close()
+
+            return failed_commit()
+
+        with mock.patch.object(
+            state,
+            "connect",
+            side_effect=fail_second_phase_commit,
+        ), self.assertRaisesRegex(sqlite3.OperationalError, "second commit failure"):
+            cli.cmd_clean(
+                argparse.Namespace(batch="batch-20260829-000000", yes=True)
+            )
+
+        self.assertFalse(os.path.exists(artifact))
+        self.assertTrue(os.path.isfile(done_marker))
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("skip", job["status"])
+        self.assertIsNone(job["fingerprint"])
+        self.assertEqual("done", batch["status"])
+        self.assertEqual(["batch.done"], os.listdir(marker_dir))
+
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.host_dir = state.host_dir()
+        dispatcher.log_line = mock.Mock()
+        dispatcher._batch_has_unresolved_launch_marker = mock.Mock(
+            return_value=False
+        )
+        dispatcher._unlock_dependent_batches()
+        with state.connect() as conn:
+            downstream = state.get_batch(conn, "downstream-id")
+        self.assertEqual("queued", downstream["status"])
+
+    def test_clean_leaves_marker_for_pre_dispatch_reconciliation(self) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("terminal")
+
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            return_value="test daemon",
+        ) as ensure_running:
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertTrue(os.path.isfile(done_marker))
+        ensure_running.assert_called_once_with()
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("pending", job["status"])
+        self.assertEqual("active", batch["status"])
+
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.cfg = self.cfg
+        dispatcher.host_dir = os.path.join(self.state_root, "review-node")
+        dispatcher.log_line = mock.Mock()
+        with state.connect() as conn:
+            ready = conn.execute(
+                "SELECT j.*, b.name AS batch_name FROM jobs j"
+                " JOIN batches b ON b.id=j.batch_id"
+                " WHERE j.id=?",
+                (job_id,),
+            ).fetchall()
+            dispatcher._reconcile_ready_batch_markers(conn, ready)
+
+        self.assertFalse(os.path.exists(done_marker))
+
+    def test_clean_old_same_name_batch_preserves_newer_done_marker(self) -> None:
+        old_job_id = self.seed_batch(batch_status="done", job_status="skip")
+        newer_batch_id = "batch-20260830-000000"
+        with state.connect() as conn:
+            task = conn.execute(
+                "SELECT spec FROM tasks WHERE batch_id=? AND id='task' AND version=1",
+                ("batch-20260829-000000",),
+            ).fetchone()
+            state.insert_batch(
+                conn,
+                newer_batch_id,
+                "batch",
+                "mix",
+                [],
+                None,
+                self.tmp.name,
+                {},
+                project="p",
+            )
+            conn.execute(
+                "UPDATE batches SET status='done' WHERE id=?",
+                (newer_batch_id,),
+            )
+            state.insert_task(
+                conn,
+                newer_batch_id,
+                "task",
+                1,
+                json.loads(task["spec"]),
+                0,
+                "p",
+            )
+            state.insert_job(
+                conn,
+                f"{newer_batch_id}-task-v1",
+                newer_batch_id,
+                "task",
+                1,
+                "new-fp",
+                None,
+                "p",
+            )
+            state.update_job(
+                conn,
+                f"{newer_batch_id}-task-v1",
+                status="done",
+            )
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("newer terminal batch")
+
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            return_value="test daemon",
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertTrue(os.path.isfile(done_marker))
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.host_dir = os.path.join(self.state_root, "review-node")
+        with state.connect() as conn:
+            old_job = state.get_job(conn, old_job_id)
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            ready = conn.execute(
+                "SELECT j.*, b.name AS batch_name FROM jobs j"
+                " JOIN batches b ON b.id=j.batch_id WHERE j.id=?",
+                (old_job_id,),
+            ).fetchall()
+            dispatcher._reconcile_ready_batch_markers(conn, ready)
+        self.assertEqual("pending", old_job["status"])
+        self.assertEqual("active", old_batch["status"])
+        self.assertTrue(os.path.isfile(done_marker))
+
+        with state.connect() as conn:
+            state.update_job(conn, old_job_id, status="done")
+        dispatcher.log_line = mock.Mock()
+        dispatcher._notify_batch = mock.Mock()
+        dispatcher._settle_batch_status()
+        with open(done_marker, encoding="utf-8") as stream:
+            self.assertEqual("newer terminal batch", stream.read())
+
+    def test_clean_rejects_same_name_queued_owner_before_artifact_deletion(
+        self,
+    ) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        artifact = os.path.join(self.tmp.name, "shared-result.txt")
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("must survive")
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "shared-result.txt"}},
+                "paths_escape": False,
+            }
+        )
+        newer_batch_id = "batch-20260830-queued"
+        self._insert_same_name_batch(newer_batch_id, "queued")
+
+        with mock.patch.object(cli, "_ensure_running_locked") as ensure_running:
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(1, rc)
+        self.assertIn(newer_batch_id, stderr)
+        self.assertTrue(os.path.isfile(artifact))
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            old_job = state.get_job(conn, job_id)
+        self.assertEqual("done", old_batch["status"])
+        self.assertEqual("skip", old_job["status"])
+        self.assertEqual("fp-1", old_job["fingerprint"])
+        ensure_running.assert_not_called()
+
+    def test_clean_phase_two_rechecks_same_name_nonterminal_owner(self) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        artifact = os.path.join(self.tmp.name, "phase-two-result.txt")
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("fixture")
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "phase-two-result.txt"}},
+                "paths_escape": False,
+            }
+        )
+        newer_batch_id = "batch-20260830-late"
+
+        def inject_conflict(*_args, **_kwargs) -> bool:
+            self._insert_same_name_batch(newer_batch_id, "active")
+            return False
+
+        with mock.patch.object(
+            artifacts,
+            "unlink_artifact",
+            side_effect=inject_conflict,
+        ), self.assertRaisesRegex(
+            state.StateError,
+            newer_batch_id,
+        ):
+            cli.cmd_clean(
+                argparse.Namespace(batch="batch-20260829-000000", yes=True)
+            )
+
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            old_job = state.get_job(conn, job_id)
+        self.assertEqual("done", old_batch["status"])
+        self.assertEqual("skip", old_job["status"])
+        self.assertIsNone(old_job["fingerprint"])
+
+    def test_clean_phase_two_claims_writer_before_daemon_settlement(self) -> None:
+        job_id = self.seed_batch(batch_status="blocked", job_status="skip")
+        real_conflict_check = cli._same_name_nonterminal_conflict
+        check_count = 0
+        contender_results: list[str] = []
+
+        def check_after_competing_settle(conn, batch_id):
+            nonlocal check_count
+            check_count += 1
+            if check_count == 2:
+                contender = sqlite3.connect(state.db_path(), timeout=0)
+                try:
+                    contender.execute(
+                        "UPDATE batches SET status='done' WHERE id=?",
+                        (batch_id,),
+                    )
+                    contender.commit()
+                    contender_results.append("committed")
+                except sqlite3.OperationalError as error:
+                    self.assertIn("locked", str(error).lower())
+                    contender_results.append("locked")
+                finally:
+                    contender.rollback()
+                    contender.close()
+            return real_conflict_check(conn, batch_id)
+
+        with mock.patch.object(
+            cli,
+            "_same_name_nonterminal_conflict",
+            side_effect=check_after_competing_settle,
+        ), mock.patch.object(cli, "_ensure_running_locked") as ensure_running:
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+
+        self.assertEqual(0, rc, stderr)
+        self.assertEqual(2, check_count)
+        self.assertEqual(["locked"], contender_results)
+        with state.connect() as conn:
+            old_batch = state.get_batch(conn, "batch-20260829-000000")
+            old_job = state.get_job(conn, job_id)
+        self.assertEqual("blocked", old_batch["status"])
+        self.assertEqual("pending", old_job["status"])
+        ensure_running.assert_not_called()
+
+    def test_clean_cancel_before_dispatch_replaces_done_with_blocked_marker(
+        self,
+    ) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        marker_dir = os.path.join(self.state_root, "review-node", "markers")
+        os.makedirs(marker_dir, exist_ok=True)
+        done_marker = os.path.join(marker_dir, "batch.done")
+        blocked_marker = os.path.join(marker_dir, "batch.blocked")
+        with open(done_marker, "w", encoding="utf-8") as stream:
+            stream.write("old done")
+        with mock.patch.object(
+            cli,
+            "_ensure_running_locked",
+            return_value="test daemon",
+        ):
+            rc, _stdout, stderr = self.capture(
+                cli.cmd_clean,
+                argparse.Namespace(batch="batch-20260829-000000", yes=True),
+            )
+        self.assertEqual(0, rc, stderr)
+        with state.connect() as conn:
+            state.update_job(
+                conn,
+                job_id,
+                status="cancelled",
+                finished_at=state.now(),
+            )
+
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.cfg = self.cfg
+        dispatcher.host_dir = os.path.join(self.state_root, "review-node")
+        dispatcher.log_line = mock.Mock()
+        dispatcher._notify_batch = mock.Mock()
+        dispatcher._settle_batch_status()
+
+        with state.connect() as conn:
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("blocked", batch["status"])
+        self.assertFalse(os.path.exists(done_marker))
+        self.assertTrue(os.path.isfile(blocked_marker))
+
+    def test_clean_refuses_active_idle_shutdown_without_side_effects(self) -> None:
+        job_id = self.seed_batch(batch_status="done", job_status="skip")
+        artifact = os.path.join(self.tmp.name, "result.txt")
+        with open(artifact, "w", encoding="utf-8") as stream:
+            stream.write("old")
+        self._replace_task_spec(
+            {
+                "id": "task",
+                "cwd_abs": self.tmp.name,
+                "artifacts": {"result": {"path": "result.txt"}},
+                "paths_escape": False,
+            }
+        )
+
+        with mock.patch.object(
+            state,
+            "submission_shutdown_active",
+            return_value=True,
+        ), self.assertRaises(state.SubmissionBlocked):
+            cli.cmd_clean(
+                argparse.Namespace(batch="batch-20260829-000000", yes=True)
+            )
+
+        self.assertTrue(os.path.isfile(artifact))
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            batch = state.get_batch(conn, "batch-20260829-000000")
+        self.assertEqual("skip", job["status"])
+        self.assertEqual("fp-1", job["fingerprint"])
+        self.assertEqual("done", batch["status"])
 
     def test_init_db_migration_failure_rolls_back_all_schema_steps(self) -> None:
         database = state.db_path()
