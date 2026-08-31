@@ -147,7 +147,7 @@ Template variables: `{ROOT}` = `default_project` root; `{PROJECT:<name>}` = expl
 
 Batch/task/dependency identifiers must match `[A-Za-z0-9][A-Za-z0-9._-]*` (not `.` or `..`). A `runtime` selects exactly one of `venv_alias`, `conda_env`, or `prefix`, and must resolve at submission. Unsupported batch `gpus`, task/stage `retry_transform`, and stage-level `probes` are rejected; put GPU demand in `resources.gpu` and probes at task level.
 
-`mode: "strict"` is a deployment-only direct-exec path. It is accepted only
+Legacy V1 `mode: "strict"` is a deployment-only direct-exec path. It is accepted only
 when one cold `config.native_exec_profiles` entry exactly matches
 `(mode, project, batch_name, task_id, submitted_argv)`. The task must contain
 one `cmd`, use a normalized absolute executable, run from the configured
@@ -180,6 +180,17 @@ window. The external retained-FD verifier/monitor and seven-field attestation
 are still required before formal execution. The current strict schema also
 rejects all user env, so the dedicated seven-field poison-overwrite probe is not
 yet runnable; its exact cold-profile exception belongs with that verifier.
+
+The explicitly versioned `sched_native_exec_profile_v2` is only that frozen
+batch compatibility validator. It exact-binds the public root/task keysets and
+values, including raw `{PROJECT:...}` cwd, empty dependencies, `_protocol`,
+non-empty batch env, empty task env, prefix runtime, integer duration, zero
+retry, raw CPU resources, empty artifacts, absent public task `git`, and the
+unchanged logical argv. A matching V2 batch is rejected by both local submit
+and daemon inbox handling before dependency/fingerprint work, durable batch or
+name consumption, running claim, or process creation. V2 currently persists
+nothing, has no launch-time re-attestation, and does not authorize `Popen`;
+those properties remain work for the retained/bootstrap launcher step.
 
 ## State Machine
 

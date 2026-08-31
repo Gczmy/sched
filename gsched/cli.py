@@ -41,6 +41,7 @@ from .schema import (
 )
 from .templates import expand_cmd
 from .native_exec import (
+    NATIVE_EXEC_V2_CONTRACT_FIELD,
     NativeExecProfileError,
     native_exec_project_roots,
     native_exec_reserved_batch_names,
@@ -426,6 +427,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
         return 1
     try:
         norm = validate_batch(spec, cfg)
+    except (SchemaError, ConfigError) as e:
+        print(f"校验失败: {e}", file=sys.stderr)
+        return 1
+    if any(
+        NATIVE_EXEC_V2_CONTRACT_FIELD in task for task in norm["tasks"]
+    ):
+        print(
+            "校验失败: native exec profile V2 仅完成冻结合同兼容校验；"
+            "实际 retained/bootstrap launcher 尚未接入，拒绝持久化或启动",
+            file=sys.stderr,
+        )
+        return 1
+    try:
         check_dependency_cycle(norm["depends_on"], cfg)
     except (SchemaError, ConfigError) as e:
         print(f"校验失败: {e}", file=sys.stderr)

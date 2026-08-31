@@ -45,6 +45,7 @@ from .executor import (
 )
 from .fingerprint import compute_fingerprint
 from .native_exec import (
+    NATIVE_EXEC_V2_CONTRACT_FIELD,
     NativeExecProfileError,
     native_exec_project_roots,
     native_exec_project_root_identity_sha256,
@@ -2088,6 +2089,14 @@ class Dispatcher:
                             raise ValueError("payload 缺少合法 spec")
                         cfg_now = self.cfg
                         norm = validate_batch(spec, cfg_now)
+                        if any(
+                            NATIVE_EXEC_V2_CONTRACT_FIELD in task
+                            for task in norm["tasks"]
+                        ):
+                            raise NativeExecProfileError(
+                                "native exec profile V2 is validation-only until "
+                                "the retained/bootstrap launcher is connected"
+                            )
                         _validate_inbox_dependencies(conn, norm)
                         bid = envelope.get("bid")
                         if not isinstance(bid, str) or not bid:

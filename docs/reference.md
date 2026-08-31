@@ -74,7 +74,7 @@
 
 标识符必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`，且不能是 `.`/`..`。已移除或未实现的输入会拒绝：批次级 `gpus`、任务/阶段级 `retry_transform`、阶段级 `probes`；GPU 需求写 `resources.gpu`，probe 只写在任务级。
 
-`strict` 不是普通用户可自由选择的模式。它只允许一个单 `cmd` 任务，并要求：管理员冷配置
+下述 `strict` 行为仅指 legacy V1，不是普通用户可自由选择的模式。它只允许一个单 `cmd` 任务，并要求：管理员冷配置
 `native_exec_profiles` 与 `(strict, project, batch name, task id, submitted argv)` 唯一精确匹配；
 `cmd[0]` 为规范化绝对路径；effective cwd 为当前项目根；不含 `stages`、`sweep`、`runtime`
 或 scheduler artifact skip/cleanup 规则、日志 probe；batch/task env 为空；resources 精确为
@@ -94,6 +94,13 @@ Popen rc 可成功结算；权威丢失时 fail-closed blocked，RC sidecar 对 
 执行证明。external retained-FD verifier/monitor、七字段 attestation 与专用 poison-overwrite probe
 尚未实现，正式任务不得据此运行。
 
+显式版本 `schema: "sched_native_exec_profile_v2"` 当前仅提供冻结批次兼容校验：精确绑定
+root/task 公共 keyset，以及 raw `{PROJECT:...}` cwd、空依赖、`_protocol`、非空 batch env、
+空 task env、prefix runtime、整数 duration、`max_retry=0`、raw CPU resources、空 artifacts、
+公共 task `git` 缺席和未改写 logical argv。local submit 与 daemon inbox 均在依赖/指纹、
+批次或名称耐久写入、running claim、进程创建之前 fail-closed。V2 当前不落库、不做 launch-time
+reattest，也不授权 Popen；retained/bootstrap launcher 接入是后续独立步骤。
+
 ### config.json 相关（代理只读，调参报告用户）
 
 | 键 | 说明 |
@@ -101,8 +108,8 @@ Popen rc 可成功结算；权威丢失时 fail-closed blocked，RC sidecar 对 
 | `projects[P].colocate / max_jobs` | 项目级共享开关 / 每卡打包密度上限（热更新）|
 | `gpus[i].max_jobs` | 异构卡每卡打包上限（热更新）|
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
-| `task_default_env` | 部署级普通任务环境缺省值 `{k:v}`；batch/task env 可覆盖。strict/native 忽略该键并从空继承环境启动。典型普通任务用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
-| `native_exec_profiles` | 管理员持有的 strict exact-profile 映射；每项 exact keys 为 `mode/project/batch_name/task_id/submitted_argv`，batch_name 在 registry 内唯一且保留。profile registry 与引用项目的 root 均为冷配置；热更新拒绝，必须重启 daemon |
+| `task_default_env` | 部署级普通任务环境缺省值 `{k:v}`；batch/task env 可覆盖。legacy V1 strict/native 忽略该键并从空继承环境启动；V2 当前不启动。典型普通任务用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
+| `native_exec_profiles` | 管理员持有的 strict exact-profile 映射；legacy V1 exact keys 为 `mode/project/batch_name/task_id/submitted_argv`；V2 用显式 schema 并增加冻结 batch/task 声明。batch_name 在 registry 内唯一且保留。profile registry 与引用项目的 root 均为冷配置；热更新拒绝，必须重启 daemon |
 
 ⚠️ config.json 为双项目共享配置，修改须经用户确认。
 

@@ -638,6 +638,85 @@ class NativeExecDispatcherInboxTests(NativeExecDispatcherCase):
             )
         return payload_path
 
+    def test_inbox_v2_is_validation_only_before_fingerprint_or_batch_write(self) -> None:
+        batch_env = {
+            "PYTHONNOUSERSITE": "1",
+            "OMP_NUM_THREADS": "1",
+        }
+        self.cfg["native_exec_profiles"] = {
+            "frozen-v2": {
+                "schema": "sched_native_exec_profile_v2",
+                "mode": "strict",
+                "project": "p",
+                "batch_name": "frozen-v2",
+                "task_id": "probe",
+                "submitted_argv": list(self.argv),
+                "cwd": "{PROJECT:p}",
+                "depends_on": [],
+                "_protocol": "scheduler_probe_runtime_end_attestation_v1",
+                "batch_env": dict(batch_env),
+                "task_env": {},
+                "runtime": {"prefix": self.tmp.name},
+                "duration_min": 1440,
+                "max_retry": 0,
+                "resources": {"gpu": 0, "cpus": 1},
+                "artifacts": {},
+            }
+        }
+        self.raw_batch = {
+            "name": "frozen-v2",
+            "project": "p",
+            "mode": "strict",
+            "cwd": "{PROJECT:p}",
+            "depends_on": [],
+            "_protocol": "scheduler_probe_runtime_end_attestation_v1",
+            "env": dict(batch_env),
+            "tasks": [
+                {
+                    "id": "probe",
+                    "cmd": list(self.argv),
+                    "env": {},
+                    "runtime": {"prefix": self.tmp.name},
+                    "duration_min": 1440,
+                    "max_retry": 0,
+                    "artifacts": {},
+                    "resources": {"gpu": 0, "cpus": 1},
+                }
+            ],
+        }
+        self._queue_payload(bid="frozen-v2-inbox-id", path_name="frozen-v2.json")
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.cfg = self.cfg
+        dispatcher.log_line = mock.Mock()
+
+        with (
+            mock.patch("gsched.dispatcher.compute_fingerprint") as fingerprint,
+            mock.patch("gsched.dispatcher._validate_inbox_dependencies") as dependencies,
+            mock.patch("gsched.dispatcher.state.submission_lock") as submission_lock,
+            mock.patch("gsched.dispatcher.state.insert_batch") as insert_batch,
+            mock.patch("gsched.dispatcher.state.insert_task") as insert_task,
+            mock.patch("gsched.dispatcher.state.insert_job") as insert_job,
+            mock.patch("subprocess.Popen") as popen,
+        ):
+            dispatcher._process_control_requests()
+
+        dependencies.assert_not_called()
+        fingerprint.assert_not_called()
+        submission_lock.assert_not_called()
+        insert_batch.assert_not_called()
+        insert_task.assert_not_called()
+        insert_job.assert_not_called()
+        popen.assert_not_called()
+        with state.connect() as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0])
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+            request = conn.execute(
+                "SELECT status, result FROM control_requests WHERE op='batch_submit'"
+            ).fetchone()
+        self.assertEqual("done", request["status"])
+        self.assertIn("validation-only", request["result"])
+
     def test_inbox_persists_same_metadata_and_fingerprint_binding(self) -> None:
         payload_path = os.path.join(self.tmp.name, "submit-native.json")
         with open(payload_path, "w", encoding="utf-8") as stream:
