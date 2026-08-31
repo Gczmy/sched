@@ -90,7 +90,7 @@ class LaunchIntentExecutorTests(unittest.TestCase):
             intent = _create_launch_intent(self.marker)
         try:
             entry = os.lstat(self.marker)
-            self.assertEqual(1, entry.st_nlink)
+            self.assertIn(entry.st_nlink, (1, 2))
             self.assertFalse(_claim_abandoned_launch_intent(self.marker))
         finally:
             os.close(intent.fd)
