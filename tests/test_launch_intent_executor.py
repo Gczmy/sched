@@ -96,6 +96,33 @@ class LaunchIntentExecutorTests(unittest.TestCase):
             os.close(intent.fd)
         self.assertTrue(_claim_abandoned_launch_intent(self.marker))
 
+    def test_hardlink_fallback_accepts_nfs_cached_two_link_fd(self) -> None:
+        real_fstat = os.fstat
+
+        def stale_nfs_fstat(fd: int) -> os.stat_result:
+            fields = list(real_fstat(fd))
+            fields[3] = 2  # st_nlink remains stale while the locked FD is open.
+            return os.stat_result(fields)
+
+        with mock.patch.object(
+            executor_module,
+            "_atomic_rename_noreplace",
+            side_effect=OSError(errno.EINVAL, "unsupported on NFS"),
+        ), mock.patch.object(
+            executor_module.os,
+            "fstat",
+            side_effect=stale_nfs_fstat,
+        ):
+            intent = _create_launch_intent(self.marker)
+            try:
+                self.assertTrue(os.path.isfile(self.marker))
+                self.assertFalse(_claim_abandoned_launch_intent(self.marker))
+            finally:
+                os.close(intent.fd)
+
+        self.assertTrue(_claim_abandoned_launch_intent(self.marker))
+        self.assertFalse(os.path.lexists(self.marker))
+
     def test_non_capability_rename_error_never_falls_back(self) -> None:
         with mock.patch.object(
             executor_module,

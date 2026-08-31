@@ -1179,6 +1179,9 @@ class ReviewStageCheckpointTests(unittest.TestCase):
         dispatcher._drop_profile = mock.Mock()
         dispatcher._release_gpu_for_job = mock.Mock()
         dispatcher._maybe_retry = mock.Mock()
+        dispatcher._consume_pending_cancel_before_requeue = mock.Mock(
+            return_value=False
+        )
         job = {
             "id": "job-v1",
             "kill_reason": None,
@@ -1187,7 +1190,9 @@ class ReviewStageCheckpointTests(unittest.TestCase):
             "gpu": None,
         }
 
-        with mock.patch("gsched.dispatcher.state.update_job") as update_job:
+        with mock.patch(
+            "gsched.dispatcher.state.get_job", return_value=job
+        ), mock.patch("gsched.dispatcher.state.update_job") as update_job:
             dispatcher._handle_job_done(object(), job, 0)
 
         update_job.assert_called_once()

@@ -229,8 +229,30 @@ def _hardlink_noreplace(source: str, destination: str, intent_fd: int) -> None:
             destination,
         )
     os.unlink(source)
-    final_entry = os.fstat(intent_fd)
-    if final_entry.st_nlink != 1 or not _intent_fd_matches(
+    try:
+        os.lstat(source)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise OSError(
+            error.errno or errno.EIO,
+            "launch intent temporary-name removal could not be verified",
+            source,
+        ) from error
+    else:
+        raise OSError(
+            errno.EIO,
+            "launch intent temporary name survived hard-link finalization",
+            source,
+        )
+    # NFS may cache st_nlink==2 on every descriptor/path lookup while the
+    # original locked descriptor remains open, even though unlink(source)
+    # succeeded; reopening after the lock is closed refreshes it to 1.  Requiring
+    # an immediate nlink==1 would therefore reject every launch on this shared
+    # filesystem.  Source-name absence plus exact destination inode/nonce is the
+    # authoritative finalization proof; intent validation deliberately accepts
+    # nlink 1 or 2, while published process identities still require nlink==1.
+    if not _intent_fd_matches(
         destination,
         intent_fd,
         nonce,
