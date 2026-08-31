@@ -74,7 +74,7 @@ try:
 except Exception:
     batches = []
 print(batches[0].get("status", "") if batches else "")')
-  if [ "$task_status" = "blocked" ] \
+  if [ "$task_status" = "cancelled" ] \
     && [ "$batch_status" = "blocked" ] \
     && [ -f "$SCHED_STATE/$NODE/markers/cancel_health.blocked" ]; then
     terminal=1
@@ -83,7 +83,7 @@ print(batches[0].get("status", "") if batches else "")')
   sleep 1
 done
 if [ "$terminal" != "1" ]; then
-  echo "synthetic running job/cancel request did not fully converge" >&2
+  echo "synthetic running job/cancel request did not converge to task=cancelled/batch=blocked" >&2
   exit 1
 fi
 "$PY" -m gsched.cli daemon stop >/dev/null 2>&1 || exit 1
