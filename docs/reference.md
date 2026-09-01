@@ -108,12 +108,16 @@ AF_UNIX stream control FD、retained project-root dirfd 与 append-only log FD�
 匹配 retained root 下 `logs/` 内由逐级 `O_NOFOLLOW` 解析的相对路径。actual argv 固定为
 `m2b-exec-monitor[native-entry-v1] --native-entry-v1`，actual env 固定为空，child
 request/control/root FD 固定为 3/4/5；logical submitted argv 只作证据，不会拼入 actual
-argv。request body 仍 opaque 且无权威，复制出的 control endpoint 也不证明 peer 已认证或
+argv。request body 仍 opaque 且无权威。私有 generated/no-data
+`NativeStep5DNoDataLaunchOwner` adapter 现在自行创建 AF_UNIX socketpair，只将 native 端交给
+plan factory 并立即关闭该源端；peer 端由创建进程私有保留，且不提供 raw-FD 或 transfer API。
+这只固定预期的 endpoint 构造形状，不认证 scheduler role，也不声称 native 可推断 peer endpoint
 独占。plan 只用 `request_frame_sha256` 命名完整 sealed frame 的 SHA-256，并另用
 `request_body_sha256` 命名 opaque body 的 SHA-256；不存在歧义的 `request_sha256` alias。
 `Executor.launch_native(plan)` 在 Linux FD-exec backend 接入前会关闭 plan 并在创建
-进程前拒绝，V2 提交闸门因此仍未解除；接入前还必须完成独占 control endpoint 构造以及原子的
-final validate/map/FD-exec。
+进程前拒绝，V2 提交闸门因此仍未解除。adapter 不含 launch、control protocol、nonce、publication
+或 daemon route；接入前仍必须完成原子的 final validate/map/FD-exec 与经过审查的真实
+direct-parent lifecycle。
 
 ### config.json 相关（代理只读，调参报告用户）
 

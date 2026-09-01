@@ -202,16 +202,22 @@ root's `logs/` directory. Its actual entry contract is fixed to argv
 `("m2b-exec-monitor[native-entry-v1]", "--native-entry-v1")`, an empty
 environment, and child request/control/root descriptors 3/4/5; the logical
 submitted argv is evidence inside the plan and is never appended to or used as
-the actual argv. The request body remains opaque and non-authoritative, and the
-duplicated control endpoint does not establish an authenticated or exclusive
+the actual argv. The request body remains opaque and non-authoritative. The
+private generated/no-data `NativeStep5DNoDataLaunchOwner` adapter now creates
+the AF_UNIX socketpair itself, supplies only the native-side endpoint to the
+plan factory, immediately closes that source endpoint, and privately retains
+the peer endpoint in the creating process without a raw-FD or transfer API. It
+fixes the intended endpoint-construction shape but does not authenticate a
+scheduler role or claim that exclusive ownership can be inferred by the native
 peer. The plan names the SHA-256 of the complete sealed frame exclusively as
 `request_frame_sha256` and separately names the SHA-256 of its opaque body as
 `request_body_sha256`; the ambiguous `request_sha256` alias does not exist.
 `Executor.launch_native(plan)` currently closes the plan and fails before
 process creation because the Linux FD-exec backend is not yet connected. V2
-submission remains blocked as described above; exclusive control-endpoint
-construction and atomic final validate/map/FD-exec are hard prerequisites for
-connecting that backend.
+submission remains blocked as described above. The adapter has no launch,
+control-protocol, nonce, publication, or daemon route; atomic final
+validate/map/FD-exec and the reviewed real direct-parent lifecycle remain hard
+prerequisites for connecting that backend.
 
 ## State Machine
 
