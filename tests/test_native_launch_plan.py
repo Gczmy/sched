@@ -63,6 +63,9 @@ class NativeLaunchPlanContractTests(unittest.TestCase):
         self.assertEqual(0, NATIVE_LAUNCH_REQUEST_SEQUENCE)
         self.assertEqual(4, NATIVE_LAUNCH_WIRE_OUTER_HEADER_BYTES)
         self.assertEqual(20, NATIVE_LAUNCH_WIRE_HEADER_BYTES)
+        self.assertIn("request_frame_sha256", NativeLaunchPlan.__slots__)
+        self.assertIn("request_body_sha256", NativeLaunchPlan.__slots__)
+        self.assertNotIn("request_sha256", NativeLaunchPlan.__slots__)
         self.assertEqual(["self", "plan"], list(inspect.signature(Executor.launch_native).parameters))
 
     def test_direct_plan_construction_requires_private_authority(self) -> None:
@@ -75,7 +78,8 @@ class NativeLaunchPlanContractTests(unittest.TestCase):
                 project_root_path="/project",
                 logical_submitted_argv=("/bin/true",),
                 launcher_sha256="c" * 64,
-                request_sha256="d" * 64,
+                request_frame_sha256="d" * 64,
+                request_body_sha256="e" * 64,
                 log_relative_path="logs/native.log",
                 owned_fds=(10, 11, 12, 13, 14),
             )
@@ -88,7 +92,8 @@ class NativeLaunchPlanContractTests(unittest.TestCase):
             "project_root_path": "/project",
             "logical_submitted_argv": ["/bin/true"],
             "launcher_sha256": "c" * 64,
-            "request_sha256": "d" * 64,
+            "request_frame_sha256": "d" * 64,
+            "request_body_sha256": "e" * 64,
             "log_relative_path": "logs/native.log",
             "launcher_fd": 10,
             "request_fd": 11,
@@ -99,6 +104,8 @@ class NativeLaunchPlanContractTests(unittest.TestCase):
         mutations = (
             {"profile_id": "bad profile"},
             {"profile_sha256": "A" * 64},
+            {"request_frame_sha256": "D" * 64},
+            {"request_body_sha256": "E" * 64},
             {"logical_submitted_argv": ["relative-python"]},
             {"request_fd": True},
             {"control_fd": 10},
@@ -138,7 +145,7 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
         memfd_flags = getattr(os, "MFD_CLOEXEC", 0) | getattr(
             os, "MFD_ALLOW_SEALING", 0
         )
-        request_body = b'{"schema":"opaque-native-request-fixture-v1"}'
+        self.request_body = b'{"schema":"opaque-native-request-fixture-v1"}'
         wire_header = struct.pack(
             "!8sBBBBII",
             NATIVE_LAUNCH_WIRE_MAGIC,
@@ -147,9 +154,9 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
             NATIVE_LAUNCH_MESSAGE_REQUEST,
             NATIVE_LAUNCH_FLAGS_NONE,
             NATIVE_LAUNCH_REQUEST_SEQUENCE,
-            len(request_body),
+            len(self.request_body),
         )
-        payload = wire_header + request_body
+        payload = wire_header + self.request_body
         self.request = struct.pack("!I", len(payload)) + payload
         request_builder_fd = os.memfd_create("native-request-test", memfd_flags)
         os.write(request_builder_fd, self.request)
@@ -221,7 +228,8 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
                 "logical-bootstrap.py",
             ],
             "launcher_sha256": self.launcher_sha256,
-            "request_sha256": hashlib.sha256(self.request).hexdigest(),
+            "request_frame_sha256": hashlib.sha256(self.request).hexdigest(),
+            "request_body_sha256": hashlib.sha256(self.request_body).hexdigest(),
             "log_relative_path": self.log_relative_path,
             "launcher_fd": self.launcher_fd,
             "request_fd": self.request_fd,
@@ -239,6 +247,15 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
         self.assertEqual(NATIVE_LAUNCH_PLAN_SCHEMA, plan.schema)
         self.assertEqual(NATIVE_ACTUAL_ARGV, plan.actual_argv)
         self.assertEqual((), plan.actual_env_items)
+        self.assertEqual(
+            hashlib.sha256(self.request).hexdigest(),
+            plan.request_frame_sha256,
+        )
+        self.assertEqual(
+            hashlib.sha256(self.request_body).hexdigest(),
+            plan.request_body_sha256,
+        )
+        self.assertFalse(hasattr(plan, "request_sha256"))
         self.assertEqual(
             (
                 "/opt/reviewed/python",
@@ -258,6 +275,53 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
         os.lseek(self.request_fd, 7, os.SEEK_SET)
         self.assertEqual(os.lseek(plan.request_fd, 0, os.SEEK_CUR), 0)
         plan.validate_live_fds()
+        self.assertEqual(os.lseek(plan.request_fd, 0, os.SEEK_CUR), 0)
+
+    def test_request_seals_are_required_before_the_frame_snapshot_is_read(self) -> None:
+        unsealed_builder = os.memfd_create(
+            "unsealed-native-request-test",
+            getattr(os, "MFD_CLOEXEC", 0)
+            | getattr(os, "MFD_ALLOW_SEALING", 0),
+        )
+        self.addCleanup(os.close, unsealed_builder)
+        os.write(unsealed_builder, self.request)
+        unsealed_request = os.open(
+            f"/proc/self/fd/{unsealed_builder}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        self.addCleanup(os.close, unsealed_request)
+
+        with mock.patch("gsched.native_launch._stable_fd_bytes") as snapshot:
+            with self.assertRaisesRegex(
+                NativeLaunchPlanError,
+                "request FD is not fully sealed",
+            ):
+                self.plan(request_fd=unsealed_request)
+        snapshot.assert_not_called()
+
+    def test_request_frame_and_body_digests_are_independently_revalidated(self) -> None:
+        with self.assertRaisesRegex(
+            NativeLaunchPlanError,
+            "request frame digest drifted",
+        ):
+            self.plan(request_frame_sha256="0" * 64)
+        with self.assertRaisesRegex(
+            NativeLaunchPlanError,
+            "request body digest drifted",
+        ):
+            self.plan(request_body_sha256="0" * 64)
+
+        frame_digest = hashlib.sha256(self.request).hexdigest()
+        body_digest = hashlib.sha256(self.request_body).hexdigest()
+        self.assertNotEqual(frame_digest, body_digest)
+        with self.assertRaisesRegex(
+            NativeLaunchPlanError,
+            "request frame digest drifted",
+        ):
+            self.plan(
+                request_frame_sha256=body_digest,
+                request_body_sha256=frame_digest,
+            )
 
     @unittest.skipUnless(hasattr(os, "O_PATH"), "requires Linux O_PATH")
     def test_project_root_o_path_descriptor_fails_closed(self) -> None:

@@ -266,7 +266,47 @@ def _pread_exact(fd: int, size: int, where: str) -> bytes:
     return b"".join(chunks)
 
 
-def _validate_native_request_frame(frame: bytes) -> None:
+def _stable_fd_bytes(fd: int, *, maximum: int, where: str) -> bytes:
+    """Read one retained regular-file snapshot without changing its offset."""
+    try:
+        before = os.fstat(fd)
+    except OSError as exc:
+        raise NativeLaunchPlanError(f"{where} cannot be fstat'ed") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise NativeLaunchPlanError(f"{where} must be a retained regular file")
+    if before.st_size < 0 or before.st_size > maximum:
+        raise NativeLaunchPlanError(f"{where} exceeds its byte bound")
+    content = _pread_exact(fd, before.st_size, where)
+    try:
+        after = os.fstat(fd)
+    except OSError as exc:
+        raise NativeLaunchPlanError(f"{where} cannot be re-fstat'ed") from exc
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_gid,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_uid,
+        after.st_gid,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after or len(content) != before.st_size:
+        raise NativeLaunchPlanError(f"{where} identity drifted during retained read")
+    return content
+
+
+def _validate_native_request_frame(frame: bytes) -> bytes:
     if len(frame) < _OUTER_HEADER.size + _WIRE_HEADER.size:
         raise NativeLaunchPlanError("sealed native request frame is truncated")
     (payload_length,) = _OUTER_HEADER.unpack_from(frame)
@@ -302,6 +342,7 @@ def _validate_native_request_frame(frame: bytes) -> None:
         raise NativeLaunchPlanError("sealed native request body size is invalid")
     if body_length != payload_length - _WIRE_HEADER.size:
         raise NativeLaunchPlanError("sealed native request body length drifted")
+    return frame[_OUTER_HEADER.size + _WIRE_HEADER.size :]
 
 
 class NativeLaunchPlan:
@@ -311,8 +352,10 @@ class NativeLaunchPlan:
     The factory makes retained copies of every caller-owned descriptor.  The
     sealed request is reopened through its live Linux FD to give the plan an
     independent offset; the other descriptors are duplicated.  The factory
-    validates all copies and closes them on any partial failure.  The current
-    executor also closes them when it refuses the not-yet-implemented backend.
+    independently binds the complete request frame and its opaque body to
+    explicitly named SHA-256 values, validates all copies, and closes them on
+    any partial failure.  The current executor also closes them when it refuses
+    the not-yet-implemented backend.
     """
 
     __slots__ = (
@@ -322,7 +365,8 @@ class NativeLaunchPlan:
         "project_root_path",
         "logical_submitted_argv",
         "launcher_sha256",
-        "request_sha256",
+        "request_frame_sha256",
+        "request_body_sha256",
         "log_relative_path",
         "_owned_fds",
         "_closed",
@@ -338,7 +382,8 @@ class NativeLaunchPlan:
         project_root_path: str,
         logical_submitted_argv: tuple[str, ...],
         launcher_sha256: str,
-        request_sha256: str,
+        request_frame_sha256: str,
+        request_body_sha256: str,
         log_relative_path: str,
         owned_fds: tuple[int, int, int, int, int],
     ) -> None:
@@ -352,7 +397,8 @@ class NativeLaunchPlan:
         self.project_root_path = project_root_path
         self.logical_submitted_argv = logical_submitted_argv
         self.launcher_sha256 = launcher_sha256
-        self.request_sha256 = request_sha256
+        self.request_frame_sha256 = request_frame_sha256
+        self.request_body_sha256 = request_body_sha256
         self.log_relative_path = log_relative_path
         self._owned_fds = owned_fds
         self._closed = False
@@ -456,20 +502,18 @@ class NativeLaunchPlan:
         if (launcher_flags & os.O_ACCMODE) != os.O_RDONLY:
             raise NativeLaunchPlanError("native launcher FD must be read-only")
 
-        request_digest, request_stat = _stable_fd_sha256(
-            self.request_fd,
-            maximum=_MAX_REQUEST_BYTES,
-            where="sealed native request FD",
-        )
-        if request_digest != self.request_sha256:
-            raise NativeLaunchPlanError("sealed native request digest drifted")
-        seals = fcntl.fcntl(self.request_fd, fcntl.F_GET_SEALS)
         required_seals = (
             fcntl.F_SEAL_SEAL
             | fcntl.F_SEAL_SHRINK
             | fcntl.F_SEAL_GROW
             | fcntl.F_SEAL_WRITE
         )
+        try:
+            seals = fcntl.fcntl(self.request_fd, fcntl.F_GET_SEALS)
+        except OSError as exc:
+            raise NativeLaunchPlanError(
+                "native request FD seals cannot be inspected"
+            ) from exc
         if seals & required_seals != required_seals:
             raise NativeLaunchPlanError("native request FD is not fully sealed")
         request_flags = fcntl.fcntl(self.request_fd, fcntl.F_GETFL)
@@ -481,13 +525,18 @@ class NativeLaunchPlan:
             raise NativeLaunchPlanError("native request FD must be seekable") from exc
         if request_offset != 0:
             raise NativeLaunchPlanError("native request FD offset must be exactly zero")
-        _validate_native_request_frame(
-            _pread_exact(
-                self.request_fd,
-                request_stat.st_size,
-                "sealed native request FD",
-            )
+        request_frame = _stable_fd_bytes(
+            self.request_fd,
+            maximum=_MAX_REQUEST_BYTES,
+            where="sealed native request FD",
         )
+        request_body = _validate_native_request_frame(request_frame)
+        request_frame_digest = hashlib.sha256(request_frame).hexdigest()
+        request_body_digest = hashlib.sha256(request_body).hexdigest()
+        if request_frame_digest != self.request_frame_sha256:
+            raise NativeLaunchPlanError("sealed native request frame digest drifted")
+        if request_body_digest != self.request_body_sha256:
+            raise NativeLaunchPlanError("sealed native request body digest drifted")
 
         try:
             control_stat = os.fstat(self.control_fd)
@@ -574,7 +623,8 @@ def _create_native_launch_plan(
     project_root_path: Any,
     logical_submitted_argv: Any,
     launcher_sha256: Any,
-    request_sha256: Any,
+    request_frame_sha256: Any,
+    request_body_sha256: Any,
     log_relative_path: Any,
     launcher_fd: Any,
     request_fd: Any,
@@ -596,7 +646,14 @@ def _create_native_launch_plan(
         "native launch project-root identity sha256",
     )
     launcher_digest = _digest(launcher_sha256, "native launcher sha256")
-    request_digest = _digest(request_sha256, "native request sha256")
+    request_frame_digest = _digest(
+        request_frame_sha256,
+        "native request frame sha256",
+    )
+    request_body_digest = _digest(
+        request_body_sha256,
+        "native request body sha256",
+    )
     if (
         type(project_root_path) is not str
         or not os.path.isabs(project_root_path)
@@ -633,7 +690,8 @@ def _create_native_launch_plan(
             project_root_path=project_root_path,
             logical_submitted_argv=logical_argv,
             launcher_sha256=launcher_digest,
-            request_sha256=request_digest,
+            request_frame_sha256=request_frame_digest,
+            request_body_sha256=request_body_digest,
             log_relative_path=relative_log,
             owned_fds=tuple(duplicates),  # type: ignore[arg-type]
         )

@@ -204,7 +204,10 @@ environment, and child request/control/root descriptors 3/4/5; the logical
 submitted argv is evidence inside the plan and is never appended to or used as
 the actual argv. The request body remains opaque and non-authoritative, and the
 duplicated control endpoint does not establish an authenticated or exclusive
-peer. `Executor.launch_native(plan)` currently closes the plan and fails before
+peer. The plan names the SHA-256 of the complete sealed frame exclusively as
+`request_frame_sha256` and separately names the SHA-256 of its opaque body as
+`request_body_sha256`; the ambiguous `request_sha256` alias does not exist.
+`Executor.launch_native(plan)` currently closes the plan and fails before
 process creation because the Linux FD-exec backend is not yet connected. V2
 submission remains blocked as described above; exclusive control-endpoint
 construction and atomic final validate/map/FD-exec are hard prerequisites for

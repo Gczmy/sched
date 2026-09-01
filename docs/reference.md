@@ -109,7 +109,9 @@ AF_UNIX stream control FD、retained project-root dirfd 与 append-only log FD�
 `m2b-exec-monitor[native-entry-v1] --native-entry-v1`，actual env 固定为空，child
 request/control/root FD 固定为 3/4/5；logical submitted argv 只作证据，不会拼入 actual
 argv。request body 仍 opaque 且无权威，复制出的 control endpoint 也不证明 peer 已认证或
-独占。`Executor.launch_native(plan)` 在 Linux FD-exec backend 接入前会关闭 plan 并在创建
+独占。plan 只用 `request_frame_sha256` 命名完整 sealed frame 的 SHA-256，并另用
+`request_body_sha256` 命名 opaque body 的 SHA-256；不存在歧义的 `request_sha256` alias。
+`Executor.launch_native(plan)` 在 Linux FD-exec backend 接入前会关闭 plan 并在创建
 进程前拒绝，V2 提交闸门因此仍未解除；接入前还必须完成独占 control endpoint 构造以及原子的
 final validate/map/FD-exec。
 
