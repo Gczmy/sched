@@ -184,7 +184,7 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         ):
             raise ConfigError(f"{p}: projects.{proj_name}.max_jobs 必须是正整数"
                               f" (该项目任务在单卡上的打包数上限)")
-    # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,8]), 不在此重复
+    # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,64]), 不在此重复
     tde = cfg.get("task_default_env")
     if tde is not None:
         if not isinstance(tde, dict) or not all(
@@ -210,7 +210,7 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     # 对象数组 {idx, mem_gib} 支持显存覆盖 (异构卡容量/无 nvidia-smi 环境)
     if "gpus" in cfg and cfg["gpus"] is not None:
         parse_gpus(cfg)  # 抛 ConfigError = 非法
-    # 通知 (设计 docs/sched_notify_design.md §3, 可选; 缺省 = 功能关闭)
+    # 通知 (现行配置见 docs/reference.md; 可选, 缺省 = 功能关闭)
     nf = cfg.get("notify")
     if nf is not None:
         if not isinstance(nf, dict):

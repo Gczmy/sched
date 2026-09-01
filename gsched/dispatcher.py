@@ -951,8 +951,9 @@ class Dispatcher:
         """P1: 批次终态. done = 全部任务成功终态 (done/skip);
         任一 failed/blocked/cancelled/timed_out -> blocked (interrupted 除外 R4).
 
-        终态批次只能由 retry/resubmit/clean 的提交事务显式重开；
-        daemon 不根据历史遗留的 pending/waiting 行猜测人工意图。"""
+        blocked 只能由 retry/resubmit 显式重开；done 可由 resubmit，或确有
+        最新 skip 重排的 clean 显式重开。daemon 不根据历史遗留的
+        pending/waiting 行猜测人工意图。"""
         marker_effects: list[tuple[str, str, str, str, str | None]] = []
         with state.connect() as conn:
             # Status snapshots and terminal publication must be one writer
@@ -1096,7 +1097,7 @@ class Dispatcher:
                     f"批次 {name} terminal effect 序列化失败，保留状态: {error}"
                 )
 
-    # ---------- 批次终态通知 (设计 docs/sched_notify_design.md) ----------
+    # ---------- 批次终态通知 (现行配置见 docs/reference.md) ----------
 
     def _notify_batch(
         self,
@@ -1782,7 +1783,7 @@ class Dispatcher:
         for path in drop_paths:
             self._drop_rc_path(path)
 
-    # ---------- B12-a: 配置热更新 (colocate_finetune_hotreload_research.md §2) ----------
+    # ---------- B12-a: 配置热更新 (现行配置见 docs/reference.md) ----------
 
     def _scan_progress(self) -> None:
         """B13-§5: 对声明 progress_regex 的运行任务, 从日志尾部提取最新进度."""

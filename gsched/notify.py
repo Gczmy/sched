@@ -1,4 +1,4 @@
-"""批次终态通知 (设计: docs/sched_notify_design.md).
+"""批次终态通知 (现行配置与命令参考: docs/reference.md).
 
 调度器保持"无意识": 批次进终态 (done/blocked) 时由 dispatcher 一次性触发,
 本模块负责构造统一事件 JSON 并投递到已配置渠道。渠道注册表结构 ——

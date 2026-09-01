@@ -3,7 +3,7 @@ export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远�
 # =============================================================================
 # run_notify_accept.sh — 批次终态通知验收 (fake-gpu 快速回归)
 # =============================================================================
-# 用途: 通知功能 (docs/sched_notify_design.md §8) 端到端验证.
+# 用途: 通知功能 (现行契约见 docs/reference.md) 端到端验证.
 #       不烧 GPU (SCHED_FAKE_GPUS), file 渠道落 notify_inbox 断言.
 #
 # 覆盖场景:

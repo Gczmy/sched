@@ -1,7 +1,7 @@
 # sched 使用参考（权威版）
 
 > 面向 AI 代理与用户的**功能与命令权威查阅文档**。改调度器行为时同步更新本文件。
-> 版本基准：当前 source/tests（2026-08-29）。发现本文档与实际行为不符 = 调度器 bug，请报告。
+> 版本基准：本次提交的 source/tests（文档同步于 2026-09-01；核心调度行为截至 `e9a44d0`）。发现本文档与实际行为不符 = 调度器 bug，请报告。
 
 ---
 
@@ -15,7 +15,7 @@
 
 - **每次 `sched submit` 都生成新的批次实例**（即使同名）。同名旧实例不会被覆盖，
   会以 `[blocked]` 等状态留在列表里 —— 用 `sched discard` 退役，忽略即可。
-- **项目隔离**：提交必须带 `"project"`；任务只落该项目的亲和卡（hard=true 不外借）。
+- **项目归属与选卡**：提交必须带 `"project"`；`gpu_affinity_hard=true` 时，该项目任务只从其亲和卡中选卡。硬亲和不会反向为项目保留 GPU；需要项目间独占隔离时，所有竞争项目必须使用互不重叠的硬亲和集合。
 - **共享装箱三要素**（想单卡多任务必读）：
   ```json
   "resources": {
@@ -40,7 +40,7 @@
 | `name` | str | ✅ | 批次名（1..128 位安全 ASCII 标识符；id 自动追加时间戳）|
 | `project` | str | ✅ | 项目名，必须在 config.projects 注册 |
 | `mode` | str | ✗ | `mix`（缺省；当前唯一实现的批次模式）|
-| `priority` | int | ✗ | 项目内派发优先级，大者先 |
+| `priority` | int | ✗ | 项目内批次优先级，默认 0；整数越大越先考虑 |
 | `cwd` | str | ✗ | 缺省为该批次的 project root；支持 `{ROOT}`/`{PROJECT:name}`/`{VENV:key}` 模板 |
 | `env` | obj | ✗ | 字符串环境变量映射（最终覆盖，优先级高于自动注入）；变量名/值必须安全，shell bootstrap 与动态加载注入变量会被拒绝 |
 | `depends_on` | [str] | ✗ | 上游批次名数组；每项同样须为安全标识符，上游 done 前挂起 |
@@ -57,13 +57,13 @@
 | `stages` | [obj] | ✅* | 多阶段替代 cmd：`[{cmd,artifacts}]` 顺序执行，失败即停；匹配 producer 指纹的私有 checkpoint 可跳过已成功 stage |
 | `cwd` | str | ✗ | 任务级目录覆盖（任意目录，J 类）|
 | `env` | obj | ✗ | 任务级安全字符串环境变量（最终覆盖）；与批次级采用同一注入变量拒绝规则 |
-| `duration_min` | int | 推荐 | 预估时长，超时看门狗 kill |
+| `duration_min` | num | 推荐 | 有限正数分钟；超时看门狗 kill |
 | `max_retry` | int | ✗ | 自动重试次数（缺省 1；0=失败即 blocked）|
 | `resources.gpu` | 0/1 | ✗ | 0=CPU-only；缺省占 1 GPU |
 | `resources.gpu_share` | bool | ✗ | true=允许共享装箱（需全局 co_locate 开启）|
 | `resources.vram_gib` | num | 共卡必填 | 峰值显存声明（GiB）；独占时用于容量校验 |
 | `resources.profile_key` | str | ✗ | 历史实测峰值键，装箱取 max(声明, 实测) |
-| `resources.cpus` | int | ✗ | CPU 核数声明 |
+| `resources.cpus` | int | ✗ | 正整数 CPU 核数声明；缺省时 CPU-only=1，GPU job=`gpu_job_cpus`（默认 8）|
 | `runtime` | obj | ✗ | `{conda_env:"名"}` ∥ `{venv_alias:"名"}` ∥ `{prefix:"路径"}` 必须且只能选一个；别名须注册、conda env/prefix 目录须在提交时存在；参与指纹 |
 | `progress_regex` | str | ✗ | 从日志尾部提取进度，status 展示 |
 | `artifacts` | obj | ✗ | `{key:{path,...}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`regex:"模式"`；内容校验有读取/执行上限，symlink 与特殊文件拒绝；命中→SKIP |
@@ -78,12 +78,33 @@
 
 | 键 | 说明 |
 |---|---|
+| `projects[P].gpu_quota` | 项目并发 running GPU job 上限；省略或 `0` = 无限制，CPU-only 不计 |
+| `projects[P].priority` | 项目优先级，默认 0；整数越大越先考虑（热更新）|
+| `projects[P].gpu_affinity` | 该项目的亲和卡列表；软亲和可在必要时外借其他卡 |
+| `projects[P].gpu_affinity_hard` | `true` 时只允许从非空 affinity 选卡；不反向保留这些卡 |
 | `projects[P].colocate / max_jobs` | 项目级共享开关 / 每卡打包密度上限（热更新）|
 | `gpus[i].max_jobs` | 异构卡每卡打包上限（热更新）|
+| `gpus` | 卡号或 `{idx,mem_gib,max_jobs}` 数组；省略/空数组时由 daemon 探测 |
+| `co_locate / co_locate_safety / co_locate_max_jobs / co_locate_freeze_pct` | 共享总开关与阈值；默认 `false / 0.7 / 3 / 85` |
+| `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 配额；默认 `0 / 8 / 2`。`cpus_total=0` 时仅以 `max_cpu_jobs` 限 CPU-only 并发 |
+| `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
+| `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
 | `task_default_env` | 部署级任务环境缺省值 `{k:v}`；batch/task env 可覆盖。典型用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
 
-⚠️ config.json 为双项目共享配置，修改须经用户确认。
+`gpu_quota` 的计数单位是 job，不是不同物理卡或显存：正整数 `N` 表示该项目最多
+同时运行 `N` 个已经分配 GPU 的 job；独占和共享任务均每个 job 计 1，共享时多个
+计数单位可能落在同一张物理卡上。`resources.gpu:0` 的 CPU-only job 不占该配额。
+当前没有项目级“禁止 GPU”开关，不能用 `gpu_quota:0` 或空 affinity 模拟；待开发项见
+[`next-development.md`](next-development.md)。
+
+ready 候选按 `(项目 priority 降序, 批次 priority 降序, job 入队 rowid 升序)`
+逐一尝试，两个 priority 都默认为 `0` 且可为任意整数。项目 priority 是第一排序键；
+低优项目的批次 priority 再大也不能越过高优项目。该机制不抢占、不预留容量，也没有
+aging/fair-share：运行中的低优任务不会被驱逐；高优候选因 quota、CPU、GPU 或
+`max_parallel` 暂时不可启动时，后续候选可以补位。
+
+⚠️ config.json 为多项目共享配置，修改须经用户确认。
 
 ---
 
@@ -150,7 +171,7 @@ sched discard <batch-ref> --yes   # 仅 blocked/queued 且无 running；证据�
 ### R7 批量取消项目队列
 
 ```bash
-sched cancel --project selfdist --yes   # ⚠️ 连 blocked 批次的 pending 一并取消
+sched cancel --project selfdist --yes   # ⚠️ 覆盖 queued/active/blocked 批次的排队或运行任务
 ```
 
 ### R8 失败排障流程
@@ -194,28 +215,45 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 
 | 命令 | 说明 | 注意 |
 |---|---|---|
-| `submit <file> [--dry-run]` | 提交批次 | dry-run 只读预览含 SKIP 预测 |
-| `run --project P [--gpus N|--cpu-only] -- cmd...` | 单条命令提交 | |
+| `init [--config PATH]` | 交互生成 config.json | 默认写 bootstrap state 下的 config |
+| `verify <batch-ref>` | 确认批次已持久化 | 网关 submit 返回“已投递”后用它确认 daemon 已入库 |
+| `submit <file> [--dry-run [--json]]` | 提交批次 | 网关推荐入口；异机写 submit_inbox，daemon 下一 tick 收编；dry-run 只读 |
+| `run --project P [--gpus 1\|--cpu-only] [--cpus N] [--duration MIN] [--cwd DIR] [--out PATH] [--venv NAME] [--dry-run] -- cmd...` | 单条命令提交 | 非 dry-run 仅计算节点；不用 inbox；批次 priority 固定 0 |
 | `status [batch-ref] [--project P] [--detail] [--json] [--limit N] [--cursor TOKEN] [--job-cursor TOKEN]` | 最新版本当前态 | 缺省 200，钳制到 1..1000；`--cursor` 翻批次页，`--job-cursor` 独立翻任务页 |
 | `task <batch-ref>:<task> [--json]` | 单任务全部版本详情 | `--json` 输出单一、版本化 JSON 文档 |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
+| `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |
 | `diag <batch-ref>[:task]` | 失败诊断（首选）| |
-| `incidents [id] [--json] [--job --gpu]` | OOM 事故快照（--json 供看板/脚本）| |
+| `incidents [id] [--limit N] [--job ID] [--gpu N] [--json]` | OOM/硬件事故快照 | `--json` 供看板/脚本 |
 | `retry <batch-ref>[:task]` | 解锁失败终态重跑（同 spec）| blocked 批次原子回 active；marker 由 daemon 派发前协调；discarded 拒绝 |
 | `resubmit <batch-ref>:<task>` / `<batch-ref> [--failed\|--all] [--dry-run]` | 新版本排队尾；支持批次级批量 | discarded/queued 守卫；done/blocked 自动回 active |
-| `cancel <batch-ref>[:task] --yes` / `cancel --project P --yes` | 取消 | 后者连带 blocked 批次的 pending |
+| `cancel <batch-ref>[:task] --yes` / `cancel --project P --yes` | 取消 | 后者遍历该项目 queued/active/blocked 批次 |
 | `discard <batch-ref> --yes` | 退役 blocked/queued 批次 | 仅拒 running；证据保留 |
 | `clean <batch-ref> --yes` | 清全部指纹+删最新 skip spec 产物 | 仅终态批次；仅重排最新 skip；done 自动回 active |
 | `list-gpus` | GPU 视图（packed=n/cap）| |
-| `config get` / `config set -f patch --yes` / `config reload` | 配置读取/补丁写入/立即热更 | 冷键拒绝；双项目共享需谨慎 |
+| `gpu-set-mem <idx> <GiB>` | 临时覆盖 state/list-gpus 中的 GPU 容量 | 重启时会被 config 或硬件探测覆盖 |
+| `gpu-ok <idx>` / `gpu-ignore <idx>` | 解除 quarantine / 静默 unmanaged 告警 | 未知 idx 拒绝；不等同于强制释放 |
+| `gpu-free <idx> --yes` | 强制 GPU 回 free | 破坏性操作；操作者须先确认无受管或外部任务；自动化应使用 request/CAS 绑定 assignments |
+| `config get` / `config set -f patch --yes` / `config reload` | 配置读取/补丁写入/立即热更 | 冷键拒绝；多项目共享需谨慎 |
 | `request <request-id> --expect-revision N [--expect-kind ...] ... -- <mutation>` | 持久化幂等 mutation | revision 必填；request-id 与完整命令/前置条件永久绑定；GPU 还必须绑定完整 assignments JSON |
-| `daemon start/stop/status/check` | daemon 生命周期 | start/stop/check 仅计算节点；显式 `SCHED_ALLOW_FOREIGN_WRITE=1` 才可覆盖 |
-| `notify-test` / `notify-inbox` / `notify-ack` | 通知测试与检查点 | |
+| `daemon start/stop/status/check [--fake]` | daemon 生命周期 | start/stop/check 仅计算节点；`--fake` 仅供 start/check 测试；显式 override 才可跨主机 |
+| `notify-test` / `notify-inbox [--all] [--json]` / `notify-ack <file>` | 通知测试与检查点 | inbox 为纯文件查询；ack 是写操作 |
 | `project list` | 项目配额/用量 | |
 
 破坏性命令（cancel/gpu-free/discard/config set/clean）缺 `--yes` 时返回码 1 =
 未确认而非失败。
+
+`sched run` 当前只有单 GPU 与 CPU-only 两种受支持的资源形态。GPU 任务省略
+`--gpus` 或显式写 `--gpus 1`；零 GPU 必须用 `--cpu-only`。当前 parser 会把未配合
+`--cpu-only` 的非正 `--gpus` 当成省略参数，最终仍按默认一张 GPU 入队，所以不要
+使用 `0` 或负数。
+它默认采用 config 中第一个 venv，工作目录为 `{ROOT}`（`default_project` 根目录）；
+`--project` 只决定归属、quota、priority 与 affinity，不改变 `{ROOT}`。需要其他项目
+目录时显式传 `--cwd '{PROJECT:P}'`。当前 `run --dry-run` 在项目成员校验前返回，
+所以预览成功不能证明 `--project` 已注册；真实提交会执行该校验。`--cpus` 与
+`--duration` 的受支持输入都是正整数，快捷入口目前不会完整预检所有非法非正值。
+与可无状态执行的 `submit --dry-run` 不同，当前 run 预览仍要求已有且可读的 state DB。
 
 ### 稳定 JSON 与跨主机读取
 
@@ -223,7 +261,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 - `task --json` 固定 `schema_version:1`，输出 `batch_id`、`batch_name`、`batch_revision`、`task` 与 `jobs` 版本时间线；每个版本含状态、运行结果/时间、resources、规范化 spec 与 log 路径。stdout 只含这一份 JSON。
 - `history --json` 固定 `schema_version:1`，`limit` 缺省 50、钳制 1..200；顶层含 `history`、`truncated` 与 `next_cursor`，每项含 `batch_id`、`batch_name`、`task`、`status`、`version` 及运行结果/时间。
 - 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check` 默认拒绝。
-- 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以只读方式核验 schema 版本、必需对象/列与 WAL 文件头；schema 已是当前版本时，查询连接固定使用私有快照上的 `mode=ro + query_only`，不再对源库执行 `journal_mode=WAL`、`BEGIN IMMEDIATE` 或幂等迁移。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、旧 schema、非 WAL 库或权限漂移才进入带有界锁重试的 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 不检查或打开数据库。
+- 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以只读方式核验 schema 版本、必需对象/列与 WAL 文件头；schema 已是当前版本时，查询连接固定使用私有快照上的 `mode=ro + query_only`，不再对源库执行 `journal_mode=WAL`、`BEGIN IMMEDIATE` 或幂等迁移。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、旧 schema、非 WAL 库或权限漂移才进入带有界锁重试的 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 以及 `config get` 不检查或打开数据库。
 - `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop` 与 `config set`；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
 - 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒只在提交后发生，marker 由 daemon 按数据库权威状态协调。`retry`/`resubmit` 的最终事务、`clean` 的发布重跑阶段以及 `cancel` 的任务分类与写入，都会在读取权威状态前取得 SQLite writer claim，防止 daemon 在状态校验与首个 job/task mutation 之间收敛或派发任务。daemon 的节点重启恢复、接管终态判定与重试发布也使用同一 writer 顺序；已落库的 cancel request 或 `kill_reason=cancelled` 永远优先于自动重试/恢复回队。`daemon start/stop` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。
 - 本地 `submit` 与网关 inbox payload 都可在 submission gate 外做预览校验和计算指纹，但最终写入前必须在同一 gate 内按最新同名代际重验依赖存在性、完整依赖图、批次 ID 与同名终态，并原子提交批次/任务/job（inbox 同时提交请求回执）。因此并发提交不能分别基于旧快照发布 `A → B`、`B → A` 环，也不会在 `clean` 两阶段之间或 `retry`/`resubmit` 事务中途插入第二个同名非终态批次；反向顺序会在重开旧批次前拒绝已有的同名非终态实例，`clean` 在删产物前和发布重跑前各重验一次。daemon 退出门禁生效时 payload 与 pending 请求保留供恢复后重试。
@@ -236,18 +274,21 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 ```
 任务:  pending → running → done / failed / blocked / cancelled / timed_out / interrupted
        pending → skip (指纹命中, 与成功等价)
-批次:  active → done | blocked (等 retry/resubmit) | cancelled
-       blocked → active (retry 或 resubmit); done → active (resubmit)
-       discarded (退役终态, 不可 retry/resubmit)
-GPU:   free ⇄ assigned ⇄ releasing; 外部占用 → unmanaged; 人工 → quarantined
+批次:  queued → active → done | blocked (等 retry/resubmit)
+       blocked → active (retry 或 resubmit)
+       done → active (resubmit，或 clean 确有最新 skip 重排)
+       blocked/queued → discarded (退役终态, 不可 retry/resubmit)
+GPU:   free → assigned → releasing → free; 外部占用 → unmanaged; 连续健康异常 → quarantined
 ```
 
-空闲 GPU 的物理探测区分信号来源：发现 compute PID 或 compute/topology 探测不确定时，
+空闲 GPU 的物理探测区分信号来源：发现 compute PID，或 compute/topology/utilization
+任一探测不确定时，
 仍在首次采样立即转 `unmanaged`（fail-closed）；只有“compute 列表完整且为空、但
 `utilization.gpu > 0`”这一类易受驱动底噪影响的信号才做连续 3 次确认。确认期间该卡
 保持 `free` 展示但从所有派发路径临时排除，任一干净采样立即清零并恢复派发；连续确认
 成立后才持久转 `unmanaged`。因此 1–2% 的单次/短时空闲抖动不会制造状态和日志风暴，
-也不存在把确认中的可疑卡分给新任务的窗口。
+也不存在把确认中的可疑卡分给新任务的窗口。已经处于 `unmanaged` 的卡连续 2 次
+干净采样后自动恢复 `free`；`quarantined` 仍须 `sched gpu-ok` 人工解除。
 
 daemon 只派发 `active` 批次中每个 task 的最新版本；终态/queued 批次和旧版本即使因
 历史数据遗留为 pending，也不会在 daemon 重启后重新执行，且不会阻塞批次收敛、
@@ -264,7 +305,8 @@ no-replace，并验证目标与锁定 FD 的 inode 一致。hard-link 的 link�
 周期 tick 会重新接管所有 `running + pgid=NULL` 行；即使某轮已 claim intent 后数据库
 收敛失败，下一轮也会消费 cancel 或安全回队并释放 GPU，不依赖 daemon 再次重启。
 `blocked` 批次不会因历史 pending/waiting 行被 daemon 自动重开；只有成功提交的
-`retry`/`resubmit`/`clean` 能显式将目标批次改回 `active`。
+`retry`/`resubmit` 能将 blocked 批次改回 `active`。`clean` 仅在 done 批次确有最新
+`skip` job 被重新排队时重开该 done 批次。
 依赖解锁在 submission gate 内的同一 SQLite writer 事务中读取上游最新代际并以
 `status='queued'` CAS 发布 `active`；并发的上游 resubmit 与下游 discard
 因此都有唯一串行化顺序，不会用陈旧成功快照解锁或复活已退役批次。上游 `done/skip`
@@ -283,10 +325,17 @@ submission gate；批次已被 retry/resubmit 重开时不会把 `active` 误报
 确认没有 `running + pgid=NULL`、没有 unresolved launch marker，也没有仍持锁的 wrapper；
 条件不满足时禁止直接启动旧 daemon，否则旧恢复逻辑可能删除在途 intent 并重复执行任务。
 
-## 6. 常见误区 TOP5
+## 6. 常见误区 TOP6
 
 1. 忘写 `gpu_share: true` → 单卡单任务（R1 清单）
 2. 改代码未 commit 就 resubmit → 正常现象是重跑；若 SKIP 见 R3/R4
 3. 共享任务漏写 `vram_gib` → 校验直接拒绝（装箱必须有名数）
 4. 同名重复 submit 会生成新实例；名称引用选择最新实例，要操作旧实例请使用完整 batch id
 5. `min_bytes` 设得比真实结果大 → 有效结果被判无效；小 JSON 用 `check:"json"`
+6. 把 `gpu_quota:0` 当成禁用 GPU → 实际是无限制；项目级禁用仍是待开发项
+
+## 7. 下一步开发（尚未实现）
+
+项目级禁止 GPU 的兼容约束、目标行为与验收标准统一记录在
+[`next-development.md`](next-development.md)。该文档中的候选能力不能作为当前
+config/API 使用；在正式实现前，`gpu_quota:0` 始终表示无限制。

@@ -125,7 +125,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "kronos_ft": input("kronos_ft venv python 路径: ").strip(),
         },
     }
-    # ---- 通知配置引导 (docs/sched_notify_design.md §3) ----
+    # ---- 通知配置引导 (现行配置见 docs/reference.md) ----
     notify_on = input("\n启用任务完成通知? (y/N) ").strip().lower()
     if notify_on in ("y", "yes"):
         cfg["notify"] = {
@@ -158,7 +158,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                     cfg["notify"]["command"] = [cmd_path]
         print(f"  通知已配置: {list(cfg['notify'].keys())}")
     else:
-        print("  通知未启用 (后续可用 sched config-edit 手动添加 notify 段)")
+        print(
+            "  通知未启用"
+            " (后续可用 sched config set -f patch.json --yes 添加 notify 段)"
+        )
 
     # M16: 原子写 —— 崩溃不留截断的 config.json (截断会导致 load_config 全线报错)
     tmp_p = p + ".tmp"
@@ -166,7 +169,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.replace(tmp_p, p)
     print(f"已生成 {p}")
-    print("下一步: `sched daemon start --check` 跑前置检查 (M0)")
+    print(
+        "下一步: 先用 `sched daemon check` 跑前置检查，"
+        "再用 `sched daemon start` 启动 (M0)"
+    )
     return 0
 
 
@@ -1609,7 +1615,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         args.project if not ref else None)
     if not ref and bulk_proj:
         if not args.yes:
-            print(f"确认取消项目 {bulk_proj} 的全部 active/blocked 批次? 加 --yes 执行")
+            print(
+                f"确认取消项目 {bulk_proj} 的全部 queued/active/blocked 批次?"
+                " 加 --yes 执行"
+            )
             return 1
         with state.connect() as conn:
             rows = conn.execute(
@@ -3229,7 +3238,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         return 1
 
 
-# ---------- 通知 (设计 docs/sched_notify_design.md) ----------
+# ---------- 通知 (现行配置与命令参考: docs/reference.md) ----------
 
 def cmd_notify_test(args: argparse.Namespace) -> int:
     """sched notify-test: 发测试通知, 验证 config.notify 各渠道可用."""
@@ -3238,7 +3247,7 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
     cfg = _load_cfg()
     ncfg = cfg.get("notify")
     if not ncfg:
-        print("config.notify 未配置 (功能关闭); 参见 docs/sched_notify_design.md §3")
+        print("config.notify 未配置 (功能关闭); 参见 docs/reference.md")
         return 1
     event = {
         "event": "batch_done",
@@ -3821,12 +3830,21 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("run", help="一行提交单任务 (B14 L1)")
     p.add_argument("--project", required=True,
                    help="项目名 (B11c 隔离, 必填)")
-    p.add_argument("--gpus", type=int, default=1, help="申请 GPU 数量 (R5)")
+    p.add_argument(
+        "--gpus",
+        type=int,
+        default=1,
+        help="申请 GPU 数量 (当前只支持 1；零 GPU 请用 --cpu-only)",
+    )
     p.add_argument("--cpus", type=int, default=None, help="CPU 配额 (记录+status 显示, B4)")
     p.add_argument("--cpu-only", action="store_true",
                    help="CPU-only 任务 (resources.gpu=0, 不占 GPU 槽位)")
     p.add_argument("--duration", type=int, default=None, help="预计时长(分钟), 超过该时长即终止")
-    p.add_argument("--cwd", default=None, help="工作目录 (默认 {ROOT})")
+    p.add_argument(
+        "--cwd",
+        default=None,
+        help="工作目录 (默认 {ROOT}，即 default_project 根目录)",
+    )
     p.add_argument("--out", default=None, help="产物路径 (声明后 done 需产物存在)")
     p.add_argument("--venv", default=None, help="venv 语义名 (默认 config 第一个)")
     p.add_argument("--dry-run", action="store_true",
@@ -3879,7 +3897,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("batch", nargs="?", default=None,
                    help="<batch> 或 <batch>:<task> (与 --project 二选一)")
     p.add_argument("--project", default=None,
-                   help="批量取消: 该项目全部 active/blocked 批次 (需 --yes)")
+                   help="批量取消: 该项目全部 queued/active/blocked 批次 (需 --yes)")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_cancel)
 
@@ -3891,7 +3909,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("task", help="<batch> 或 <batch>:<task> (批次级=全部非 done/skip)")
     p.set_defaults(fn=cmd_diag)
 
-    p = sub.add_parser("discard", help="退役被取代的 blocked 批次")
+    p = sub.add_parser("discard", help="退役被取代的 blocked/queued 批次")
     p.add_argument("batch", help="批次名或 id")
     p.add_argument("--yes", action="store_true", help="确认执行")
     p.set_defaults(fn=cmd_discard)
