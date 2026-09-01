@@ -119,6 +119,14 @@ plan factory 并立即关闭该源端；peer 端由创建进程私有保留，�
 或 daemon route；接入前仍必须完成原子的 final validate/map/FD-exec 与经过审查的真实
 direct-parent lifecycle。
 
+`gsched.native_step5d_alignment.foundation_alignment_projection()` 提供只读、可 JSON 序列化的
+`digest_and_direct_parent_endpoint_foundation_only` 声明；其值从生产 launch 常量、
+plan/owner slots、私有 factory 签名与 authority flags 派生。声明明确把 canonical request、
+owner-lifetime nonce、control protocol 和 isolated runtime 标为 `unimplemented`，并固定
+`step5d_complete=false`。它不导入项目侧协议、不创建 endpoint，也不新增
+launch/send/daemon API；主仓验证器会独立重建并追踪生产 foundation 后才接受相等。
+因此它只能用于基础对齐，不能作为 Step 5D 完成证据。
+
 ### config.json 相关（代理只读，调参报告用户）
 
 | 键 | 说明 |

@@ -219,6 +219,18 @@ control-protocol, nonce, publication, or daemon route; atomic final
 validate/map/FD-exec and the reviewed real direct-parent lifecycle remain hard
 prerequisites for connecting that backend.
 
+`gsched.native_step5d_alignment.foundation_alignment_projection()` exposes a
+read-only, JSON-compatible
+`digest_and_direct_parent_endpoint_foundation_only` declaration derived from
+production launch constants, plan/owner slots, private factory signatures,
+and authority flags. It explicitly records canonical request construction,
+owner-lifetime nonce handling, the control protocol, and isolated runtime as
+`unimplemented`, with `step5d_complete=false`. The declaration imports no
+project protocol, creates no endpoint, and adds no launch, send, or daemon API;
+the main-repository validator independently reconstructs and traces the
+production foundation before accepting equality. This is an alignment aid,
+not completion evidence.
+
 ## State Machine
 
 ```text
