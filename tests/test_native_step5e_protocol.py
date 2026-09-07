@@ -22,12 +22,18 @@ def vectors():
     assert p.digest(data) == freeze['vectors_file_sha256']
     result = json.loads(data)
     assert result['machine_canonical_sha256'] == p.CONTRACT_SHA256 == freeze['machine_canonical_sha256']
+    corrected_bytes = (root / 'scripts/contract/m2b_step5e_raw_collection_vector_erratum_v1.json').read_bytes()
+    assert p.digest(corrected_bytes) == '8b7fefa8173b955a4013dcb1c051b308d7a8e9f3a8539a815920552cf3cc72aa'
+    corrected = json.loads(corrected_bytes)
+    assert corrected['source_vectors_file_sha256'] == freeze['vectors_file_sha256']
+    assert corrected['machine_canonical_sha256'] == p.CONTRACT_SHA256
+    result['raw_collection_erratum'] = corrected['vector']
     return result
 
 
 @pytest.mark.parametrize('phase_index', range(3))
 def test_frozen_phase_exchange(vectors, phase_index):
-    v = vectors['vectors'][phase_index]
+    v = vectors['raw_collection_erratum'] if phase_index == 1 else vectors['vectors'][phase_index]
     anchor = p.parse_anchor(v['anchor_canonical_utf8'].encode())
     envelope, frame, body = p.parse_request(bytes.fromhex(v['request']['packet_hex']))
     assert p.digest(frame) == v['step5d_frame_sha256']
@@ -43,6 +49,13 @@ def test_frozen_phase_exchange(vectors, phase_index):
                            expected_launch_nonce=body['launch_nonce'])
         assert p.encode_frame(message).hex() == entry['wire']['packet_hex']
     assert v['startup'][0]['wire']['canonical_utf8'].find(anchor['anchor_nonce']) >= 0
+
+
+def test_original_raw_collection_vector_has_invalid_session(vectors):
+    original = vectors['vectors'][1]
+    assert json.loads(original['anchor_canonical_utf8'])['session_id'] == 'review-session-raw_collection'
+    with pytest.raises(p.Step5EProtocolViolation, match='^anchor_schema_mismatch$'):
+        p.parse_anchor(original['anchor_canonical_utf8'].encode())
 
 
 @pytest.mark.parametrize('field', ['session_id', 'anchor_nonce'])
