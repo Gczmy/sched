@@ -7,6 +7,7 @@ execution, seventh field or formal publication is provided.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import secrets
@@ -61,7 +62,12 @@ def _root_observation(root_fd: int, path: str) -> dict[str, Any]:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
         cursor = os.open("/", flags)
         for component in path[1:].split("/"):
-            next_fd = os.open(component, flags, dir_fd=cursor)
+            try:
+                next_fd = os.open(component, flags, dir_fd=cursor)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOENT, errno.ENOTDIR):
+                    raise protocol.Step5DProtocolViolation("project_root_identity_mismatch") from exc
+                raise
             os.close(cursor)
             cursor = next_fd
         retained, observed = os.fstat(root_fd), os.fstat(cursor)
@@ -146,11 +152,11 @@ def _send_ack(channel: socket.socket, frame: bytes, deadline: float) -> None:
     while offset < len(frame):
         _arm(channel, deadline)
         try:
-            # Every nonempty write is made by this live direct parent and carries
-            # its credentials, including partial writes and EINTR retries.
+            # Only the first successful nonempty segment carries user-supplied
+            # credentials. EINTR consumes no bytes; later credentials are kernel-owned.
             written = channel.sendmsg(
                 [frame[offset:]],
-                [(socket.SOL_SOCKET, _SCM_CREDENTIALS, credentials)],
+                [(socket.SOL_SOCKET, _SCM_CREDENTIALS, credentials)] if offset == 0 else [],
                 _MSG_NOSIGNAL,
             )
         except InterruptedError:
