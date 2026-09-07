@@ -78,6 +78,12 @@ integer: omission or `0` means **unlimited**, not “no GPUs.” A positive valu
 concurrent running GPU jobs, not distinct physical cards; co-located jobs each consume
 one quota unit, while CPU-only jobs consume none.
 
+`projects.<name>.gpu_enabled` is a boolean, defaulting to `true`. Setting it to
+`false` rejects new GPU submissions and manual GPU retry/resubmit operations,
+holds queued GPU work, and leaves running jobs and CPU-only work unaffected.
+Re-enabling resumes the existing queued versions. Inspect the effective policy
+with `sched project list --json`; see [project GPU access](docs/project-gpu-access.md).
+
 Project and batch priorities default to `0` and may be any integer. Ready jobs are
 considered by project priority descending, then batch priority descending, then FIFO
 insertion order. Priority is non-preemptive: a running lower-priority job is never
@@ -204,16 +210,21 @@ The CLI is designed for reliable scripting:
 - On a host other than `config.node`, `sched submit` durably writes a `submit_inbox` payload for the daemon; “delivered” is not yet “queued,” so confirm it with `sched verify`. Other mutations—including `sched run`—are rejected by default. Daemon `start`, `stop`, and `check` are compute-node-only. `SCHED_ALLOW_FOREIGN_WRITE=1` is an explicit safety override, not the normal gateway workflow.
 - Don't edit `state.db` directly — it uses a WAL concurrency protocol; ad-hoc SQL is an anti-pattern.
 
-## Known Limitation / Next Development
+## Project GPU Access
 
-There is currently no project-level “GPU disabled” setting. `gpu_quota: 0` must remain
-backward-compatible as unlimited; `resources.gpu: 0` and `sched run --cpu-only` only
-make individual tasks CPU-only. The planned behavior and acceptance criteria are tracked
-in the [next-development backlog](docs/next-development.md).
+Apply a patch such as `{"projects":{"my-project":{"gpu_enabled":false}}}` through
+`sched config set -f <patch.json> --yes` on the configured compute node. This setting
+supports hot updates; queued GPU jobs remain `pending` with
+`wait_reason: "project_gpu_disabled"`. Update the paired `dsh-node-sched` plugin before
+using this feature because older strict status validators reject the new wait reason.
+Gateway delivery rejected after a policy change is diagnosed with
+`sched verify <full-batch-id>`. See the [behavior and validation record](docs/project-gpu-access.md)
+and [development backlog](docs/next-development.md).
 
 ## Tests
 
 ```bash
+bash tests/run_project_gpu_enabled_accept.sh # project GPU access, hot updates, CPU-only
 bash tests/run_probes_accept.sh          # probe semantics
 bash tests/run_colocate_accept.sh        # co-location packing
 bash tests/run_gpu_mem_accept.sh         # memory management

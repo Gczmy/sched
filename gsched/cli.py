@@ -31,6 +31,7 @@ from .config import (
     default_state_dir,
     load_config,
     parse_gpus,
+    project_gpu_enabled,
     resolve_template,
     task_environment,
 )
@@ -40,6 +41,7 @@ from .schema import (
     parse_shell_cmd,
     validate_batch,
     validate_persisted_dependencies,
+    validate_project_gpu_access,
 )
 from .templates import expand_cmd
 
@@ -552,6 +554,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     with db_context as conn:
         if not dry_run:
             try:
+                validate_project_gpu_access(_load_cfg(), norm.get("project"), norm["tasks"])
                 # Fingerprint expansion above may take long enough for another
                 # submit to replace a dependency name.  The submission gate is
                 # the commit-time authority, so validate the latest graph again.
@@ -729,6 +732,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         "project": proj,
     }
 
+    try:
+        validate_project_gpu_access(cfg, proj, [task_spec])
+    except SchemaError as error:
+        print(f"校验失败: {error}", file=sys.stderr)
+        return 1
+
     from .fingerprint import compute_fingerprint
 
     if getattr(args, "dry_run", False):
@@ -762,6 +771,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         artifacts=task_spec.get("artifacts"),
     )
     with state.submission_connect() as conn:
+        try:
+            validate_project_gpu_access(_load_cfg(), proj, [task_spec])
+        except SchemaError as error:
+            print(f"校验失败: {error}", file=sys.stderr)
+            return 1
         state.insert_batch(
             conn, bid, batch_name, "mix", [], None, "{ROOT}", None,
             project=proj,
@@ -815,9 +829,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
             "SELECT id, name, status, created_at, project FROM batches WHERE id=?",
             (batch_id,),
         ).fetchone() if batch_id else None
+        rejection = None
+        if not row:
+            prefix = f"submit {json.dumps(reference, ensure_ascii=True)} => "
+            receipt = conn.execute(
+                "SELECT result FROM control_requests WHERE op='batch_submit'"
+                " AND status='done' AND substr(result,1,?)=? ORDER BY id DESC LIMIT 1",
+                (len(prefix), prefix),
+            ).fetchone()
+            if receipt:
+                rejection = receipt["result"][len(prefix):]
     if not row:
+        if rejection:
+            print(f"❌ 批次投递被拒绝: {reference}\n   {rejection}")
+            return 1
         print(f"❌ 未找到批次: {reference}")
-        print("   可能原因: 登录节点直提被守护检查点覆盖; 请检查 submit_inbox")
+        print("   批次可能仍在等待 inbox 消费；请使用投递时的完整 batch ID 核对回执")
         return 1
     print("✅ 批次已持久化:")
     print(
@@ -1173,6 +1200,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 status, wait_reason = "pending", "dependency"
             elif quota_wait(job, resources):
                 wait_reason = "quota"
+            if (status == "pending" and resources.get("gpu", 1) != 0
+                    and not project_gpu_enabled(cfg, job["project"])):
+                wait_reason = "project_gpu_disabled"
             batch_id = job["batch_id"]
             out["jobs"].append(
                 {
@@ -1805,6 +1835,23 @@ def _rev_diff_warn(conn, j) -> str | None:
             "旧 spec; 如需新 spec 请用 sched resubmit 或重新提交批次")
 
 
+def _validate_gpu_requeue(conn, cfg: dict, batch: str, project: str | None, jobs) -> None:
+    specs = []
+    for job in jobs:
+        row = conn.execute(
+            "SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+            (batch, job["task_id"], job["version"]),
+        ).fetchone()
+        try:
+            spec = json.loads(row["spec"]) if row else None
+        except (ValueError, TypeError) as error:
+            raise SchemaError(f"任务 spec 损坏: {job['task_id']}") from error
+        if not isinstance(spec, dict):
+            raise SchemaError(f"任务 spec 缺失或非法: {job['task_id']}")
+        specs.append(spec)
+    validate_project_gpu_access(cfg, project, specs)
+
+
 def cmd_retry(args: argparse.Namespace) -> int:
     """sched retry <batch>[:task]: 解锁失败终态重跑.
 
@@ -1829,7 +1876,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
                 return 1
             task = None
         batch_row = conn.execute(
-            "SELECT status FROM batches WHERE id=?",
+            "SELECT status, project FROM batches WHERE id=?",
             (batch,),
         ).fetchone()
         if not batch_row:
@@ -1863,6 +1910,14 @@ def cmd_retry(args: argparse.Namespace) -> int:
         if not targets:
             print(f"无失败终态任务: {ref}")
             return 0
+        try:
+            _validate_gpu_requeue(
+                conn, _load_cfg(), batch, batch_row["project"],
+                [job for job in targets if job["status"] in ("blocked", "cancelled", "timed_out", "failed")],
+            )
+        except SchemaError as error:
+            print(f"retry 拒绝: {error}", file=sys.stderr)
+            return 1
         blocked_markers = [
             j for j in targets
             if j["kill_reason"] != "probe"
@@ -2081,6 +2136,11 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        try:
+            _validate_gpu_requeue(conn, cfg, batch, project, jobs)
+        except SchemaError as error:
+            print(f"resubmit 拒绝: {error}", file=sys.stderr)
+            return 1
         if args.dry_run:
             print(
                 f"[dry-run] 将 resubmit {len(jobs)} 个任务"
@@ -2163,6 +2223,11 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 "错误: fingerprint 准备期间批次状态已变化，请重试",
                 file=sys.stderr,
             )
+            return 1
+        try:
+            validate_project_gpu_access(_load_cfg(), project, [item["spec"] for item in prepared_specs])
+        except SchemaError as error:
+            print(f"resubmit 拒绝: {error}", file=sys.stderr)
             return 1
         conflict = _same_name_nonterminal_conflict(conn, batch)
         if conflict is not None:
@@ -3340,29 +3405,44 @@ def cmd_project_list(args: argparse.Namespace) -> int:
     """sched project list: 列出已配置项目及配额/用量."""
     cfg = _load_cfg()
     projects = cfg.get("projects", {})
-    if not projects:
+    if not projects and not getattr(args, "json", False):
         print("未配置任何项目")
         return 0
+    rows = []
     with state.connect() as conn:
-        print(f"{'项目':<16} {'GPU配额':<7} {'优先级':<6} {'colocate':<9} "
-              f"{'单卡上限':<8} {'亲和卡':<12} {'已用/配额':<10} 根目录")
         for name, pcfg in projects.items():
-            quota = pcfg.get("gpu_quota", 0)
+            quota = int(pcfg.get("gpu_quota", 0) or 0)
+            enabled = project_gpu_enabled(cfg, name)
             prio = pcfg.get("priority", 0)
             aff = pcfg.get("gpu_affinity", [])
             root = pcfg.get("root", "")
             # B12-b/c: colocate 三态与项目级打包上限可视化
             col = pcfg.get("colocate")
-            col_s = "跟随全局" if col is None else ("on" if col else "off")
-            mjs = str(pcfg["max_jobs"]) if pcfg.get("max_jobs") else "-"
             used = conn.execute(
                 "SELECT COUNT(*) FROM jobs"
                 " WHERE status='running' AND gpu IS NOT NULL AND project=?",
                 (name,),
             ).fetchone()[0]
-            quota_str = f"{used}/{quota}" if quota > 0 else f"{used}/∞"
-            print(f"{name:<16} {quota:<7} {prio:<6} {col_s:<9} "
-                  f"{mjs:<8} {str(aff):<12} {quota_str:<10} {root}")
+            rows.append({
+                "name": name, "gpu_enabled": enabled, "gpu_quota": quota,
+                "gpu_access": "disabled" if not enabled else "limited" if quota else "unlimited",
+                "gpu_used": used, "priority": prio, "colocate": col,
+                "max_jobs": pcfg.get("max_jobs"), "gpu_affinity": aff, "root": root,
+            })
+    if getattr(args, "json", False):
+        print(json.dumps({"schema_version": 1, "projects": rows}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"{'项目':<16} {'GPU访问':<7} {'GPU配额':<7} {'优先级':<6} {'colocate':<9} "
+          f"{'单卡上限':<8} {'亲和卡':<12} {'已用/配额':<10} 根目录")
+    for row in rows:
+        access = {"disabled": "禁用", "unlimited": "无限制", "limited": "限额"}[row["gpu_access"]]
+        quota = row["gpu_quota"]
+        quota_str = f"{row['gpu_used']}/{quota}" if quota else f"{row['gpu_used']}/∞"
+        col = row["colocate"]
+        col_s = "跟随全局" if col is None else "on" if col else "off"
+        mjs = str(row["max_jobs"]) if row["max_jobs"] else "-"
+        print(f"{row['name']:<16} {access:<7} {quota:<7} {row['priority']:<6} {col_s:<9} "
+              f"{mjs:<8} {str(row['gpu_affinity']):<12} {quota_str:<10} {row['root']}")
     return 0
 
 
@@ -4036,6 +4116,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("project", help="多项目管理")
     sub_p = p.add_subparsers(dest="project_action", required=True)
     p_list = sub_p.add_parser("list", help="列出项目及配额/用量")
+    p_list.add_argument("--json", action="store_true", help="结构化项目 GPU 访问策略与用量")
     p_list.set_defaults(fn=cmd_project_list)
 
     args = ap.parse_args(argv)

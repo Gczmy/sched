@@ -167,6 +167,8 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             raise ConfigError(f"{p}: projects.{proj_name} 缺少 root 字段")
         if not isinstance(proj_cfg["root"], str) or not proj_cfg["root"]:
             raise ConfigError(f"{p}: projects.{proj_name}.root 必须是非空字符串")
+        if not isinstance(proj_cfg.get("gpu_enabled", True), bool):
+            raise ConfigError(f"{p}: projects.{proj_name}.gpu_enabled 必须是布尔 (缺省=true)")
         gq = proj_cfg.get("gpu_quota")
         if gq is not None:
             if not isinstance(gq, int) or isinstance(gq, bool) or gq < 0:
@@ -283,6 +285,12 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             raise ConfigError(f"{p}: {k} 必须是 [{lo}, {hi}] 范围内的整数")
         if not isinstance(v, (int, float)) or isinstance(v, bool) or not (lo <= v <= hi):
             raise ConfigError(f"{p}: {k} 必须在 [{lo}, {hi}] 范围 (默认 {dfl})")
+
+
+def project_gpu_enabled(cfg: dict, project: str | None) -> bool:
+    """Unknown projects and invalid switches cannot grant GPU access."""
+    entry = cfg.get("projects", {}).get(project)
+    return isinstance(entry, dict) and entry.get("gpu_enabled", True) is True
 
 
 def task_environment(cfg: dict, batch_env: dict | None, task_env: dict | None) -> dict[str, str]:

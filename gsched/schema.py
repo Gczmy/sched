@@ -12,7 +12,7 @@ import re
 import shlex
 from typing import Any
 
-from .config import ConfigError, expand_path, resolve_template
+from .config import ConfigError, expand_path, resolve_template, project_gpu_enabled
 
 SUDO_TOKENS = {"sudo", "su", "runuser"}
 MAX_NESTED_SHELL_STATES = 1024
@@ -568,7 +568,23 @@ def _validate_artifacts(
     return artifacts
 
 
-def validate_batch(spec: dict, cfg: dict) -> dict:
+def validate_project_gpu_access(cfg: dict, project: str | None, tasks) -> None:
+    """Validate admission without changing queued or running task state."""
+    for task in tasks:
+        resources = task.get("resources") or {}
+        if not isinstance(resources, dict):
+            raise SchemaError("resources 必须是对象")
+        gpu = resources.get("gpu", 1)
+        if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu not in (0, 1):
+            raise SchemaError("resources.gpu 必须是 0 或 1")
+        if gpu and not project_gpu_enabled(cfg, project):
+            raise SchemaError(
+                f"project '{project}' 禁止 GPU (gpu_enabled=false 或项目未注册):"
+                f" 任务 '{task.get('id', '?')}' 申请了 GPU；CPU-only 任务仍允许"
+            )
+
+
+def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> dict:
     """校验整个 batch.json, 返回规范化后的 spec (模板已展开, cwd 已归一化).
 
     通过后调用方持 spec 入队 (insert_batch + insert_task + insert_job).
@@ -680,6 +696,9 @@ def validate_batch(spec: dict, cfg: dict) -> dict:
                 prx, f"tasks[{i}].progress_regex"
             )
         norm_tasks.append(nt)
+
+    if check_gpu_access:
+        validate_project_gpu_access(cfg, project, norm_tasks)
 
     project = spec.get("project")
     if project is not None and not isinstance(project, str):

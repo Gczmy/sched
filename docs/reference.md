@@ -78,6 +78,7 @@
 
 | 键 | 说明 |
 |---|---|
+| `projects[P].gpu_enabled` | 布尔值，省略为 `true`；`false` 禁止新 GPU 提交与手动 GPU 重跑，暂停排队 GPU 派发，运行中任务和 CPU-only 不受影响（热更新） |
 | `projects[P].gpu_quota` | 项目并发 running GPU job 上限；省略或 `0` = 无限制，CPU-only 不计 |
 | `projects[P].priority` | 项目优先级，默认 0；整数越大越先考虑（热更新）|
 | `projects[P].gpu_affinity` | 该项目的亲和卡列表；软亲和可在必要时外借其他卡 |
@@ -95,8 +96,10 @@
 `gpu_quota` 的计数单位是 job，不是不同物理卡或显存：正整数 `N` 表示该项目最多
 同时运行 `N` 个已经分配 GPU 的 job；独占和共享任务均每个 job 计 1，共享时多个
 计数单位可能落在同一张物理卡上。`resources.gpu:0` 的 CPU-only job 不占该配额。
-当前没有项目级“禁止 GPU”开关，不能用 `gpu_quota:0` 或空 affinity 模拟；待开发项见
-[`next-development.md`](next-development.md)。
+项目级禁止 GPU 使用 `gpu_enabled:false`，不能用 `gpu_quota:0` 或空 affinity 模拟。
+切回 `true` 后原排队版本继续运行，无需重新提交。配置写入与最终派发共用 submission
+gate；开关读取失败时暂停 GPU 派发，CPU-only 使用最后有效配置。入口、重试和并发
+行为详见 [`project-gpu-access.md`](project-gpu-access.md)。
 
 ready 候选按 `(项目 priority 降序, 批次 priority 降序, job 入队 rowid 升序)`
 逐一尝试，两个 priority 都默认为 `0` 且可为任意整数。项目 priority 是第一排序键；
@@ -216,7 +219,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | 命令 | 说明 | 注意 |
 |---|---|---|
 | `init [--config PATH]` | 交互生成 config.json | 默认写 bootstrap state 下的 config |
-| `verify <batch-ref>` | 确认批次已持久化 | 网关 submit 返回“已投递”后用它确认 daemon 已入库 |
+| `verify <batch-ref>` | 确认批次已持久化 | 网关 submit 返回“已投递”后确认入库；完整 batch ID 可查询消费拒绝原因 |
 | `submit <file> [--dry-run [--json]]` | 提交批次 | 网关推荐入口；异机写 submit_inbox，daemon 下一 tick 收编；dry-run 只读 |
 | `run --project P [--gpus 1\|--cpu-only] [--cpus N] [--duration MIN] [--cwd DIR] [--out PATH] [--venv NAME] [--dry-run] -- cmd...` | 单条命令提交 | 非 dry-run 仅计算节点；不用 inbox；批次 priority 固定 0 |
 | `status [batch-ref] [--project P] [--detail] [--json] [--limit N] [--cursor TOKEN] [--job-cursor TOKEN]` | 最新版本当前态 | 缺省 200，钳制到 1..1000；`--cursor` 翻批次页，`--job-cursor` 独立翻任务页 |
@@ -239,7 +242,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `request <request-id> --expect-revision N [--expect-kind ...] ... -- <mutation>` | 持久化幂等 mutation | revision 必填；request-id 与完整命令/前置条件永久绑定；GPU 还必须绑定完整 assignments JSON |
 | `daemon start/stop/status/check [--fake]` | daemon 生命周期 | start/stop/check 仅计算节点；`--fake` 仅供 start/check 测试；显式 override 才可跨主机 |
 | `notify-test` / `notify-inbox [--all] [--json]` / `notify-ack <file>` | 通知测试与检查点 | inbox 为纯文件查询；ack 是写操作 |
-| `project list` | 项目配额/用量 | |
+| `project list` | 项目 GPU 访问策略、配额/用量 | `--json` |
 
 破坏性命令（cancel/gpu-free/discard/config set/clean）缺 `--yes` 时返回码 1 =
 未确认而非失败。
@@ -261,7 +264,10 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 
 ### 稳定 JSON 与跨主机读取
 
-- `status --json` 固定 `schema_version:1`，`limit` 缺省 200、钳制 1..1000；顶层含 `batches`、`jobs`、`gpus`、`cpu`、`daemon_health`、`truncated:{batches,jobs}`、批次分页 `next_cursor` 与独立任务分页 `next_job_cursor`。先按当前态优先、再按新旧顺序有界选择批次，任务只来自已返回批次且只含各 task 最新 version，因此每个 `jobs[].batch_id` 都能在 `batches` 中解析。等待态统一为 `"status":"pending"` 与独立 `"wait_reason":"quota"|"dependency"|null`，不要解析人类视图的装饰文本。`batches[].revision` 是整数；`gpus[].revision` 是整数，`gpus[].assignments` 按 `job_id` 排序且每项为 `{"job_id":...,"vram_gib":...}`。只有 `truncated.batches=true` 时才用 `next_cursor`；只有 `truncated.jobs=true` 时才用 `next_job_cursor`。指定一个批次时也可只翻其任务页，不会丢失该批次行。
+- `project list --json` 输出 `{"schema_version":1,"projects":[...]}`；每项含 `name`、有效布尔值 `gpu_enabled`、整数 `gpu_quota`（省略或 null 归一为 0）、`gpu_access:"disabled"|"unlimited"|"limited"`、`gpu_used`、`priority`、`colocate`、`max_jobs`、`gpu_affinity`、`root`。禁用不清空原配额，`gpu_used` 仍显示运行中的 GPU job 数。
+- `project_gpu_disabled` 仅用于排队 GPU 任务，优先于 quota/dependency 等待原因；任务状态仍为 `pending`。这扩展了 schema 1 的等待原因枚举，启用此功能前应同步更新 `dsh-node-sched`，旧插件的严格校验会拒绝新值。
+
+- `status --json` 固定 `schema_version:1`，`limit` 缺省 200、钳制 1..1000；顶层含 `batches`、`jobs`、`gpus`、`cpu`、`daemon_health`、`truncated:{batches,jobs}`、批次分页 `next_cursor` 与独立任务分页 `next_job_cursor`。先按当前态优先、再按新旧顺序有界选择批次，任务只来自已返回批次且只含各 task 最新 version，因此每个 `jobs[].batch_id` 都能在 `batches` 中解析。等待态统一为 `"status":"pending"` 与独立 `"wait_reason":"project_gpu_disabled"|"quota"|"dependency"|null`，不要解析人类视图的装饰文本。`batches[].revision` 是整数；`gpus[].revision` 是整数，`gpus[].assignments` 按 `job_id` 排序且每项为 `{"job_id":...,"vram_gib":...}`。只有 `truncated.batches=true` 时才用 `next_cursor`；只有 `truncated.jobs=true` 时才用 `next_job_cursor`。指定一个批次时也可只翻其任务页，不会丢失该批次行。
 - `task --json` 固定 `schema_version:1`，输出 `batch_id`、`batch_name`、`batch_revision`、`task` 与 `jobs` 版本时间线；每个版本含状态、运行结果/时间、resources、规范化 spec 与 log 路径。stdout 只含这一份 JSON。
 - `history --json` 固定 `schema_version:1`，`limit` 缺省 50、钳制 1..200；顶层含 `history`、`truncated` 与 `next_cursor`，每项含 `batch_id`、`batch_name`、`task`、`status`、`version` 及运行结果/时间。
 - 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check` 默认拒绝。
@@ -336,10 +342,10 @@ submission gate；批次已被 retry/resubmit 重开时不会把 `active` 误报
 3. 共享任务漏写 `vram_gib` → 校验直接拒绝（装箱必须有名数）
 4. 同名重复 submit 会生成新实例；名称引用选择最新实例，要操作旧实例请使用完整 batch id
 5. `min_bytes` 设得比真实结果大 → 有效结果被判无效；小 JSON 用 `check:"json"`
-6. 把 `gpu_quota:0` 当成禁用 GPU → 实际是无限制；项目级禁用仍是待开发项
+6. 把 `gpu_quota:0` 当成禁用 GPU → 实际是无限制；项目级禁用使用 `gpu_enabled:false`
 
 ## 7. 下一步开发（尚未实现）
 
-项目级禁止 GPU 的兼容约束、目标行为与验收标准统一记录在
-[`next-development.md`](next-development.md)。该文档中的候选能力不能作为当前
-config/API 使用；在正式实现前，`gpu_quota:0` 始终表示无限制。
+尚未实现的能力记录在 [`next-development.md`](next-development.md)，不能作为当前
+config/API 使用。项目级 GPU 开关 ND-01 已实现，行为与验收依据见
+[`project-gpu-access.md`](project-gpu-access.md)。

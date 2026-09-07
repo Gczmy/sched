@@ -610,7 +610,8 @@ sched_accept_cleanup
 
     def test_all_acceptance_scripts_keep_shared_source_and_traps(self) -> None:
         scripts = sorted((REPO_ROOT / "tests").glob("run_*_accept.sh"))
-        self.assertEqual(len(scripts), 51)
+        self.assertGreaterEqual(len(scripts), 52)
+        self.assertIn(REPO_ROOT / "tests/run_project_gpu_enabled_accept.sh", scripts)
         for script in scripts:
             text = script.read_text(encoding="utf-8")
             self.assertIn("source tests/acceptance_cleanup.sh", text, script.name)

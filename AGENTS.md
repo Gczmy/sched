@@ -41,6 +41,7 @@
 | 来源 | 用途 |
 | --- | --- |
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
+| `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
 | `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
 | `docs/code_review_sched_dsh_2026-08-29.md` | 联合复审历史；问题是否仍存在需对照当前代码 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -100,7 +101,7 @@
 | `sched discard <batch> --yes`、`sched clean <batch> --yes` | 退役旧批次／清理最新产物和指纹并重排符合条件的 skip；约束见 reference |
 | `sched history [batch] --json` | 历史各版本；支持 `--limit`、`--cursor`、`--status`、`--project` |
 | `sched incidents [id] --json` | OOM／硬件事故快照；支持 `--job`、`--gpu` |
-| `sched list-gpus`、`sched project list` | GPU 状态／项目配额与用量 |
+| `sched list-gpus`、`sched project list --json` | GPU 状态／项目 GPU 访问策略、配额与用量 |
 | `sched gpu-set-mem <idx> <gib>`、`sched gpu-ok <idx>`、`sched gpu-ignore <idx>`、`sched gpu-free <idx> --yes` | 卡管理；未知 idx 报错，`gpu-set-mem` 是临时容量覆盖 |
 | `sched config get`、`sched config set -f <patch.json> --yes`、`sched config reload` | 读取配置／深合并补丁并触发热更／请求重载 |
 | `sched request <request-id> --expect-revision N ... -- <mutation>` | 计算节点持久化幂等写操作，前置条件见下文 |
@@ -109,6 +110,8 @@
 ### 与 dsh-node-sched 的接口约定
 
 `status`、`task`、`history` 的 JSON 当前使用 `schema_version: 1`。任务关联使用 `batch_id`，不要用显示名称关联。等待态使用 `status: "pending"` 和独立的 `wait_reason`。
+
+项目禁用 GPU 时，排队 GPU 任务的 `wait_reason` 为 `project_gpu_disabled`。使用此功能前需同步更新配套插件；旧插件的严格校验不接受这个新值。
 
 `status` 的批次分页与任务分页相互独立，分别检查 `truncated.batches`／`next_cursor` 和 `truncated.jobs`／`next_job_cursor`；`history` 使用自己的 `truncated` 与 `next_cursor`。不能将截断、过期或读取失败的结果当作完整当前态；看板写操作要求新鲜且完整的有效快照。
 
@@ -123,7 +126,8 @@
 - 任务：`pending → running → done / failed / blocked / cancelled / timed_out / interrupted`；`pending → skip` 表示产物指纹命中，属于成功终态。
 - 批次：依赖未满足为 `queued`，解锁后为 `active`；全部成功终态为 `done`，任一失败终态为 `blocked`；`blocked/queued` 可人工退役为 `discarded`。
 - GPU：`free → assigned → releasing → free`。外部 compute PID 或 compute/topology/utilization 探测不确定时立即 `unmanaged`；只有进程列表完整且为空、利用率可读且大于 0 的信号连续 3 tick 才确认，确认期间即使显示 `free` 也禁止派发。`unmanaged` 连续 2 次干净采样自动恢复，`quarantined` 需 `gpu-ok` 解除。
-- `projects[P].gpu_quota` 省略或为 `0` 表示无限制；正整数限制并发 running GPU job 数，不是物理卡数。共享 job 各计 1，CPU-only 不计。项目级禁止 GPU 尚未实现，不能用零配额或空 affinity 代替。
+- `projects[P].gpu_enabled` 必须为布尔值，省略为 `true`。热更新为 `false` 后拒绝新 GPU 提交与手动 GPU retry/resubmit，暂停派发已排队 GPU 任务；运行中任务正常结束，CPU-only 不受影响。恢复为 `true` 后原排队版本继续运行。
+- `projects[P].gpu_quota` 省略或为 `0` 表示无限制；正整数限制并发 running GPU job 数，不是物理卡数。共享 job 各计 1，CPU-only 不计。禁止 GPU 使用 `gpu_enabled:false`，不能用零配额或空 affinity 代替。
 - 派发顺序为项目 priority 降序、批次 priority 降序、同值 FIFO；不抢占，高优候选暂不可运行时低优候选可补位。`gpu_affinity_hard` 只限制本项目候选卡；独占隔离需要所有竞争项目使用互不重叠的硬亲和集合。
 
 ## 通知与检查点

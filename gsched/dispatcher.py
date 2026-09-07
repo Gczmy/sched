@@ -43,8 +43,8 @@ from .executor import (
     stage_checkpoint_valid,
 )
 from .fingerprint import compute_fingerprint
-from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template, task_environment
-from .schema import SchemaError, validate_batch, validate_persisted_dependencies
+from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template, task_environment, project_gpu_enabled
+from .schema import SchemaError, validate_batch, validate_persisted_dependencies, validate_project_gpu_access
 from .templates import expand_cmd
 
 POLL_SEC = 10
@@ -2012,6 +2012,7 @@ class Dispatcher:
                     def discard_payload() -> None:
                         if payload_path not in cleanup_payloads:
                             cleanup_payloads.append(payload_path)
+                    bid = None
                     try:
                         payload_fd = None
                         try:
@@ -2032,7 +2033,9 @@ class Dispatcher:
                         if not isinstance(spec, dict) or "name" not in spec:
                             raise ValueError("payload 缺少合法 spec")
                         cfg_now = self.cfg
-                        norm = validate_batch(spec, cfg_now)
+                        # Admission is checked under the submission gate below,
+                        # after duplicate detection and against the latest policy.
+                        norm = validate_batch(spec, cfg_now, check_gpu_access=False)
                         bid = envelope.get("bid")
                         if not isinstance(bid, str) or not bid:
                             bid = f"{norm['name']}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
@@ -2088,6 +2091,9 @@ class Dispatcher:
                                 )
                                 duplicate = True
                             else:
+                                validate_project_gpu_access(
+                                    self._read_gpu_policy(), norm.get("project"), norm["tasks"],
+                                )
                                 _validate_inbox_dependencies(submit_conn, norm)
                                 existing = submit_conn.execute(
                                     "SELECT status FROM batches WHERE name=?",
@@ -2182,7 +2188,8 @@ class Dispatcher:
                                 f"({len(norm['tasks'])} 任务)"
                             )
                     except (SchemaError, ConfigError, ValueError, TypeError, KeyError, FileNotFoundError, sqlite3.IntegrityError) as error:
-                        state.finish_control_request(conn, r["id"], f"失败: {error}")
+                        prefix = f"submit {json.dumps(bid, ensure_ascii=True)} => " if bid else ""
+                        state.finish_control_request(conn, r["id"], f"{prefix}失败: {error}")
                         discard_payload()
                         safe_log(f"⚠️ batch_submit req {r['id']} 拒绝: {error}")
                     except Exception as error:
@@ -3257,6 +3264,14 @@ class Dispatcher:
                 self._remove_marker(job["batch_name"], "done")
                 self._remove_marker(job["batch_name"], "blocked")
 
+    def _read_gpu_policy(self) -> dict:
+        """Read at the gate; mtime and a queued reload are not admission fences."""
+        try:
+            return load_config(getattr(self, "_config_path", None), apply_runtime_state=False)
+        except (ConfigError, OSError, ValueError) as error:
+            # Keep an inbox request pending when configuration cannot be read.
+            raise RuntimeError(f"GPU 策略配置不可用: {error}") from error
+
     def _dispatch_ready_jobs(self) -> None:
         # clean performs a two-phase database mutation around external artifact
         # deletion.  The final skip/cleanup/Popen decision must share its gate:
@@ -3268,6 +3283,11 @@ class Dispatcher:
             self._dispatch_ready_jobs_serialized()
 
     def _dispatch_ready_jobs_serialized(self) -> None:
+        try:
+            gpu_policy = self._read_gpu_policy()
+        except RuntimeError as error:
+            self.log_line(f"本轮暂停 GPU 派发: {error}")
+            gpu_policy = {}  # CPU-only work continues using the last valid config.
         with self._dispatch_connection() as conn:
             # 只派发 active 批次中每个 task 的最新版本 pending job。
             # queued 批次 (依赖未解锁) 与终态批次一律不派发；done/blocked
@@ -3414,6 +3434,8 @@ class Dispatcher:
                         self.log_line(
                             f"job {j['id']} 存量 spec 非法, 已隔离: {exc}"
                         )
+                    continue
+                if not is_cpu_only and not project_gpu_enabled(gpu_policy, project):
                     continue
                 # GPU quota does not apply to CPU-only work.
                 if not is_cpu_only and not self._project_quota_available(conn, project):
