@@ -310,6 +310,7 @@ def parse_anchor(payload: bytes) -> dict:
     for key in ('scope', 'protocol_sha256'):
         if type(value[key]) is not str:
             fail(reason)
+    sha(value['protocol_sha256'], reason)
     session(value['session_id'], reason); sha(value['anchor_nonce'], reason)
     prefix(value['scheduler_identity_prefix'], value['phase'], reason)
     issuer = process_identity(value['issuer_process_identity'], reason)
