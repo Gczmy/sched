@@ -43,7 +43,7 @@ from .executor import (
     stage_checkpoint_valid,
 )
 from .fingerprint import compute_fingerprint
-from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template
+from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template, task_environment
 from .schema import SchemaError, validate_batch, validate_persisted_dependencies
 from .templates import expand_cmd
 
@@ -2062,6 +2062,8 @@ class Dispatcher:
                                 t["git"],
                                 cfg_now.get("venvs", {}),
                                 runtime_prefix=t.get("runtime_prefix"),
+                                execution_env=task_environment(cfg_now, norm.get("env"), t.get("env")),
+                                artifacts=t.get("artifacts"),
                             )
                             prepared_tasks.append((i2, t, cmd_e, stages_e, fp, stage_fps))
 
@@ -3274,7 +3276,7 @@ class Dispatcher:
             # B11c: 显式带出 rowid 与两处 project; 排序在 Python 层做双键
             ready = conn.execute(
                 "SELECT j.*, j.rowid AS rid, b.project AS batch_project,"
-                " b.priority AS batch_priority, b.name AS batch_name"
+                " b.priority AS batch_priority, b.name AS batch_name, b.env AS batch_env"
                 " FROM jobs j JOIN batches b ON j.batch_id=b.id"
                 " WHERE j.status IN ('pending','waiting_quota')"
                 " AND b.status='active'"
@@ -3321,7 +3323,7 @@ class Dispatcher:
                 )
                 self._ready_task_specs[job["id"]] = task_spec
                 self._ready_fingerprint_snapshots[job["id"]] = (
-                    self._snapshot_fingerprint(task_spec, task_cwd, job["id"])
+                    self._snapshot_fingerprint(task_spec, task_cwd, job["id"], json.loads(job["batch_env"] or "{}"))
                 )
             # B11c: waiting_quota 只是"配额不足被跳过"的可见标记, 不是终态;
             # 重新入候选前归一化回 pending, 否则 _launch_job 的 pending 条件
@@ -3723,7 +3725,7 @@ class Dispatcher:
         """事务内释放: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
         state.release_gpu(conn, job_id)
     def _snapshot_fingerprint(
-        self, spec: dict, cwd: str, job_id: str
+        self, spec: dict, cwd: str, job_id: str, batch_env: dict | None = None
     ) -> tuple[str | None, dict, str | None]:
         try:
             current_fp, stage_fingerprints, git_rev = compute_fingerprint(
@@ -3733,6 +3735,8 @@ class Dispatcher:
                 spec.get("git"),
                 getattr(self, "venv_paths", {}),
                 runtime_prefix=spec.get("runtime_prefix"),
+                execution_env=task_environment(getattr(self, "cfg", {}), batch_env, spec.get("env")),
+                artifacts=spec.get("artifacts"),
             )
         except Exception as exc:
             self.log_line(
@@ -3782,7 +3786,10 @@ class Dispatcher:
             # Direct callers receive the same no-writer-transaction guarantee.
             if conn.in_transaction:
                 conn.commit()
-            fingerprint_snapshot = self._snapshot_fingerprint(spec, cwd, j["id"])
+            batch = state.get_batch(conn, j["batch_id"])
+            fingerprint_snapshot = self._snapshot_fingerprint(
+                spec, cwd, j["id"], json.loads(batch["env"] or "{}") if batch else {},
+            )
         current_fp, stage_fingerprints, git_rev = fingerprint_snapshot
 
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
@@ -3858,12 +3865,7 @@ class Dispatcher:
         # Batch, task, and deployment defaults may not redirect it.
         b = state.get_batch(conn, j["batch_id"])
         batch_env = json.loads(b["env"]) if b and b["env"] else {}
-        task_env = {**batch_env, **dict(spec.get("env", {}))}
-        # B18: 部署级环境缺省值 (config.task_default_env) —— setdefault 语义,
-        # batch/task env 声明优先。本机用它注入 PYTHONNOUSERSITE=1 隔离
-        # ~/.local 用户站点污染 (策略在配置, 不在代码)。
-        for _dk, _dv in (self.cfg.get("task_default_env") or {}).items():
-            task_env.setdefault(str(_dk), str(_dv))
+        task_env = task_environment(self.cfg, batch_env, spec.get("env"))
         task_env["SCHED_PROFILE_OUT"] = self._profile_path(j)
         # Dispatcher-owned live identity: these values are derived from the
         # persisted batch/job records and must override batch/task/default env.
@@ -3985,10 +3987,17 @@ class Dispatcher:
         """
         if current_fingerprint is _FINGERPRINT_UNSET:
             try:
+                batch = state.get_batch(conn, j["batch_id"])
                 current_fingerprint, _, _ = compute_fingerprint(
                     spec.get("cmd"), spec.get("stages"),
                     spec.get("cwd_abs") or ".", spec.get("git"), self.venv_paths,
                     runtime_prefix=spec.get("runtime_prefix"),
+                    execution_env=task_environment(
+                        getattr(self, "cfg", {}),
+                        json.loads(batch["env"] or "{}") if batch else {},
+                        spec.get("env"),
+                    ),
+                    artifacts=spec.get("artifacts"),
                 )
             except Exception:
                 return False

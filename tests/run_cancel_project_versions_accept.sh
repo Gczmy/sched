@@ -3,7 +3,7 @@
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
-PY=${PY:-python3}
+PY=${PY:-$(command -v python3)}
 sched_accept_make_root SCHED_STATE "sched-cancel-project"
 export SCHED_STATE
 export SCHED_CONFIG="$SCHED_STATE/config.json"

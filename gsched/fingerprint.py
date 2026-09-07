@@ -1,10 +1,11 @@
 """产物指纹 (文档 §3.2 A2).
 
-指纹 = cmdline hash + git rev + venv 路径. 代码版本必须入指纹:
+指纹覆盖命令、工作目录、声明的合并环境、产物规则、git 内容与 runtime/venv 路径。
+代码版本必须入指纹:
 代码更新后同一 cmdline 的旧产物视为过期必须重跑 (darf_da 实踩).
 
 git rev 按任务 cwd 向上找最近 .git (J 类); 非 git 目录 (git:false)
-不做代码版本指纹, 指纹 = cmdline + venv.
+不做代码版本指纹，其余执行输入仍参与计算。
 """
 
 from __future__ import annotations
@@ -260,6 +261,9 @@ def compute_fingerprint(
     git: bool | None,
     venv_paths: dict[str, str],
     runtime_prefix: str | None = None,
+    *,
+    execution_env: dict[str, str] | None = None,
+    artifacts: dict | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """Compute task and per-stage producer fingerprints.
 
@@ -297,22 +301,27 @@ def compute_fingerprint(
         if not dirty_ok:
             return None, None, rev
 
-    def fp_for(cmd_list: list[str]) -> str:
+    def fp_for(cmd_list: list[str], output_rules: dict | None = None) -> str:
         resolved = [resolve_venv(t) for t in cmd_list]
         payload = json.dumps({
+            "schema": 2,
             "cmd": resolved,
+            "cwd": os.path.realpath(cwd),
+            "env": execution_env or {},
+            "artifacts": output_rules or {},
+            "task_artifacts": artifacts or {},
             "rev": rev if use_code else None,
-            "dirty": dirty_hash,   # None = 干净树 (与历史指纹兼容)
+            "dirty": dirty_hash,   # None = 干净树
             "runtime": runtime_prefix,   # B15: 声明了才参与哈希 (环境漂移可审计)
-        })
+        }, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
 
     if stages is not None:
-        stage_fps = {str(i): fp_for(s["cmd"]) for i, s in enumerate(stages)}
+        stage_fps = {str(i): fp_for(s["cmd"], s.get("artifacts")) for i, s in enumerate(stages)}
         # 任务级指纹 = 全部 stage 指纹串联 (代码/venv 任一变化即变)
         task_fp = hashlib.sha256(
-            json.dumps(stage_fps, sort_keys=True).encode()
+            json.dumps({"stages": stage_fps, "artifacts": artifacts or {}}, sort_keys=True).encode()
         ).hexdigest()
         return task_fp, stage_fps, rev
     else:
-        return fp_for(cmd or []), None, rev
+        return fp_for(cmd or [], artifacts), None, rev

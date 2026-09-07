@@ -7,6 +7,7 @@ config.json 是唯一权威配置, 框架代码零写死账户/节点/路径/项
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -45,30 +46,43 @@ def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float], dict[i
     B12-c: 对象形态可选 max_jobs (正整数) = 该卡共享装箱任务数上限
     (异构卡差异化密度; 缺省跟随全局 co_locate_max_jobs). 热键 —— 可热更新.
     """
-    raw = cfg.get("gpus") or []
+    raw = cfg.get("gpus")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise ConfigError("gpus 必须是卡号整数数组或对象数组")
     idxs: list[int] = []
     mem: dict[int, float] = {}
     mj: dict[int, int] = {}
     for g in raw:
         if isinstance(g, dict):
             idx = g.get("idx")
-            if idx is None or not isinstance(idx, int) or isinstance(idx, bool):
-                raise ConfigError(f"gpus 对象形态必须有整数 idx: {g}")
+            if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+                raise ConfigError(f"gpus 对象形态必须有非负整数 idx: {g}")
             idxs.append(idx)
             m = g.get("mem_gib")
             if m is not None:
-                if not isinstance(m, (int, float)) or isinstance(m, bool) or m <= 0:
-                    raise ConfigError(f"gpus[{idx}].mem_gib 必须 > 0 的数字 (GiB): {g}")
-                mem[idx] = float(m)
+                try:
+                    capacity = float(m)
+                except (TypeError, ValueError, OverflowError):
+                    capacity = math.nan
+                if (
+                    not isinstance(m, (int, float))
+                    or isinstance(m, bool)
+                    or not math.isfinite(capacity)
+                    or capacity <= 0
+                ):
+                    raise ConfigError(f"gpus[{idx}].mem_gib 必须是有限正数 (GiB): {g}")
+                mem[idx] = capacity
             mjv = g.get("max_jobs")
             if mjv is not None:
                 if not isinstance(mjv, int) or isinstance(mjv, bool) or mjv < 1:
                     raise ConfigError(f"gpus[{idx}].max_jobs 必须是正整数: {g}")
                 mj[idx] = mjv
         else:
-            if not isinstance(g, int) or isinstance(g, bool):
+            if not isinstance(g, int) or isinstance(g, bool) or g < 0:
                 # M17: 原消息引用只在 dict 分支赋值的 idx -> NameError
-                raise ConfigError(f"gpus 必须是卡号整数数组或对象数组: {g}")
+                raise ConfigError(f"gpus 必须是非负卡号整数数组或对象数组: {g}")
             idxs.append(g)
     # 去重保序 (同一卡重复声明 -> 后者覆盖显存, 卡号只留一个)
     seen: set[int] = set()
@@ -163,8 +177,8 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
                 raise ConfigError(f"{p}: projects.{proj_name}.priority 必须是整数")
         ga = proj_cfg.get("gpu_affinity")
         if ga is not None:
-            if not isinstance(ga, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in ga):
-                raise ConfigError(f"{p}: projects.{proj_name}.gpu_affinity 必须是卡号整数数组")
+            if not isinstance(ga, list) or not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in ga):
+                raise ConfigError(f"{p}: projects.{proj_name}.gpu_affinity 必须是非负卡号整数数组")
         hard_affinity = proj_cfg.get("gpu_affinity_hard", False)
         if not isinstance(hard_affinity, bool):
             raise ConfigError(
@@ -265,8 +279,19 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         v = cfg.get(k)
         if v is None:
             continue
+        if k == "co_locate_max_jobs" and (not isinstance(v, int) or isinstance(v, bool)):
+            raise ConfigError(f"{p}: {k} 必须是 [{lo}, {hi}] 范围内的整数")
         if not isinstance(v, (int, float)) or isinstance(v, bool) or not (lo <= v <= hi):
             raise ConfigError(f"{p}: {k} 必须在 [{lo}, {hi}] 范围 (默认 {dfl})")
+
+
+def task_environment(cfg: dict, batch_env: dict | None, task_env: dict | None) -> dict[str, str]:
+    """Merge declared environment identically for fingerprinting and launch."""
+    return {
+        str(key): str(value)
+        for layer in (cfg.get("task_default_env") or {}, batch_env or {}, task_env or {})
+        for key, value in layer.items()
+    }
 
 
 def resolve_template(value: str, cfg: dict[str, Any], cwd: str | None = None) -> str:

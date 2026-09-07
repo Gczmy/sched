@@ -1,0 +1,2 @@
+# Shell entry points must remain executable by Bash after a Windows checkout.
+*.sh text eol=lf

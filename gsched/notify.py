@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import smtplib
 import subprocess
 from email.header import Header
@@ -58,7 +59,7 @@ def build_event(conn, batch, host_dir: str) -> dict[str, Any]:
             fins.append(j["finished_at"])
         if not git_rev and j["git_rev"]:
             git_rev = j["git_rev"]
-        if j["status"] in ("failed", "blocked", "cancelled", "timed_out"):
+        if j["status"] in ("failed", "blocked", "cancelled", "timed_out", "interrupted"):
             failures.append({
                 "task_id": j["task_id"],
                 "status": j["status"],
@@ -237,15 +238,25 @@ def list_inbox(unacked_only: bool = True) -> list[str]:
             continue
         if unacked_only and f.endswith(".acked"):
             continue
-        files.append(os.path.join(d, f))
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return files
+        path = os.path.join(d, f)
+        try:
+            files.append((os.path.getmtime(path), path))
+        except FileNotFoundError:
+            continue  # Concurrent acknowledgement or retention cleanup.
+    files.sort(reverse=True)
+    return [path for _, path in files]
 
 
 def ack(path: str) -> str:
     """确认事件: rename 加 .acked 后缀. 返回新路径."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
+    path = os.path.abspath(path)
+    if (
+        os.path.realpath(os.path.dirname(path)) != os.path.realpath(inbox_dir())
+        or not path.endswith((".json", ".json.acked"))
+    ):
+        raise ValueError("只能确认当前节点 notify_inbox 内的 JSON 事件")
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise ValueError("事件必须是普通文件，不能是符号链接")
     new = path if path.endswith(".acked") else path + ".acked"
     if new != path:
         os.rename(path, new)

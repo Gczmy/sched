@@ -25,7 +25,7 @@
   }
   ```
   ⚠️ 最常见错误：写了 vram_gib 但忘写 gpu_share → 任务独占整卡，单卡单任务。
-- **指纹、stage checkpoint 与重跑**：指纹覆盖命令、git HEAD、tracked 文件的 staged/unstaged 内容与 runtime；任意 untracked 输出不参与 producer 指纹。stage 仅在产物有效且 job 私有 checkpoint sidecar 的 producer 指纹匹配时跳过；stage 命令返回 0 后必须先通过其完整产物规则才写 sidecar，任务最终收敛时会再次校验任务级与全部 stage 产物。`force_rerun:true` 绕过任务 SKIP 和 stage checkpoint。
+- **指纹、stage checkpoint 与重跑**：指纹覆盖命令、真实工作目录、声明的合并环境（`task_default_env < batch.env < task.env`）、产物规则、git HEAD、tracked 文件的 staged/unstaged 内容与 runtime；任意 untracked 输出和未声明的宿主环境不参与 producer 指纹。stage 仅在产物有效且 job 私有 checkpoint sidecar 的 producer 指纹匹配时跳过；stage 命令返回 0 后必须先通过其完整产物规则才写 sidecar，任务最终收敛时会再次校验任务级与全部 stage 产物。`force_rerun:true` 绕过任务 SKIP 和 stage checkpoint。2026-09-07 指纹格式升级后，旧 producer/checkpoint 无法匹配，新提交或重开的任务会重新执行一次；已完成任务不会因此自动入队。
   tracked 代码未提交改动也会改变指纹；untracked 源码不会，因此生产代码应纳入版本控制。强制重跑见 R4/R5。
   对任务操作一律使用 `<batch-id-or-name>:<task>`；先精确匹配完整 batch id，否则选同名最新批次，裸 task 无效。
 
@@ -245,15 +245,19 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 未确认而非失败。
 
 `sched run` 当前只有单 GPU 与 CPU-only 两种受支持的资源形态。GPU 任务省略
-`--gpus` 或显式写 `--gpus 1`；零 GPU 必须用 `--cpu-only`。当前 parser 会把未配合
-`--cpu-only` 的非正 `--gpus` 当成省略参数，最终仍按默认一张 GPU 入队，所以不要
-使用 `0` 或负数。
+`--gpus` 或显式写 `--gpus 1`；零 GPU 必须用 `--cpu-only`。拒绝其他 GPU 数量，
+也拒绝同时指定 `--gpus` 与 `--cpu-only`。
 它默认采用 config 中第一个 venv，工作目录为 `{ROOT}`（`default_project` 根目录）；
 `--project` 只决定归属、quota、priority 与 affinity，不改变 `{ROOT}`。需要其他项目
-目录时显式传 `--cwd '{PROJECT:P}'`。当前 `run --dry-run` 在项目成员校验前返回，
-所以预览成功不能证明 `--project` 已注册；真实提交会执行该校验。`--cpus` 与
-`--duration` 的受支持输入都是正整数，快捷入口目前不会完整预检所有非法非正值。
+目录时显式传 `--cwd '{PROJECT:P}'`。`run --dry-run` 与真实提交都校验项目成员，
+并要求显式提供的 `--cpus` 与 `--duration` 为正整数。命令按 argv 保留引号，
+使用非登录 Bash 保留所选 venv 的 `PATH`；需要 shell 管道时显式使用 `bash -c`。
 与可无状态执行的 `submit --dry-run` 不同，当前 run 预览仍要求已有且可读的 state DB。
+
+`config set` 将读取、深合并、校验和原子替换置于同一个 submission gate，
+并发补丁按顺序读取前一个已提交配置，避免相互覆盖。`notify-ack` 只接受当前
+节点 `notify_inbox` 内的普通 `.json`／`.json.acked` 文件；损坏事件在查询中标记
+为不可读，不中断其余事件。
 
 ### 稳定 JSON 与跨主机读取
 

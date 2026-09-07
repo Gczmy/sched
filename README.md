@@ -120,15 +120,15 @@ sched run --project vision --cpu-only -- python prep_data.py       # CPU-only ta
 
 `sched run` is a direct compute-node mutation and does not use the gateway submission
 inbox. It currently supports exactly one GPU: omit `--gpus` or use `--gpus 1`; use
-`--cpu-only` for a zero-GPU task. The current parser treats a non-positive `--gpus`
-without `--cpu-only` as the omitted/default one-GPU case, so never use `0` or a negative
-value. Its batch priority is always the
+`--cpu-only` for a zero-GPU task. Other GPU counts and combining `--gpus` with
+`--cpu-only` are rejected. Explicit CPU counts and durations must be positive integers.
+Its batch priority is always the
 default `0`. Unless overridden, it uses the first configured venv and `{ROOT}` (the
 `default_project` root) as its working directory; `--project` does not change `{ROOT}`.
 For another project root, pass `--cwd '{PROJECT:nlp}'` explicitly (replace `nlp`
-with the selected project). A current `run --dry-run` returns before project-membership
-validation, so a successful preview does not prove that `--project` is registered;
-the real submission performs that check. Unlike stateless `submit --dry-run`, the run
+with the selected project). Both `run --dry-run` and real submission validate project
+membership. Commands preserve argv quoting and the configured venv PATH through a
+non-login Bash; use explicit `bash -c` for shell pipelines. Unlike stateless `submit --dry-run`, the run
 preview currently requires an existing readable state database.
 
 ## batch.json Format

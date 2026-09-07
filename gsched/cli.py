@@ -32,6 +32,7 @@ from .config import (
     load_config,
     parse_gpus,
     resolve_template,
+    task_environment,
 )
 from .schema import (
     SchemaError,
@@ -178,7 +179,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
     """Build a read-only preview using the same trust boundaries as execution."""
-    from .artifacts import check_artifact
+    from .artifacts import check_artifacts
     from .fingerprint import compute_fingerprint
 
     producer_fps: dict[tuple[str | None, str], str] = {}
@@ -216,11 +217,9 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
         if not producer or not fingerprint or producer != fingerprint:
             return False, "无可信匹配的 producer fingerprint (必跑)"
         failures: list[str] = []
-        for key, rule in artifacts.items():
-            path = rule.get("path")
-            if path and not os.path.isabs(path):
-                path = os.path.normpath(os.path.join(cwd_abs, path))
-            result = check_artifact(path or "", rule)
+        for key, result in check_artifacts(
+            artifacts, cwd_abs, paths_escape=task.get("paths_escape", False)
+        ).items():
             if result is not None:
                 failures.append(f"{key}:{result}")
         if failures:
@@ -244,7 +243,7 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
                     stage["cmd"], cfg, stage_artifacts, cwd_abs
                 )
                 expanded_stages.append(expanded)
-                fingerprint_stages.append({"cmd": expanded})
+                fingerprint_stages.append({"cmd": expanded, "artifacts": stage["artifacts"]})
             _, _, rev = compute_fingerprint(
                 None,
                 fingerprint_stages,
@@ -252,6 +251,8 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
                 task["git"],
                 venv_paths,
                 runtime_prefix=task.get("runtime_prefix"),
+                execution_env=task_environment(cfg, norm.get("env"), task.get("env")),
+                artifacts=task.get("artifacts"),
             )
             git_rev = rev or git_rev
             reason = (
@@ -284,6 +285,8 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
             task["git"],
             venv_paths,
             runtime_prefix=task.get("runtime_prefix"),
+            execution_env=task_environment(cfg, norm.get("env"), task.get("env")),
+            artifacts=task.get("artifacts"),
         )
         git_rev = rev or git_rev
         skip, reason = predict_task(
@@ -393,7 +396,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if _unwarn:
         print(
             f"⚠️ 任务 {', '.join(_unwarn)} 未声明运行环境"
-            " ({VENV} 或 runtime 字段), 指纹仅含 git rev",
+            " ({VENV} 或 runtime 字段), 指纹不记录运行环境路径",
             file=diagnostic_stream,
         )
 
@@ -536,6 +539,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         fp, stage_fps, _rev = compute_fingerprint(
             cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {}),
             runtime_prefix=t.get("runtime_prefix"),
+            execution_env=task_environment(cfg, norm.get("env"), t.get("env")),
+            artifacts=t.get("artifacts"),
         )
         prepared_tasks.append((i, t, cmd_e, stages_e, fp, stage_fps))
     if stateless_dry_run:
@@ -638,7 +643,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     cmd_parts = list(args.cmd)
     while cmd_parts and cmd_parts[0] == "--":
         cmd_parts.pop(0)
-    shell_cmd = " ".join(cmd_parts)
+    shell_cmd = shlex.join(cmd_parts)
     try:
         tokens = parse_shell_cmd(shell_cmd, "sched run")
     except SchemaError as e:
@@ -676,11 +681,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     # resources: --cpu-only -> gpu:0 (CPU-only, 不占 GPU 槽位); --cpus 记录配额
     # C3 修复: --gpus >1 此前被静默忽略且回显说谎 (schema resources.gpu ∈ {0,1},
     # 多卡未打通 allocator); 直接拒绝, 不再假装支持
-    if args.gpus and args.gpus > 1 and not args.cpu_only:
+    if args.gpus is not None and (args.gpus != 1 or args.cpu_only):
         print(
-            "错误: 暂不支持多卡任务 (--gpus 仅接受 1; 多卡训练请用 batch.json 拆多任务)",
+            "错误: --gpus 仅接受 1，且不能与 --cpu-only 同时使用",
             file=sys.stderr,
         )
+        return 1
+    for flag, value in (("--cpus", args.cpus), ("--duration", args.duration)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            print(f"错误: {flag} 必须是正整数", file=sys.stderr)
+            return 1
+    proj = getattr(args, "project", None)
+    if not proj or proj not in cfg.get("projects", {}):
+        print("错误: --project 必须指定 config.projects 中已注册的项目", file=sys.stderr)
         return 1
     resources: dict[str, Any] = {}
     if args.cpu_only:
@@ -688,11 +701,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.cpus:
         resources["cpus"] = args.cpus
 
-    # N8: `--` 后是 shell 字符串, 由 bash -lc 执行 (保持管道/重定向灵活性).
-    # 注意: args.cmd 经外层 shell 解析后内层引号已丢失 (argv 传参的固有限制),
-    # 这里对每个 token 分别 shlex.quote 再拼接, 重建正确的 shell 语法 ——
-    # `python -c "code"` 会变成 `python -c 'code'`, 带空格参数不会被拆散.
-    # venv 通过 PATH 注入生效: bash 解析 `python` -> venv/bin/python
+    # Preserve argv quoting and the configured venv PATH. A login shell would
+    # source profiles that can silently replace PATH with the system Python.
     # (executor 另注入 CUDA_VISIBLE_DEVICES: GPU 任务=卡号, CPU-only="")
     venv_bin = os.path.dirname(interp)
     shell_env = {
@@ -703,8 +713,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     task_spec = {
         "id": "run",
-        # bash -lc 执行 shell 字符串 (cmd[0] 非 {VENV:} 模板 —— run 是独立形态, 不走 batch 校验)
-        "cmd": ["/bin/bash", "-lc", shell_cmd_quoted],
+        "cmd": ["/bin/bash", "-c", shell_cmd_quoted],
         "stages": None,
         "cwd_abs": cwd_abs,
         "git": None,
@@ -717,6 +726,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         ),
         "paths_escape": bool(args.out and os.path.isabs(args.out)),
         "probes": None,
+        "project": proj,
     }
 
     from .fingerprint import compute_fingerprint
@@ -725,6 +735,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # §G4 A 类 (与 submit 同一预览路径): 纯只读, 不 insert, 不拉起 daemon
         norm = {
             "name": batch_name,
+            "project": proj,
             "tasks": [task_spec],
             "depends_on": [],
         }
@@ -745,21 +756,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"  ⚠️ 预测基于当前 git rev {prev['git_rev'][:12]} (提交前若 pull 代码则预测作废, §G4)")
         return 0
 
-    # B11c: run 快捷提交同样强制项目归属 (无 project = 绕过隔离, 拒绝)
-    proj = getattr(args, "project", None)
-    if not proj:
-        known = ", ".join(sorted(cfg.get("projects", {}).keys())) or "无"
-        print(
-            f"错误: 缺少 --project (B11c 项目隔离, 可选: {known})",
-            file=sys.stderr,
-        )
-        return 1
-    if proj not in cfg.get("projects", {}):
-        print(f"错误: project '{proj}' 未在 config.projects 中定义", file=sys.stderr)
-        return 1
-
     fp, stage_fps, rev = compute_fingerprint(
-        task_spec["cmd"], None, cwd_abs, None, cfg.get("venvs", {})
+        task_spec["cmd"], None, cwd_abs, None, cfg.get("venvs", {}),
+        execution_env=task_environment(cfg, None, task_spec.get("env")),
+        artifacts=task_spec.get("artifacts"),
     )
     with state.submission_connect() as conn:
         state.insert_batch(
@@ -1987,7 +1987,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     prepared_specs = []
     with state.connect() as conn:
         batch_row = conn.execute(
-            "SELECT status, project, name FROM batches WHERE id=?", (batch,)
+            "SELECT status, project, name, env FROM batches WHERE id=?", (batch,)
         ).fetchone()
         if not batch_row:
             print(f"错误: 批次不存在: {ref}", file=sys.stderr)
@@ -2139,6 +2139,8 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             spec.get("git"),
             cfg.get("venvs", {}),
             runtime_prefix=spec.get("runtime_prefix"),
+            execution_env=task_environment(cfg, json.loads(batch_row["env"] or "{}"), spec.get("env")),
+            artifacts=spec.get("artifacts"),
         )
         prepared["fingerprint"] = fingerprint
         prepared["stage_fingerprints"] = stage_fingerprints
@@ -2644,6 +2646,14 @@ def cmd_config_get(args: argparse.Namespace) -> int:
 
 
 def cmd_config_set(args: argparse.Namespace) -> int:
+    # Serialize the complete read/merge/replace cycle with other CLI writers.
+    # Atomic rename alone neither merges concurrent patches nor protects the
+    # shared validation temp path from another config set process.
+    with state.submission_lock():
+        return _config_set_serialized(args)
+
+
+def _config_set_serialized(args: argparse.Namespace) -> int:
     """sched config set -f <patch.json> [--yes]: 深合并补丁 -> 校验 -> 原子写 -> 热重载.
 
     冷键 (node/state_dir/user/schema_version/gpus 卡集与容量) 变更直接拒绝 ——
@@ -2672,7 +2682,11 @@ def cmd_config_set(args: argparse.Namespace) -> int:
     # 冷键拒绝 (与 dispatcher CONFIG_COLD_KEYS 同口径)
     cold = [k for k in ("node", "state_dir", "user", "schema_version")
             if old.get(k) != new_cfg.get(k)]
-    og, ng = parse_gpus(old), parse_gpus(new_cfg)
+    try:
+        og, ng = parse_gpus(old), parse_gpus(new_cfg)
+    except ConfigError as exc:
+        print(f"错误: 新配置校验失败 (未写入): {exc}", file=sys.stderr)
+        return 1
     if (og[0], og[1]) != (ng[0], ng[1]):
         cold.append("gpus(卡集或容量覆盖)")
     if cold:
@@ -3126,8 +3140,8 @@ def cmd_gpu_set_mem(args: argparse.Namespace) -> int:
     只更新 state.db/list-gpus, 运行中 daemon 的 allocator 缓存不变;
     重启探测会覆盖该临时值. 如需调度生效请改 config.gpus 后重启 daemon.
     """
-    if args.gib <= 0:
-        print(f"错误: mem_gib 必须 > 0 (got {args.gib})", file=sys.stderr)
+    if not math.isfinite(args.gib) or args.gib <= 0:
+        print(f"错误: mem_gib 必须是有限正数 (got {args.gib})", file=sys.stderr)
         return 1
     with state.connect() as conn:
         row = conn.execute("SELECT * FROM gpus WHERE idx=?", (args.idx,)).fetchone()
@@ -3280,7 +3294,7 @@ def cmd_notify_inbox(args: argparse.Namespace) -> int:
             try:
                 with open(p, encoding="utf-8") as f:
                     out.append(json.load(f) | {"_file": p})
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError):
                 out.append({"_file": p, "_error": "不可读"})
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
@@ -3291,11 +3305,13 @@ def cmd_notify_inbox(args: argparse.Namespace) -> int:
         try:
             with open(p, encoding="utf-8") as f:
                 ev = json.load(f)
+            if not isinstance(ev, dict):
+                raise ValueError("事件必须是 JSON 对象")
             mark = "✅" if ev.get("event") == "batch_done" else "❌"
             n_fail = len(ev.get("failures") or [])
             extra = f" ({n_fail} 失败)" if n_fail else ""
             print(f"  {mark} {os.path.basename(p):<52} {ev.get('batch')}{extra}")
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError):
             print(f"  ⚠️ {os.path.basename(p)} (不可读)")
     print(f"\n共 {len(files)} 条; 处理后确认: sched notify-ack <文件路径>")
     return 0
@@ -3309,6 +3325,9 @@ def cmd_notify_ack(args: argparse.Namespace) -> int:
         new = notify.ack(args.file)
     except FileNotFoundError:
         print(f"错误: 事件文件不存在: {args.file}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"错误: 无法确认事件: {exc}", file=sys.stderr)
         return 1
     print(f"已确认: {new}")
     return 0
@@ -3833,7 +3852,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--gpus",
         type=int,
-        default=1,
+        default=None,
         help="申请 GPU 数量 (当前只支持 1；零 GPU 请用 --cpu-only)",
     )
     p.add_argument("--cpus", type=int, default=None, help="CPU 配额 (记录+status 显示, B4)")

@@ -1,92 +1,146 @@
-# sched 开发指南（gsched GPU 任务调度器）
+# sched 开发与操作指南
 
-## LLM agent 操作契约（L0）
+本文件是 `sched` 项目的规则入口，适用于本目录及其子目录。配套仓库为同级的 `../dsh-node-sched`（当前本地路径 `D:/dsh-node-sched`）。
 
-本目录的调度器保持"无意识"：不含任何 agent 逻辑，只提供标准接口。**agent 操作调度器的唯一正确方式是 `sched` CLI**（入口 `gsched.cli:main`，零依赖纯标准库）。
-- 配套项目为 `/Users/zzc/quant_trade/dsh-node-sched`，与 `sched` 配合使用。
+## 沟通
 
-### 铁律
+面向用户的叙述默认使用简体中文；代码、命令和技术标识保持英文。先给影响与结论，再给行动、待决策事项和必要证据；没有对应内容就省略。
 
-- **只走 CLI，禁止直接改 state.db / state 目录文件**（WAL 并发有协议，手工 SQL 属反模式，历史事故）。要改状态就找对应子命令；没有对应命令 = 先提需求，不要绕。
-- **脚本/agent 解析输出一律用 `--json`**（`status --json`、`submit --dry-run --json`），不要解析人类可读文本。
-- 破坏性命令需要 `--yes`（`cancel`、`discard`、`clean`、`config set`、`gpu-free`）；缺 `--yes` 返回码 1 是“未确认”，不是执行失败。
-- daemon 生命周期与前置检查（`sched daemon start/stop/check`）必须在**计算节点**执行；查询类命令在登录节点可直接用，数据库查询通过私有只读 DB/WAL 快照完成。
-### 网关纪律
+使用简洁、连贯的段落，只有确实适合并列比较或按步骤执行时才使用列表。使用具体、简单的词，避免无意义术语、套话、重复总结和未经请求的对比。技术细节只保留对理解结论、判断风险或复现结果有帮助的部分。
 
-- 任何 SSH 操作前，必须先询问用户当前是校外还是校内环境；校内使用 `HPDC`，校外使用 `HPDC_outside`。
-- 网关禁止运行任何计算任务；测试、训练、批处理和 smoke test 必须在计算节点执行。正常提交统一使用网关上的 `sched submit <batch.json>`，由文件 inbox 交给计算节点 daemon 收编；返回“已投递”后用 `sched verify` 确认入库。
-- `sched run` 是计算节点直写入口，不走网关 inbox；除 dry-run 外不得在网关执行。网关上的其他 mutation 默认也会被主机守卫拒绝，不把 `SCHED_ALLOW_FOREIGN_WRITE=1` 当作日常工作流。
-- daemon 统一运行在 `84016.ambior1` 上。
-- 如需重启 daemon，严格按以下步骤执行：
-  1. 根据网络环境执行 `ssh HPDC`（校内）或 `ssh HPDC_outside`（校外）。
-  2. 执行 `screen -d -r 84016.ambior1`。
-  3. 重启 daemon。
+## 指令优先级
 
-### 子命令速查
+遵守系统、平台和安全约束。用户当前明确指令优先于 Skill、历史记忆和默认偏好。项目目录中的 `AGENTS.md` 只在该项目范围内补充或覆盖全局规则，不将本项目规则自动扩展到其他仓库。
 
-| 命令 | 用途 | 关键参数 |
-|------|------|---------|
-| `sched submit <batch.json>` | 提交批次（网关推荐入口） | `--dry-run [--json]` 只读预览；异机投递后 `sched verify` |
-| `sched run` | 计算节点一行提交单任务 | 只支持 `--gpus 1` 或 `--cpu-only`；`--dry-run` 只读 |
-| `sched status [批次]` | 三视图总览 | `--json`（脚本用）、`--detail`、`--project`、分页 cursor |
-| `sched task <批次>:<任务>` | 单任务详情 | `--json` 输出稳定版本化文档 |
-| `sched diag <批次>[:任务]` | 失败诊断（状态+命令+git+日志尾部） | 排雷首选，一步到位 |
-| `sched log <批次>:<任务>` | 任务日志 | `-n N` 尾部行数、`-f` 跟踪 |
-| `sched retry <批次>[:任务]` | 解锁失败终态重跑 | 不带 `:任务` = 批次级全部 |
-| `sched cancel <批次>[:任务]` | 取消（转发 daemon 组级 kill） | `--yes` |
-| `sched resubmit <批次>:<任务>` | 新版本重新提交 | 批次级另支持 `--failed` / `--all` / `--dry-run` |
-| `sched history [批次]` | 历史查询 | `--json` / `--limit` / `--status done,failed` / `--project` |
-| `sched markers` | 批次终态一览 | |
-| `sched discard <批次>` / `sched clean <批次>` | 退役旧批次 / 清 skip 产物并重排 | `--yes`；约束见 reference |
-| `sched incidents [id]` | OOM/硬件事故快照 | `--json` / `--job ID` / `--gpu N` |
-| `sched list-gpus` | GPU 状态/显存 | |
-| `sched gpu-set-mem/ok/ignore/free` | 卡管理 | 未知 idx 会报错 |
-| `sched config get/set/reload` | 配置读取、补丁写入、热更 | `set -f patch.json --yes` |
-| `sched project list` | 项目配额、优先级、亲和与用量 | `gpu_quota=0` 显示为 `∞` |
-| `sched notify-inbox` | 列批次终态通知事件（agent 检查点） | `--all` 含已确认 / `--json` |
-| `sched notify-ack <文件>` | 确认通知事件（rename `.acked`，7 天后自动清理） | |
-| `sched notify-test` | 发测试通知验证 config.notify 各渠道 | |
+## 执行方式
 
-### 状态语义速查
+用户表示要开始新工作或修复现有问题时，持续推进，直到目标完成。向用户提问之前，先完成上下文里已经授权、并且能把下一步变成可审查结果的工作；用户批准的应该是具体、可检查的结果。已有授权继续有效，不为同一动作重复请求确认。
 
-- 任务：`pending → running → done / failed / blocked / cancelled / timed_out / interrupted / skip`（skip = 产物指纹命中，成功等价终态）
-- 批次：依赖未满足为 `queued`；解锁后 `active`；全部成功终态 → `done`；任一失败终态 → `blocked`；`blocked/queued` 可人工退役为 `discarded`
-- 卡：`free → assigned → releasing → free`；外部 compute PID 或 compute/topology/utilization 任一探测不确定会立即 `unmanaged`；仅 compute 列表完整且为空、utilization 可读且 >0 的信号连续 3 tick 才确认，确认期间虽显示 free 但禁止派发；`unmanaged` 连续 2 次干净采样自动恢复；`quarantined` 需 `gpu-ok` 解除
+用户的建议不适合目标时直接说明，不要迎合。不要因为假想风险，主动增加警告、免责声明、审批流程或安全／合规清单。
 
-### 项目配额与优先级
+## 测试与验证
 
-- `projects[P].gpu_quota` 省略或设为 `0` 表示无限制；正整数限制并发 running GPU job 数，不是物理卡数。共享 job 各计 1，CPU-only 不计。
-- 当前没有项目级“禁止 GPU”开关；不要把 `gpu_quota:0` 或空 affinity 当成禁用。该后续开发项记录在 `docs/next-development.md`。
-- 派发顺序为项目 priority 降序、批次 priority 降序、同值 FIFO；数值越大越先考虑。优先级不抢占，高优候选暂不可运行时低优候选可补位。
-- `gpu_affinity_hard` 只限制本项目的候选卡，不反向保留 GPU；独占隔离要求所有竞争项目使用互不重叠的硬亲和集合。
+不要为可逆、影响小、只是复述实现的改动写测试。运行与本次改动相称的测试并完成必要检查；通过后，只有出现新改动、新失败或尚未解决的疑点时，才扩大或重复测试。
 
-### 通知与检查点
+调度器的执行型测试依赖 Linux/POSIX 环境；远程测试、训练、批处理和 smoke test 必须在计算节点执行。纯文档改动可在本地静态检查路径、命令引用与差异，无需启动 daemon。验收脚本位于 `tests/run_*_accept.sh`，Python 回归位于 `tests/test_*.py`；文档引用检查见 `tests/run_docs_refs_accept.sh`。
 
-批次终态 marker：`{SCHED_STATE}/<node>/markers/<批次名>.done|.blocked`
+收尾删除本次产生、之后用不上的临时文件。调度器管理的状态、日志和产物仍须遵守下文的 CLI 操作契约，不因清理临时文件而直接删除。
 
-**通知快速入门（3 步启用）**：
+## 工具与并行
 
-1. **配置 config.json**（手动或 `sched init` 交互引导）：
-   ```json
-   "notify": {
-     "on": ["batch_done", "batch_blocked"],
-     "file": {"enabled": true}
-   }
-   ```
+搜索文件或文本优先使用 `rg`、`rg --files`；独立的读取和查询尽量批量执行。网页控制台无 CLI/API 时，使用已登录的 Chrome 浏览器；飞书优先使用 `lark-cli`。
 
-2. **验证**：`sched notify-test` → 应输出 `ok: file -> .../notify_inbox/...`
+只有存在真正独立的工作流，且委派能节省时间或提升质量时才使用子 Agent。共享状态、连续决策和简单任务由当前 Agent 直接完成；委派任务必须有明确输入、输出和完成判据，最终结论由主 Agent 汇总并验证。
 
-3. **agent 使用**：每次被唤醒先 `sched notify-inbox` 查未读事件，处理后 `sched notify-ack <文件>` 确认
+## 规则来源
 
-**可用渠道**：
-- `file`（推荐）：事件 JSON 写 inbox，agent `ls + Read` 即可
-- `email`：需配置 SMTP（`notify.email.smtp_host/port/user/to`，密码走 `password_env` 环境变量）
-- `command`：调用用户脚本（事件 JSON 走 stdin），示例见 `sched/scripts/notify_*.sh`
+全局规则维护在当前生效的 canonical `AGENTS.md`；本文件维护 `sched` 项目约定。`CLAUDE.md` 只作兼容入口，引用对应的 `AGENTS.md`，不复制规则正文。
 
-notify_inbox：`{SCHED_STATE}/<node>/notify_inbox/*.json`——批次终态事件落盘（需 config.json 配 `notify.file` 渠道），agent 每次被唤醒先 `sched notify-inbox` 查未读事件再开工，处理后 `sched notify-ack` 确认
-- command 推渠道（可选）：config.json 配 `notify.command` 指向用户脚本（事件 JSON 走 stdin），批次终态即唤醒 agent；示例 `sched/scripts/notify_tmux_example.sh`（tmux 注入）/ `notify_headless_example.sh`（无头调用，自动检测 claude/kimi/pi CLI）
+项目事实、生产状态、历史决策和对外契约以项目级 `AGENTS.md` 及其指定的脚本、探针、决策记录和合同文件为准。代码用于核对当前实现；文档与实现不一致时明确指出差异。生产现状需通过 CLI 查询确认，不能把历史记录当作当前状态。
 
-### 参考文档
+| 来源 | 用途 |
+| --- | --- |
+| `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
+| `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
+| `docs/code_review_sched_dsh_2026-08-29.md` | 联合复审历史；问题是否仍存在需对照当前代码 |
+| `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
 
-- API、配置与命令：`docs/reference.md`
-- 尚未实现的下一步开发项：`docs/next-development.md`
+## 项目边界与代码入口
+
+`sched`（Python 包名 `gsched`）是节点级 GPU/CPU 批量任务调度器，要求 Python >= 3.10，运行时零第三方依赖。调度器保持“无意识”：只提供标准接口，不含 Agent 逻辑。Agent 操作调度器的唯一入口是 `sched` CLI（`gsched.cli:main`）。
+
+`dsh-node-sched` 是 dsh 插件：`packages/node-sched` 负责 SSH 传输、查询、写操作转发与审计，`packages/node-sched-ui` 负责看板。调度和状态语义由 `sched` 实现，配套插件不重新实现调度逻辑。
+
+| 代码 | 职责 |
+| --- | --- |
+| `gsched/cli.py` | 命令解析、主机守卫、JSON 输出、提交与 `request` |
+| `gsched/state.py` | SQLite WAL、私有只读快照、事务、revision 与请求记录 |
+| `gsched/daemon.py`、`gsched/dispatcher.py` | 生命周期、inbox 消费、恢复、依赖解锁与派发 |
+| `gsched/allocator.py`、`gsched/executor.py` | GPU 探测与分配、任务启动和进程组管理 |
+| `gsched/schema.py`、`gsched/config.py`、`gsched/templates.py` | 批次与配置校验、runtime 解析、模板展开 |
+| `gsched/fingerprint.py`、`gsched/artifacts.py`、`gsched/notify.py` | 指纹与产物校验、终态通知 |
+
+跨仓库修改 CLI 或 JSON 契约时，同时核对配套仓库的 `packages/node-sched/lib/index.js`、`packages/node-sched-ui/src/ui-contracts.js` 及两边的契约测试。前端源码在 `packages/node-sched-ui/src/`，不要直接编辑生成的 `lib/client.js`。
+
+## 调度器操作契约
+
+- 只走 CLI，禁止直接修改 `state.db` 或 state 目录文件，不用手写 SQL 绕过 WAL 和并发协议。没有对应子命令时先提出接口需求。
+- 脚本或 Agent 解析结构化结果时使用命令支持的 `--json`。`config get` 本身输出 JSON；`diag`、`log`、`verify` 等没有该选项，不虚构参数，也不把展示文本当稳定字段。
+- `cancel`、`discard`、`clean`、`config set`、`gpu-free` 必须带 `--yes`。缺少该参数时返回码 `1` 表示未确认；参数要求不等于需要向已有授权的用户再问一次。
+- 查询可在登录／网关节点执行；数据库查询由 CLI 获取私有只读 DB/WAL 快照，不能自行用 SQLite 打开共享源库。节点目录取自 `config.node`，不要用网关的 `hostname` 推导。
+- `sched daemon start/stop/check` 必须在计算节点执行；登录节点可用 `sched daemon status`。其他写操作受主机守卫约束，不把 `SCHED_ALLOW_FOREIGN_WRITE=1` 当作日常工作流。
+
+### HPDC 登录与执行位置
+
+远程 HPDC 登录统一使用 `ssh HPDC`。`HPDC_outside` 入口暂时关闭，不再按校内／校外选择入口或询问网络环境；配套仓库旧日志中的入口提示不改变此约定。
+
+网关禁止运行计算任务。正常批次提交使用网关上的 `sched submit <batch.json>`，由文件 inbox 交给计算节点 daemon 收编；返回“已投递”后，用 `sched verify <batch-id>` 确认入库。`sched run` 是计算节点直接写入入口，不走网关 inbox，除 `--dry-run` 外不得在网关执行。
+
+生产 daemon 约定通过 `84016.ambior1` screen 会话进入计算节点后管理；节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消未完成任务。需要重启时按顺序执行：
+
+1. 执行 `ssh HPDC`。
+2. 执行 `screen -d -r 84016.ambior1`。
+3. 确认当前主机与 `sched config get` 的 `node` 一致，再执行 `sched daemon stop`、`sched daemon check`、`sched daemon start`；检查未通过时先处理失败项。
+
+### 常用命令
+
+任务引用使用 `<batch-id-or-name>:<task-id>`，完整 batch ID 优先匹配，名称解析为同名最新批次。自动化写操作使用完整 ID，避免同名批次歧义。
+
+| 命令 | 用途与关键参数 |
+| --- | --- |
+| `sched submit <batch.json> --dry-run --json` | 校验、任务展开与 SKIP 预览；正式提交去掉预览参数 |
+| `sched verify <batch-id>` | 确认批次已持久化；投递成功不代表已经入库 |
+| `sched run` | 计算节点提交单任务；GPU 用 `--gpus 1`，CPU 用 `--cpu-only` |
+| `sched status [batch] --json` | 当前态；支持 `--project`、`--limit`、`--cursor`、`--job-cursor` |
+| `sched task <batch>:<task> --json` | 单任务与各版本详情 |
+| `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
+| `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
+| `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |
+| `sched cancel <batch>[:task] --yes` | 取消任务／批次；也支持 `--project P --yes` |
+| `sched discard <batch> --yes`、`sched clean <batch> --yes` | 退役旧批次／清理最新产物和指纹并重排符合条件的 skip；约束见 reference |
+| `sched history [batch] --json` | 历史各版本；支持 `--limit`、`--cursor`、`--status`、`--project` |
+| `sched incidents [id] --json` | OOM／硬件事故快照；支持 `--job`、`--gpu` |
+| `sched list-gpus`、`sched project list` | GPU 状态／项目配额与用量 |
+| `sched gpu-set-mem <idx> <gib>`、`sched gpu-ok <idx>`、`sched gpu-ignore <idx>`、`sched gpu-free <idx> --yes` | 卡管理；未知 idx 报错，`gpu-set-mem` 是临时容量覆盖 |
+| `sched config get`、`sched config set -f <patch.json> --yes`、`sched config reload` | 读取配置／深合并补丁并触发热更／请求重载 |
+| `sched request <request-id> --expect-revision N ... -- <mutation>` | 计算节点持久化幂等写操作，前置条件见下文 |
+| `sched markers`、`sched notify-inbox --json`、`sched notify-ack <file>`、`sched notify-test` | 批次终态／通知查询／确认／渠道验证 |
+
+### 与 dsh-node-sched 的接口约定
+
+`status`、`task`、`history` 的 JSON 当前使用 `schema_version: 1`。任务关联使用 `batch_id`，不要用显示名称关联。等待态使用 `status: "pending"` 和独立的 `wait_reason`。
+
+`status` 的批次分页与任务分页相互独立，分别检查 `truncated.batches`／`next_cursor` 和 `truncated.jobs`／`next_job_cursor`；`history` 使用自己的 `truncated` 与 `next_cursor`。不能将截断、过期或读取失败的结果当作完整当前态；看板写操作要求新鲜且完整的有效快照。
+
+插件的查询通道与写入目标独立配置。切换看板 SSH 绑定不会切换 writer；writer 默认禁用，启用时必须显式配置目标并验证实际主机、`config.node` 与 `mutationExpectedNode` 一致。`screen` writer 还需要显式会话名，插件没有内置生产会话。
+
+看板写操作经 `sched request` 转发。每次逻辑操作分配并持久化独立的 `request-id`；同一操作重放时必须沿用该 ID 与完全相同的命令、前置条件，不能在结果未知时换 ID 或自动换连接重发。批次绑定 `revision`，任务额外绑定 `version`，GPU 绑定其 `revision` 与完整有序的 `assignments`；具体参数见 `docs/reference.md`。
+
+`request` 返回码 `64` 表示参数或请求绑定错误，`65` 表示前置条件冲突，`75` 表示先前结果未知、拒绝重放。它只包装已支持的写命令，不是绕过主机守卫的网关入口；网关正常提交仍使用 `sched submit`。
+
+## 状态与资源语义
+
+- 任务：`pending → running → done / failed / blocked / cancelled / timed_out / interrupted`；`pending → skip` 表示产物指纹命中，属于成功终态。
+- 批次：依赖未满足为 `queued`，解锁后为 `active`；全部成功终态为 `done`，任一失败终态为 `blocked`；`blocked/queued` 可人工退役为 `discarded`。
+- GPU：`free → assigned → releasing → free`。外部 compute PID 或 compute/topology/utilization 探测不确定时立即 `unmanaged`；只有进程列表完整且为空、利用率可读且大于 0 的信号连续 3 tick 才确认，确认期间即使显示 `free` 也禁止派发。`unmanaged` 连续 2 次干净采样自动恢复，`quarantined` 需 `gpu-ok` 解除。
+- `projects[P].gpu_quota` 省略或为 `0` 表示无限制；正整数限制并发 running GPU job 数，不是物理卡数。共享 job 各计 1，CPU-only 不计。项目级禁止 GPU 尚未实现，不能用零配额或空 affinity 代替。
+- 派发顺序为项目 priority 降序、批次 priority 降序、同值 FIFO；不抢占，高优候选暂不可运行时低优候选可补位。`gpu_affinity_hard` 只限制本项目候选卡；独占隔离需要所有竞争项目使用互不重叠的硬亲和集合。
+
+## 通知与检查点
+
+处理调度器唤醒或继续跟进批次时，先运行 `sched notify-inbox --json` 查看未读事件；处理后将返回的 `_file` 传给 `sched notify-ack <file>`，不要手动 rename。已确认事件添加 `.acked` 后缀，由 daemon 在 7 天后清理。
+
+启用 file 通知时，将以下补丁保存为 state 目录外的 JSON 文件，在计算节点执行 `sched config set -f <patch.json> --yes`，再用 `sched notify-test` 验证；首次初始化也可使用 `sched init`。
+
+```json
+{
+  "notify": {
+    "on": ["batch_done", "batch_blocked"],
+    "file": {"enabled": true}
+  }
+}
+```
+
+state 根目录优先级为 `SCHED_STATE` > 已加载的 `config.state_dir` > `~/.sched`。批次终态 marker 位于 `<state>/<node>/markers/<batch-name>.done|.blocked`，通知位于 `<state>/<node>/notify_inbox/`；这些路径用于理解与诊断，操作仍走 CLI。
+
+支持 `file`、`email` 和 `command` 渠道，`webhook` 尚未实现。email 的 SMTP 密码通过 `password_env` 指定的环境变量提供；command 将事件 JSON 送入脚本 stdin。唤醒脚本示例见 `scripts/notify_tmux_example.sh` 和 `scripts/notify_headless_example.sh`。
