@@ -57,7 +57,7 @@ def poison_environment():
 
 def validate_request(value):
     require(type(value) is dict and value.keys() == REQUEST_KEYS)
-    require(value['schema'] == SCHEMA and type(value['phase']) is str and value['phase'] in PHASES)
+    require(type(value['schema']) is str and value['schema'] == SCHEMA and type(value['phase']) is str and value['phase'] in PHASES)
     for key in ('main_revision', 'scheduler_revision'):
         hex_value(value[key], 40)
     for key in ('nonce', 'phase_sha256', 'runtime_manifest_sha256'):
@@ -65,8 +65,10 @@ def validate_request(value):
     token(value['session_id'])
     p = value['prefix']
     require(type(p) is dict and p.keys() == set(SCHEDULER_KEYS[:-1]))
+    require(all(type(k) is str and type(v) is str for k,v in p.items()))
     require(p == prefix(value['phase'], p['SCHED_RUN_ID'], p['SCHED_LAUNCH_MARKER']))
     require(type(value['poison_environment']) is dict and value['poison_environment'] == poison_environment())
+    require(all(type(k) is str and type(v) is str for k,v in value['poison_environment'].items()))
     return value
 
 
