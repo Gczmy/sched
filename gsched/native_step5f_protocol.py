@@ -10,8 +10,8 @@ import json
 import os
 import re
 
-CONTRACT_SHA256 = '0a892f68a5859bdc0992ff99c3b682f44c6bb2680f37115a4823841911faf871'
-PROFILE = 'trusted_bootstrap_guarded_generated_phase/v5'
+CONTRACT_SHA256 = 'd64dd6a07dafc9855515e3f2a05903b206a2a028c250980d991695e9fda9cef1'
+PROFILE = 'trusted_bootstrap_guarded_generated_phase/v6'
 SCHEMA = 'm2b_step5f_scheduler_request/v1'
 PHASES = ('preparation', 'raw_collection', 'aggregation')
 SCHEDULER_KEYS = ('SCHED_BATCH_ID', 'SCHED_LAUNCH_MARKER', 'SCHED_PROJECT',
