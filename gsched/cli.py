@@ -795,32 +795,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _daemon_health() -> dict[str, Any]:
-    """B26: 读取 daemon 心跳/tick_ok 文件年龄 (CLI 侧只读文件, 不开 DB)."""
-    import os as _os
-    from .config import default_state_dir as _dsd
+    """The same read-only health contract as daemon status --json."""
     try:
         cfg = _load_cfg()
     except (Exception, SystemExit):
         cfg = {}
-    host = cfg.get("node")
-    if not host:
+    if not cfg.get("node"):
         return {}
-    base = _os.path.join(_dsd(), str(host))
-    def _age(name: str):
-        try:
-            return round(max(0.0, time.time() - _os.path.getmtime(_os.path.join(base, name))), 1)
-        except OSError:
-            return None
-    hb_age = _age("daemon.heartbeat")
-    tick_age = _age("daemon.tick_ok")
-    from .resources import drain_state
-    return {
-        "heartbeat_age_s": hb_age,
-        "tick_ok_age_s": tick_age,
-        # 冻结判定: tick_ok 超 90s 未更新 (阈值同 dispatcher._check_frozen)
-        "frozen": bool(tick_age is not None and tick_age > 90),
-        "draining": drain_state() is not None,
-    }
+    from .daemon import health_snapshot
+    return health_snapshot()
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -3320,6 +3303,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
 
     try:
+        if getattr(args, "json", False) and args.action != "status":
+            raise ValueError("--json 仅用于 daemon status")
         if getattr(args, "stop_when_idle", False) and args.action != "drain":
             raise ValueError("--stop-when-idle 仅用于 daemon drain")
         if args.action in ("drain", "resume"):
@@ -3354,7 +3339,10 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 )
             ) else 0
         if args.action == "status":
-            print(daemon.status_str())
+            if getattr(args, "json", False):
+                print(json.dumps({"schema_version": 1, **daemon.health_snapshot()}, ensure_ascii=False))
+            else:
+                print(daemon.status_str())
             return 0
         issues = daemon.check(fake=getattr(args, "fake", False))
         failures = 0
@@ -4151,6 +4139,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("daemon", help="daemon 生命周期")
     p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume"])
+    p.add_argument("--json", action="store_true", help="status: 结构化只读健康状态")
     p.add_argument("--stop-when-idle", action="store_true", help="drain: running 清空后退出，保留 pending")
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
     p.set_defaults(fn=cmd_daemon)

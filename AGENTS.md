@@ -105,6 +105,7 @@
 | `sched list-gpus`、`sched project list --json` | GPU 状态／项目 GPU 访问策略、配额与用量 |
 | `sched gpu-set-mem <idx> <gib>`、`sched gpu-ok <idx>`、`sched gpu-ignore <idx>`、`sched gpu-free <idx> --yes` | 卡管理；未知 idx 报错，`gpu-set-mem` 是临时容量覆盖 |
 | `sched config get`、`sched config set -f <patch.json> --yes`、`sched config reload` | 读取配置／深合并补丁并触发热更／请求重载 |
+| `sched daemon status --json` | 只读健康查询，不打开 DB；区分调度健康、进程存活与查询节点，跨节点 PID 状态为 unknown |
 | `sched daemon drain [--stop-when-idle]`、`sched daemon resume` | 暂停新派发／解除暂停；running 自然结束、pending 保留；排空状态跨重启保留 |
 | `sched request <request-id> --expect-revision N ... -- <mutation>` | 计算节点持久化幂等写操作，前置条件见下文 |
 | `sched markers`、`sched notify-inbox --json`、`sched notify-ack <file>`、`sched notify-test` | 批次终态／通知查询／确认／渠道验证 |

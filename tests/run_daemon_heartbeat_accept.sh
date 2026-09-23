@@ -86,7 +86,12 @@ from gsched import daemon
 
 with mock.patch.object(daemon, "_heartbeat_fresh", return_value=True), \
      mock.patch.object(daemon, "_read_pid", return_value=None), \
-     mock.patch.object(daemon, "_read_lease_owner", return_value=None):
+     mock.patch.object(daemon, "_read_lease_owner", return_value=None), \
+     mock.patch.object(daemon, "health_snapshot", return_value={
+         "health_state": "healthy", "process_state": "unknown", "draining": False,
+         "pid": None, "node": "testnode", "query_host": "gateway",
+         "heartbeat_age_s": 1, "tick_ok_age_s": 1,
+     }):
     assert daemon.is_running()
     assert "运行中" in daemon.status_str()
     assert "计算节点" in daemon.stop()

@@ -184,13 +184,103 @@ def ensure_running() -> str:
     return start(fake=bool(os.environ.get("SCHED_FAKE_GPUS")))
 
 
+def health_snapshot() -> dict[str, Any]:
+    """Read health without opening the DB or probing a foreign PID namespace.
+
+    Health is observational, not authorization to start/stop or steal a lease.
+    Keep lifecycle guards independent of this display contract.
+    """
+    from .resources import drain_state
+
+    observed_at = time.time()
+    node = state.hostname()
+    query_host = socket.gethostname().strip()
+    read_error = None
+
+    def age(name: str) -> float | None:
+        nonlocal read_error
+        try:
+            delta = observed_at - os.stat(os.path.join(_host_dir(), name)).st_mtime
+            if delta < -5:
+                read_error = "timestamp_in_future"
+                return None
+            return round(max(0.0, delta), 1)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            read_error = "health_file_unreadable"
+            return None
+
+    hb_age = age("daemon.heartbeat")
+    tick_age = age("daemon.tick_ok")
+    owner = _read_lease_owner()
+    pid = owner["pid"] if owner else _read_pid()
+    process_state = "unknown"
+    if owner and owner["physical_host"] == query_host:
+        try:
+            token = process_start_token(pid)
+            if token is not None:
+                process_state = "running" if token == owner["start_token"] else "stopped"
+            elif not _pid_alive(pid):
+                process_state = "stopped"
+            # An owner replacement while sampling invalidates PID evidence.
+            if _read_lease_owner() != owner:
+                process_state = "unknown"
+        except OSError:
+            process_state = "unknown"
+    elif owner is None and query_host == node and hb_age is None:
+        # Clean shutdown removes the lease, PID and heartbeat. Missing or
+        # unreadable ownership alone does not establish that it is stopped.
+        try:
+            absent = True
+            for path in (_pid_file(), os.path.dirname(_owner_file()), _heartbeat_file()):
+                try:
+                    os.lstat(path)
+                    absent = False
+                except FileNotFoundError:
+                    pass
+            if absent and read_error is None:
+                process_state = "stopped"
+        except OSError:
+            pass
+
+    frozen = tick_age is not None and tick_age > 90
+    if read_error:
+        health_state = "unknown"
+    elif process_state == "stopped":
+        health_state = "stopped"
+    elif frozen:
+        health_state = "stalled"
+    elif hb_age is not None and hb_age < 60 and tick_age is not None:
+        health_state = "healthy"
+    elif hb_age is not None or process_state == "running":
+        health_state = "delayed"
+    else:
+        health_state = "unknown"
+    return {
+        "node": node, "query_host": query_host, "pid": pid,
+        "observed_at": observed_at, "process_state": process_state,
+        "health_state": health_state, "read_error": read_error,
+        "heartbeat_age_s": hb_age, "tick_ok_age_s": tick_age,
+        "frozen": frozen, "draining": drain_state() is not None,
+    }
+
+
 def status_str() -> str:
-    pid = _read_pid()
-    if _heartbeat_fresh():
-        return f"运行中 (pid={pid}, host={state.hostname()})"
-    if _pid_alive(pid):
-        return f"PID 存在但心跳过期 (pid={pid}, 可能卡死, F3/F4 会处理)"
-    return "未运行"
+    health = health_snapshot()
+    label = {
+        "healthy": "运行中，调度正常",
+        "stalled": "调度停滞",
+        "delayed": "心跳延迟或等待首次调度",
+        "stopped": "已停止",
+        "unknown": "状态未知",
+    }[health["health_state"]]
+    if health["health_state"] == "healthy" and health["draining"]:
+        label = "运行中，已暂停新派发"
+    process = {"running": "存活", "stopped": "已停止", "unknown": "未知"}[health["process_state"]]
+    return (f"{label} (pid={health['pid']}, host={health['node']}, "
+            f"进程={process}, heartbeat_age_s={health['heartbeat_age_s']}, "
+            f"tick_ok_age_s={health['tick_ok_age_s']}, query_host={health['query_host']})")
 
 
 # ---------- start ----------
