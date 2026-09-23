@@ -1,5 +1,15 @@
 # 2026-09-22 HPDC 资源修复记录
 
+2026-09-23 05:05 UTC 恢复完成：daemon 已无损重启为 PID 635428，`draining=false`、心跳及 tick 正常；22 个实验全部持久化，2 个 running、20 个因项目配额 pending。运行的是 `electricity_h336_seed45/46`，CPU 声明预留 60/120 核、主机内存声明预留 72/96 GiB；GPU 0/1 实测利用率 98%/95%，各约 7.3 GiB 显存，GPU 2/3 空闲。两项 migration/profile 检查通过，已存在实际 GPU 计算进程。
+
+- 调度器功能提交：`e2db9cccea50a87ed63a21c7a95d7ad8dcb6e184`，已推送 GitHub 并同步 HPDC 源码仓库。生产 wrapper 与 daemon 的 `PYTHONPATH` 均为 `/home/zzhang54/zzhang54/sched-resource-release-e2db9cc`。发布目录由该提交归档生成，102 个文件与计算节点验证的候选包一致；后续仅补充本记录不要求重启 daemon。
+- 配套插件提交：`9e2845577f12f39ea75434c95eea62933fb7e98e`，在 GitHub `78a9bcd` 上整合并重建，已推送。尚未定位实际看板运行主机/profile，因此这里确认的是代码和生成物同步，不代表运行中看板已更新。
+- 验证：Python 共 388 项（387 通过、1 跳过），排空/恢复验收通过，CPU 配额 6/6，文档引用检查通过；修订后的恢复脚本 3 项回归和排空验收再次通过。UI 41/41、相关后端契约 11/11；真实生产 CLI 的 3 页、2927 条任务通过整合后的严格 JSON 校验。
+- 首个批次保持 `waveletmixer_sched_20260922_native_electricity_h336_seed45-20260923015708674`，使用原请求 ID 重放，没有重复入队。其余 21 项逐一提交并 verify，所有批次 active 后才 resume。旧成功结果、6 个预检失败和 4 个暂缓实验保持原有处理结论；EntoKids 的产物路径问题仍独立阻塞。
+- 部署审计仍在下文 OPS 目录：`restart-e2db9cc.json`、`activation.failed-before-e2db9cc.json`、`activation-recovery-e2db9cc.log`、`activation.json` 与 `receipts.json`。生产回执共 22 条，最终阶段为 `active`。
+
+以下为恢复前检查和准备记录。
+
 2026-09-23 04:43 UTC 复查：旧训练 `traffic_h96_seed42` 已于 01:55 UTC 成功完成，新 daemon PID 547232 于 01:57 UTC 启动。切换脚本在首个批次提交后，因把短暂的 `queued/dependency` 状态误判为异常而退出；当前保持 `draining`，22 个新批次仅 1 个已入库，其余 21 个未提交。完整 CLI 分页无 running，4 张 GPU 无计算进程，`daemon check` 全部通过。
 
 修复后的 `activate_once.py` 接受无依赖批次在一次 daemon tick 前的暂态，并在所有批次变为 active 后才 resume。`--continue-submission --release-path <verified-release>` 用原 request-id 和原始提交路径继续已配置、已暂停的部署，原子保存回执，避免重跑旧切换步骤或重复提交。该选项必须在计算节点执行，且 wrapper 已指向经验证的 release。
