@@ -218,6 +218,14 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     if "venvs" not in cfg or not isinstance(cfg["venvs"], dict):
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用
+    from .resources import finite_number
+    for key, default, positive in (
+        ("host_mem_total_gib", 0, False),
+        ("host_mem_reserve_gib", 16, False),
+        ("host_mem_default_gib", 8, True),
+    ):
+        if not finite_number(cfg.get(key, default), positive=positive):
+            raise ConfigError(f"{p}: {key} 必须是有限{'正' if positive else '非负'}数")
     for k, min_v in (("cpus_total", 0), ("gpu_job_cpus", 1), ("max_cpu_jobs", 1)):
         v = cfg.get(k)
         if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < min_v):

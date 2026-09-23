@@ -64,6 +64,7 @@
 | `resources.vram_gib` | num | 共卡必填 | 峰值显存声明（GiB）；独占时用于容量校验 |
 | `resources.profile_key` | str | ✗ | 历史实测峰值键，装箱取 max(声明, 实测) |
 | `resources.cpus` | int | ✗ | 正整数 CPU 核数声明；缺省时 CPU-only=1，GPU job=`gpu_job_cpus`（默认 8）|
+| `resources.host_mem_gib` | number | ✗ | 有限正数主机内存预留（GiB）；缺省 `host_mem_default_gib`，CPU/GPU 任务均计入 |
 | `runtime` | obj | ✗ | `{conda_env:"名"}` ∥ `{venv_alias:"名"}` ∥ `{prefix:"路径"}` 必须且只能选一个；别名须注册、conda env/prefix 目录须在提交时存在；参与指纹 |
 | `progress_regex` | str | ✗ | 从日志尾部提取进度，status 展示 |
 | `artifacts` | obj | ✗ | `{key:{path,...}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`regex:"模式"`；内容校验有读取/执行上限，symlink 与特殊文件拒绝；命中→SKIP |
@@ -88,6 +89,7 @@
 | `gpus` | 卡号或 `{idx,mem_gib,max_jobs}` 数组；省略/空数组时由 daemon 探测 |
 | `co_locate / co_locate_safety / co_locate_max_jobs / co_locate_freeze_pct` | 共享总开关与阈值；默认 `false / 0.7 / 3 / 85` |
 | `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 配额；默认 `0 / 8 / 2`。`cpus_total=0` 时仅以 `max_cpu_jobs` 限 CPU-only 并发 |
+| `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
 | `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
 | `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
@@ -106,6 +108,20 @@ ready 候选按 `(项目 priority 降序, 批次 priority 降序, job 入队 row
 低优项目的批次 priority 再大也不能越过高优项目。该机制不抢占、不预留容量，也没有
 aging/fair-share：运行中的低优任务不会被驱逐；高优候选因 quota、CPU、GPU 或
 `max_parallel` 暂时不可启动时，后续候选可以补位。
+
+启用主机内存准入后，所有 running 版本的声明预留总和加上新任务必须不超过
+`min(host_mem_total_gib, MemTotal-host_mem_reserve_gib)`。分配 CPU/GPU 之前，还检查
+计算节点 `MemAvailable`，扣除运行任务尚未使用的预留和本 tick 新启动任务的预留，
+保留系统余量。运行进程树采用 PSS，读取失败的部分按未使用预留保守处理，不累加 RSS。
+采样或配置读取失败时暂停派发。预留不是 cgroup 硬限制；任务仍应保留运行期内存保护。
+`status.cpu.used` 和 `host_memory.used_gib` 都是声明预留，不是实时 CPU/PSS 用量。
+节点可用内存来自 daemon 最近 90 秒内的采样，未知时为 null，不在网关采样替代。
+
+安全维护使用 `sched daemon drain` 暂停新派发，已有任务自然结束，pending 保留。
+`sched daemon drain --stop-when-idle` 还会在 running 和未决启动标记清空后退出。
+排空请求跨 daemon 重启保留；`sched daemon resume` 解除，daemon 已退出时再
+`sched daemon start`。这些写操作只在计算节点执行，当前不由 `sched request` 包装。
+`daemon stop` 仍会取消运行任务，不用于无损排空。
 
 ⚠️ config.json 为多项目共享配置，修改须经用户确认。
 
@@ -240,7 +256,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `gpu-free <idx> --yes` | 强制 GPU 回 free | 破坏性操作；操作者须先确认无受管或外部任务；自动化应使用 request/CAS 绑定 assignments |
 | `config get` / `config set -f patch --yes` / `config reload` | 配置读取/补丁写入/立即热更 | 冷键拒绝；多项目共享需谨慎 |
 | `request <request-id> --expect-revision N [--expect-kind ...] ... -- <mutation>` | 持久化幂等 mutation | revision 必填；request-id 与完整命令/前置条件永久绑定；GPU 还必须绑定完整 assignments JSON |
-| `daemon start/stop/status/check [--fake]` | daemon 生命周期 | start/stop/check 仅计算节点；`--fake` 仅供 start/check 测试；显式 override 才可跨主机 |
+| `daemon start/stop/status/check/drain/resume` | daemon 生命周期 | start/stop/check/drain/resume 仅计算节点；`--fake` 仅供 start/check 测试；显式 override 才可跨主机 |
 | `notify-test` / `notify-inbox [--all] [--json]` / `notify-ack <file>` | 通知测试与检查点 | inbox 为纯文件查询；ack 是写操作 |
 | `project list` | 项目 GPU 访问策略、配额/用量 | `--json` |
 
@@ -267,10 +283,10 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 - `project list --json` 输出 `{"schema_version":1,"projects":[...]}`；每项含 `name`、有效布尔值 `gpu_enabled`、整数 `gpu_quota`（省略或 null 归一为 0）、`gpu_access:"disabled"|"unlimited"|"limited"`、`gpu_used`、`priority`、`colocate`、`max_jobs`、`gpu_affinity`、`root`。禁用不清空原配额，`gpu_used` 仍显示运行中的 GPU job 数。
 - `project_gpu_disabled` 仅用于排队 GPU 任务，优先于 quota/dependency 等待原因；任务状态仍为 `pending`。这扩展了 schema 1 的等待原因枚举，启用此功能前应同步更新 `dsh-node-sched`，旧插件的严格校验会拒绝新值。
 
-- `status --json` 固定 `schema_version:1`，`limit` 缺省 200、钳制 1..1000；顶层含 `batches`、`jobs`、`gpus`、`cpu`、`daemon_health`、`truncated:{batches,jobs}`、批次分页 `next_cursor` 与独立任务分页 `next_job_cursor`。先按当前态优先、再按新旧顺序有界选择批次，任务只来自已返回批次且只含各 task 最新 version，因此每个 `jobs[].batch_id` 都能在 `batches` 中解析。等待态统一为 `"status":"pending"` 与独立 `"wait_reason":"project_gpu_disabled"|"quota"|"dependency"|null`，不要解析人类视图的装饰文本。`batches[].revision` 是整数；`gpus[].revision` 是整数，`gpus[].assignments` 按 `job_id` 排序且每项为 `{"job_id":...,"vram_gib":...}`。只有 `truncated.batches=true` 时才用 `next_cursor`；只有 `truncated.jobs=true` 时才用 `next_job_cursor`。指定一个批次时也可只翻其任务页，不会丢失该批次行。
+- `status --json` 固定 `schema_version:1`，`limit` 缺省 200、钳制 1..1000；顶层可含 `host_memory:{used_gib,total_gib,reserve_gib,default_job_gib,available_gib}`（启用内存准入时），`daemon_health.draining` 表示持久排空；顶层含 `batches`、`jobs`、`gpus`、`cpu`、`daemon_health`、`truncated:{batches,jobs}`、批次分页 `next_cursor` 与独立任务分页 `next_job_cursor`。先按当前态优先、再按新旧顺序有界选择批次，任务只来自已返回批次且只含各 task 最新 version，因此每个 `jobs[].batch_id` 都能在 `batches` 中解析。等待态统一为 `"status":"pending"` 与独立 `"wait_reason":"project_gpu_disabled"|"quota"|"dependency"|"cpu"|"host_memory"|"gpu"|"parallel"|"draining"|"batch_blocked"|null`，不要解析人类视图的装饰文本。`batches[].revision` 是整数；`gpus[].revision` 是整数，`gpus[].assignments` 按 `job_id` 排序且每项为 `{"job_id":...,"vram_gib":...}`。只有 `truncated.batches=true` 时才用 `next_cursor`；只有 `truncated.jobs=true` 时才用 `next_job_cursor`。指定一个批次时也可只翻其任务页，不会丢失该批次行。
 - `task --json` 固定 `schema_version:1`，输出 `batch_id`、`batch_name`、`batch_revision`、`task` 与 `jobs` 版本时间线；每个版本含状态、运行结果/时间、resources、规范化 spec 与 log 路径。stdout 只含这一份 JSON。
 - `history --json` 固定 `schema_version:1`，`limit` 缺省 50、钳制 1..200；顶层含 `history`、`truncated` 与 `next_cursor`，每项含 `batch_id`、`batch_name`、`task`、`status`、`version` 及运行结果/时间。
-- 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check` 默认拒绝。
+- 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check/drain/resume` 默认拒绝。
 - 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以只读方式核验 schema 版本、必需对象/列与 WAL 文件头；schema 已是当前版本时，查询连接固定使用私有快照上的 `mode=ro + query_only`，不再对源库执行 `journal_mode=WAL`、`BEGIN IMMEDIATE` 或幂等迁移。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、旧 schema、非 WAL 库或权限漂移才进入带有界锁重试的 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 以及 `config get` 不检查或打开数据库。
 - `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop` 与 `config set`；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
 - 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒只在提交后发生，marker 由 daemon 按数据库权威状态协调。`retry`/`resubmit` 的最终事务、`clean` 的发布重跑阶段以及 `cancel` 的任务分类与写入，都会在读取权威状态前取得 SQLite writer claim，防止 daemon 在状态校验与首个 job/task mutation 之间收敛或派发任务。daemon 的节点重启恢复、接管终态判定与重试发布也使用同一 writer 顺序；已落库的 cancel request 或 `kill_reason=cancelled` 永远优先于自动重试/恢复回队。`daemon start/stop` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。

@@ -784,6 +784,8 @@ def _validate_task(
     if not isinstance(resources, dict):
         raise SchemaError(f"{where}.resources: 必须是对象")
     cpus = resources.get("cpus")
+    if "host_mem_gib" in resources and not _is_finite_positive_number(resources["host_mem_gib"]):
+        raise SchemaError(f"{where}.resources.host_mem_gib: 必须是有限正数 (GiB 主机内存预留)")
     if cpus is not None:
         if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
             raise SchemaError(f"{where}.resources.cpus: 必须是正整数 (声明 CPU 配额)")

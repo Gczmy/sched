@@ -703,6 +703,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         resources["gpu"] = 0
     if args.cpus:
         resources["cpus"] = args.cpus
+    if getattr(args, "host_mem_gib", None) is not None:
+        resources["host_mem_gib"] = args.host_mem_gib
 
     # Preserve argv quoting and the configured venv PATH. A login shell would
     # source profiles that can silently replace PATH with the system Python.
@@ -811,11 +813,13 @@ def _daemon_health() -> dict[str, Any]:
             return None
     hb_age = _age("daemon.heartbeat")
     tick_age = _age("daemon.tick_ok")
+    from .resources import drain_state
     return {
         "heartbeat_age_s": hb_age,
         "tick_ok_age_s": tick_age,
         # 冻结判定: tick_ok 超 90s 未更新 (阈值同 dispatcher._check_frozen)
         "frozen": bool(tick_age is not None and tick_age > 90),
+        "draining": drain_state() is not None,
     }
 
 
@@ -1249,12 +1253,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
         cpu_used = 0
         running_specs = conn.execute(
-            "WITH latest AS ("
-            " SELECT batch_id, task_id, MAX(version) AS version"
-            " FROM jobs GROUP BY batch_id, task_id)"
-            " SELECT t.spec FROM jobs j JOIN latest l"
-            " ON j.batch_id=l.batch_id AND j.task_id=l.task_id"
-            " AND j.version=l.version"
+            "SELECT t.spec FROM jobs j"
             " LEFT JOIN tasks t ON t.batch_id=j.batch_id"
             " AND t.id=j.task_id AND t.version=j.version"
             " WHERE j.status='running'"
@@ -1266,6 +1265,45 @@ def cmd_status(args: argparse.Namespace) -> int:
                 task_spec = {}
             cpu_used += _task_cpus_of(task_spec.get("resources") or {}, cfg)
         out["cpu"] = {"used": cpu_used, "total": cfg.get("cpus_total", 0)}
+
+        from . import resources as admission
+        memory_used = admission.memory_usage(conn, cfg)
+        snapshot = admission.admission_snapshot()
+        sample = snapshot.get("sample")
+        limit = cfg.get("host_mem_total_gib", 0)
+        if limit:
+            out["host_memory"] = {
+                "used_gib": memory_used, "total_gib": limit,
+                "reserve_gib": cfg.get("host_mem_reserve_gib", 16),
+                "default_job_gib": cfg.get("host_mem_default_gib", 8),
+                "available_gib": sample.get("MemAvailable") if isinstance(sample, dict) else None,
+            }
+        draining = admission.drain_state() is not None
+        batch_states = {b["id"]: b["status"] for b in out["batches"]}
+        for job in out["jobs"]:
+            if job["status"] != "pending" or job["wait_reason"] == "project_gpu_disabled":
+                continue
+            batch_status = batch_states.get(job["batch_id"])
+            if batch_status == "queued":
+                job["wait_reason"] = "dependency"
+            elif batch_status != "active":
+                job["wait_reason"] = "batch_blocked"
+            elif draining:
+                job["wait_reason"] = "draining"
+            elif job["wait_reason"] is None:
+                res = job["resources"]
+                try:
+                    requested_memory = admission.host_mem_gib({"resources": res}, cfg)
+                except (TypeError, ValueError, AttributeError):
+                    requested_memory = limit + 1  # Legacy invalid spec awaits daemon rejection.
+                if cfg.get("cpus_total", 0) and cpu_used + _task_cpus_of(res, cfg) > cfg["cpus_total"]:
+                    job["wait_reason"] = "cpu"
+                elif limit and memory_used + requested_memory > limit:
+                    job["wait_reason"] = "host_memory"
+                else:
+                    reason = snapshot.get("waits", {}).get(job["id"])
+                    if reason in admission.WAIT_REASONS:
+                        job["wait_reason"] = reason
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1337,7 +1375,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     cpu = out.get("cpu")
     if cpu:
         total_text = str(cpu["total"]) if cpu["total"] else "未配置"
-        print(f"=== CPU ===\n  占用 {cpu['used']} / {total_text} 核")
+        print(f"=== CPU ===\n  声明预留 {cpu['used']} / {total_text} 核 (非实测利用率)")
+    memory = out.get("host_memory")
+    if memory:
+        print(f"=== 主机内存 ===\n  声明预留 {memory['used_gib']:g} / {memory['total_gib']:g} GiB")
     return 0
 
 
@@ -3279,6 +3320,18 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
 
     try:
+        if getattr(args, "stop_when_idle", False) and args.action != "drain":
+            raise ValueError("--stop-when-idle 仅用于 daemon drain")
+        if args.action in ("drain", "resume"):
+            from . import resources as admission
+            if args.action == "drain":
+                admission.set_drain(stop=getattr(args, "stop_when_idle", False))
+                print("已暂停新派发；运行中任务继续，pending 保留。" +
+                      ("排空后 daemon 自动退出。" if getattr(args, "stop_when_idle", False) else "用 daemon resume 恢复。"))
+            else:
+                admission.resume()
+                print("已解除排空；运行中的 daemon 将恢复派发。未运行时请 daemon start。")
+            return 0
         if args.action == "start":
             text = daemon.start(fake=getattr(args, "fake", False))
             print(text)
@@ -3936,6 +3989,7 @@ def main(argv: list[str] | None = None) -> int:
         help="申请 GPU 数量 (当前只支持 1；零 GPU 请用 --cpu-only)",
     )
     p.add_argument("--cpus", type=int, default=None, help="CPU 配额 (记录+status 显示, B4)")
+    p.add_argument("--host-mem-gib", type=float, default=None, help="主机内存预留 (GiB)")
     p.add_argument("--cpu-only", action="store_true",
                    help="CPU-only 任务 (resources.gpu=0, 不占 GPU 槽位)")
     p.add_argument("--duration", type=int, default=None, help="预计时长(分钟), 超过该时长即终止")
@@ -4096,7 +4150,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_request)
 
     p = sub.add_parser("daemon", help="daemon 生命周期")
-    p.add_argument("action", choices=["start", "stop", "status", "check"])
+    p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume"])
+    p.add_argument("--stop-when-idle", action="store_true", help="drain: running 清空后退出，保留 pending")
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
     p.set_defaults(fn=cmd_daemon)
 

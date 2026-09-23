@@ -751,6 +751,8 @@ class Dispatcher:
                     break
                 self._tick()
                 self._touch_tick_ok()  # B26: tick 完成才写 —— 调度健康真信号
+                if self._drain_complete():
+                    break
                 tick_failures = 0
             except KeyboardInterrupt:
                 break
@@ -800,6 +802,9 @@ class Dispatcher:
         代表 crash-window 进程，必须全局 fail-closed。
         返回 True = 触发退出 (主循环 break, 随后 _cleanup_lock).
         """
+        from .resources import drain_state
+        if drain_state() is not None:
+            return False  # Explicit drain controls its own shutdown boundary.
         if self.idle_timeout_min <= 0:
             return False  # 0 = 禁用
         with state.submission_lock():
@@ -3283,11 +3288,21 @@ class Dispatcher:
             self._dispatch_ready_jobs_serialized()
 
     def _dispatch_ready_jobs_serialized(self) -> None:
+        from . import resources as admission
+        if admission.drain_state() is not None:
+            return
         try:
             gpu_policy = self._read_gpu_policy()
         except RuntimeError as error:
             self.log_line(f"本轮暂停 GPU 派发: {error}")
+            if self.cfg.get("host_mem_total_gib", 0):
+                return  # Never admit from stale memory limits after a failed reload.
             gpu_policy = {}  # CPU-only work continues using the last valid config.
+        admission_cfg = dict(self.cfg)
+        if gpu_policy:
+            for key, default in (("host_mem_total_gib", 0), ("host_mem_reserve_gib", 16),
+                                 ("host_mem_default_gib", 8)):
+                admission_cfg[key] = gpu_policy.get(key, default)
         with self._dispatch_connection() as conn:
             # 只派发 active 批次中每个 task 的最新版本 pending job。
             # queued 批次 (依赖未解锁) 与终态批次一律不派发；done/blocked
@@ -3368,6 +3383,11 @@ class Dispatcher:
             cpus_total = int(self.cfg.get("cpus_total", 0) or 0)
             max_cpu_jobs = int(self.cfg.get("max_cpu_jobs", DEFAULT_MAX_CPU_JOBS))
             used_cpu = self._cpu_in_use(conn)
+            used_memory = admission.memory_usage(conn, admission_cfg)
+            memory_sample = admission.host_memory() if admission_cfg.get("host_mem_total_gib", 0) else None
+            outstanding_memory = admission.memory_outstanding(conn, admission_cfg) if memory_sample else 0
+            launched_memory = 0.0
+            resource_waits = {}
             cpu_only_running = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL"
             ).fetchone()[0]
@@ -3411,6 +3431,7 @@ class Dispatcher:
                         raise ValueError("resources.gpu 必须是 0 或 1")
                     is_cpu_only = gpu_request == 0
                     task_cpus = self._task_cpus(spec)
+                    task_memory = admission.host_mem_gib(spec, admission_cfg)
                     if task_cpus <= 0:
                         raise ValueError("resources.cpus 必须为正整数")
                     mp = spec.get("max_parallel")
@@ -3442,13 +3463,20 @@ class Dispatcher:
                     continue
                 # B14 L4: sweep.max_parallel -- 同批 running 达上限则等下轮
                 if mp and running_per_batch.get(j["batch_id"], 0) >= mp:
+                    resource_waits[j["id"]] = "parallel"
                     continue
                 if cpus_total > 0 and used_cpu + task_cpus > cpus_total:
+                    resource_waits[j["id"]] = "cpu"
                     # CPU 配额不足: 本任务等下轮 (CPU 超卖禁止, 与 GPU 同纪律)
                     # 批内补位: continue 让后面的小任务可插队 (大任务等 GPU 释放同轮再试)
                     continue
+                if not admission.memory_available(admission_cfg, used_memory, task_memory,
+                                                  memory_sample, launched_memory, outstanding_memory):
+                    resource_waits[j["id"]] = "host_memory"
+                    continue
                 if is_cpu_only:
                     if cpus_total <= 0 and cpu_only_running >= max_cpu_jobs:
+                        resource_waits[j["id"]] = "cpu"
                         continue  # 回退模式: CPU-only 并发上限 (旧语义)
                     gpu = None  # CPU-only: 不占 GPU 槽位
                 else:
@@ -3457,12 +3485,15 @@ class Dispatcher:
                     self._assign_reject_scope = "request"
                     gpu = self._assign_in_tx(conn, j["id"], spec, project)
                     if gpu is None:
+                        resource_waits[j["id"]] = "gpu"
                         continue
                 try:
                     launched = self._launch_job(conn, j, gpu)
                     # D1: 竞态放弃/skip 不占 CPU 配额 (skip 密集批次不再人为压低并发)
                     if launched:
                         used_cpu += task_cpus
+                        used_memory += task_memory
+                        launched_memory += task_memory
                         if is_cpu_only:
                             cpu_only_running += 1
                         else:
@@ -3490,6 +3521,23 @@ class Dispatcher:
                         finished_at=state.now(),
                     )
                     self._maybe_retry(conn, j)
+
+            admission.publish_admission(memory_sample, resource_waits)
+
+    def _drain_complete(self) -> bool:
+        """Stop after all owned work exits, preserving pending jobs and inbox."""
+        from . import resources as admission
+        with state.submission_lock():
+            request = admission.drain_state()
+            if not request or not request.get("stop") or request.get("invalid"):
+                return False
+            with state.connect() as conn:
+                running = conn.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone()
+            if running or self._unresolved_launch_markers():
+                return False
+            state.mark_idle_shutdown()
+            self.log_line("排空完成，停止 daemon；保留 pending 与排空请求，resume 后恢复派发")
+            return True
 
     def _task_cpus(self, spec: dict) -> int:
         """Return a validated CPU reservation for one task."""

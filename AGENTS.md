@@ -77,11 +77,12 @@
 
 网关禁止运行计算任务。正常批次提交使用网关上的 `sched submit <batch.json>`，由文件 inbox 交给计算节点 daemon 收编；返回“已投递”后，用 `sched verify <batch-id>` 确认入库。`sched run` 是计算节点直接写入入口，不走网关 inbox，除 `--dry-run` 外不得在网关执行。
 
-生产 daemon 约定通过 `84016.ambior1` screen 会话进入计算节点后管理；节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消未完成任务。需要重启时按顺序执行：
+生产 daemon 通过现有 `ambior1` screen 会话进入计算节点后管理；2026-09-22 实查为 `318061.ambior1`、节点 `ambiorix`、租约 `2333`（120 CPU，至 2026-09-28 22:11:15 UTC）。后续先用 `screen -ls` 确认会话，节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消运行任务。支持 drain 的版本需要无损重启时按顺序执行：
 
 1. 执行 `ssh HPDC`。
-2. 执行 `screen -d -r 84016.ambior1`。
-3. 确认当前主机与 `sched config get` 的 `node` 一致，再执行 `sched daemon stop`、`sched daemon check`、`sched daemon start`；检查未通过时先处理失败项。
+2. 执行 `screen -d -r 318061.ambior1`（会话变更时使用实查值）。
+3. 确认当前主机与 `sched config get` 的 `node` 一致，执行 `sched daemon drain --stop-when-idle`，等待 running 和未决启动标记清空、daemon 自然退出。
+4. 完成维护并通过 `sched daemon check` 后，执行 `sched daemon resume`、`sched daemon start`。旧版本尚无 drain 时，先等运行任务自然结束再 stop；不可用 stop 模拟无损排空。
 
 ### 常用命令
 
@@ -104,6 +105,7 @@
 | `sched list-gpus`、`sched project list --json` | GPU 状态／项目 GPU 访问策略、配额与用量 |
 | `sched gpu-set-mem <idx> <gib>`、`sched gpu-ok <idx>`、`sched gpu-ignore <idx>`、`sched gpu-free <idx> --yes` | 卡管理；未知 idx 报错，`gpu-set-mem` 是临时容量覆盖 |
 | `sched config get`、`sched config set -f <patch.json> --yes`、`sched config reload` | 读取配置／深合并补丁并触发热更／请求重载 |
+| `sched daemon drain [--stop-when-idle]`、`sched daemon resume` | 暂停新派发／解除暂停；running 自然结束、pending 保留；排空状态跨重启保留 |
 | `sched request <request-id> --expect-revision N ... -- <mutation>` | 计算节点持久化幂等写操作，前置条件见下文 |
 | `sched markers`、`sched notify-inbox --json`、`sched notify-ack <file>`、`sched notify-test` | 批次终态／通知查询／确认／渠道验证 |
 
