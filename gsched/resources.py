@@ -180,9 +180,18 @@ def drain_state():
         return {"stop": False, "invalid": True}
 
 
+def _sync_control_directory():
+    fd = os.open(state.host_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def set_drain(*, stop=False):
     with state.submission_lock():
         write_private_json("daemon.drain.json", {"stop": bool(stop), "requested_at": time.time()})
+        _sync_control_directory()
 
 
 def resume():
@@ -191,11 +200,13 @@ def resume():
         try:
             info = os.lstat(path)
         except FileNotFoundError:
+            _sync_control_directory()
             return
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
             raise ValueError("drain control is not a regular private file")
         os.unlink(path)
+        _sync_control_directory()
 
 
 def publish_admission(sample, waits):

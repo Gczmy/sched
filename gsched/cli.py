@@ -3810,9 +3810,15 @@ def cmd_request(args: argparse.Namespace) -> int:
         print("错误: request 只允许调度器 mutation 子命令", file=sys.stderr)
         return 64
     if command[0] == "daemon" and (
-        len(command) < 2 or command[1] not in {"start", "stop"}
+        len(command) < 2 or command[1] not in {"start", "stop", "drain", "resume"}
     ):
-        print("错误: request 只允许 daemon start/stop", file=sys.stderr)
+        print("错误: request 只允许 daemon start/stop/drain/resume", file=sys.stderr)
+        return 64
+    if command[:2] == ["daemon", "drain"] and command[2:] not in ([], ["--stop-when-idle"]):
+        print("错误: request daemon drain 只接受 --stop-when-idle", file=sys.stderr)
+        return 64
+    if command[:2] == ["daemon", "resume"] and command[2:]:
+        print("错误: request daemon resume 不接受额外参数", file=sys.stderr)
         return 64
     if command[0] == "config" and (
         len(command) < 2 or command[1] != "set"
@@ -4359,6 +4365,16 @@ def main(argv: list[str] | None = None) -> int:
 
     command = getattr(args, "_subcommand", None)
     daemon_action = getattr(args, "action", None) if command == "daemon" else None
+    daemon_write_action = daemon_action
+    if command == "request":
+        wrapped = list(getattr(args, "command", []) or [])
+        if wrapped[:1] == ["--"]:
+            wrapped = wrapped[1:]
+        if len(wrapped) >= 2 and wrapped[0] == "daemon":
+            daemon_write_action = wrapped[1]
+    daemon_requires_host = daemon_write_action in {
+        "start", "stop", "check", "drain", "resume",
+    }
     config_get = (
         command == "config" and getattr(args, "config_cmd", None) == "get"
     )
@@ -4375,8 +4391,7 @@ def main(argv: list[str] | None = None) -> int:
             config_error = error
 
     if (
-        command == "daemon"
-        and daemon_action in ("start", "stop", "check")
+        daemon_requires_host
         and not allow_foreign_write
         and cfg is None
     ):
@@ -4388,13 +4403,12 @@ def main(argv: list[str] | None = None) -> int:
 
     foreign = bool(cfg and _is_foreign_host(cfg))
     if (
-        command == "daemon"
-        and daemon_action in ("start", "stop", "check")
+        daemon_requires_host
         and foreign
         and not allow_foreign_write
     ):
         print(
-            f"错误: daemon {daemon_action} 必须在计算节点"
+            f"错误: daemon {daemon_write_action} 必须在计算节点"
             f" {cfg.get('node')} 上执行；当前主机只允许 daemon status",
             file=sys.stderr,
         )
