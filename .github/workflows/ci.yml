@@ -68,6 +68,7 @@ jobs:
         if: matrix.python == '3.10'
         run: |
           python tests/run_native_integration_accept.py
+          python tests/run_host_resources_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh
