@@ -132,6 +132,10 @@ launch/send/daemon API；主仓验证器会独立重建并追踪生产 foundatio
 
 ### config.json 相关（代理只读，调参报告用户）
 
+`sched init` 要求显式填写 daemon 的计算节点名，新配置使用 `example` 项目和
+`python` 解释器别名；已有配置不自动改名。使用 `{ROOT}` 的配置必须设置
+`default_project`，不再回退到某个特定部署的项目名。
+
 | 键 | 说明 |
 |---|---|
 | `projects[P].gpu_enabled` | 布尔值，省略为 `true`；`false` 禁止新 GPU 提交与手动 GPU 重跑，暂停排队 GPU 派发，运行中任务和 CPU-only 不受影响（热更新） |
@@ -246,7 +250,7 @@ sched discard <batch-ref> --yes   # 仅 blocked/queued 且无 running；证据�
 ### R7 批量取消项目队列
 
 ```bash
-sched cancel --project selfdist --yes   # ⚠️ 覆盖 queued/active/blocked 批次的排队或运行任务
+sched cancel --project <project> --yes   # 覆盖 queued/active/blocked 批次的排队或运行任务
 ```
 
 ### R8 失败排障流程

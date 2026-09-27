@@ -678,9 +678,9 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
         raise SchemaError(f"project '{project}' 未在 config.projects 中定义 (可选: {known})")
 
     # 批次 cwd: 模板展开。B11c 修复 (2026-08-26): 默认跟随批次声明的项目根
-    # ({PROJECT:<project>})，而非 {ROOT}(=default_project) —— 否则 selfdist
-    # 批次没写 cwd 时会在 veighna 仓库里跑、指纹也取错仓库 (GPU 隔离了但
-    # cwd/指纹没隔离)。显式声明 cwd/{ROOT} 仍可覆盖。
+    # ({PROJECT:<project>})，而非 {ROOT}(=default_project)，避免未声明 cwd
+    # 的批次在另一个项目根目录运行并使用错误的代码指纹。
+    # 显式声明 cwd/{ROOT} 仍可覆盖。
     batch_cwd = spec.get("cwd", "{PROJECT:" + str(project) + "}")
     if (
         not isinstance(batch_cwd, str)

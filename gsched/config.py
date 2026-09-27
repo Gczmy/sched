@@ -329,7 +329,7 @@ def task_environment(cfg: dict, batch_env: dict | None, task_env: dict | None) -
 def resolve_template(value: str, cfg: dict[str, Any], cwd: str | None = None) -> str:
     """解析模板变量 {ROOT} / {PROJECT:name} / {VENV:name} / {STATE}.
 
-    嵌套路径保留: "{ROOT}/nn/data" -> "/home/.../veighna-trade/nn/data".
+    嵌套路径保留: "{ROOT}/nn/data" -> "/srv/projects/example/nn/data".
     未识别变量 -> 保持原样 (由调用方决定是否报错).
     """
     if not isinstance(value, str) or not value.startswith(TEMPLATE_PREFIX):
@@ -343,7 +343,10 @@ def resolve_template(value: str, cfg: dict[str, Any], cwd: str | None = None) ->
     name = value[1:end]
     rest = value[end + 1:]
     if name == "ROOT":
-        return _project_root(cfg, cfg.get("default_project", "a_share")) + rest
+        project = cfg.get("default_project")
+        if not isinstance(project, str) or not project:
+            raise ConfigError("{ROOT} 要求显式配置 default_project")
+        return _project_root(cfg, project) + rest
     if name.startswith("PROJECT:"):
         return _project_root(cfg, name.split(":", 1)[1]) + rest
     if name.startswith("VENV:"):

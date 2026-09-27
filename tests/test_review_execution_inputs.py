@@ -13,6 +13,20 @@ from test_review_cli_state import TempStateCase
 
 
 class ExecutionInputTests(TempStateCase):
+    def test_init_requires_explicit_compute_node_without_writing_config(self):
+        path = os.path.join(self.tmp.name, "new-config.json")
+        answers = ["test-user", "", self.state_root, self.tmp.name, "/usr/bin/python3"]
+        with mock.patch("builtins.input", side_effect=answers):
+            self.assertEqual(1, cli.cmd_init(argparse.Namespace(config=path)))
+        self.assertFalse(os.path.exists(path))
+
+    def test_root_template_requires_explicit_default_project(self):
+        cfg = {"projects": {"example": {"root": self.tmp.name}}}
+        with self.assertRaisesRegex(config.ConfigError, "default_project"):
+            config.resolve_template("{ROOT}/data", cfg)
+        cfg["default_project"] = "example"
+        self.assertEqual(self.tmp.name + "/data", config.resolve_template("{ROOT}/data", cfg))
+
     def fingerprint(self, *, cwd=None, env=None, artifacts=None, stages=None):
         return compute_fingerprint(
             ["echo", "result"], stages, cwd or self.tmp.name, False, {},

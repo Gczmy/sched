@@ -1,7 +1,7 @@
 #!/bin/bash
 export SCHED_ALLOW_FOREIGN_WRITE=1  # 测试在本机跑, config node 写死远端名 — 跳过 B24d 守卫
 # =============================================================================
-# run_b13_accept.sh — SelfDistOTS 改进批次验收 (环境净化/指纹/artifact/进度/批量取消)
+# run_b13_accept.sh — 调度行为验收 (环境净化/指纹/artifact/进度/批量取消)
 # =============================================================================
 # 覆盖场景:
 #   S1 环境净化: daemon 的 conda 污染键不泄漏; VENV 感知注入 CONDA_PREFIX/PATH
@@ -192,7 +192,7 @@ assert_count_increment() { # $1=before $2=after $3=description
   return 1
 }
 
-echo "=== B13 SelfDistOTS 改进批次验收 ==="
+echo "=== B13 调度行为验收 ==="
 
 # ---------- S1: 环境净化 ----------
 echo "--- S1: conda 环境净化 + VENV 注入 ---"
@@ -225,8 +225,8 @@ ENV_BID=$(submit_batch_id "$S" "$S/b1.json" envp) || {
   bad "净化任务提交失败"
   exit 1
 }
-# 关键: 以被污染的父环境启动 daemon (模拟 kronos_ft 下启动)
-CONDA_PREFIX=/poison/conda CONDA_DEFAULT_ENV=kronos_ft \
+# 关键: 以被污染的父环境启动 daemon
+CONDA_PREFIX=/poison/conda CONDA_DEFAULT_ENV=unrelated_env \
   SCHED_FAKE_GPUS=0:24 $PY -m gsched.cli daemon start --fake >/dev/null 2>&1
 assert_task_status "$S" "$ENV_BID" done "净化任务执行完成" || {
   stop_daemon "$S"

@@ -4,3 +4,21 @@ __pycache__/
 *.egg-info/
 .omc/
 tmp/
+
+# Local deployment data and credentials must stay outside tracked examples.
+.local/
+.venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+!.env.template
+/.sched/
+/config.local.json
+/docs/operations/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key

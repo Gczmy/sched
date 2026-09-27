@@ -1184,7 +1184,7 @@ class Dispatcher:
             for b in batches:
                 # B17: 只统计每任务最新版本 —— 旧版本的失败终态行不应永久
                 # 把批次钉在 blocked (否则 resubmit 新版本后批次无法回 active,
-                # 新 pending 全部冻结 —— SelfDistOTS 实测踩坑)。与 C4/retry
+                # 新 pending 全部冻结)。与 C4/retry
                 # 的"每 task 取最新 version"口径一致。
                 jobs = conn.execute(
                     "SELECT j.* FROM jobs j"
@@ -4618,7 +4618,7 @@ class Dispatcher:
         """B13-§4 语义修正: 对照"产物生产者"的指纹, 而非本行自比.
 
         旧实现 cur == j["fingerprint"] 是提交时/派发时两次对同一树状态采样,
-        永远自洽 —— 改码后 resubmit 照样 SKIP (SelfDistOTS 实际踩坑).
+        永远自洽 —— 改码后 resubmit 照样 SKIP.
         正确语义: 磁盘上的产物必须有同 task 的可信 done/skip 生产者;
         当前态指纹与其不同时必须重跑。首跑没有可信生产者，绝不复用磁盘上
         预先存在的产物。

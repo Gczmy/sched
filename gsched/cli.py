@@ -182,22 +182,24 @@ def cmd_init(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "user": input(f"运行账户 [{os.environ.get('USER','')}]: ").strip()
         or os.environ.get("USER", ""),
-        "node": input("daemon 计算节点名 [ambiorix]: ").strip() or "ambiorix",
+        "node": input("daemon 计算节点名（必填）: ").strip(),
         "state_dir": input(f"state 目录 [{default_state_dir()}]: ").strip()
         or default_state_dir(),
-        "ssh_chain": ["HPDC"],
         "gpus": [0, 1, 2, 3],
         "projects": {
-            "a_share": {
-                "root": input("a_share 项目根目录: ").strip(),
+            "example": {
+                "root": input("example 项目根目录: ").strip(),
                 "git": True,
             }
         },
-        "default_project": "a_share",
+        "default_project": "example",
         "venvs": {
-            "kronos_ft": input("kronos_ft venv python 路径: ").strip(),
+            "python": input("python 解释器路径: ").strip(),
         },
     }
+    if not cfg["node"]:
+        print("错误: 必须显式填写 daemon 计算节点名", file=sys.stderr)
+        return 1
     # ---- 通知配置引导 (现行配置见 docs/reference.md) ----
     notify_on = input("\n启用任务完成通知? (y/N) ").strip().lower()
     if notify_on in ("y", "yes"):

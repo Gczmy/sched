@@ -1,6 +1,6 @@
 # sched 开发与操作指南
 
-本文件是 `sched` 项目的规则入口，适用于本目录及其子目录。配套仓库为同级的 `../dsh-node-sched`（当前本地路径 `D:/dsh-node-sched`）。
+本文件是 `sched` 项目的规则入口，适用于本目录及其子目录。配套仓库为同级的 `../dsh-node-sched`。
 
 ## 沟通
 
@@ -44,7 +44,8 @@
 | `docs/native-integration.md` | M2B 分支整合范围、实验接口限制与外部测试依赖 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
 | `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
-| `docs/code_review_sched_dsh_2026-08-29.md` | 联合复审历史；问题是否仍存在需对照当前代码 |
+| `docs/README.md` | 当前文档索引及历史记录的适用范围 |
+| `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
 
 ## 项目边界与代码入口
@@ -78,10 +79,10 @@
 
 网关禁止运行计算任务。正常批次提交使用网关上的 `sched submit <batch.json>`，由文件 inbox 交给计算节点 daemon 收编；返回“已投递”后，用 `sched verify <batch-id>` 确认入库。`sched run` 是计算节点直接写入入口，不走网关 inbox，除 `--dry-run` 外不得在网关执行。
 
-生产 daemon 通过现有 `ambior1` screen 会话进入计算节点后管理；2026-09-22 实查为 `318061.ambior1`、节点 `ambiorix`、租约 `2333`（120 CPU，至 2026-09-28 22:11:15 UTC）。后续先用 `screen -ls` 确认会话，节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消运行任务。支持 drain 的版本需要无损重启时按顺序执行：
+生产 daemon 通过实际部署使用的 screen 会话进入计算节点后管理。节点、会话、租约与有效期属于私有运行信息，不写入仓库；先用 `screen -ls` 确认会话，节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消运行任务。支持 drain 的版本需要无损重启时按顺序执行：
 
 1. 执行 `ssh HPDC`。
-2. 执行 `screen -d -r 318061.ambior1`（会话变更时使用实查值）。
+2. 执行 `screen -ls`，再执行 `screen -d -r <session-id>`，使用实查会话。
 3. 确认当前主机与 `sched config get` 的 `node` 一致，执行 `sched daemon drain --stop-when-idle`，等待 running 和未决启动标记清空、daemon 自然退出。
 4. 完成维护并通过 `sched daemon check` 后，执行 `sched daemon resume`、`sched daemon start`。旧版本尚无 drain 时，先等运行任务自然结束再 stop；不可用 stop 模拟无损排空。
 

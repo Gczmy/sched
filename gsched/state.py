@@ -403,7 +403,7 @@ def hostname() -> str:
 
     优先读 config.json 的 node 字段 (daemon 常驻计算节点, 多机共享 home 时
     登录节点 CLI 也读同一 state.db); 无 config/无 node 字段 fallback 本机
-    hostname. 背景: 登录节点 gethostname() = hpdc-gateway != ambiorix,
+    hostname. 背景: 登录节点 gethostname() 与配置的计算节点不同，
     登录节点 sched status 读到空目录 (旧坑: 只能 tmux 进计算节点查状态).
 
     M16: 回退仅限 config **不存在** (未 init 的环境); 存在但解析失败必须
