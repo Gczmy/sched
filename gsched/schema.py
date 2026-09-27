@@ -13,6 +13,18 @@ import shlex
 from typing import Any
 
 from .config import ConfigError, expand_path, resolve_template, project_gpu_enabled
+from .native_exec import (
+    NATIVE_EXEC_ALL_INTERNAL_FIELDS,
+    NATIVE_EXEC_PROFILE_V2_SCHEMA,
+    NATIVE_EXEC_V2_CONTRACT_FIELD,
+    NATIVE_EXEC_V2_ROOT_KEYS,
+    NATIVE_EXEC_V2_TASK_KEYS,
+    NativeExecProfileError,
+    native_exec_profile_schema_for_batch,
+    native_exec_project_root_identity_sha256,
+    native_exec_reserved_batch_names,
+    resolve_native_exec_profile,
+)
 
 SUDO_TOKENS = {"sudo", "su", "runuser"}
 MAX_NESTED_SHELL_STATES = 1024
@@ -592,11 +604,36 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
     if not isinstance(spec, dict):
         raise SchemaError("batch.json 顶层必须是 JSON 对象")
 
+    supplied_native_fields = sorted(NATIVE_EXEC_ALL_INTERNAL_FIELDS.intersection(spec))
+    if supplied_native_fields:
+        raise SchemaError(
+            "batch.json 不得提供 scheduler 内部 native-exec 字段: "
+            f"{supplied_native_fields}"
+        )
+
     name = _validate_identifier(spec.get("name"), "name")
 
     mode = spec.get("mode", "mix")
-    if mode != "mix":
-        raise SchemaError(f"mode 目前仅支持 mix (实际 {mode})")
+    if mode not in ("mix", "strict"):
+        raise SchemaError(f"mode 仅支持 mix 或冷配置精确授权的 strict (实际 {mode})")
+    try:
+        reserved_native_names = native_exec_reserved_batch_names(cfg)
+        strict_native_profile_schema = native_exec_profile_schema_for_batch(cfg, name)
+    except NativeExecProfileError as exc:
+        raise SchemaError(f"native_exec_profiles 配置非法: {exc}") from exc
+    if name in reserved_native_names and mode != "strict":
+        raise SchemaError(
+            f"批次名 '{name}' 已由 admin native_exec_profile 保留，"
+            "只能通过 exact mode=strict 提交"
+        )
+    if mode == "strict" and strict_native_profile_schema == NATIVE_EXEC_PROFILE_V2_SCHEMA:
+        actual_root_keys = frozenset(spec)
+        if actual_root_keys != NATIVE_EXEC_V2_ROOT_KEYS:
+            raise SchemaError(
+                "mode=strict V2 batch keys 必须精确匹配；"
+                f"missing={sorted(NATIVE_EXEC_V2_ROOT_KEYS - actual_root_keys, key=repr)}, "
+                f"extra={sorted(actual_root_keys - NATIVE_EXEC_V2_ROOT_KEYS, key=repr)}"
+            )
 
     depends_on = spec.get("depends_on", [])
     if not isinstance(depends_on, list):
@@ -608,6 +645,10 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
         raise SchemaError("gpus: 批次级选卡未实现, 请使用 task.resources")
 
     env = _validate_env(spec.get("env", {}), "env")
+    if mode == "strict" and env and strict_native_profile_schema != NATIVE_EXEC_PROFILE_V2_SCHEMA:
+        raise SchemaError(
+            "mode=strict 不允许 batch env；原生执行环境只由 scheduler 控制字段构造"
+        )
 
     # 批次级通知覆盖 (设计 §3): false = 本批不通知; {"email_to": [...]} 改收件人;
     # 缺省/true = 跟随全局 config.notify
@@ -654,6 +695,22 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
     tasks = spec.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise SchemaError("tasks 必须是至少一个任务的对象数组")
+    if mode == "strict":
+        if len(tasks) != 1:
+            raise SchemaError("mode=strict 仅允许一个精确授权的 cmd 任务")
+        if "sweep" in spec:
+            raise SchemaError("mode=strict 不允许 sweep 展开")
+        sole_task = tasks[0]
+        if not isinstance(sole_task, dict) or "stages" in sole_task:
+            raise SchemaError("mode=strict 仅允许单一 cmd，不能声明 stages")
+        if strict_native_profile_schema == NATIVE_EXEC_PROFILE_V2_SCHEMA:
+            actual_task_keys = frozenset(sole_task)
+            if actual_task_keys != NATIVE_EXEC_V2_TASK_KEYS:
+                raise SchemaError(
+                    "mode=strict V2 task keys 必须精确匹配；"
+                    f"missing={sorted(NATIVE_EXEC_V2_TASK_KEYS - actual_task_keys, key=repr)}, "
+                    f"extra={sorted(actual_task_keys - NATIVE_EXEC_V2_TASK_KEYS, key=repr)}"
+                )
 
     # B14 L4: sweep.matrix 同质任务矩阵展开。
     #   sweep: {matrix: {参数名: [取值...]}, max_parallel: N}
@@ -669,11 +726,118 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
 
     norm_tasks = []
     seen_ids: set[str] = set()
+    strict_project_root = None
+    strict_project_root_identity_sha256 = None
+    if mode == "strict":
+        strict_project_root = os.path.realpath(
+            os.path.expanduser(resolve_template(f"{{PROJECT:{project}}}", cfg))
+        )
+        try:
+            strict_project_root_identity_sha256 = (
+                native_exec_project_root_identity_sha256(
+                    strict_project_root
+                )
+            )
+        except NativeExecProfileError as exc:
+            raise SchemaError(str(exc)) from exc
     force_rerun = spec.get("force_rerun", False)
     if not isinstance(force_rerun, bool):
         raise SchemaError("force_rerun: 必须是布尔")
     for i, t in enumerate(tasks):
         nt = _validate_task(t, cfg, batch_cwd_abs, f"tasks[{i}]", seen_ids)
+        if mode == "strict":
+            from .templates import expand_cmd
+
+            assert nt["cmd"] is not None
+            assert strict_project_root is not None
+            if nt["cwd_abs"] != strict_project_root:
+                raise SchemaError(
+                    "mode=strict 的 effective cwd 必须等于当前 config project root"
+                )
+            is_native_v2 = strict_native_profile_schema == NATIVE_EXEC_PROFILE_V2_SCHEMA
+            if "runtime" in t and not is_native_v2:
+                raise SchemaError(
+                    "mode=strict 不允许另行声明 runtime；执行环境必须由精确 argv 决定"
+                )
+            if not is_native_v2 and ("git" not in t or t["git"] is not False):
+                raise SchemaError(
+                    "mode=strict 必须显式声明 git=false，禁止 native verifier "
+                    "之前执行 PATH 解析的 git 指纹子进程"
+                )
+            if nt["env"]:
+                raise SchemaError(
+                    "mode=strict 不允许 task env；原生执行环境只由 scheduler 控制字段构造"
+                )
+            if nt["resources"] != {
+                "gpu": 0,
+                "cpus": 1,
+                "gpu_share": False,
+            }:
+                raise SchemaError(
+                    "mode=strict 当前只允许精确 CPU-only resources: "
+                    "gpu=0, cpus=1, gpu_share=false"
+                )
+            if nt["artifacts"] or nt["paths_escape"]:
+                raise SchemaError(
+                    "mode=strict 不允许 scheduler artifact skip/cleanup 规则"
+                )
+            if nt["probes"] is not None:
+                raise SchemaError(
+                    "mode=strict 不允许 scheduler 日志 probe 改写任务终态"
+                )
+            if nt["max_retry"] != 0:
+                raise SchemaError(
+                    "mode=strict 必须显式声明 max_retry=0，不能自动重放原生执行"
+                )
+            effective_argv = expand_cmd(nt["cmd"], cfg, None, nt["cwd_abs"])
+            if effective_argv != nt["cmd"]:
+                raise SchemaError(
+                    "mode=strict 的 submitted argv 必须已是最终 argv，不能依赖模板展开"
+                )
+            batch_contract = None
+            if is_native_v2:
+                batch_contract = {
+                    "cwd": spec["cwd"],
+                    "depends_on": spec["depends_on"],
+                    "_protocol": spec["_protocol"],
+                    "batch_env": spec["env"],
+                    "task_env": t["env"],
+                    "runtime": t["runtime"],
+                    "duration_min": t["duration_min"],
+                    "max_retry": t["max_retry"],
+                    "resources": t["resources"],
+                    "artifacts": t["artifacts"],
+                }
+            try:
+                native_profile = resolve_native_exec_profile(
+                    cfg,
+                    mode=mode,
+                    project=project,
+                    batch_name=name,
+                    task_id=nt["id"],
+                    submitted_argv=nt["cmd"],
+                    batch_contract=batch_contract,
+                )
+            except NativeExecProfileError as exc:
+                raise SchemaError(f"native_exec_profiles 配置非法: {exc}") from exc
+            if native_profile is None:
+                raise SchemaError(
+                    "mode=strict 未精确匹配 admin cold native_exec_profile"
+                )
+            nt["_native_exec_profile_id"] = native_profile["profile_id"]
+            nt["_native_exec_profile_sha256"] = native_profile[
+                "profile_sha256"
+            ]
+            assert strict_project_root_identity_sha256 is not None
+            nt["_native_exec_project_root_identity_sha256"] = (
+                strict_project_root_identity_sha256
+            )
+            nt["_native_exec_submitted_argv"] = list(
+                native_profile["submitted_argv"]
+            )
+            if is_native_v2:
+                nt["git"] = False
+                nt[NATIVE_EXEC_V2_CONTRACT_FIELD] = native_profile["contract"]
         if batch_max_parallel is not None:
             nt["max_parallel"] = batch_max_parallel
         if force_rerun:
@@ -727,6 +891,13 @@ def _validate_task(
 ) -> dict:
     if not isinstance(t, dict):
         raise SchemaError(f"{where}: 任务必须是对象")
+
+    supplied_native_fields = sorted(NATIVE_EXEC_ALL_INTERNAL_FIELDS.intersection(t))
+    if supplied_native_fields:
+        raise SchemaError(
+            f"{where}: 不得提供 scheduler 内部 native-exec 字段: "
+            f"{supplied_native_fields}"
+        )
 
     tid = _validate_identifier(t.get("id"), f"{where}.id")
     if tid in seen_ids:
