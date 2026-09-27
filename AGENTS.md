@@ -41,6 +41,7 @@
 | 来源 | 用途 |
 | --- | --- |
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
+| `docs/native-integration.md` | M2B 分支整合范围、实验接口限制与外部测试依赖 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
 | `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
 | `docs/code_review_sched_dsh_2026-08-29.md` | 联合复审历史；问题是否仍存在需对照当前代码 |

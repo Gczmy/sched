@@ -26,6 +26,8 @@ from typing import Any, Callable, NamedTuple
 from . import state
 
 from .artifacts import all_pass, check_artifacts
+from .native_launch import NativeLaunchPlan, NativeLaunchUnavailable
+from .native_monitor import NativeMonitorLaunch
 
 # 常见进度行: "Epoch 5/30", "epoch: 5, loss: 0.12", "trial 3/20"
 PROGRESS_RE = re.compile(
@@ -410,6 +412,20 @@ def _claim_abandoned_launch_intent(path: str) -> bool | None:
             pass
 
 
+NATIVE_EXEC_ALLOWED_ENV_KEYS = frozenset(
+    {
+        "SCHED_PROFILE_OUT",
+        "SCHED_BATCH_ID",
+        "SCHED_TASK_ID",
+        "SCHED_RUN_ID",
+        "SCHED_PROJECT",
+        "SCHED_RC_DIR",
+        "SCHED_RC_PREFIX",
+        "SCHED_LAUNCH_MARKER",
+    }
+)
+
+
 class _DarwinProcBsdInfo(ctypes.Structure):
     _fields_ = [
         ("pbi_flags", ctypes.c_uint32),
@@ -725,7 +741,95 @@ class Executor:
         self.sanitize_env = sanitize_env
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
         self._dead_pgroups: set[int] = set()
+        # Native M is a direct child, not a process group or job-result owner.
+        self._native_monitors: dict[str, Any] = {}
+        self._native_monitor_ids: set[str] = set()
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
+
+    def reserve_native_monitor(self, session_id: str) -> None:
+        """Register an empty native owner before any child can be created.
+
+        Caller supplies a fresh 128-bit hexadecimal session key before calling
+        start, so even an interrupted return cannot hide the cleanup handle.
+        The bridge is imported only on explicit native use, with no fallback.
+        """
+        if type(session_id) is not str or re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
+            raise ValueError("native monitor session key must be 32 lowercase hexadecimal characters")
+        if session_id in self._native_monitor_ids:
+            raise ValueError("native monitor session key already consumed")
+        self._native_monitor_ids.add(session_id)
+        from . import _m2b_scheduler_native
+
+        owner = _m2b_scheduler_native.create_empty(session_id)
+        try:
+            self._native_monitors[session_id] = owner
+        except BaseException:
+            owner.discard_empty()  # native check proves no start/FD/wait owner
+            raise
+
+    def native_monitor_sessions(self) -> tuple[str, ...]:
+        return tuple(self._native_monitors)
+
+    def recover_native_monitor(self, session_id: str) -> None:
+        """Recover a native pin after an interrupted registry update, same TID.
+
+        This only finds the original in-memory owner. It cannot reconstruct
+        wait authority after daemon restart or from a disk PID/job record.
+        """
+        if session_id in self._native_monitors:
+            return
+        from . import _m2b_scheduler_native
+
+        for owner in _m2b_scheduler_native.retained_owners():
+            if json.loads(owner.snapshot())["session_id"] == session_id:
+                self._native_monitor_ids.add(session_id)
+                self._native_monitors[session_id] = owner
+                return
+        raise KeyError("no original native monitor owner on this process/thread")
+
+    def start_native_monitor(self, session_id: str, plan: NativeMonitorLaunch) -> None:
+        """Start real M through the already registered native owner.
+
+        Any start/return exception triggers native cancellation while retaining
+        the entry. The caller still owns the borrowed input FDs. No Popen,
+        process-group signalling, or job-success publication is involved.
+        """
+        if type(plan) is not NativeMonitorLaunch:
+            raise TypeError("native monitor start requires NativeMonitorLaunch")
+        owner = self._native_monitors[session_id]
+        try:
+            owner.start(*plan.native_arguments())
+        except BaseException as start_error:
+            try:
+                owner.cancel()
+            except BaseException as cleanup_error:
+                raise start_error from cleanup_error
+            raise
+
+    def poll_native_monitor(self, session_id: str) -> dict[str, Any]:
+        """Return actual native wait observations, never inferred exit codes."""
+        return json.loads(self._native_monitors[session_id].poll())
+
+    def close_native_monitor(self, session_id: str) -> None:
+        self._native_monitors[session_id].close()
+
+    def cancel_native_monitor(self, session_id: str) -> None:
+        self._native_monitors[session_id].cancel()
+
+    def persist_native_monitor(self, session_id: str) -> dict[str, Any]:
+        owner = self._native_monitors[session_id]
+        owner.persist()
+        return owner.publication_status()
+
+    def retire_native_monitor(self, session_id: str) -> None:
+        owner = self._native_monitors[session_id]
+        owner.retire()  # actual cleanup + latest native record durably exported
+        del self._native_monitors[session_id]
+
+    def discard_empty_native_monitor(self, session_id: str) -> None:
+        owner = self._native_monitors[session_id]
+        owner.discard_empty()
+        del self._native_monitors[session_id]
 
     def has_process(self, pgid: int) -> bool:
         """Whether this executor still owns the Popen handle for a process group."""
@@ -780,6 +884,26 @@ class Executor:
         ldl = merged_env.get("LD_LIBRARY_PATH", "")
         merged_env["LD_LIBRARY_PATH"] = f"{lib}:{ldl}" if ldl else lib
 
+    def launch_native(self, plan: NativeLaunchPlan) -> int:
+        """Consume one retained native plan or fail without a fallback.
+
+        The actual entry argv and empty environment are properties of the
+        scheduler-owned plan.  This interface intentionally accepts no public
+        ``cmd``, pathname executable, environment, cwd, or shell input.  The
+        reviewed Linux FD-exec backend is a later step, so the current method
+        closes every plan-owned descriptor and raises before process creation.
+        """
+        if not isinstance(plan, NativeLaunchPlan):
+            raise TypeError("launch_native requires a NativeLaunchPlan")
+        try:
+            plan.validate_live_fds()
+            raise NativeLaunchUnavailable(
+                "native FD-exec backend is not connected; no pathname or logical-argv "
+                "fallback is allowed"
+            )
+        finally:
+            plan.close()
+
     def launch(
         self,
         cmd: list[str] | None,
@@ -793,6 +917,9 @@ class Executor:
         stage_fingerprints: dict[str, str] | None = None,
         stage_checkpoint_dir: str | None = None,
         force_rerun: bool = False,
+        native_exec_profile_id: str | None = None,
+        native_exec_profile_sha256: str | None = None,
+        native_exec_submitted_argv: list[str] | None = None,
     ) -> int:
         """启动任务. 返回 wrapper 进程 PID (pgid 锚点).
 
@@ -802,19 +929,81 @@ class Executor:
         - CPU-only 任务 (gpu=None): 注入 CUDA_VISIBLE_DEVICES="" 禁 GPU ——
           XGB 等库启动时会初始化 CUDA context (即使 CPU 训练), 空串禁用
         - 一律注入 PYTHONUNBUFFERED=1 (日志即时性)
+        - legacy V1 native-exec 三字段必须同时缺席或同时有效；启用时只允许
+          单一 exact argv 并直接 Popen，不经 bash supervisor/RC shell。该路径
+          仍是非正式 foundation；V2 retained-FD 接口只允许走 launch_native。
         """
+        native_values = (
+            native_exec_profile_id,
+            native_exec_profile_sha256,
+            native_exec_submitted_argv,
+        )
+        native_exec = any(value is not None for value in native_values)
+        if native_exec:
+            if any(value is None for value in native_values):
+                raise ValueError("native-exec metadata must be all present or all absent")
+            if (
+                not isinstance(native_exec_profile_id, str)
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+                    native_exec_profile_id,
+                )
+                is None
+            ):
+                raise ValueError("native-exec profile id is invalid")
+            if (
+                not isinstance(native_exec_profile_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", native_exec_profile_sha256)
+                is None
+            ):
+                raise ValueError("native-exec profile digest is invalid")
+            if (
+                not isinstance(native_exec_submitted_argv, list)
+                or not native_exec_submitted_argv
+                or any(
+                    not isinstance(token, str) or not token or "\0" in token
+                    for token in native_exec_submitted_argv
+                )
+            ):
+                raise ValueError("native-exec submitted argv is invalid")
+            if (
+                not os.path.isabs(native_exec_submitted_argv[0])
+                or os.path.normpath(native_exec_submitted_argv[0])
+                != native_exec_submitted_argv[0]
+            ):
+                raise ValueError(
+                    "native-exec executable must be a normalized absolute path"
+                )
+            if conda_env_dir is not None:
+                raise ValueError("native-exec launch forbids an explicit runtime")
+            if gpu is not None:
+                raise ValueError("native-exec launch is CPU-only")
+            if stages is not None:
+                raise ValueError("native-exec launch forbids stages")
+            if cmd != native_exec_submitted_argv:
+                raise ValueError("native-exec command differs from submitted argv")
+            unexpected_env = sorted(set(env) - NATIVE_EXEC_ALLOWED_ENV_KEYS)
+            if unexpected_env:
+                raise ValueError(
+                    "native-exec environment contains non-scheduler keys: "
+                    f"{unexpected_env}"
+                )
         if stages is not None and stage_checkpoint_dir:
             state.ensure_private_directory(stage_checkpoint_dir)
         state.ensure_private_directory(os.path.dirname(log_path))
         log_f = state.open_private_text(log_path, "a")
 
-        merged_env = dict(os.environ)
+        # A native verifier is the first reviewed process.  It must not inherit
+        # daemon/PATH/loader/Python startup state; only dispatcher-owned control
+        # values are copied into an otherwise empty execve environment.
+        merged_env = {} if native_exec else dict(os.environ)
         for k, v in env.items():
             merged_env[k] = str(v)
         # H8 修复: 钉卡/fake 剥离放在任务 env 合并**之后** (§4.1 不可覆盖);
         # 否则任务 env 里的 CUDA_VISIBLE_DEVICES/SCHED_FAKE_GPUS 静默覆盖钉卡
         merged_env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
-        merged_env.setdefault("PYTHONUNBUFFERED", "1")
+        if not native_exec:
+            merged_env.setdefault("PYTHONUNBUFFERED", "1")
         merged_env.pop("SCHED_FAKE_GPUS", None)  # fake-gpu 不传染给子进程
         rc_dir = merged_env.get("SCHED_RC_DIR")
         rc_prefix = merged_env.get("SCHED_RC_PREFIX")
@@ -822,7 +1011,7 @@ class Executor:
         if launch_marker:
             launch_marker = str(launch_marker)
             state.ensure_private_directory(os.path.dirname(launch_marker) or ".")
-        if self.sanitize_env:
+        if self.sanitize_env and not native_exec:
             self._sanitize_conda_env(
                 merged_env,
                 cmd,
@@ -870,7 +1059,13 @@ class Executor:
             "return \"$__sched_foreground_rc\"; "
             "}; "
         )
-        if stages is not None:
+        if native_exec:
+            # The first process must be the externally reviewed native verifier
+            # itself.  A shell wrapper would create an unreviewed execution
+            # boundary and could rewrite argv or environment before execve.
+            shell_body = None
+            wrapper_cmd = [str(token) for token in (cmd or [])]
+        elif stages is not None:
             parts = []
             stale_sidecars = []
             fingerprints = stage_fingerprints or {}

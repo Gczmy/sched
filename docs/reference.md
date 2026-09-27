@@ -39,7 +39,7 @@
 |---|---|---|---|
 | `name` | str | ✅ | 批次名（1..128 位安全 ASCII 标识符；id 自动追加时间戳）|
 | `project` | str | ✅ | 项目名，必须在 config.projects 注册 |
-| `mode` | str | ✗ | `mix`（缺省；当前唯一实现的批次模式）|
+| `mode` | str | ✗ | `mix`（缺省）或管理员冷 profile 精确授权的 `strict` |
 | `priority` | int | ✗ | 项目内批次优先级，默认 0；整数越大越先考虑 |
 | `cwd` | str | ✗ | 缺省为该批次的 project root；支持 `{ROOT}`/`{PROJECT:name}`/`{VENV:key}` 模板 |
 | `env` | obj | ✗ | 字符串环境变量映射（最终覆盖，优先级高于自动注入）；变量名/值必须安全，shell bootstrap 与动态加载注入变量会被拒绝 |
@@ -75,6 +75,61 @@
 
 标识符必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`，且不能是 `.`/`..`。已移除或未实现的输入会拒绝：批次级 `gpus`、任务/阶段级 `retry_transform`、阶段级 `probes`；GPU 需求写 `resources.gpu`，probe 只写在任务级。
 
+M2B 的可用范围、外部 bridge 依赖和测试入口见 [native-integration.md](native-integration.md)。
+
+下述 `strict` 行为仅指 legacy V1，不是普通用户可自由选择的模式。它只允许一个单 `cmd` 任务，并要求：管理员冷配置
+`native_exec_profiles` 与 `(strict, project, batch name, task id, submitted argv)` 唯一精确匹配；
+`cmd[0]` 为规范化绝对路径；effective cwd 为当前项目根；不含 `stages`、`sweep`、`runtime`
+或 scheduler artifact skip/cleanup 规则、日志 probe；batch/task env 为空；resources 精确为
+`gpu=0, cpus=1, gpu_share=false`；显式 `git=false` 与 `max_retry=0`。`git=false` 阻止 reviewed
+native verifier 之前启动 PATH-resolved Git 子进程，code-byte 绑定由 external verifier 负责。四项 scheduler-owned metadata
+（profile id/digest、project-root identity digest、submitted argv）会落库，两个 digest 共同参与
+指纹。profile 对全部 mix 入口（包括 `sched run`）保留 batch name，第一次 strict 耐久入库后该名称永久消费；任何终态后的 fresh submit、
+retry/resubmit、失败重试或节点重启重放均拒绝。同 batch id 的 inbox 重投仅在耐久
+batch/task/job 不可变绑定精确一致时幂等，同名预占或持久态漂移会 fail-closed。
+
+dispatcher 在 running claim 前复核 cold profile、当前/持久 project-root canonical path 与
+device/inode identity、空 env、CPU-only resources。通过后从空继承环境构造 scheduler-owned
+control/identity 字段并 exact argv 直接 Popen，不走 Bash/RC supervisor。只有当前 daemon 持有的
+Popen rc 可成功结算；权威丢失时 fail-closed blocked，RC sidecar 对 native 无成功权威。
+
+边界：该实现仍按路径打开 executable/cwd，reattest→Popen 存在 TOCTOU；它不是 byte/FD-exact
+执行证明。external retained-FD verifier/monitor、七字段 attestation 与专用 poison-overwrite probe
+尚未实现，正式任务不得据此运行。
+
+显式版本 `schema: "sched_native_exec_profile_v2"` 当前仅提供冻结批次兼容校验：精确绑定
+root/task 公共 keyset，以及 raw `{PROJECT:...}` cwd、空依赖、`_protocol`、非空 batch env、
+空 task env、prefix runtime、整数 duration、`max_retry=0`、raw CPU resources、空 artifacts、
+公共 task `git` 缺席和未改写 logical argv。local submit 与 daemon inbox 均在依赖/指纹、
+批次或名称耐久写入、running claim、进程创建之前 fail-closed。V2 当前不落库、不做 launch-time
+reattest，也不授权 Popen；retained/bootstrap launcher 接入是后续独立步骤。
+
+后续接口目前也仅是 fail-closed plan foundation：scheduler 私有的一次性
+`NativeLaunchPlan` 持有并复核 retained launcher FD、全封印 request memfd、已连接
+AF_UNIX stream control FD、retained project-root dirfd 与 append-only log FD。request
+副本具有独立的零 offset；root 必须是非 `O_PATH` 的 `O_RDONLY` FD；单链接 log FD 必须
+匹配 retained root 下 `logs/` 内由逐级 `O_NOFOLLOW` 解析的相对路径。actual argv 固定为
+`m2b-exec-monitor[native-entry-v1] --native-entry-v1`，actual env 固定为空，child
+request/control/root FD 固定为 3/4/5；logical submitted argv 只作证据，不会拼入 actual
+argv。request body 仍 opaque 且无权威。私有 generated/no-data
+`NativeStep5DNoDataLaunchOwner` adapter 现在自行创建 AF_UNIX socketpair，只将 native 端交给
+plan factory 并立即关闭该源端；peer 端由创建进程私有保留，且不提供 raw-FD 或 transfer API。
+这只固定预期的 endpoint 构造形状，不认证 scheduler role，也不声称 native 可推断 peer endpoint
+独占。plan 只用 `request_frame_sha256` 命名完整 sealed frame 的 SHA-256，并另用
+`request_body_sha256` 命名 opaque body 的 SHA-256；不存在歧义的 `request_sha256` alias。
+`Executor.launch_native(plan)` 在 Linux FD-exec backend 接入前会关闭 plan 并在创建
+进程前拒绝，V2 提交闸门因此仍未解除。adapter 不含 launch、control protocol、nonce、publication
+或 daemon route；接入前仍必须完成原子的 final validate/map/FD-exec 与经过审查的真实
+direct-parent lifecycle。
+
+`gsched.native_step5d_alignment.foundation_alignment_projection()` 提供只读、可 JSON 序列化的
+`digest_and_direct_parent_endpoint_foundation_only` 声明；其值从生产 launch 常量、
+plan/owner slots、私有 factory 签名与 authority flags 派生。声明明确把 canonical request、
+owner-lifetime nonce、control protocol 和 isolated runtime 标为 `unimplemented`，并固定
+`step5d_complete=false`。它不导入项目侧协议、不创建 endpoint，也不新增
+launch/send/daemon API；主仓验证器会独立重建并追踪生产 foundation 后才接受相等。
+因此它只能用于基础对齐，不能作为 Step 5D 完成证据。
+
 ### config.json 相关（代理只读，调参报告用户）
 
 | 键 | 说明 |
@@ -93,7 +148,8 @@
 | `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
 | `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
-| `task_default_env` | 部署级任务环境缺省值 `{k:v}`；batch/task env 可覆盖。典型用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
+| `task_default_env` | 部署级普通任务环境缺省值 `{k:v}`；batch/task env 可覆盖。legacy V1 strict/native 忽略该键并从空继承环境启动；V2 当前不启动。典型普通任务用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
+| `native_exec_profiles` | 管理员持有的 strict exact-profile 映射；legacy V1 exact keys 为 `mode/project/batch_name/task_id/submitted_argv`；V2 用显式 schema 并增加冻结 batch/task 声明。batch_name 在 registry 内唯一且保留。profile registry 与引用项目的 root 均为冷配置；热更新拒绝，必须重启 daemon |
 
 `gpu_quota` 的计数单位是 job，不是不同物理卡或显存：正整数 `N` 表示该项目最多
 同时运行 `N` 个已经分配 GPU 的 job；独占和共享任务均每个 job 计 1，共享时多个

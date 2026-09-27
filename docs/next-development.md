@@ -3,7 +3,10 @@
 本文记录尚未实现的开发项，不是当前配置/API 参考。当前可用行为以
 [`reference.md`](reference.md) 和实际 CLI 为准。
 
-当前没有已排定的后续开发项。
+M2B 实验分支已整合，后续仍需接通 V2 的 retained-FD 启动后端与
+正式 dispatcher 生命周期，并完成外部 C bridge 和 MPC_OTSF 全链路验收。
+这些工作尚未实现或排期；当前合并不授权正式研究任务执行。
+范围与依赖见 [native-integration.md](native-integration.md)。
 
 ## 已完成的开发项
 

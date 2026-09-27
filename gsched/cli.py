@@ -44,6 +44,12 @@ from .schema import (
     validate_project_gpu_access,
 )
 from .templates import expand_cmd
+from .native_exec import (
+    NATIVE_EXEC_V2_CONTRACT_FIELD,
+    NativeExecProfileError,
+    native_exec_project_roots,
+    native_exec_reserved_batch_names,
+)
 
 
 def _is_foreign_host(cfg: dict) -> bool:
@@ -100,6 +106,70 @@ def _parse_task_ref(ref: str) -> tuple[str, str]:
 
 
 # ---------- 命令实现 ----------
+
+_NATIVE_EXEC_METADATA_KEYS = (
+    "_native_exec_profile_id",
+    "_native_exec_profile_sha256",
+    "_native_exec_project_root_identity_sha256",
+    "_native_exec_submitted_argv",
+)
+
+
+def _native_exec_fingerprint_kwargs(task: dict) -> dict[str, str]:
+    """Return native fingerprint binding only for a complete normalized tuple."""
+    if all(key in task for key in _NATIVE_EXEC_METADATA_KEYS):
+        return {
+            "native_exec_profile_sha256": task[
+                "_native_exec_profile_sha256"
+            ],
+            "native_exec_project_root_identity_sha256": task[
+                "_native_exec_project_root_identity_sha256"
+            ],
+        }
+    return {}
+
+
+def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
+    """Persist the schema-issued native metadata without partial tuples."""
+    if all(key in source for key in _NATIVE_EXEC_METADATA_KEYS):
+        destination.update(
+            {key: source[key] for key in _NATIVE_EXEC_METADATA_KEYS}
+        )
+
+
+def _native_exec_metadata_error(task: dict, expanded_cmd: Any) -> str | None:
+    """Reject partial or command-drifted native metadata before persistence."""
+    present = [key for key in _NATIVE_EXEC_METADATA_KEYS if key in task]
+    if present and len(present) != len(_NATIVE_EXEC_METADATA_KEYS):
+        return "native exec metadata must be an all-or-none tuple"
+    if present and (
+        not isinstance(task["_native_exec_profile_id"], str)
+        or not task["_native_exec_profile_id"]
+    ):
+        return "native exec profile id must be non-empty"
+    if present and (
+        not isinstance(task["_native_exec_profile_sha256"], str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", task["_native_exec_profile_sha256"]
+        )
+        is None
+    ):
+        return "native exec profile sha256 must be lowercase 64-hex"
+    if present and (
+        not isinstance(
+            task["_native_exec_project_root_identity_sha256"], str
+        )
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            task["_native_exec_project_root_identity_sha256"],
+        )
+        is None
+    ):
+        return "native exec project root identity sha256 must be lowercase 64-hex"
+    if present and task["_native_exec_submitted_argv"] != expanded_cmd:
+        return "native exec submitted argv does not match expanded command"
+    return None
+
 
 def cmd_init(args: argparse.Namespace) -> int:
     """sched init: 向导生成 config.json (M0)."""
@@ -255,6 +325,7 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
                 runtime_prefix=task.get("runtime_prefix"),
                 execution_env=task_environment(cfg, norm.get("env"), task.get("env")),
                 artifacts=task.get("artifacts"),
+                **_native_exec_fingerprint_kwargs(task),
             )
             git_rev = rev or git_rev
             reason = (
@@ -289,6 +360,7 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
             runtime_prefix=task.get("runtime_prefix"),
             execution_env=task_environment(cfg, norm.get("env"), task.get("env")),
             artifacts=task.get("artifacts"),
+            **_native_exec_fingerprint_kwargs(task),
         )
         git_rev = rev or git_rev
         skip, reason = predict_task(
@@ -322,7 +394,10 @@ def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, con
         return
     print(f"=== dry-run: {norm['name']} ({len(norm['tasks'])} 任务, mode={norm['mode']}) ===")
     if conflict:
-        print("  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
+        if norm["mode"] == "strict":
+            print("  ⚠️ strict 批次名已消费 — 实际提交会被拒绝")
+        else:
+            print("  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
     if prev["dep_status"]:
         print("--- 依赖就绪 ---")
         for dep, st in prev["dep_status"].items():
@@ -364,6 +439,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
         return 1
     try:
         norm = validate_batch(spec, cfg)
+    except (SchemaError, ConfigError) as e:
+        print(f"校验失败: {e}", file=sys.stderr)
+        return 1
+    if any(
+        NATIVE_EXEC_V2_CONTRACT_FIELD in task for task in norm["tasks"]
+    ):
+        print(
+            "校验失败: native exec profile V2 仅完成冻结合同兼容校验；"
+            "实际 retained/bootstrap launcher 尚未接入，拒绝持久化或启动",
+            file=sys.stderr,
+        )
+        return 1
+    try:
         check_dependency_cycle(norm["depends_on"], cfg)
     except (SchemaError, ConfigError) as e:
         print(f"校验失败: {e}", file=sys.stderr)
@@ -501,6 +589,23 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # Foreign-host or first-run dry-run cannot create/migrate/write state.db.
     # Dependency and producer state is UNAVAILABLE; the daemon rechecks on submit.
     if not stateless_dry_run:
+        # Strict native profile names are durable one-shot capabilities.  This
+        # early read avoids git/fingerprint work for an already consumed name;
+        # the authoritative check is repeated under submission_connect below.
+        if norm["mode"] == "strict" and not dry_run:
+            with state.connect() as conn:
+                consumed = conn.execute(
+                    "SELECT 1 FROM batches WHERE name=? LIMIT 1",
+                    (norm["name"],),
+                ).fetchone()
+            if consumed is not None:
+                print(
+                    f"错误: strict 批次名 '{norm['name']}' 已消费；"
+                    "必须配置新的 native profile/batch name 并重启 daemon",
+                    file=sys.stderr,
+                )
+                return 1
+        # 依赖 name 存在性 (O1): 提交时解析为最新同 name 批次 id
         with state.connect() as conn:
             try:
                 validate_persisted_dependencies(
@@ -538,11 +643,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
                         "paths_escape": s.get("paths_escape", False),
                     }
                 )
+        native_metadata_error = _native_exec_metadata_error(t, cmd_e)
+        if native_metadata_error is not None:
+            print(f"校验失败: {native_metadata_error}", file=sys.stderr)
+            return 1
         fp, stage_fps, _rev = compute_fingerprint(
             cmd_e, stages_e, t["cwd_abs"], t["git"], cfg.get("venvs", {}),
             runtime_prefix=t.get("runtime_prefix"),
             execution_env=task_environment(cfg, norm.get("env"), t.get("env")),
             artifacts=t.get("artifacts"),
+            **_native_exec_fingerprint_kwargs(t),
         )
         prepared_tasks.append((i, t, cmd_e, stages_e, fp, stage_fps))
     if stateless_dry_run:
@@ -572,16 +682,25 @@ def cmd_submit(args: argparse.Namespace) -> int:
         existing = conn.execute(
             "SELECT status FROM batches WHERE name=?", (norm["name"],)
         ).fetchall()
-        conflict = any(
+        strict_consumed = norm["mode"] == "strict" and bool(existing)
+        ordinary_conflict = any(
             b["status"] not in ("done", "blocked", "discarded")
             for b in existing
         )
+        conflict = strict_consumed or ordinary_conflict
         if conflict and not dry_run:
-            print(
-                f"错误: 同名批次 '{norm['name']}' 已有未终态批次 (定案 6),"
-                " 请改名或用 sched resubmit",
-                file=sys.stderr,
-            )
+            if strict_consumed:
+                print(
+                    f"错误: strict 批次名 '{norm['name']}' 已消费；"
+                    "必须配置新的 native profile/batch name 并重启 daemon",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"错误: 同名批次 '{norm['name']}' 已有未终态批次 (定案 6),"
+                    " 请改名或用 sched resubmit",
+                    file=sys.stderr,
+                )
             return 1
 
         if dry_run:
@@ -620,6 +739,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "runtime": t.get("runtime"),
                 "runtime_prefix": t.get("runtime_prefix"),
             }
+            _persist_native_exec_metadata(t, spec_json)
             state.insert_task(
                 conn, bid, t["id"], 1, spec_json, i,
                 norm.get("project"),
@@ -656,8 +776,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("错误: 空命令", file=sys.stderr)
         return 1
 
-    from datetime import datetime
-
     # venv: 无 --venv 时用 config 第一个 venv
     venvs = cfg.get("venvs", {})
     venv_name = args.venv or next(iter(venvs), None)
@@ -677,6 +795,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     ts = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
     batch_name = f"run-{tokens[0].split('/')[-1]}-{ts[-6:]}"
     bid = f"{batch_name}-{ts}"
+    try:
+        reserved_native_names = native_exec_reserved_batch_names(cfg)
+    except NativeExecProfileError as error:
+        print(f"错误: native_exec_profiles 配置非法: {error}", file=sys.stderr)
+        return 1
+    if batch_name in reserved_native_names:
+        print(
+            f"错误: sched run 生成的批次名 '{batch_name}' 已由 "
+            "admin native_exec_profile 保留；拒绝 mix 快捷提交",
+            file=sys.stderr,
+        )
+        return 1
 
     cwd = args.cwd or "{ROOT}"
     cwd_abs = os.path.realpath(os.path.expanduser(resolve_template(cwd, cfg)))
@@ -1900,11 +2030,18 @@ def cmd_retry(args: argparse.Namespace) -> int:
                 return 1
             task = None
         batch_row = conn.execute(
-            "SELECT status, project FROM batches WHERE id=?",
+            "SELECT status, project, name, mode FROM batches WHERE id=?",
             (batch,),
         ).fetchone()
         if not batch_row:
             print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+            return 1
+        if batch_row["mode"] == "strict":
+            print(
+                "错误: strict 批次的原生执行绑定不允许 retry;"
+                " 请重新审批并提交新批次",
+                file=sys.stderr,
+            )
             return 1
         if batch_row["status"] == "discarded":
             print(
@@ -1942,6 +2079,27 @@ def cmd_retry(args: argparse.Namespace) -> int:
         except SchemaError as error:
             print(f"retry 拒绝: {error}", file=sys.stderr)
             return 1
+        for job in targets:
+            task_row = conn.execute(
+                "SELECT spec FROM tasks"
+                " WHERE batch_id=? AND id=? AND version=?",
+                (job["batch_id"], job["task_id"], job["version"]),
+            ).fetchone()
+            if task_row is None:
+                continue
+            try:
+                task_spec = json.loads(task_row["spec"])
+            except (json.JSONDecodeError, TypeError):
+                task_spec = None
+            if isinstance(task_spec, dict) and any(
+                key in task_spec for key in _NATIVE_EXEC_METADATA_KEYS
+            ):
+                print(
+                    "错误: 含原生执行绑定的任务不允许 retry;"
+                    " 请重新审批并提交新批次",
+                    file=sys.stderr,
+                )
+                return 1
         blocked_markers = [
             j for j in targets
             if j["kill_reason"] != "probe"
@@ -2066,10 +2224,17 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
     prepared_specs = []
     with state.connect() as conn:
         batch_row = conn.execute(
-            "SELECT status, project, name, env FROM batches WHERE id=?", (batch,)
+            "SELECT status, project, name, env, mode FROM batches WHERE id=?", (batch,)
         ).fetchone()
         if not batch_row:
             print(f"错误: 批次不存在: {ref}", file=sys.stderr)
+            return 1
+        if batch_row["mode"] == "strict":
+            print(
+                "错误: strict 批次的原生执行绑定不允许 resubmit;"
+                " 请重新审批并提交新批次",
+                file=sys.stderr,
+            )
             return 1
         if batch_row["status"] == "discarded":
             print(
@@ -2165,17 +2330,6 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
         except SchemaError as error:
             print(f"resubmit 拒绝: {error}", file=sys.stderr)
             return 1
-        if args.dry_run:
-            print(
-                f"[dry-run] 将 resubmit {len(jobs)} 个任务"
-                " (各生成新版本排队尾):"
-            )
-            for job in jobs:
-                print(
-                    f"  {job['task_id']} [{job['status']}]"
-                    f" v{job['version']} -> v{job['version'] + 1}"
-                )
-            return 0
         for job in jobs:
             task_row = conn.execute(
                 "SELECT spec, order_idx FROM tasks"
@@ -2197,6 +2351,13 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if any(key in spec for key in _NATIVE_EXEC_METADATA_KEYS):
+                print(
+                    "错误: 含原生执行绑定的任务不允许 resubmit;"
+                    " 请重新审批并提交新批次",
+                    file=sys.stderr,
+                )
+                return 1
             spec.pop("retry_transform", None)
             for stage in spec.get("stages") or []:
                 if isinstance(stage, dict):
@@ -2211,6 +2372,17 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                     "order_idx": task_row["order_idx"],
                 }
             )
+        if args.dry_run:
+            print(
+                f"[dry-run] 将 resubmit {len(jobs)} 个任务"
+                " (各生成新版本排队尾):"
+            )
+            for job in jobs:
+                print(
+                    f"  {job['task_id']} [{job['status']}]"
+                    f" v{job['version']} -> v{job['version'] + 1}"
+                )
+            return 0
 
     from .fingerprint import compute_fingerprint
 
@@ -2745,7 +2917,8 @@ def cmd_config_set(args: argparse.Namespace) -> int:
 def _config_set_serialized(args: argparse.Namespace) -> int:
     """sched config set -f <patch.json> [--yes]: 深合并补丁 -> 校验 -> 原子写 -> 热重载.
 
-    冷键 (node/state_dir/user/schema_version/gpus 卡集与容量) 变更直接拒绝 ——
+    冷键 (node/state_dir/user/schema_version/gpus/native_exec_profiles 及其引用的 project root)
+    变更直接拒绝 ——
     与 daemon 侧热更新拒绝逻辑一致 (B12-a)。写入成功后自动写 config_reload
     控制请求, daemon 下个 tick (<10s) 生效, 不受 NFS mtime 缓存延迟影响。
     """
@@ -2769,7 +2942,7 @@ def _config_set_serialized(args: argparse.Namespace) -> int:
     _deep_merge(new_cfg, patch)
 
     # 冷键拒绝 (与 dispatcher CONFIG_COLD_KEYS 同口径)
-    cold = [k for k in ("node", "state_dir", "user", "schema_version")
+    cold = [k for k in ("node", "state_dir", "user", "schema_version", "native_exec_profiles")
             if old.get(k) != new_cfg.get(k)]
     try:
         og, ng = parse_gpus(old), parse_gpus(new_cfg)
@@ -2778,6 +2951,16 @@ def _config_set_serialized(args: argparse.Namespace) -> int:
         return 1
     if (og[0], og[1]) != (ng[0], ng[1]):
         cold.append("gpus(卡集或容量覆盖)")
+    try:
+        native_roots_changed = (
+            native_exec_project_roots(old)
+            != native_exec_project_roots(new_cfg)
+        )
+    except NativeExecProfileError as error:
+        print(f"错误: 新配置校验失败 (未写入): {error}", file=sys.stderr)
+        return 1
+    if native_roots_changed:
+        cold.append("native_exec_project_roots")
     if cold:
         print(f"错误: 含冷键变更 {cold} —— 热更新拒绝, 请手动编辑并重启 daemon",
               file=sys.stderr)
@@ -2828,7 +3011,8 @@ def cmd_config_reload(args: argparse.Namespace) -> int:
 
     CLI 本地先 load_config() 预校验 —— 语法/结构错误当场报给调用者,
     通过后才写 control_request 让 daemon 下个 tick (<10s) 换配置.
-    冷键变更 (node/state_dir/user/gpus 卡集) daemon 会拒绝并提示重启.
+    冷键变更 (node/state_dir/user/gpus/native_exec_profiles 及其引用的 project root) daemon
+    会拒绝并提示重启.
     """
     try:
         load_config()
@@ -2839,7 +3023,10 @@ def cmd_config_reload(args: argparse.Namespace) -> int:
         req_id = state.insert_control_request(
             conn, "*config*", op="config_reload")
     print(f"✅ 配置校验通过, 重载请求 #{req_id} 已入队 (daemon <10s 内生效)")
-    print("   注意: node/state_dir/user/gpus 卡集为冷键, 变更需重启 daemon")
+    print(
+        "   注意: node/state_dir/user/gpus 卡集、native_exec_profiles "
+        "及其引用的 project root 为冷键, 变更需重启 daemon"
+    )
     return 0
 
 

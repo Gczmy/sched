@@ -12,9 +12,11 @@ import time
 def main():
     with tempfile.TemporaryDirectory(prefix='sched-host-resources-') as temporary:
         root = Path(temporary)
+        # Keep real-memory admission viable on small Linux development machines.
+        # Two 0.5 GiB reservations still exceed the configured usable 0.875 GiB.
         cfg = {'schema_version': 1, 'node': socket.gethostname(), 'user': os.environ['USER'],
                'state_dir': str(root/'state'), 'gpus': [0], 'cpus_total': 2,
-               'host_mem_total_gib': 16, 'host_mem_reserve_gib': 1,
+               'host_mem_total_gib': 1, 'host_mem_reserve_gib': 0.125,
                'default_project': 'test', 'projects': {'test': {'root': str(root), 'git': False}},
                'venvs': {'python': sys.executable}}
         (root/'config.json').write_text(json.dumps(cfg))
@@ -42,7 +44,7 @@ def main():
                     "exec('while not release.exists():\\n time.sleep(.1)'); "
                     f"Path({str(root/(task+'.txt'))!r}).write_text('ok')")
             tasks.append({'id': task, 'cmd': [sys.executable, '-c', code],
-                          'resources': {'gpu': 1, 'cpus': 1, 'host_mem_gib': 8}, 'max_retry': 0,
+                          'resources': {'gpu': 1, 'cpus': 1, 'host_mem_gib': 0.5}, 'max_retry': 0,
                           'artifacts': {'result': {'path': str(root/(task+'.txt'))}}})
         (root/'batch.json').write_text(json.dumps({'name': 'drain-lifecycle', 'project': 'test', 'tasks': tasks}))
         try:
