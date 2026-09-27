@@ -15,6 +15,8 @@ import stat
 from collections.abc import Mapping
 from typing import Any, Final, NamedTuple
 
+from .native_deployment import NativeDeployment, require_deployment
+
 from .native_step5d_wire import (
     NATIVE_ACTUAL_ARGV,
     NATIVE_EXEC_TARGET_CLOEXEC_REQUIRED,
@@ -111,21 +113,6 @@ PHASE_PROFILES: Final = (
     "raw_collection",
     "aggregation",
 )
-_PYTHON: Final = "/home/zzhang54/miniconda3/envs/mpcotsf/bin/python"
-LOGICAL_ARGV_PROFILES: Final = {
-    phase: (
-        _PYTHON,
-        "-I",
-        "-S",
-        "experiments/m2b_runtime_bootstrap.py",
-        "--phase-entrypoint",
-        "experiments/m2b_scheduler_identity_probe.py",
-        "--phase-profile",
-        phase,
-    )
-    for phase in PHASE_PROFILES
-}
-
 REQUEST_KEYS: Final = frozenset(
     {
         "schema",
@@ -553,7 +540,7 @@ def _validate_path(value: Any) -> str:
     return path
 
 
-def _validate_request_structure(request: dict[str, Any]) -> None:
+def _validate_request_structure(request: dict[str, Any], deployment: NativeDeployment) -> None:
     if frozenset(request) != REQUEST_KEYS:
         _raise("request_schema_mismatch")
     if request["schema"] != REQUEST_SCHEMA or type(request["schema"]) is not str:
@@ -608,7 +595,7 @@ def _validate_request_structure(request: dict[str, Any]) -> None:
         _raise("request_schema_mismatch")
 
     root = _plain_object(request["project_root_expectation"], PROJECT_ROOT_KEYS)
-    if type(root["project"]) is not str or root["project"] != "mpcotsf":
+    if type(root["project"]) is not str or root["project"] != deployment.project:
         _raise("request_schema_mismatch")
     _validate_path(root["canonical_absolute_path"])
     _strict_int(root["st_dev"], minimum=0, maximum=_MAX_UINT64)
@@ -627,14 +614,14 @@ def _validate_request_structure(request: dict[str, Any]) -> None:
     _require_sha256(request["submitted_logical_argv_sha256"])
 
 
-def validate_request_body(payload: bytes) -> dict[str, Any]:
+def validate_request_body(payload: bytes, *, deployment: NativeDeployment) -> dict[str, Any]:
     """Validate one request body in the exact frozen first-failure order."""
 
     try:
         request = parse_canonical_json_object(payload)
     except (TypeError, ValueError):
         _raise("request_body_noncanonical")
-    _validate_request_structure(request)
+    _validate_request_structure(request, require_deployment(deployment))
 
     if request["protocol_sha256"] != PARENT_PROTOCOL_SHA256:
         _raise("request_protocol_mismatch")
@@ -642,17 +629,17 @@ def validate_request_body(payload: bytes) -> dict[str, Any]:
     phase = request["target_phase_profile"]
     if phase not in PHASE_PROFILES:
         _raise("request_target_phase_mismatch")
-    expected_argv = LOGICAL_ARGV_PROFILES[phase]
+    expected_argv = deployment.argv(phase)
     if tuple(request["submitted_logical_argv"]) != expected_argv:
         _raise("request_target_phase_mismatch")
 
     prefix = request["scheduler_identity_prefix"]
-    expected_batch = f"mpcotsf-cpu-m2b-step5d-peer-bound-stop-v1-{phase}"
-    expected_task = f"m2b_step5d_peer_bound_stop_{phase}"
+    expected_batch = deployment.batch_name(phase)
+    expected_task = deployment.task_id(phase)
     run_id = prefix["SCHED_RUN_ID"]
     expected_rc = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
     if (
-        prefix["SCHED_PROJECT"] != "mpcotsf"
+        prefix["SCHED_PROJECT"] != deployment.project
         or prefix["SCHED_BATCH_ID"] != expected_batch
         or prefix["SCHED_TASK_ID"] != expected_task
         or prefix["SCHED_RC_PREFIX"] != expected_rc
@@ -676,6 +663,7 @@ def validate_request_body(payload: bytes) -> dict[str, Any]:
 
 def build_request_body(
     *,
+    deployment: NativeDeployment,
     target_phase_profile: str,
     scheduler_identity_prefix: Mapping[str, Any],
     launch_nonce: str,
@@ -686,7 +674,7 @@ def build_request_body(
 
     if target_phase_profile not in PHASE_PROFILES:
         _raise("request_target_phase_mismatch")
-    argv = list(LOGICAL_ARGV_PROFILES[target_phase_profile])
+    argv = list(require_deployment(deployment).argv(target_phase_profile))
     request = {
         "schema": REQUEST_SCHEMA,
         "request_kind": REQUEST_KIND,
@@ -704,12 +692,12 @@ def build_request_body(
         "scientific_input_policy": SCIENTIFIC_INPUT_POLICY,
     }
     payload = canonical_json_bytes(request)
-    validate_request_body(payload)
+    validate_request_body(payload, deployment=deployment)
     return payload
 
 
-def encode_request_frame(body: bytes) -> bytes:
-    validate_request_body(body)
+def encode_request_frame(body: bytes, *, deployment: NativeDeployment) -> bytes:
+    validate_request_body(body, deployment=deployment)
     return encode_native_launch_frame(
         channel=NATIVE_LAUNCH_CHANNEL_REQUEST,
         message_type=NATIVE_LAUNCH_MESSAGE_REQUEST,
@@ -718,7 +706,7 @@ def encode_request_frame(body: bytes) -> bytes:
     )
 
 
-def request_digests(frame: bytes) -> RequestDigests:
+def request_digests(frame: bytes, *, deployment: NativeDeployment) -> RequestDigests:
     try:
         decoded = decode_native_launch_frame(frame)
     except (TypeError, ValueError):
@@ -729,7 +717,7 @@ def request_digests(frame: bytes) -> RequestDigests:
         or decoded.sequence != NATIVE_LAUNCH_REQUEST_SEQUENCE
     ):
         _raise("request_frame_invalid")
-    validate_request_body(decoded.opaque_body)
+    validate_request_body(decoded.opaque_body, deployment=deployment)
     return RequestDigests(
         request_frame_sha256=hashlib.sha256(frame).hexdigest(),
         request_body_sha256=hashlib.sha256(decoded.opaque_body).hexdigest(),
@@ -986,7 +974,7 @@ def parse_failure_frame(frame: bytes) -> dict[str, Any]:
 
 
 def scheduler_prefix(
-    *, target_phase_profile: str, run_id: str, launch_marker: str
+    *, deployment: NativeDeployment, target_phase_profile: str, run_id: str, launch_marker: str
 ) -> dict[str, str]:
     if target_phase_profile not in PHASE_PROFILES:
         _raise("request_target_phase_mismatch")
@@ -994,24 +982,21 @@ def scheduler_prefix(
     _bounded_text(
         launch_marker, minimum=1, maximum=_MAX_DYNAMIC_STRING_BYTES
     )
+    require_deployment(deployment)
     return {
-        "SCHED_BATCH_ID": (
-            "mpcotsf-cpu-m2b-step5d-peer-bound-stop-v1-"
-            + target_phase_profile
-        ),
-        "SCHED_TASK_ID": (
-            "m2b_step5d_peer_bound_stop_" + target_phase_profile
-        ),
+        "SCHED_BATCH_ID": deployment.batch_name(target_phase_profile),
+        "SCHED_TASK_ID": deployment.task_id(target_phase_profile),
         "SCHED_RUN_ID": run_id,
-        "SCHED_PROJECT": "mpcotsf",
+        "SCHED_PROJECT": deployment.project,
         "SCHED_RC_PREFIX": hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24],
         "SCHED_LAUNCH_MARKER": launch_marker,
     }
 
 
-def alignment_projection() -> dict[str, Any]:
+def alignment_projection(*, deployment: NativeDeployment) -> dict[str, Any]:
     """Return the complete shared Step 5D scheduler/native projection."""
 
+    require_deployment(deployment)
     false_authority_fields = [
         "scheduler_role_authority_claimed",
         "external_anchor_authenticated",
@@ -1102,8 +1087,8 @@ def alignment_projection() -> dict[str, Any]:
                 "active_phase_authorization_sha256": None,
                 "scientific_input_policy": SCIENTIFIC_INPUT_POLICY,
                 "peer_role": PEER_ROLE,
-                "scheduler_project": "mpcotsf",
-                "project_root_project": "mpcotsf",
+                "scheduler_project": deployment.project,
+                "project_root_project": deployment.project,
             },
             "field_types": {
                 "schema": (
@@ -1152,7 +1137,7 @@ def alignment_projection() -> dict[str, Any]:
             },
             "phase_profiles": list(PHASE_PROFILES),
             "logical_argv_profiles": {
-                phase: list(LOGICAL_ARGV_PROFILES[phase])
+                phase: list(deployment.argv(phase))
                 for phase in PHASE_PROFILES
             },
             "logical_argv_profile_rule": {
@@ -1197,19 +1182,19 @@ def alignment_projection() -> dict[str, Any]:
                     "exact_keyset": sorted(SCHEDULER_PREFIX_KEYS),
                     "rules": {
                         "SCHED_BATCH_ID": (
-                            "exact Step 5D batch claim mpcotsf-cpu-m2b-"
-                            "step5d-peer-bound-stop-v1-{target_phase_profile}"
+                            "exact Step 5D batch claim "
+                            + deployment.batch_name_template.replace("{phase}", "{target_phase_profile}")
                         ),
                         "SCHED_TASK_ID": (
                             "exact Step 5D task claim "
-                            "m2b_step5d_peer_bound_stop_{target_phase_profile}"
+                            + deployment.task_id_template.replace("{phase}", "{target_phase_profile}")
                         ),
                         "SCHED_RUN_ID": (
                             "untrusted scheduler_dynamic_string; shape only "
                             "because this slice has no request-external "
                             "expected value"
                         ),
-                        "SCHED_PROJECT": "string exactly mpcotsf",
+                        "SCHED_PROJECT": "string exactly " + deployment.project,
                         "SCHED_RC_PREFIX": (
                             "first 24 lowercase hexadecimal characters of "
                             "SHA256(SCHED_RUN_ID UTF-8)"
@@ -1286,7 +1271,7 @@ def alignment_projection() -> dict[str, Any]:
                 "project_root_expectation_v1": {
                     "exact_keyset": sorted(PROJECT_ROOT_KEYS),
                     "rules": {
-                        "project": "string exactly mpcotsf",
+                        "project": "string exactly " + deployment.project,
                         "canonical_absolute_path": (
                             "path that starts with one slash, is not root, has "
                             "no trailing slash, NUL, //, empty, dot or dot-dot "
@@ -1726,7 +1711,6 @@ __all__ = [
     "FAILURE_DIGEST_KNOWNNESS",
     "FAILURE_REASON_STATES",
     "FAILURE_SCHEMA",
-    "LOGICAL_ARGV_PROFILES",
     "NATIVE_FAILURE_REASONS",
     "PARENT_PROTOCOL_SHA256",
     "PEER_ROLE",

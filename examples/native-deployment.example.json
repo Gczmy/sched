@@ -1,0 +1,11 @@
+{
+  "schema": "sched_native_deployment/v1",
+  "project": "example",
+  "batch_name_template": "example-native-{phase}",
+  "task_id_template": "task-{phase}",
+  "logical_argv_profiles": {
+    "preparation": ["/opt/example/bin/python", "-I", "-S", "scripts/example.py", "--phase", "preparation"],
+    "raw_collection": ["/opt/example/bin/python", "-I", "-S", "scripts/example.py", "--phase", "raw_collection"],
+    "aggregation": ["/opt/example/bin/python", "-I", "-S", "scripts/example.py", "--phase", "aggregation"]
+  }
+}

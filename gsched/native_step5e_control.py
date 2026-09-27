@@ -15,6 +15,7 @@ from . import _native_step5d_linux as linux
 from . import native_step5d_protocol as parent
 from . import native_step5e_protocol as p
 from . import native_step5e_transport as transport
+from .native_deployment import NativeDeployment, require_deployment
 
 
 class _NonceOwner:
@@ -45,9 +46,10 @@ class NativeStep5ESender:
     All sockets passed into run become owned by this object, even on rejection.
     """
     __slots__ = ('_pid', '_root', '_session', '_state', '_failure', '_init_bytes',
-                 '_nonce_owner', '_nonce', '_request_frame', '_startup', '_channel')
+                 '_nonce_owner', '_nonce', '_request_frame', '_startup', '_channel', '_deployment')
 
-    def __init__(self, *, expected_root: dict, expected_session: str):
+    def __init__(self, *, deployment: NativeDeployment, expected_root: dict, expected_session: str):
+        self._deployment = require_deployment(deployment)
         transport.capability()
         p.credentials(expected_root, 'startup_protocol_failure')
         p.session(expected_session, 'startup_protocol_failure')
@@ -86,7 +88,7 @@ class NativeStep5ESender:
                 p.validate_startup(value, 'ABORT', expected_session=self._session)
                 self._reject('startup_protocol_failure')
             p.validate_startup(value, name, expected_session=self._session,
-                               expected_launch_nonce=self._nonce)
+                               expected_launch_nonce=self._nonce, deployment=self._deployment)
             return value, rights
         except p.Step5EProtocolViolation:
             transport._close_rights(rights)
@@ -153,10 +155,12 @@ class NativeStep5ESender:
                         credentials=dict(pid=self._pid, uid=os.getuid(), gid=os.getgid()),
                         process_identity=identity)
             body = parent.build_request_body(target_phase_profile=init['phase'],
+                deployment=self._deployment,
                 scheduler_identity_prefix=init['scheduler_identity_prefix'], launch_nonce=self._nonce,
                 control_peer_expectation=peer, project_root_expectation=init['root_identity'])
-            self._request_frame = parent.encode_request_frame(body)
-            envelope = p.request_envelope(self._session, init['anchor_nonce'], self._request_frame)
+            self._request_frame = parent.encode_request_frame(body, deployment=self._deployment)
+            envelope = p.request_envelope(self._session, init['anchor_nonce'], self._request_frame,
+                                          deployment=self._deployment)
             transport.send_frame(self._channel, envelope, deadline_ns=attempt_deadline_ns)
             self._state = 'REQUEST_SENT'
             # V is created after S: INIT cannot contain its future PID. S only

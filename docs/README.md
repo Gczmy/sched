@@ -8,6 +8,7 @@
 | [reference.md](reference.md) | 配置、CLI、JSON、状态机与写操作契约 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [native-integration.md](native-integration.md) | 实验 native 接口的实现范围与外部依赖 |
+| [native-deployment.md](native-deployment.md) | 私有部署绑定的迁移、信任来源与 Python API |
 | [next-development.md](next-development.md) | 尚未完成的开发项 |
 | [repository-hygiene.md](repository-hygiene.md) | 仓库中的隐私信息和运行记录边界 |
 

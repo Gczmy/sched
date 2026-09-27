@@ -24,6 +24,7 @@ from . import _native_step5d_linux as linux
 from . import native_step5d_protocol as protocol
 from . import native_step5d_wire as wire
 from .native_launch import NativeLaunchPlan, _project_root_identity
+from .native_deployment import NativeDeployment, require_deployment
 from .native_step5d import _create_step5d_no_data_launch_owner
 
 _SESSION_AUTHORITY = object()
@@ -50,7 +51,7 @@ def _require_linux() -> None:
         _fail("platform_or_capability_unavailable")
 
 
-def _root_observation(root_fd: int, path: str) -> dict[str, Any]:
+def _root_observation(root_fd: int, path: str, *, deployment: NativeDeployment) -> dict[str, Any]:
     """Reopen every absolute component without following a symlink."""
     if (
         type(path) is not str or not path.startswith("/") or path == "/"
@@ -78,7 +79,7 @@ def _root_observation(root_fd: int, path: str) -> dict[str, Any]:
             or any(getattr(retained, f) != getattr(observed, f) for f in fields)
         ):
             _fail("project_root_identity_mismatch")
-        return {"project": "mpcotsf", "canonical_absolute_path": path,
+        return {"project": require_deployment(deployment).project, "canonical_absolute_path": path,
                 **{f: getattr(retained, f) for f in fields}}
     except OSError as exc:
         raise protocol.Step5DProtocolViolation("project_root_io_failure") from exc
@@ -180,9 +181,10 @@ def _send_ack(channel: socket.socket, frame: bytes, deadline: float) -> None:
 class NativeStep5DRequestOwner:
     """Consume each generated nonce once for this creating-process lifetime."""
 
-    __slots__ = ("_pid", "_lock", "_consumed_nonces")
+    __slots__ = ("_pid", "_lock", "_consumed_nonces", "_deployment")
 
-    def __init__(self) -> None:
+    def __init__(self, *, deployment: NativeDeployment) -> None:
+        self._deployment = require_deployment(deployment)
         _require_linux()
         self._pid = os.getpid()
         self._lock = threading.Lock()
@@ -210,18 +212,20 @@ class NativeStep5DRequestOwner:
         _require_linux()
         nonce = secrets.token_hex(32)
         self._claim_nonce(nonce)  # Before socket, memfd, retained copies or child.
-        root = _root_observation(project_root_fd, project_root_path)
+        root = _root_observation(project_root_fd, project_root_path, deployment=self._deployment)
         peer = _peer_observation()
         body = protocol.build_request_body(
+            deployment=self._deployment,
             target_phase_profile=target_phase_profile,
             scheduler_identity_prefix=protocol.scheduler_prefix(
+                deployment=self._deployment,
                 target_phase_profile=target_phase_profile, run_id=run_id,
                 launch_marker=launch_marker,
             ), launch_nonce=nonce, control_peer_expectation=peer,
             project_root_expectation=root,
         )
-        frame = protocol.encode_request_frame(body)
-        digests = protocol.request_digests(frame)
+        frame = protocol.encode_request_frame(body, deployment=self._deployment)
+        digests = protocol.request_digests(frame, deployment=self._deployment)
         request_fds: list[int] = []
         transport_owner = None
         retained_root = -1
@@ -232,12 +236,12 @@ class NativeStep5DRequestOwner:
             transport_owner = _create_step5d_no_data_launch_owner(
                 profile_id="m2b-step5d-" + target_phase_profile,
                 profile_sha256=hashlib.sha256(protocol.canonical_json_bytes(
-                    list(protocol.LOGICAL_ARGV_PROFILES[target_phase_profile])
+                    list(self._deployment.argv(target_phase_profile))
                 )).hexdigest(),
                 project_root_identity_sha256=_project_root_identity(
                     project_root_path, os.fstat(retained_root)
                 ), project_root_path=project_root_path,
-                logical_submitted_argv=protocol.LOGICAL_ARGV_PROFILES[target_phase_profile],
+                logical_submitted_argv=self._deployment.argv(target_phase_profile),
                 launcher_sha256=launcher_sha256,
                 request_frame_sha256=digests.request_frame_sha256,
                 request_body_sha256=digests.request_body_sha256,
@@ -245,7 +249,8 @@ class NativeStep5DRequestOwner:
                 request_fd=request_fd, project_root_fd=retained_root, log_fd=log_fd,
             )
             session = NativeStep5DPreparedStop(
-                _SESSION_AUTHORITY, transport_owner, retained_root, body, frame, peer, root
+                _SESSION_AUTHORITY, transport_owner, retained_root, body, frame, peer, root,
+                deployment=self._deployment,
             )
             transport_owner = None
             retained_root = -1
@@ -263,7 +268,7 @@ class NativeStep5DPreparedStop:
     """One stop-only exchange; peer and monitor binding never leave the owner."""
 
     __slots__ = ("_pid", "_owner", "_root_fd", "_body", "_frame", "_peer", "_root",
-                 "_state", "_deadline", "_child_pid", "_challenge", "_terminal", "_failure")
+                 "_state", "_deadline", "_child_pid", "_challenge", "_terminal", "_failure", "_deployment")
     formal_ready = False
     scientific_result = False
     logical_python_executed = False
@@ -272,9 +277,10 @@ class NativeStep5DPreparedStop:
     external_formal_authority_claimed = False
 
     def __init__(self, authority: object, owner: Any, root_fd: int, body: bytes,
-                 frame: bytes, peer: dict[str, Any], root: dict[str, Any]) -> None:
+                 frame: bytes, peer: dict[str, Any], root: dict[str, Any], *, deployment: NativeDeployment) -> None:
         if authority is not _SESSION_AUTHORITY:
             _fail("authority_invariant_failure")
+        self._deployment = require_deployment(deployment)
         self._pid = os.getpid()
         self._owner, self._root_fd = owner, root_fd
         self._body, self._frame, self._peer, self._root = body, frame, peer, root
@@ -332,8 +338,8 @@ class NativeStep5DPreparedStop:
                 terminal = self._validate_failure(first)
             else:
                 challenge = protocol.parse_challenge_frame(first)
-                request = protocol.validate_request_body(self._body)
-                digests = protocol.request_digests(self._frame)
+                request = protocol.validate_request_body(self._body, deployment=self._deployment)
+                digests = protocol.request_digests(self._frame, deployment=self._deployment)
                 for key, expected in (
                     ("request_frame_sha256", digests.request_frame_sha256),
                     ("request_body_sha256", digests.request_body_sha256),
@@ -373,7 +379,7 @@ class NativeStep5DPreparedStop:
 
     def _validate_failure(self, frame: bytes) -> dict[str, Any]:
         failure = protocol.parse_failure_frame(frame)
-        digests = protocol.request_digests(self._frame)
+        digests = protocol.request_digests(self._frame, deployment=self._deployment)
         for key in ("request_frame_sha256", "request_body_sha256"):
             if failure[key] is not None and failure[key] != getattr(digests, key):
                 _fail("request_digest_mismatch")
@@ -382,7 +388,8 @@ class NativeStep5DPreparedStop:
     def _revalidate(self) -> None:
         if _peer_observation() != self._peer:
             _fail("peer_process_identity_mismatch")
-        if _root_observation(self._root_fd, self._root["canonical_absolute_path"]) != self._root:
+        if _root_observation(self._root_fd, self._root["canonical_absolute_path"],
+                             deployment=self._deployment) != self._root:
             _fail("project_root_identity_mismatch")
 
     def confirm_child_exit(self, waited_pid: int, wait_status: int) -> dict[str, Any]:

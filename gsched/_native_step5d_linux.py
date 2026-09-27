@@ -243,7 +243,9 @@ def observe_process_identity(pid: int) -> dict[str, Any]:
         os.close(pidfd)
 
 
-def _project_root_expectation(root_fd: int, root_path: Path) -> dict[str, Any]:
+def _project_root_expectation(root_fd: int, root_path: Path, *, deployment) -> dict[str, Any]:
+    from .native_deployment import require_deployment
+    require_deployment(deployment)
     canonical = root_path.resolve(strict=True)
     if canonical != root_path or root_path.is_symlink():
         raise Step5DLinuxError("project root must already be canonical and non-symlink")
@@ -251,7 +253,7 @@ def _project_root_expectation(root_fd: int, root_path: Path) -> dict[str, Any]:
     if not stat_is_directory(status.st_mode) or status.st_nlink <= 0:
         raise Step5DLinuxError("project root descriptor is not one linked directory")
     return {
-        "project": "mpcotsf",
+        "project": deployment.project,
         "canonical_absolute_path": str(canonical),
         "st_dev": status.st_dev,
         "st_ino": status.st_ino,

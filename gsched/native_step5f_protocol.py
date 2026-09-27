@@ -10,6 +10,8 @@ import json
 import os
 import re
 
+from .native_deployment import NativeDeployment, require_deployment
+
 CONTRACT_SHA256 = '90982c9356960485eeeabbe6fec78437a7f0c7a29d2ac6f8743545759aecc3b0'
 PROFILE = 'trusted_bootstrap_guarded_generated_phase/v10'
 SCHEMA = 'm2b_step5f_scheduler_request/v1'
@@ -41,12 +43,13 @@ def hex_value(value, length=64):
     return value
 
 
-def prefix(phase, run_id, launch_marker):
+def prefix(phase, run_id, launch_marker, *, deployment: NativeDeployment):
+    require_deployment(deployment)
     require(type(phase) is str and phase in PHASES)
     token(run_id)
     token(launch_marker)
-    return dict(SCHED_BATCH_ID='mpcotsf-cpu-m2b-step5d-peer-bound-stop-v1-'+phase,
-                SCHED_TASK_ID='m2b_step5d_peer_bound_stop_'+phase, SCHED_PROJECT='mpcotsf',
+    return dict(SCHED_BATCH_ID=deployment.batch_name(phase),
+                SCHED_TASK_ID=deployment.task_id(phase), SCHED_PROJECT=deployment.project,
                 SCHED_RUN_ID=run_id, SCHED_LAUNCH_MARKER=launch_marker,
                 SCHED_RC_PREFIX=hashlib.sha256(run_id.encode('ascii')).hexdigest()[:24])
 
@@ -55,7 +58,8 @@ def poison_environment():
     return {key: 'STEP5F-POISON-'+str(index) for index, key in enumerate(SCHEDULER_KEYS)}
 
 
-def validate_request(value):
+def validate_request(value, *, deployment: NativeDeployment):
+    require_deployment(deployment)
     require(type(value) is dict and value.keys() == REQUEST_KEYS)
     require(type(value['schema']) is str and value['schema'] == SCHEMA and type(value['phase']) is str and value['phase'] in PHASES)
     for key in ('main_revision', 'scheduler_revision'):
@@ -66,19 +70,19 @@ def validate_request(value):
     p = value['prefix']
     require(type(p) is dict and p.keys() == set(SCHEDULER_KEYS[:-1]))
     require(all(type(k) is str and type(v) is str for k,v in p.items()))
-    require(p == prefix(value['phase'], p['SCHED_RUN_ID'], p['SCHED_LAUNCH_MARKER']))
+    require(p == prefix(value['phase'], p['SCHED_RUN_ID'], p['SCHED_LAUNCH_MARKER'], deployment=deployment))
     require(type(value['poison_environment']) is dict and value['poison_environment'] == poison_environment())
     require(all(type(k) is str and type(v) is str for k,v in value['poison_environment'].items()))
     return value
 
 
-def canonical_request(value):
+def canonical_request(value, *, deployment: NativeDeployment):
     """Pure reusable encoding; this helper does not consume or grant authority."""
-    validate_request(value)
+    validate_request(value, deployment=deployment)
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('ascii')
 
 
-def parse_request(raw):
+def parse_request(raw, *, deployment: NativeDeployment):
     require(type(raw) is bytes and 0 < len(raw) <= 1048576)
 
     def pairs(items):
@@ -90,14 +94,15 @@ def parse_request(raw):
 
     try:
         value = json.loads(raw.decode('ascii'), object_pairs_hook=pairs)
-        require(canonical_request(value) == raw)
+        require(canonical_request(value, deployment=deployment) == raw)
     except (UnicodeError, json.JSONDecodeError, TypeError, OverflowError, RecursionError) as exc:
         raise Step5FProtocolViolation('input_invalid') from exc
     return value
 
 
 class RequestOwner:
-    def __init__(self):
+    def __init__(self, *, deployment: NativeDeployment):
+        self._deployment = require_deployment(deployment)
         self._pid = os.getpid()
         self._used = False
 
@@ -106,9 +111,9 @@ class RequestOwner:
         require(not self._used, 'request_already_consumed')
         # Freeze mutable input by a pure validation/encoding round-trip before
         # consumption; no callback or resource acquisition occurs after consume.
-        fixed = parse_request(canonical_request(value))
+        fixed = parse_request(canonical_request(value, deployment=self._deployment), deployment=self._deployment)
         nonce = fixed['nonce']
         require(nonce not in _CONSUMED, 'nonce_already_consumed')
         _CONSUMED.add(nonce)
         self._used = True
-        return canonical_request(fixed)
+        return canonical_request(fixed, deployment=self._deployment)

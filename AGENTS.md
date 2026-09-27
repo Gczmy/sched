@@ -42,6 +42,7 @@
 | --- | --- |
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
 | `docs/native-integration.md` | M2B 分支整合范围、实验接口限制与外部测试依赖 |
+| `docs/native-deployment.md` | 实验协议的私有部署绑定、显式调用参数与冻结报文兼容性 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
 | `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |

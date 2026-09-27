@@ -14,6 +14,7 @@ import struct
 from typing import Any
 
 from . import native_step5d_protocol as parent
+from .native_deployment import NativeDeployment, require_deployment
 
 CONTRACT_SHA256 = '72702e8c1db9e55f6e3c74456d1e46857b13968a1a2a4d5d65a5bb7c58d55265'
 FRAME_PAYLOAD_MAX = 196608
@@ -134,9 +135,9 @@ def path_text(value: Any, *, absolute: bool, reason: str) -> str:
     return value
 
 
-def root_identity(value: Any, reason: str) -> dict:
+def root_identity(value: Any, reason: str, *, deployment: NativeDeployment) -> dict:
     exact_object(value, parent.PROJECT_ROOT_KEYS, reason)
-    if value['project'] != 'mpcotsf':
+    if value['project'] != require_deployment(deployment).project:
         fail(reason)
     path_text(value['canonical_absolute_path'], absolute=True, reason=reason)
     integer(value['st_dev'], 0, 18446744073709551615, reason)
@@ -149,12 +150,12 @@ def root_identity(value: Any, reason: str) -> dict:
     return value
 
 
-def prefix(value: Any, phase: Any, reason: str) -> dict:
+def prefix(value: Any, phase: Any, reason: str, *, deployment: NativeDeployment) -> dict:
     exact_object(value, parent.SCHEDULER_PREFIX_KEYS, reason)
     if type(phase) is not str or phase not in parent.PHASE_PROFILES:
         fail(reason)
     try:
-        expected = parent.scheduler_prefix(target_phase_profile=phase,
+        expected = parent.scheduler_prefix(deployment=deployment, target_phase_profile=phase,
             run_id=value['SCHED_RUN_ID'], launch_marker=value['SCHED_LAUNCH_MARKER'])
     except (parent.Step5DProtocolViolation, TypeError, ValueError):
         fail(reason)
@@ -186,16 +187,16 @@ def parse_frame(frame: bytes, reason: str = 'control_message_invalid') -> dict:
     return parse_json(frame[4:], reason)
 
 
-def startup_message(name: str, session_id: str, **fields: Any) -> dict:
+def startup_message(name: str, session_id: str, *, deployment: NativeDeployment | None = None, **fields: Any) -> dict:
     if name not in STARTUP_SCHEMAS:
         fail('startup_protocol_failure')
     value = dict(schema=STARTUP_SCHEMAS[name], session_id=session_id, **fields)
-    validate_startup(value, name, expected_session=session_id)
+    validate_startup(value, name, expected_session=session_id, deployment=deployment)
     return value
 
 
 def validate_startup(value: dict, name: str, *, expected_session: str,
-                     expected_launch_nonce: str | None = None) -> dict:
+                     expected_launch_nonce: str | None = None, deployment: NativeDeployment | None = None) -> dict:
     reason = 'startup_protocol_failure'
     if name not in STARTUP_SCHEMAS:
         fail(reason)
@@ -204,8 +205,8 @@ def validate_startup(value: dict, name: str, *, expected_session: str,
         fail(reason)
     if name == 'INIT':
         sha(value['anchor_nonce'], reason)
-        prefix(value['scheduler_identity_prefix'], value['phase'], reason)
-        root_identity(value['root_identity'], reason)
+        prefix(value['scheduler_identity_prefix'], value['phase'], reason, deployment=deployment)
+        root_identity(value['root_identity'], reason, deployment=deployment)
     if name in ('READY', 'ADOPT', 'ADOPTED'):
         nonce = sha(value['launch_nonce'], reason)
         if expected_launch_nonce is not None and nonce != expected_launch_nonce:
@@ -213,28 +214,28 @@ def validate_startup(value: dict, name: str, *, expected_session: str,
     return value
 
 
-def parse_embedded(frame: bytes) -> dict:
+def parse_embedded(frame: bytes, *, deployment: NativeDeployment) -> dict:
     reason = 'request_noncanonical_or_frame_invalid'
     if type(frame) is not bytes or not 1 <= len(frame) <= EMBEDDED_FRAME_MAX:
         fail(reason)
     try:
-        parent.request_digests(frame)
+        parent.request_digests(frame, deployment=deployment)
         decoded = parent.decode_native_launch_frame(frame)
-        return parent.validate_request_body(decoded.opaque_body)
+        return parent.validate_request_body(decoded.opaque_body, deployment=deployment)
     except parent.Step5DProtocolViolation as exc:
         fail('request_contract_or_profile_mismatch' if exc.exit_code == 78 else reason)
     except (ValueError, TypeError):
         fail(reason)
 
 
-def request_envelope(session_id: str, anchor_nonce: str, frame: bytes) -> dict:
+def request_envelope(session_id: str, anchor_nonce: str, frame: bytes, *, deployment: NativeDeployment) -> dict:
     reason = 'request_noncanonical_or_frame_invalid'
-    session(session_id, reason); sha(anchor_nonce, reason); parse_embedded(frame)
+    session(session_id, reason); sha(anchor_nonce, reason); parse_embedded(frame, deployment=deployment)
     return dict(schema=REQUEST_SCHEMA, session_id=session_id, anchor_nonce=anchor_nonce,
                 step5d_request_frame_base64=base64.b64encode(frame).decode('ascii'))
 
 
-def parse_request(frame: bytes) -> tuple[dict, bytes, dict]:
+def parse_request(frame: bytes, *, deployment: NativeDeployment) -> tuple[dict, bytes, dict]:
     reason = 'request_noncanonical_or_frame_invalid'
     value = parse_frame(frame, reason)
     exact_object(value, REQUEST_KEYS, reason)
@@ -250,7 +251,7 @@ def parse_request(frame: bytes) -> tuple[dict, bytes, dict]:
         fail(reason)
     if base64.b64encode(embedded).decode('ascii') != encoded:
         fail(reason)
-    return value, embedded, parse_embedded(embedded)
+    return value, embedded, parse_embedded(embedded, deployment=deployment)
 
 
 def validate_control(value: dict, *, ack: bool = False) -> dict:
@@ -299,7 +300,7 @@ def validate_manifest(value: Any) -> list:
     return value
 
 
-def parse_anchor(payload: bytes) -> dict:
+def parse_anchor(payload: bytes, *, deployment: NativeDeployment) -> dict:
     reason = 'anchor_schema_mismatch'
     if type(payload) is not bytes or not 1 <= len(payload) <= ANCHOR_MAX:
         fail(reason)
@@ -312,11 +313,11 @@ def parse_anchor(payload: bytes) -> dict:
             fail(reason)
     sha(value['protocol_sha256'], reason)
     session(value['session_id'], reason); sha(value['anchor_nonce'], reason)
-    prefix(value['scheduler_identity_prefix'], value['phase'], reason)
+    prefix(value['scheduler_identity_prefix'], value['phase'], reason, deployment=deployment)
     issuer = process_identity(value['issuer_process_identity'], reason)
     subject = process_identity(value['subject_process_identity'], reason)
     creds = credentials(value['subject_credentials'], reason)
-    root_identity(value['root_identity'], reason); validate_manifest(value['code_manifest'])
+    root_identity(value['root_identity'], reason, deployment=deployment); validate_manifest(value['code_manifest'])
     if creds['pid'] != subject['pid']:
         fail(reason)
     if value['scope'] != SCOPE or value['protocol_sha256'] != CONTRACT_SHA256 or value['authorization'] is not None:

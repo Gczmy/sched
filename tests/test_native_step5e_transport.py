@@ -1,5 +1,6 @@
 """Real Linux ancillary/ownership checks; generated sockets only."""
 import os
+import signal
 import socket
 import sys
 import time
@@ -31,10 +32,10 @@ def pair():
         left.close(); right.close()
 
 
-def test_adopt_enables_own_passcred_without_requiring_root_to_set_it(pair):
+def test_adopt_enables_own_passcred_without_requiring_root_to_set_it(pair, deployment):
     verifier, subject = pair
     subject.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 0)
-    owner = control.NativeStep5ESender(expected_root=credentials(os.getppid()), expected_session='test')
+    owner = control.NativeStep5ESender(deployment=deployment, expected_root=credentials(os.getppid()), expected_session='test')
     try:
         owner._adopt(subject.detach())
         assert owner._channel.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) == 1
@@ -45,10 +46,10 @@ def test_adopt_enables_own_passcred_without_requiring_root_to_set_it(pair):
 
 
 @pytest.mark.parametrize('kind', ['malformed_frame', 'wrong_credentials', 'extra_rights', 'missing_rights'])
-def test_startup_rejection_closes_rights_and_uses_startup_reason(pair, kind):
+def test_startup_rejection_closes_rights_and_uses_startup_reason(pair, kind, deployment):
     sender, receiver = pair
     expected = credentials(os.getppid()) if kind == 'wrong_credentials' else credentials()
-    owner = control.NativeStep5ESender(expected_root=expected, expected_session='test')
+    owner = control.NativeStep5ESender(deployment=deployment, expected_root=expected, expected_session='test')
     owner._startup = receiver
     nonce = 'c' * 64
     owner._nonce = nonce
@@ -72,9 +73,9 @@ def test_startup_rejection_closes_rights_and_uses_startup_reason(pair, kind):
 
 
 @pytest.mark.parametrize('rejection', ['stopped_reentry', 'pid_guard'])
-def test_rejected_invocation_closes_incoming_socket(pair, rejection):
+def test_rejected_invocation_closes_incoming_socket(pair, rejection, deployment):
     other, incoming = pair
-    owner = control.NativeStep5ESender(expected_root=credentials(os.getppid()), expected_session='test')
+    owner = control.NativeStep5ESender(deployment=deployment, expected_root=credentials(os.getppid()), expected_session='test')
     if rejection == 'stopped_reentry': owner._state = 'STOPPED'
     else: owner._pid += 1
     with pytest.raises(p.Step5EProtocolViolation, match='^startup_protocol_failure$'):
@@ -120,3 +121,81 @@ def test_nonce_replay_and_pid_guard_precede_lock():
             owner.claim('d' * 64)
     finally:
         owner.lock.release()
+
+
+@pytest.mark.parametrize('bad_project', [False, True])
+def test_sender_exchange_uses_pinned_deployment_before_ready(deployment, bad_project):
+    """Real fork, SCM_RIGHTS and credential-bound startup; no native executable."""
+    from test_native_deployment import request
+    root_pid = os.getpid()
+    root, subject = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    for channel in (root, subject):
+        channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    pid = os.fork()
+    if pid == 0:
+        root.close()
+        try:
+            sender = control.NativeStep5ESender(deployment=deployment,
+                expected_root=credentials(root_pid), expected_session='example-session')
+            try:
+                sender.run(subject, attempt_deadline_ns=time.monotonic_ns() + 8_000_000_000)
+            except p.Step5EProtocolViolation:
+                os._exit(0 if bad_project else 1)
+            os._exit(1 if bad_project else 0)
+        except BaseException:
+            os._exit(2)
+    subject.close()
+    verifier = None
+    reaped = False
+    end = time.monotonic_ns() + 8_000_000_000
+    try:
+        body = p.parent.validate_request_body(request(deployment), deployment=deployment)
+        init = p.startup_message('INIT', 'example-session', deployment=deployment,
+            phase='preparation', anchor_nonce='d' * 64,
+            scheduler_identity_prefix=body['scheduler_identity_prefix'],
+            root_identity=body['project_root_expectation'])
+        if bad_project:
+            init['scheduler_identity_prefix']['SCHED_PROJECT'] = 'substituted'
+        transport.send_frame(root, init, deadline_ns=end)
+        if not bad_project:
+            ready, _, _ = transport.receive_frame(root, deadline_ns=end, expected_credentials=credentials(pid))
+            p.validate_startup(ready, 'READY', expected_session='example-session')
+            verifier, delegated = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            verifier.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            try:
+                adopt = p.startup_message('ADOPT', 'example-session', launch_nonce=ready['launch_nonce'])
+                transport.send_frame(root, adopt, deadline_ns=end, rights=(delegated.fileno(),))
+            finally:
+                delegated.close()
+            adopted, _, _ = transport.receive_frame(root, deadline_ns=end, expected_credentials=credentials(pid))
+            p.validate_startup(adopted, 'ADOPTED', expected_session='example-session',
+                               expected_launch_nonce=ready['launch_nonce'])
+            transport.send_frame(root, p.startup_message('GO', 'example-session'), deadline_ns=end)
+            _, _, frame = transport.receive_frame(verifier, deadline_ns=end, expected_credentials=credentials(pid))
+            _, embedded, actual = p.parse_request(frame, deployment=deployment)
+            assert actual['submitted_logical_argv'] == list(deployment.argv('preparation'))
+            challenge = dict(schema=p.CHALLENGE_SCHEMA, session_id='example-session', anchor_nonce='d' * 64,
+                monitor_nonce='c' * 64, step5d_request_frame_sha256=p.digest(embedded),
+                anchor_sha256='e' * 64, retained_code_manifest_sha256='f' * 64, decision=p.DECISION)
+            transport.send_frame(verifier, challenge, deadline_ns=end)
+            ack, _, _ = transport.receive_frame(verifier, deadline_ns=end, expected_credentials=credentials(pid))
+            p.validate_ack(ack, challenge)
+            transport.require_eof(verifier, deadline_ns=end, expected_credentials=credentials(pid))
+            transport.send_frame(root, p.startup_message('STOP', 'example-session'), deadline_ns=end)
+        else:
+            transport.require_eof(root, deadline_ns=end, expected_credentials=credentials(pid))
+        while time.monotonic_ns() < end:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                reaped = True
+                assert os.waitstatus_to_exitcode(status) == 0
+                break
+            time.sleep(.01)
+        assert reaped, 'sender did not terminate'
+    finally:
+        root.close()
+        if verifier is not None:
+            verifier.close()
+        if not reaped:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
