@@ -225,11 +225,15 @@ CLI 为可靠的脚本化使用而设计：
 
 ## 已知限制与下一步开发
 
-当前没有项目级“禁止 GPU”设置。`gpu_quota: 0` 必须保持向后兼容，继续表示无限制；
-`resources.gpu: 0` 和 `sched run --cpu-only` 只能把单个任务声明为 CPU-only。
-计划行为与验收标准记录在 [下一步开发清单](docs/next-development.md)中。
+项目级禁止 GPU 已支持：通过 `sched config set` 将 `projects.<name>.gpu_enabled`
+设为 `false`，会拒绝新 GPU 提交与手动重跑、暂停已排队 GPU 任务，运行中任务和
+CPU-only 任务不受影响。`gpu_quota: 0` 仍表示无限制。行为与验收依据见
+[项目 GPU 开关](docs/project-gpu-access.md)，尚未实现的功能见
+[下一步开发清单](docs/next-development.md)。
 
 ## 测试
+
+公共 CI、Python 回归、隐私检查与提交钩子的使用见[开发与提交检查](CONTRIBUTING.md)。
 
 ```bash
 bash tests/run_probes_accept.sh          # probe 探针语义

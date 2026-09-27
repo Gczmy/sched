@@ -309,6 +309,9 @@ and [development backlog](docs/next-development.md).
 
 ## Tests
 
+See [contributing and repository checks](CONTRIBUTING.md) for the public Linux CI,
+Python regressions, privacy checks and optional pre-commit hook.
+
 ```bash
 bash tests/run_project_gpu_enabled_accept.sh # project GPU access, hot updates, CPU-only
 bash tests/run_probes_accept.sh          # probe semantics

@@ -1,0 +1,10 @@
+#!/bin/sh
+# No environment activation or remote calls. Scan the exact staged contents.
+for interpreter in python3 python; do
+    if command -v "$interpreter" >/dev/null 2>&1 &&
+       "$interpreter" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+        exec "$interpreter" scripts/check_repository.py --staged
+    fi
+done
+printf '%s\n' 'Repository check requires Python 3.10 or newer.' >&2
+exit 1

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  repository:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Check scanner against synthetic Git repositories
+        run: python -m unittest discover -s scripts -p test_repository_check.py -v
+      - name: Check privacy, Markdown references and commit whitespace
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ -z "$DIFF_BASE" || "$DIFF_BASE" =~ ^0+$ ]]; then
+            DIFF_BASE=$(git rev-parse HEAD^ 2>/dev/null || true)
+          fi
+          if [[ -n "$DIFF_BASE" ]]; then
+            python scripts/check_repository.py --all --base "$DIFF_BASE"
+          else
+            python scripts/check_repository.py --all
+          fi
+
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      M2B_STEP5E_CONTRACT_ROOT: ""
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e '.[test]'
+      - name: Public Linux regression suite
+        run: python -m pytest -q -rs tests
+      - name: CPU acceptance and CLI contracts
+        if: matrix.python == '3.10'
+        run: |
+          python tests/run_native_integration_accept.py
+          bash tests/run_mode_consistency_accept.sh
+          bash tests/run_project_gpu_enabled_accept.sh
+          bash tests/run_docs_refs_accept.sh

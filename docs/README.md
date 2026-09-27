@@ -5,6 +5,7 @@
 
 | 文档 | 用途 |
 | --- | --- |
+| [开发与提交检查](../CONTRIBUTING.md) | 公共 CI、隐私检查与本地提交钩子 |
 | [reference.md](reference.md) | 配置、CLI、JSON、状态机与写操作契约 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [native-integration.md](native-integration.md) | 实验 native 接口的实现范围与外部依赖 |

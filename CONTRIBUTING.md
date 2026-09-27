@@ -1,0 +1,69 @@
+# 开发与提交检查
+
+调度器运行时仍只依赖 Python 标准库。测试需要 Python >= 3.10 和 pytest，
+执行型测试在本地 Linux／WSL 或 CI 的 Linux runner 运行，不连接 HPDC。
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[test]'
+python -m pytest -q -rs tests
+python tests/run_native_integration_accept.py
+```
+
+公共 CI 在 Python 3.10 和 3.14 上运行回归，并在 3.10 上运行 CPU native、
+mode、项目 GPU 开关和文档引用验收。没有 `M2B_STEP5E_CONTRACT_ROOT` 时，
+依赖私有冻结合同的测试按现有规则跳过；公开向量和进程握手测试继续执行。
+这不替代私有合同兼容性验证或集群部署验收。
+
+## 提交前检查
+
+以下入口仅依赖 Python 标准库和 Git，Windows 也可用 `python` 执行：
+
+```bash
+python3 scripts/check_repository.py --all
+git add <files>
+python3 scripts/check_repository.py --staged
+```
+
+`--all` 检查已跟踪文件的当前工作区内容；新文件先 `git add` 才纳入。
+`--staged` 读取 Git index 中的原始 blob，不会用工作区的新内容替换暂存内容；
+删除或重命名目标时，也检查未修改 Markdown 的引用。两种模式都检查本仓库
+Markdown 文件／目录链接与 AGENTS 中的文档路径，不请求外部网站或校验标题锚点。
+暂存模式检查暂存差异空白；全量模式检查工作区差异，CI 另传 `--base <full-sha>`
+检查提交范围。返回码 `0` 为通过、`1` 为发现问题、`2` 为无法完成检查。
+
+可启用版本控制内的提交钩子，在提交前自动检查暂存内容：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+若已有其他 hooks，先合并调用，不覆盖已有配置。CI 在 push／pull_request 时运行
+同一检查；它发生在上传之后，因此提交前的本地检查仍有必要。
+
+## 隐私规则与例外
+
+检查个人绝对家目录、常见服务令牌、私钥头、带密码的 URL、固定 screen 会话，
+以及误入 Git 的本地配置、运行日志、状态数据库和生产诊断目录。测试、示例和
+已跟踪生成文件同样检查；`user`、`example`、`tester`、`test`、`runner` 是通用
+路径占位名称。超过 8 MiB 的文件和子模块不会被静默跳过，而会报告需处理。
+输出只有文件、行号和规则名，不打印命中的内容。
+
+任意任务名称、任意格式秘密以及编码后的内容无法仅凭这些规则可靠判断，仍需
+审查新增配置和记录。本检查不扫描或净化 Git 历史。信息边界见
+[repository-hygiene.md](docs/repository-hygiene.md)。
+
+确需保留的虚构测试数据可以添加 `.repository-check.json`，顶层固定为
+`schema_version: 1` 与 `exceptions: []`。每条例外必须指定已有的完整 `path`、
+单条内容 `rule`、该行 UTF-8 字节（不含换行）的 `line_sha256` 和具体 `reason`。
+不支持文件夹、通配符或关闭整个规则；改变样例内容会使旧摘要失效。
+不要把真实敏感值写入例外说明，也不要为真实部署资料增加例外。
+
+```bash
+python3 -m unittest discover -s scripts -p test_repository_check.py -v
+```
+
+检查器、测试和 `.githooks/pre-commit` 在 `sched` 与 `dsh-node-sched` 中保持逐字节
+一致；修改时同步两份，并在各自独立 checkout 验证。两个仓库的公共 CI 不要求
+另一仓库或私有研究仓库存在。GitHub Actions 固定到已核对的提交，只有读取权限。

@@ -1,2 +1,4 @@
 # Shell entry points must remain executable by Bash after a Windows checkout.
 *.sh text eol=lf
+*.py text eol=lf
+.githooks/* text eol=lf
