@@ -4404,6 +4404,7 @@ def main(argv: list[str] | None = None) -> int:
     foreign = bool(cfg and _is_foreign_host(cfg))
     if (
         daemon_requires_host
+        and command == "daemon"
         and foreign
         and not allow_foreign_write
     ):
