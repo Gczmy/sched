@@ -25,6 +25,8 @@ cancel/timeout。真正的 T2 M 启动及原始 pidfd/wait 所有权、T3 在 V/
 session 持久写入 `timed_out` 意图；尚未消费的日志与 M 意图 CAS 会拒绝后续尝试。
 T2a 意图提交后、真正 M 启动前仍须再查取消／超时。看门狗不发进程组信号、
 不结算任务；正式链还须确定 `duration_min` 是从预留还是实际 V/P 执行起算。
+日志与 M 意图 CAS 会拒绝已发布或无法检查的 daemon shutdown 标记；标记在
+检查后发布的竞态仍须由实际 M-birth gate 处理。
 原始 owner/wait、启动后取消／超时执行与终态通路仍未接通，不能视为正式可运行。
 `reserved` 在日志尝试失败后保留非空 `log_attempted_at`，同一 session 不可再次打开；
 它与 `log_bound` 在崩溃/日志故障后均属已消费未决，不能自动回队或重放。T2a

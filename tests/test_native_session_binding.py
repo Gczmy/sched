@@ -380,6 +380,37 @@ class NativeSessionBindingTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_shutdown_fences_log_attempt_without_consumption(self) -> None:
+        self.activate()
+        session_id = self.claim()["session_id"]
+        self.db.commit()
+        marker_path = os.path.join(self.root, ".daemon-stopping")
+        with mock.patch.object(
+            state, "submission_shutdown_marker", return_value=marker_path
+        ):
+            with open(marker_path, "xb"):
+                pass
+            self.db.execute("BEGIN DEFERRED")
+            with self.assertRaisesRegex(state.StateError, "daemon shutdown"):
+                state.mark_native_session_log_attempted(self.db, session_id)
+            # Even a caller that catches the error and commits cannot consume
+            # the one-shot attempt while shutdown is published.
+            self.db.commit()
+            self.assertIsNone(
+                state.get_native_session(self.db, session_id)["log_attempted_at"]
+            )
+            os.unlink(marker_path)
+            with mock.patch.object(
+                state.os, "lstat", side_effect=PermissionError("injected")
+            ):
+                self.db.execute("BEGIN DEFERRED")
+                with self.assertRaisesRegex(state.StateError, "cannot inspect"):
+                    state.mark_native_session_log_attempted(self.db, session_id)
+                self.db.commit()
+            self.assertIsNone(
+                state.get_native_session(self.db, session_id)["log_attempted_at"]
+            )
+
     def test_uncertain_log_attempt_commit_never_opens_file(self) -> None:
         class CommitUnknown(sqlite3.Connection):
             def commit(self) -> None:
@@ -543,6 +574,70 @@ class NativeSessionBindingTests(unittest.TestCase):
                 " WHERE session_id=?", (session_id,),
             )
         self.db.rollback()
+
+    def test_shutdown_fences_monitor_intent_without_consumption(self) -> None:
+        session_id, log_fd = self._bound_log()
+        inode = os.fstat(log_fd)
+        marker_path = os.path.join(self.root, ".daemon-stopping")
+        with mock.patch.object(
+            state, "submission_shutdown_marker", return_value=marker_path
+        ):
+            with open(marker_path, "xb"):
+                pass
+            self.db.execute("BEGIN DEFERRED")
+            with self.assertRaisesRegex(state.StateError, "daemon shutdown"):
+                state.mark_native_monitor_launch_attempted(
+                    self.db, session_id, inode.st_dev, inode.st_ino
+                )
+            self.db.commit()
+            self.assertIsNone(
+                state.get_native_session(self.db, session_id)[
+                    "monitor_launch_attempted_at"
+                ]
+            )
+            os.unlink(marker_path)
+            with mock.patch.object(
+                state.os, "lstat", side_effect=PermissionError("injected")
+            ):
+                self.db.execute("BEGIN DEFERRED")
+                with self.assertRaisesRegex(state.StateError, "cannot inspect"):
+                    state.mark_native_monitor_launch_attempted(
+                        self.db, session_id, inode.st_dev, inode.st_ino
+                    )
+                self.db.commit()
+            self.assertIsNone(
+                state.get_native_session(self.db, session_id)[
+                    "monitor_launch_attempted_at"
+                ]
+            )
+
+    def test_monitor_shutdown_check_runs_after_writer_claim(self) -> None:
+        session_id, log_fd = self._bound_log()
+        inode = os.fstat(log_fd)
+        database_path = self.db.execute("PRAGMA database_list").fetchone()["file"]
+        observed = []
+
+        def marker_after_writer() -> str:
+            with closing(sqlite3.connect(database_path, timeout=0.0)) as other:
+                with self.assertRaises(sqlite3.OperationalError):
+                    other.execute("BEGIN IMMEDIATE")
+            observed.append(True)
+            return os.path.join(self.root, ".absent-shutdown-marker")
+
+        with mock.patch.object(
+            state, "submission_shutdown_marker", side_effect=marker_after_writer
+        ):
+            self.db.execute("BEGIN DEFERRED")
+            state.mark_native_monitor_launch_attempted(
+                self.db, session_id, inode.st_dev, inode.st_ino
+            )
+        self.db.commit()
+        self.assertEqual([True], observed)
+        self.assertIsNotNone(
+            state.get_native_session(self.db, session_id)[
+                "monitor_launch_attempted_at"
+            ]
+        )
 
     def test_monitor_intent_rejects_replaced_project_log_path(self) -> None:
         session_id, log_fd = self._bound_log()

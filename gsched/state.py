@@ -1561,6 +1561,24 @@ _NATIVE_SESSION_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _NATIVE_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
+def _check_native_session_shutdown_marker(action: str) -> None:
+    """Deny an isolated prelaunch CAS if daemon shutdown is already published.
+
+    The caller must already hold the SQLite writer so a concurrent cancel
+    cannot change job state between this inspection and the launch CAS.  The
+    marker may still be published later; actual M birth needs its own gate.
+    """
+    try:
+        os.lstat(submission_shutdown_marker())
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise StateError(
+            f"native {action} cannot inspect shutdown marker"
+        ) from error
+    raise StateError(f"native {action} rejected during daemon shutdown")
+
+
 def get_native_session(
     conn: sqlite3.Connection, session_id: str,
 ) -> sqlite3.Row | None:
@@ -1713,6 +1731,11 @@ def mark_native_session_log_attempted(
         raise StateError("native session id is invalid")
     if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
         raise StateError("native log attempt requires a caller-owned writer transaction")
+    # A DEFERRED caller transaction may not own the writer yet.  Acquire it
+    # before checking the stop marker, then leave the one-shot CAS untouched
+    # when the marker exists or its state cannot be inspected.
+    conn.execute("UPDATE jobs SET status=status WHERE 0")
+    _check_native_session_shutdown_marker("log attempt")
     changed = conn.execute(
         "UPDATE native_sessions SET log_attempted_at=?"
         " WHERE session_id=? AND phase='reserved' AND log_attempted_at IS NULL"
@@ -1789,6 +1812,8 @@ def mark_native_monitor_launch_attempted(
         raise StateError("native monitor launch log inode identity is invalid")
     if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
         raise StateError("native monitor launch intent requires a caller-owned writer transaction")
+    conn.execute("UPDATE jobs SET status=status WHERE 0")
+    _check_native_session_shutdown_marker("monitor launch intent")
     changed = conn.execute(
         "UPDATE native_sessions SET monitor_launch_attempted_at=?"
         " WHERE session_id=? AND phase='log_bound'"
