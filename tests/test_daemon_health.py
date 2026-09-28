@@ -123,6 +123,17 @@ class DaemonHealthTests(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertEqual({"schema_version": 1, **expected}, json.loads(stream.getvalue()))
 
+    def test_request_capabilities_do_not_depend_on_daemon_liveness(self):
+        for host in ("gateway", "compute"):
+            with self.subTest(host=host):
+                self.host.return_value = host
+                self.owner.return_value = None
+                health = daemon.health_snapshot()
+                self.assertEqual([
+                    "daemon-start", "daemon-stop", "daemon-drain",
+                    "daemon-drain-stop-when-idle", "daemon-resume",
+                ], health["request_actions"])
+
     def test_json_flag_cannot_trigger_a_mutation(self):
         with mock.patch.object(daemon, "stop") as stop:
             self.assertEqual(1, cli.cmd_daemon(argparse.Namespace(action="stop", json=True)))

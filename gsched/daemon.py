@@ -263,6 +263,12 @@ def health_snapshot() -> dict[str, Any]:
         "health_state": health_state, "read_error": read_error,
         "heartbeat_age_s": hb_age, "tick_ok_age_s": tick_age,
         "frozen": frozen, "draining": drain_state() is not None,
+        # Capabilities of this CLI installation, not proof of writer identity
+        # or of the version running in another process/on another host.
+        "request_actions": [
+            "daemon-start", "daemon-stop", "daemon-drain",
+            "daemon-drain-stop-when-idle", "daemon-resume",
+        ],
     }
 
 

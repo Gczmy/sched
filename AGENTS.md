@@ -72,7 +72,7 @@
 - 脚本或 Agent 解析结构化结果时使用命令支持的 `--json`。`config get` 本身输出 JSON；`diag`、`log`、`verify` 等没有该选项，不虚构参数，也不把展示文本当稳定字段。
 - `cancel`、`discard`、`clean`、`config set`、`gpu-free` 必须带 `--yes`。缺少该参数时返回码 `1` 表示未确认；参数要求不等于需要向已有授权的用户再问一次。
 - 查询可在登录／网关节点执行；数据库查询由 CLI 获取私有只读 DB/WAL 快照，不能自行用 SQLite 打开共享源库。节点目录取自 `config.node`，不要用网关的 `hostname` 推导。
-- `sched daemon start/stop/check` 必须在计算节点执行；登录节点可用 `sched daemon status`。其他写操作受主机守卫约束，不把 `SCHED_ALLOW_FOREIGN_WRITE=1` 当作日常工作流。
+- `sched daemon start/stop/check/drain/resume` 必须在计算节点执行，包括 `request` 包装的调用；登录节点可用 `sched daemon status`。其他写操作受主机守卫约束，不把 `SCHED_ALLOW_FOREIGN_WRITE=1` 当作日常工作流。
 
 ### HPDC 登录与执行位置
 

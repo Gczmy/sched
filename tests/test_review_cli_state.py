@@ -2989,6 +2989,9 @@ class ReviewIdempotentRequestTests(TempStateCase):
         for index, command in enumerate(
             (
                 ["daemon", "start"],
+                ["daemon", "drain"],
+                ["daemon", "drain", "--stop-when-idle"],
+                ["daemon", "resume"],
                 ["config", "set", "-f", "patch.json", "--yes"],
             )
         ):

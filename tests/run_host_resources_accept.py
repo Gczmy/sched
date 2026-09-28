@@ -30,6 +30,10 @@ def main():
             return result.stdout
         def snapshot():
             return json.loads(cli('status', '--json'))
+        def request(request_id, *command):
+            return cli('request', request_id, '--expect-revision', '0', '--', *command)
+        def health():
+            return json.loads(cli('daemon', 'status', '--json'))
         def wait(check):
             deadline = time.monotonic()+120
             while time.monotonic()<deadline:
@@ -48,25 +52,30 @@ def main():
                           'artifacts': {'result': {'path': str(root/(task+'.txt'))}}})
         (root/'batch.json').write_text(json.dumps({'name': 'drain-lifecycle', 'project': 'test', 'tasks': tasks}))
         try:
-            cli('daemon', 'drain')
+            assert 'daemon-drain-stop-when-idle' in health()['request_actions']
+            request('initial-drain', 'daemon', 'drain')
             cli('submit', str(root/'batch.json'))
             data = wait(lambda d: len(d['jobs']) == 2 and
                         all(j['status']=='pending' and j['wait_reason']=='draining' for j in d['jobs']))
             assert all(j['status']=='pending' and j['wait_reason']=='draining' for j in data['jobs'])
-            cli('daemon', 'resume')
+            request('initial-resume', 'daemon', 'resume')
+            request('initial-drain', 'daemon', 'drain')
+            assert not health()['draining']
             wait(lambda d: sum(j['status']=='running' for j in d['jobs']) == 1)
-            cli('daemon', 'drain', '--stop-when-idle')
+            request('stop-after-drain', 'daemon', 'drain', '--stop-when-idle')
+            request('initial-resume', 'daemon', 'resume')
+            assert health()['draining']
             (root/'release').touch()
             data = wait(lambda d: [j['status'] for j in d['jobs']] == ['done', 'pending'])
             deadline = time.monotonic()+60
-            while '运行中' in cli('daemon', 'status') and time.monotonic()<deadline:
+            while health()['health_state'] != 'stopped' and time.monotonic()<deadline:
                 time.sleep(1)
-            assert '运行中' not in cli('daemon', 'status')
+            assert health()['health_state'] == 'stopped'
             assert data['host_memory']['used_gib'] == 0
-            cli('daemon', 'resume')
+            request('restart-resume', 'daemon', 'resume')
             cli('daemon', 'start', '--fake')
             wait(lambda d: len(d['jobs'])==2 and all(j['status']=='done' for j in d['jobs']))
-            print('PASS: drain preserves pending, completes running, exits, resumes and releases reservations')
+            print('PASS: maintenance requests preserve pending, finish running, exit, resume, release reservations and resist stale replay')
         finally:
             cli('daemon', 'stop')
 
