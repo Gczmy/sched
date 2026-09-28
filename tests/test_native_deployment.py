@@ -190,8 +190,14 @@ def test_step5f_owner_preserves_nonce_and_single_use_guards(deployment):
         f.RequestOwner()
 
 
-def test_step5d_owner_retains_cold_bindings_without_launch(deployment, tmp_path):
+@pytest.mark.parametrize("trailing_empty_arg", [False, True])
+def test_step5d_owner_retains_cold_bindings_without_launch(deployment, tmp_path,
+                                                            trailing_empty_arg):
     from gsched.native_step5d_control import NativeStep5DRequestOwner
+    if trailing_empty_arg:
+        value = json.loads(EXAMPLE.read_bytes())
+        value["logical_argv_profiles"]["preparation"].append("")
+        deployment = parse(value)
     root = tmp_path.resolve()
     launcher = root / "launcher"
     launcher.write_bytes(b"synthetic-launcher-not-executed")

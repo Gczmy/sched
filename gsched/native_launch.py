@@ -75,9 +75,10 @@ def _logical_argv(value: Any) -> tuple[str, ...]:
         raise NativeLaunchPlanError("logical submitted argv must be non-empty")
     detached: list[str] = []
     for index, token in enumerate(value):
-        if type(token) is not str or not token or "\0" in token:
+        if type(token) is not str or "\0" in token or (index == 0 and not token):
+            requirement = "non-empty NUL-free" if index == 0 else "NUL-free"
             raise NativeLaunchPlanError(
-                f"logical submitted argv[{index}] must be a non-empty NUL-free string"
+                f"logical submitted argv[{index}] must be a {requirement} string"
             )
         detached.append(token)
     if not os.path.isabs(detached[0]) or os.path.normpath(detached[0]) != detached[0]:
