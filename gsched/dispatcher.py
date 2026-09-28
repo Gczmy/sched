@@ -2809,6 +2809,7 @@ class Dispatcher:
         only closes later launch CAS gates; it must not imply a signal or a
         completed job.
         """
+        expired_jobs: list[tuple[str, str, int, str]] = []
         with state.connect() as conn:
             rows = conn.execute(
                 "SELECT j.*, n.session_id FROM jobs j"
@@ -2836,20 +2837,29 @@ class Dispatcher:
                     continue
                 if time.time() - started <= duration * 60:
                     continue
-                conn.execute("BEGIN IMMEDIATE")
-                timed_out = state.mark_native_session_timed_out(
-                    conn,
-                    session_id=job["session_id"],
-                    job_id=job["id"],
-                    job_version=job["version"],
-                    started_at=job["started_at"],
+                expired_jobs.append(
+                    (job["session_id"], job["id"], job["version"], job["started_at"])
                 )
-                conn.commit()
-                if timed_out:
-                    self.log_line(
-                        f"job {job['id']} native session 超时; "
-                        "保留未结算任务及 timed_out intent"
+
+        for session_id, job_id, job_version, started_at in expired_jobs:
+            # Re-enter the same ordering domain as CLI cancel and daemon
+            # shutdown before claiming the writer. The CAS rechecks any stale
+            # snapshot after the read connection has been released.
+            with state.submission_lock():
+                with state.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    timed_out = state.mark_native_session_timed_out(
+                        conn,
+                        session_id=session_id,
+                        job_id=job_id,
+                        job_version=job_version,
+                        started_at=started_at,
                     )
+            if timed_out:
+                self.log_line(
+                    f"job {job_id} native session 超时; "
+                    "保留未结算任务及 timed_out intent"
+                )
 
     def _check_probes(self) -> None:
         """L6 probes 日志门控 (§3.4d R3): 运行中任务按声明匹配日志模式.

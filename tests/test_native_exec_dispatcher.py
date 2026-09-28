@@ -822,6 +822,59 @@ class NativeExecDispatcherRecoveryTests(NativeExecDispatcherCase):
         dispatcher._signal_job_result.assert_not_called()
         dispatcher.executor.has_process.assert_not_called()
 
+    def test_native_timeout_claims_submission_gate_before_writer(self) -> None:
+        self.raw_batch["tasks"][0]["duration_min"] = 1
+        job_id = self._seed_isolated_native_session()
+        dispatcher = self._dispatcher()
+        with state.connect() as conn:
+            state.update_job(conn, job_id, started_at="2000-01-01 00:00:00")
+
+        original_mark = state.mark_native_session_timed_out
+
+        def mark_under_gate(conn, **kwargs):
+            self.assertEqual(1, state._submission_lock_depth.get())
+            self.assertTrue(conn.in_transaction)
+            return original_mark(conn, **kwargs)
+
+        with mock.patch.object(
+            state, "mark_native_session_timed_out", side_effect=mark_under_gate
+        ) as mark:
+            dispatcher._check_native_timeouts()
+
+        mark.assert_called_once()
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+        self.assertEqual("timed_out", job["kill_reason"])
+
+    def test_native_timeout_snapshot_loses_to_cancel_before_gate(self) -> None:
+        self.raw_batch["tasks"][0]["duration_min"] = 1
+        job_id = self._seed_isolated_native_session()
+        dispatcher = self._dispatcher()
+        with state.connect() as conn:
+            state.update_job(conn, job_id, started_at="2000-01-01 00:00:00")
+
+        original_lock = state.submission_lock
+        request_ids = []
+
+        def cancel_before_timeout_lock():
+            with state.connect() as conn:
+                request_ids.append(state.insert_control_request(conn, job_id))
+            return original_lock()
+
+        with mock.patch.object(
+            state, "submission_lock", side_effect=cancel_before_timeout_lock
+        ):
+            dispatcher._check_native_timeouts()
+
+        self.assertEqual(1, len(request_ids))
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE id=?", (request_ids[0],)
+            ).fetchone()
+        self.assertIsNone(job["kill_reason"])
+        self.assertEqual("pending", request["status"])
+
     def test_pending_native_cancel_wins_over_timeout(self) -> None:
         self.raw_batch["tasks"][0]["duration_min"] = 1
         job_id = self._seed_isolated_native_session()
