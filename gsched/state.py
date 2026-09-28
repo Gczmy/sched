@@ -1816,6 +1816,46 @@ def mark_native_monitor_launch_attempted(
     return session
 
 
+def mark_native_session_timed_out(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    job_id: str,
+    job_version: int,
+    started_at: str,
+) -> bool:
+    """Record an isolated native timeout without claiming owner or wait authority.
+
+    The caller holds the writer before this CAS.  A pending cancellation wins
+    over timeout; neither outcome settles the job or signals a process group.
+    """
+    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
+        raise StateError("native timeout requires a caller-owned writer transaction")
+    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
+        raise StateError("native timeout session id is invalid")
+    if type(job_id) is not str or not job_id or type(job_version) is not int or job_version < 1:
+        raise StateError("native timeout job identity is invalid")
+    if type(started_at) is not str or not started_at:
+        raise StateError("native timeout start time is invalid")
+    changed = conn.execute(
+        "UPDATE jobs SET kill_reason='timed_out'"
+        " WHERE id=? AND version=? AND started_at=?"
+        " AND status='running' AND pgid IS NULL AND kill_reason IS NULL"
+        " AND rc IS NULL AND finished_at IS NULL"
+        " AND version=(SELECT MAX(j2.version) FROM jobs j2"
+        "   WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)"
+        " AND EXISTS (SELECT 1 FROM native_sessions n"
+        "   WHERE n.session_id=? AND n.job_id=jobs.id"
+        "   AND n.job_version=jobs.version"
+        "   AND n.evaluation_domain='isolated_integration'"
+        "   AND n.owner_kind='unbound')"
+        " AND NOT EXISTS (SELECT 1 FROM control_requests c"
+        "   WHERE c.job_id=jobs.id AND c.op='cancel')",
+        (job_id, job_version, started_at, session_id),
+    )
+    return changed.rowcount == 1
+
+
 def update_job(conn: sqlite3.Connection, job_id: str, **fields: Any) -> None:
     cols = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))

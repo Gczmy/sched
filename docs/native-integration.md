@@ -30,7 +30,10 @@ V2 profile 的提交入口仍在持久化和启动前拒绝。内部已具备冻
 内部另有 isolated-only 的 native session 抢占/预留、日志打开前独立提交的一次性
 `log_attempted_at` CAS、项目日志 inode 绑定，以及 T2a 的一次性
 `monitor_launch_attempted_at` 启动前 CAS。文件打开失败永久消费本 session 的日志
-尝试；启动意图提交结果不明也不得重试。它们未接入 dispatcher，owner 仍未绑定，
+尝试；启动意图提交结果不明也不得重试。隔离域 session 超过 `duration_min`
+时，dispatcher 只持久写入 `timed_out` 意图，阻止后续启动前 CAS，不发信号或
+结算任务；已提交 T2a 意图的会话在 M 启动前仍须再次检查。上述 helper 未接入正式
+V2 派发，owner 仍未绑定，
 不创建或启动 M，不能作为生产授权、启动或完成证据。
 
 ## 外部依赖

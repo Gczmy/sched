@@ -794,6 +794,63 @@ class NativeExecDispatcherRecoveryTests(NativeExecDispatcherCase):
         dispatcher._signal_job_result.assert_not_called()
         dispatcher.executor.has_process.assert_not_called()
 
+    def test_native_timeout_is_durable_without_owner_or_process_group(self) -> None:
+        self.raw_batch["tasks"][0]["duration_min"] = 1
+        job_id = self._seed_isolated_native_session()
+        dispatcher = self._dispatcher()
+        dispatcher._signal_job_result = mock.Mock()
+        with state.connect() as conn:
+            state.update_job(conn, job_id, started_at="2000-01-01 00:00:00")
+
+        dispatcher._check_timeouts()
+        dispatcher._check_timeouts()
+
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            session = state.get_native_session(conn, "a" * 32)
+            conn.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(state.StateError, "no longer an active reservation"):
+                state.mark_native_session_log_attempted(conn, "a" * 32)
+        self.assertEqual("running", job["status"])
+        self.assertEqual("timed_out", job["kill_reason"])
+        self.assertIsNone(job["pgid"])
+        self.assertIsNone(job["rc"])
+        self.assertIsNone(job["finished_at"])
+        self.assertEqual("reserved", session["phase"])
+        self.assertIsNone(session["log_attempted_at"])
+        self.assertEqual(1, dispatcher.log_line.call_count)
+        dispatcher._signal_job_result.assert_not_called()
+        dispatcher.executor.has_process.assert_not_called()
+
+    def test_pending_native_cancel_wins_over_timeout(self) -> None:
+        self.raw_batch["tasks"][0]["duration_min"] = 1
+        job_id = self._seed_isolated_native_session()
+        dispatcher = self._dispatcher()
+        with state.connect() as conn:
+            state.update_job(conn, job_id, started_at="2000-01-01 00:00:00")
+            request_id = state.insert_control_request(conn, job_id)
+
+        dispatcher._check_timeouts()
+
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            self.assertFalse(
+                state.mark_native_session_timed_out(
+                    conn,
+                    session_id="a" * 32,
+                    job_id=job_id,
+                    job_version=1,
+                    started_at=job["started_at"],
+                )
+            )
+        self.assertIsNone(job["kill_reason"])
+        self.assertEqual("pending", request["status"])
+        dispatcher.log_line.assert_not_called()
+
     def test_node_restart_and_stop_preserve_unowned_session(self) -> None:
         job_id = self._seed_isolated_native_session()
         dispatcher = self._dispatcher()

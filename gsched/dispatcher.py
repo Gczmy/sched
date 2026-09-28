@@ -2800,6 +2800,57 @@ class Dispatcher:
                     "保留 timed_out intent 等待重试"
                 )
 
+        self._check_native_timeouts()
+
+    def _check_native_timeouts(self) -> None:
+        """Persist timeout intent for isolated sessions without a process group.
+
+        The native owner has not been connected to the dispatcher.  The intent
+        only closes later launch CAS gates; it must not imply a signal or a
+        completed job.
+        """
+        with state.connect() as conn:
+            rows = conn.execute(
+                "SELECT j.*, n.session_id FROM jobs j"
+                " JOIN native_sessions n ON n.job_id=j.id AND n.job_version=j.version"
+                " WHERE j.status='running' AND j.kill_reason IS NULL"
+                " AND j.pgid IS NULL AND j.started_at IS NOT NULL"
+                " AND n.evaluation_domain='isolated_integration'"
+                " AND n.owner_kind='unbound'"
+                " AND NOT EXISTS (SELECT 1 FROM control_requests c"
+                "   WHERE c.job_id=j.id AND c.op='cancel')"
+            ).fetchall()
+            for job in rows:
+                try:
+                    spec = self._load_task_spec(conn, job)
+                    duration = spec.get("duration_min")
+                    if type(duration) is not int or duration <= 0:
+                        raise ValueError("native duration_min 必须为正整数")
+                    started = time.mktime(
+                        time.strptime(job["started_at"], "%Y-%m-%d %H:%M:%S")
+                    )
+                except (TypeError, ValueError) as error:
+                    self.log_line(
+                        f"job {job['id']} native duration 规则非法, 已忽略: {error}"
+                    )
+                    continue
+                if time.time() - started <= duration * 60:
+                    continue
+                conn.execute("BEGIN IMMEDIATE")
+                timed_out = state.mark_native_session_timed_out(
+                    conn,
+                    session_id=job["session_id"],
+                    job_id=job["id"],
+                    job_version=job["version"],
+                    started_at=job["started_at"],
+                )
+                conn.commit()
+                if timed_out:
+                    self.log_line(
+                        f"job {job['id']} native session 超时; "
+                        "保留未结算任务及 timed_out intent"
+                    )
+
     def _check_probes(self) -> None:
         """L6 probes 日志门控 (§3.4d R3): 运行中任务按声明匹配日志模式.
 

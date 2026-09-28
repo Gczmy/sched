@@ -21,7 +21,11 @@ dispatcher 不调用这些 helper，T2a 不创建或启动 M owner；其提交�
 cancel/timeout。真正的 T2 M 启动及原始 pidfd/wait 所有权、T3 在 V/P exec 前
 重验耐久 cancel/timeout、T4 以实际 END/wait 和完整证据原子发布终态都未实现。
 隔离域 native session 已在 legacy dispatcher 的恢复、取消和停止路径保守保留；
-尚无原始 owner/wait、timeout 与终态通路，不能视为正式可运行。
+超时看门狗从 T1 的 `started_at` 起计时，为超过 `duration_min` 的隔离域
+session 持久写入 `timed_out` 意图；尚未消费的日志与 M 意图 CAS 会拒绝后续尝试。
+T2a 意图提交后、真正 M 启动前仍须再查取消／超时。看门狗不发进程组信号、
+不结算任务；正式链还须确定 `duration_min` 是从预留还是实际 V/P 执行起算。
+原始 owner/wait、启动后取消／超时执行与终态通路仍未接通，不能视为正式可运行。
 `reserved` 在日志尝试失败后保留非空 `log_attempted_at`，同一 session 不可再次打开；
 它与 `log_bound` 在崩溃/日志故障后均属已消费未决，不能自动回队或重放。T2a
 提交结果不明或提交后失去 owner 时也不重试 M 启动。
