@@ -35,7 +35,7 @@ T2a 意图提交后、真正 M 启动前仍须再查取消／超时。看门狗�
 
 ## 已完成的开发项
 
-P2 看板维护操作已在调度器和配套插件分支实现：`request` 支持
+P2 看板维护操作已合入调度器和配套插件的 `main`：`request` 支持
 `daemon drain`、`daemon drain --stop-when-idle` 和 `daemon resume`；插件在
 实际 writer 上核验节点、完整状态与 CLI 能力，旧 CLI 禁用维护按钮。调度器
 回归位于 `tests/test_daemon_maintenance_request.py` 和

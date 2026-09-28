@@ -48,8 +48,8 @@ owner 必须显式接收配置，不从请求获取预期值。迁移方式和�
 `gsched._m2b_scheduler_native` 扩展。其 C 源码和专用构建/验收脚本位于
 配套研究仓库 `MPC_OTSF`，不随 `sched` 包构建或安装；普通 daemon 不依赖它。
 整合不修改该仓库的冻结合同，也不把历史 native 运行记录当作当前验证。
-`Executor.start_native_monitor()` 对同一 session 只允许一次 native 调用；重复调用
-在 Python 边界拒绝，不会因底层拒绝而误取消原 M。从 native pin 恢复的 owner
+`Executor.start_native_monitor()` 在原线程原子消费一次性启动令牌；重复或跨线程
+调用在 Python 边界拒绝，不会因底层拒绝而误取消原 M。从 native pin 恢复的 owner
 一律视为启动尝试已消费，不能用恢复动作重放启动。同一进程内的 session
 由仍存活的原 `Executor` 独占认领，其他实例不能同时接管同一 C pin；原实例
 失去所有引用后，可由原线程的新实例恢复。成功退役或丢弃空 owner 后释放

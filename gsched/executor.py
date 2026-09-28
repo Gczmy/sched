@@ -879,12 +879,18 @@ class Executor:
         """
         if type(plan) is not NativeMonitorLaunch:
             raise TypeError("native monitor start requires NativeMonitorLaunch")
-        owner = self._native_monitors[session_id]
-        if session_id in self._native_monitor_start_attempts:
-            raise ValueError("native monitor start already attempted")
-        # Consume before crossing into C. A second call must not turn the
-        # native duplicate-start rejection into cancellation of the first M.
-        self._native_monitor_start_attempts.add(session_id)
+        with _locked_native_monitor_claims():
+            claim = _native_monitor_claims.get(session_id)
+            if claim is None or _native_monitor_claimant(session_id) is not self:
+                raise RuntimeError("native monitor start requires its claimed Executor")
+            if claim[1] is not threading.current_thread():
+                raise RuntimeError("native monitor start requires its original thread")
+            owner = self._native_monitors[session_id]
+            if session_id in self._native_monitor_start_attempts:
+                raise ValueError("native monitor start already attempted")
+            # Consume atomically before crossing into C. A second call must
+            # not cancel the first M after a native duplicate-start rejection.
+            self._native_monitor_start_attempts.add(session_id)
         try:
             owner.start(*plan.native_arguments())
         except BaseException as start_error:

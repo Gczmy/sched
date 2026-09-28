@@ -59,6 +59,7 @@ class NativeMonitorExecutorTests(unittest.TestCase):
         owner = mock.Mock()
         executor = Executor()
         executor._native_monitors[SESSION_ID] = owner
+        executor_module._claim_native_monitor(SESSION_ID, executor)
 
         executor.start_native_monitor(SESSION_ID, _plan())
         with self.assertRaisesRegex(ValueError, "already attempted"):
@@ -72,6 +73,7 @@ class NativeMonitorExecutorTests(unittest.TestCase):
         owner.start.side_effect = RuntimeError("native start failed")
         executor = Executor()
         executor._native_monitors[SESSION_ID] = owner
+        executor_module._claim_native_monitor(SESSION_ID, executor)
 
         with self.assertRaisesRegex(RuntimeError, "native start failed"):
             executor.start_native_monitor(SESSION_ID, _plan())
@@ -98,6 +100,44 @@ class NativeMonitorExecutorTests(unittest.TestCase):
             executor.start_native_monitor(SESSION_ID, _plan())
 
         owner.start.assert_not_called()
+        owner.cancel.assert_not_called()
+
+    def test_foreign_thread_cannot_consume_start_or_cancel_owner(self) -> None:
+        owner = mock.Mock()
+        executor = Executor()
+        executor._native_monitors[SESSION_ID] = owner
+        claimed = threading.Event()
+        begin_start = threading.Event()
+        finished = threading.Event()
+        failures: list[BaseException] = []
+
+        def original_thread() -> None:
+            try:
+                executor_module._claim_native_monitor(SESSION_ID, executor)
+                claimed.set()
+                if not begin_start.wait(5):
+                    raise TimeoutError("start barrier timed out")
+                executor.start_native_monitor(SESSION_ID, _plan())
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=original_thread)
+        worker.start()
+        try:
+            self.assertTrue(claimed.wait(5))
+            with self.assertRaisesRegex(RuntimeError, "original thread"):
+                executor.start_native_monitor(SESSION_ID, _plan())
+            owner.start.assert_not_called()
+            owner.cancel.assert_not_called()
+        finally:
+            begin_start.set()
+            worker.join(5)
+
+        self.assertTrue(finished.is_set())
+        self.assertEqual(failures, [])
+        owner.start.assert_called_once()
         owner.cancel.assert_not_called()
 
     def test_other_executor_cannot_take_or_recover_claimed_pin(self) -> None:
