@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS native_sessions (
   phase TEXT NOT NULL CHECK (phase IN ('reserved', 'log_bound')),
   created_at TEXT NOT NULL,
   log_bound_at TEXT,
+  monitor_launch_attempted_at TEXT,
   UNIQUE (project_root_identity_sha256, log_relative_path),
   CHECK (
     (phase='reserved' AND log_dev IS NULL AND log_ino IS NULL AND log_bound_at IS NULL)
@@ -173,7 +174,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -202,6 +203,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "revision_gpu_job_insert",
         "revision_gpu_job_delete",
         "revision_gpu_job_update",
+        "native_session_monitor_launch_immutable",
     },
 }
 
@@ -216,6 +218,7 @@ _REQUIRED_MIGRATED_COLUMNS = {
         "owner_kind", "profile_id", "profile_sha256", "project_root_path",
         "project_root_identity_sha256", "log_relative_path", "log_attempted_at", "log_dev",
         "log_ino", "phase", "created_at", "log_bound_at",
+        "monitor_launch_attempted_at",
     },
     "gpus": {"mem_total_gib", "revision"},
     "operation_requests": {"output_compacted"},
@@ -437,9 +440,15 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     }
     if version == 1:
         required_objects["table"].remove("native_sessions")
+        required_objects["trigger"].remove("native_session_monitor_launch_immutable")
         del required_columns["native_sessions"]
     elif version == 2:
+        required_objects["trigger"].remove("native_session_monitor_launch_immutable")
         required_columns["native_sessions"].remove("log_attempted_at")
+        required_columns["native_sessions"].remove("monitor_launch_attempted_at")
+    elif version == 3:
+        required_objects["trigger"].remove("native_session_monitor_launch_immutable")
+        required_columns["native_sessions"].remove("monitor_launch_attempted_at")
 
     objects: dict[str, set[str]] = {kind: set() for kind in required_objects}
     for kind, name in conn.execute(
@@ -854,7 +863,7 @@ def _database_schema_is_current(database: str) -> bool:
 
 
 def _database_schema_is_query_compatible(database: str) -> bool:
-    """Accept complete private WAL schemas v1-v3 for local queries only."""
+    """Accept complete private WAL schemas v1-v4 for local queries only."""
     return _database_schema_is_usable(database, allow_legacy=True)
 
 
@@ -909,6 +918,7 @@ def _initialize_database() -> None:
         migrate_job_progress(conn)
         migrate_operation_requests(conn)
         migrate_native_session_log_attempts(conn)
+        migrate_native_monitor_launch_attempts(conn)
         migrate_revisions(conn)
         migrate_legacy_job_statuses(conn)
         conn.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
@@ -917,7 +927,7 @@ def _initialize_database() -> None:
 def ensure_db_initialized() -> str:
     """Initialize only when the read-only schema probe finds work to do.
 
-    Query commands accept complete private WAL schemas v1-v3 without entering
+    Query commands accept complete private WAL schemas v1-v4 without entering
     init_db() or requesting ``BEGIN IMMEDIATE``.  A fresh, stale, partially
     copied, non-WAL, or permission-drifted state still takes the existing full
     atomic initialization path.
@@ -1047,6 +1057,30 @@ def migrate_native_session_log_attempts(conn: sqlite3.Connection) -> None:
             " SET log_attempted_at=COALESCE(log_bound_at, created_at)"
             " WHERE log_attempted_at IS NULL"
         )
+
+
+def migrate_native_monitor_launch_attempts(conn: sqlite3.Connection) -> None:
+    """Consume every pre-v4 session: an earlier M attempt is unknowable."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(native_sessions)").fetchall()
+    }
+    added = "monitor_launch_attempted_at" not in columns
+    if added:
+        conn.execute("ALTER TABLE native_sessions ADD COLUMN monitor_launch_attempted_at TEXT")
+    if added or int(conn.execute("PRAGMA user_version").fetchone()[0]) < 4:
+        conn.execute(
+            "UPDATE native_sessions"
+            " SET monitor_launch_attempted_at=COALESCE(log_bound_at, log_attempted_at, created_at)"
+            " WHERE monitor_launch_attempted_at IS NULL"
+        )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS native_session_monitor_launch_immutable"
+        " BEFORE UPDATE ON native_sessions"
+        " WHEN OLD.monitor_launch_attempted_at IS NOT NULL"
+        "  AND NEW.monitor_launch_attempted_at IS NOT OLD.monitor_launch_attempted_at"
+        " BEGIN SELECT RAISE(ABORT, 'native monitor launch intent is immutable'); END;"
+    )
 
 
 def migrate_revisions(conn: sqlite3.Connection) -> None:
@@ -1715,6 +1749,50 @@ def bind_native_session_log(
     session = get_native_session(conn, session_id)
     if session is None:
         raise StateError("native log binding disappeared")
+    return session
+
+
+def mark_native_monitor_launch_attempted(
+    conn: sqlite3.Connection,
+    session_id: str,
+    log_dev: int,
+    log_ino: int,
+) -> sqlite3.Row:
+    """Consume one isolated M-birth intent in the caller's writer transaction.
+
+    The caller must confirm a separate commit before starting any native owner.
+    This reservation does not create or bind an owner, nor grant phase execution.
+    """
+    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
+        raise StateError("native session id is invalid")
+    if type(log_dev) is not int or log_dev < 0 or type(log_ino) is not int or log_ino <= 0:
+        raise StateError("native monitor launch log inode identity is invalid")
+    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
+        raise StateError("native monitor launch intent requires a caller-owned writer transaction")
+    changed = conn.execute(
+        "UPDATE native_sessions SET monitor_launch_attempted_at=?"
+        " WHERE session_id=? AND phase='log_bound'"
+        " AND log_attempted_at IS NOT NULL"
+        " AND monitor_launch_attempted_at IS NULL"
+        " AND log_dev=? AND log_ino=?"
+        " AND evaluation_domain='isolated_integration' AND owner_kind='unbound'"
+        " AND NOT EXISTS (SELECT 1 FROM control_requests c"
+        "   WHERE c.job_id=native_sessions.job_id AND c.op='cancel')"
+        " AND EXISTS (SELECT 1 FROM jobs j JOIN batches b ON b.id=j.batch_id"
+        "   WHERE j.id=native_sessions.job_id"
+        "   AND j.version=native_sessions.job_version"
+        "   AND j.status='running' AND j.pgid IS NULL"
+        "   AND j.kill_reason IS NULL AND b.status='active'"
+        "   AND b.mode='strict'"
+        "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+        "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))",
+        (now(), session_id, str(log_dev), str(log_ino)),
+    )
+    if changed.rowcount != 1:
+        raise StateError("native monitor launch intent is no longer an active reservation")
+    session = get_native_session(conn, session_id)
+    if session is None:
+        raise StateError("native monitor launch intent disappeared")
     return session
 
 

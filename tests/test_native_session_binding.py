@@ -1,7 +1,8 @@
-"""Durable candidate reservation and unique native log binding on Linux."""
+"""Durable isolated native session, log, and monitor intent on Linux."""
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import sys
@@ -15,6 +16,7 @@ from gsched.native_exec import native_exec_project_root_identity_sha256
 from gsched.native_launch import (
     NativeLaunchPlanError,
     _create_bound_native_session_log,
+    _commit_native_monitor_launch_intent,
 )
 
 
@@ -36,6 +38,7 @@ class NativeSessionBindingTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.db.executescript(state.SCHEMA)
         state.migrate_project_columns(self.db)
+        state.migrate_native_monitor_launch_attempts(self.db)
         self.profile_digest = "a" * 64
         state.insert_batch(
             self.db, "batch", "batch", "strict", [], None,
@@ -77,7 +80,7 @@ class NativeSessionBindingTests(unittest.TestCase):
         self.db.execute("UPDATE batches SET status='active' WHERE id='batch'")
         self.db.commit()
 
-    def test_v1_database_migrates_and_read_only_probe_sees_v3(self) -> None:
+    def test_v1_database_migrates_and_read_only_probe_sees_v4(self) -> None:
         old_dir = tempfile.TemporaryDirectory(prefix="sched-native-migrate-")
         self.addCleanup(old_dir.cleanup)
         old_path = os.path.join(old_dir.name, "state.db")
@@ -131,6 +134,7 @@ class NativeSessionBindingTests(unittest.TestCase):
         self.addCleanup(old_dir.cleanup)
         old_path = os.path.join(old_dir.name, "state.db")
         v2_schema = state.SCHEMA.replace("  log_attempted_at TEXT,\n", "", 1)
+        v2_schema = v2_schema.replace("  monitor_launch_attempted_at TEXT,\n", "", 1)
         self.assertNotEqual(state.SCHEMA, v2_schema)
         old = sqlite3.connect(old_path)
         old.row_factory = sqlite3.Row
@@ -170,12 +174,13 @@ class NativeSessionBindingTests(unittest.TestCase):
         migrated = sqlite3.connect(old_path)
         try:
             row = migrated.execute(
-                "SELECT phase,log_attempted_at FROM native_sessions WHERE session_id=?",
+                "SELECT phase,log_attempted_at,monitor_launch_attempted_at"
+                " FROM native_sessions WHERE session_id=?",
                 ("2" * 32,),
             ).fetchone()
-            self.assertEqual(("reserved", "2026-01-01"), row)
+            self.assertEqual(("reserved", "2026-01-01", "2026-01-01"), row)
             self.assertEqual(
-                3, migrated.execute("PRAGMA user_version").fetchone()[0]
+                4, migrated.execute("PRAGMA user_version").fetchone()[0]
             )
         finally:
             migrated.close()
@@ -457,6 +462,267 @@ class NativeSessionBindingTests(unittest.TestCase):
         reservation = state.get_native_session(self.db, reservation["session_id"])
         self.assertEqual("reserved", reservation["phase"])
         self.assertIsNotNone(reservation["log_attempted_at"])
+
+    def _bound_log(self) -> tuple[str, int]:
+        self.activate()
+        reservation = self.claim()
+        self.db.commit()
+        fd = _create_bound_native_session_log(
+            self.db, session_id=reservation["session_id"],
+            project_root_fd=self.root_fd,
+        )
+        self.addCleanup(os.close, fd)
+        return reservation["session_id"], fd
+
+    def test_monitor_intent_requires_bound_log_and_exact_retained_fd(self) -> None:
+        self.activate()
+        reservation = self.claim()
+        self.db.commit()
+        with self.assertRaises(NativeLaunchPlanError):
+            _commit_native_monitor_launch_intent(
+                self.db, session_id=reservation["session_id"],
+                project_root_fd=self.root_fd, log_fd=self.root_fd,
+            )
+        self.assertIsNone(state.get_native_session(
+            self.db, reservation["session_id"]
+        )["monitor_launch_attempted_at"])
+
+        log_fd = _create_bound_native_session_log(
+            self.db, session_id=reservation["session_id"],
+            project_root_fd=self.root_fd,
+        )
+        self.addCleanup(os.close, log_fd)
+        log_path = os.path.join(self.root, reservation["log_relative_path"])
+        read_fd = os.open(log_path, os.O_RDONLY | os.O_CLOEXEC)
+        self.addCleanup(os.close, read_fd)
+        no_append_fd = os.open(log_path, os.O_WRONLY | os.O_CLOEXEC)
+        self.addCleanup(os.close, no_append_fd)
+        for bad_fd in (read_fd, no_append_fd):
+            with self.assertRaises(NativeLaunchPlanError):
+                _commit_native_monitor_launch_intent(
+                    self.db, session_id=reservation["session_id"],
+                    project_root_fd=self.root_fd, log_fd=bad_fd,
+                )
+        no_cloexec_fd = os.dup(log_fd)
+        self.addCleanup(os.close, no_cloexec_fd)
+        fcntl.fcntl(no_cloexec_fd, fcntl.F_SETFD, 0)
+        with self.assertRaises(NativeLaunchPlanError):
+            _commit_native_monitor_launch_intent(
+                self.db, session_id=reservation["session_id"],
+                project_root_fd=self.root_fd, log_fd=no_cloexec_fd,
+            )
+        self.assertIsNone(state.get_native_session(
+            self.db, reservation["session_id"]
+        )["monitor_launch_attempted_at"])
+
+        self.db.execute("UPDATE native_sessions SET log_ino='999' WHERE session_id=?",
+                        (reservation["session_id"],))
+        self.db.commit()
+        with self.assertRaises(NativeLaunchPlanError):
+            _commit_native_monitor_launch_intent(
+                self.db, session_id=reservation["session_id"],
+                project_root_fd=self.root_fd, log_fd=log_fd,
+            )
+
+    def test_monitor_intent_commits_once_and_cannot_be_cleared(self) -> None:
+        session_id, log_fd = self._bound_log()
+        intent = _commit_native_monitor_launch_intent(
+            self.db, session_id=session_id,
+            project_root_fd=self.root_fd, log_fd=log_fd,
+        )
+        self.assertIsNotNone(intent["monitor_launch_attempted_at"])
+        self.assertFalse(self.db.in_transaction)
+        with self.assertRaises(NativeLaunchPlanError):
+            _commit_native_monitor_launch_intent(
+                self.db, session_id=session_id,
+                project_root_fd=self.root_fd, log_fd=log_fd,
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(
+                "UPDATE native_sessions SET monitor_launch_attempted_at=NULL"
+                " WHERE session_id=?", (session_id,),
+            )
+        self.db.rollback()
+
+    def test_monitor_intent_rejects_replaced_project_log_path(self) -> None:
+        session_id, log_fd = self._bound_log()
+        session = state.get_native_session(self.db, session_id)
+        log_path = os.path.join(self.root, session["log_relative_path"])
+        os.unlink(log_path)
+        with open(log_path, "xb") as replacement:
+            replacement.write(b"replacement")
+        with self.assertRaises(NativeLaunchPlanError):
+            _commit_native_monitor_launch_intent(
+                self.db, session_id=session_id,
+                project_root_fd=self.root_fd, log_fd=log_fd,
+            )
+        self.assertIsNone(state.get_native_session(
+            self.db, session_id
+        )["monitor_launch_attempted_at"])
+
+    def test_monitor_intent_writer_competition_and_job_guards(self) -> None:
+        session_id, log_fd = self._bound_log()
+        inode = os.fstat(log_fd)
+        for mutation in (
+            "UPDATE batches SET status='blocked' WHERE id='batch'",
+            "UPDATE jobs SET status='failed' WHERE id='job-v1'",
+            "UPDATE jobs SET pgid=123 WHERE id='job-v1'",
+            "UPDATE jobs SET kill_reason='cancelled' WHERE id='job-v1'",
+            "INSERT INTO jobs (id,batch_id,task_id,version,status)"
+            " VALUES ('job-v2','batch','task',2,'pending')",
+        ):
+            with self.subTest(mutation=mutation):
+                self.db.execute("BEGIN IMMEDIATE")
+                self.db.execute(mutation)
+                with self.assertRaises(state.StateError):
+                    state.mark_native_monitor_launch_attempted(
+                        self.db, session_id, inode.st_dev, inode.st_ino
+                    )
+                self.db.rollback()
+        for wrong_dev, wrong_ino in (
+            (inode.st_dev + 1, inode.st_ino),
+            (inode.st_dev, inode.st_ino + 1),
+        ):
+            self.db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(state.StateError):
+                state.mark_native_monitor_launch_attempted(
+                    self.db, session_id, wrong_dev, wrong_ino
+                )
+            self.db.rollback()
+        # The table CHECK also rejects these values in normal operation.  Force
+        # a malformed row to prove the CAS itself does not trust that CHECK.
+        self.db.execute("PRAGMA ignore_check_constraints=ON")
+        try:
+            for column, value in (
+                ("evaluation_domain", "production"),
+                ("owner_kind", "production_owner"),
+            ):
+                with self.subTest(column=column):
+                    self.db.execute("BEGIN IMMEDIATE")
+                    self.db.execute(
+                        f"UPDATE native_sessions SET {column}=? WHERE session_id=?",
+                        (value, session_id),
+                    )
+                    with self.assertRaises(state.StateError):
+                        state.mark_native_monitor_launch_attempted(
+                            self.db, session_id, inode.st_dev, inode.st_ino
+                        )
+                    self.db.rollback()
+        finally:
+            self.db.execute("PRAGMA ignore_check_constraints=OFF")
+        db_path = self.db.execute("PRAGMA database_list").fetchone()[2]
+        with closing(sqlite3.connect(db_path, timeout=0)) as other:
+            other.row_factory = sqlite3.Row
+            self.db.execute("BEGIN IMMEDIATE")
+            state.mark_native_monitor_launch_attempted(
+                self.db, session_id, inode.st_dev, inode.st_ino
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                other.execute("BEGIN IMMEDIATE")
+            self.db.commit()
+            other.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(state.StateError):
+                state.mark_native_monitor_launch_attempted(
+                    other, session_id, inode.st_dev, inode.st_ino
+                )
+            other.rollback()
+
+    def test_monitor_intent_rejects_any_durable_cancel_record(self) -> None:
+        session_id, log_fd = self._bound_log()
+        request_id = state.insert_control_request(self.db, "job-v1")
+        self.db.commit()
+        for request_status in ("pending", "done"):
+            with self.subTest(request_status=request_status):
+                with self.assertRaises(state.StateError):
+                    _commit_native_monitor_launch_intent(
+                        self.db, session_id=session_id,
+                        project_root_fd=self.root_fd, log_fd=log_fd,
+                    )
+                self.assertIsNone(state.get_native_session(
+                    self.db, session_id
+                )["monitor_launch_attempted_at"])
+                self.db.execute(
+                    "UPDATE control_requests SET status='done' WHERE id=?",
+                    (request_id,),
+                )
+                self.db.commit()
+
+    def test_uncertain_monitor_intent_commit_consumes_without_return(self) -> None:
+        class CommitUnknown(sqlite3.Connection):
+            def commit(self) -> None:
+                super().commit()
+                raise sqlite3.OperationalError("injected unknown launch commit")
+
+        session_id, log_fd = self._bound_log()
+        db_path = self.db.execute("PRAGMA database_list").fetchone()[2]
+        with closing(sqlite3.connect(db_path, factory=CommitUnknown)) as other:
+            other.row_factory = sqlite3.Row
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError, "unknown launch commit"
+            ):
+                _commit_native_monitor_launch_intent(
+                    other, session_id=session_id,
+                    project_root_fd=self.root_fd, log_fd=log_fd,
+                )
+        self.assertIsNotNone(state.get_native_session(
+            self.db, session_id
+        )["monitor_launch_attempted_at"])
+        with self.assertRaises(NativeLaunchPlanError):
+            _commit_native_monitor_launch_intent(
+                self.db, session_id=session_id,
+                project_root_fd=self.root_fd, log_fd=log_fd,
+            )
+
+    def test_v3_migration_consumes_existing_bound_session(self) -> None:
+        old_dir = tempfile.TemporaryDirectory(prefix="sched-native-v3-migrate-")
+        self.addCleanup(old_dir.cleanup)
+        db_path = os.path.join(old_dir.name, "state.db")
+        v3_schema = state.SCHEMA.replace("  monitor_launch_attempted_at TEXT,\n", "", 1)
+        with closing(sqlite3.connect(db_path)) as old:
+            old.row_factory = sqlite3.Row
+            old.execute("PRAGMA journal_mode=WAL")
+            old.executescript(v3_schema)
+            state.migrate_gpu_jobs(old)
+            state.migrate_project_columns(old)
+            state.migrate_incidents(old)
+            state.migrate_job_progress(old)
+            state.migrate_operation_requests(old)
+            state.migrate_revisions(old)
+            old.execute("PRAGMA user_version=3")
+            for session_id, phase in (("3" * 32, "reserved"), ("4" * 32, "log_bound")):
+                old.execute(
+                    "INSERT INTO native_sessions ("
+                    "session_id,job_id,job_version,evaluation_domain,owner_kind,"
+                    "profile_id,profile_sha256,project_root_path,"
+                    "project_root_identity_sha256,log_relative_path,"
+                    "log_attempted_at,log_dev,log_ino,phase,created_at,log_bound_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        session_id, f"old-{session_id}", 1,
+                        "isolated_integration", "unbound", "candidate-v2",
+                        self.profile_digest, self.root, self.root_digest,
+                        f"logs/sched-native-{session_id}.log", "2026-01-01",
+                        "1" if phase == "log_bound" else None,
+                        "2" if phase == "log_bound" else None,
+                        phase, "2026-01-01",
+                        "2026-01-01" if phase == "log_bound" else None,
+                    ),
+                )
+            old.commit()
+        os.chmod(db_path, 0o600)
+        with (
+            mock.patch.object(state, "default_state_dir", return_value=old_dir.name),
+            mock.patch.object(state, "db_path", return_value=db_path),
+        ):
+            self.assertTrue(state._database_schema_is_query_compatible(db_path))
+            state._initialize_database()
+        with closing(sqlite3.connect(db_path)) as upgraded:
+            consumed = upgraded.execute(
+                "SELECT monitor_launch_attempted_at FROM native_sessions"
+            ).fetchall()
+            self.assertEqual(2, len(consumed))
+            self.assertTrue(all(row[0] is not None for row in consumed))
+            self.assertEqual(4, upgraded.execute("PRAGMA user_version").fetchone()[0])
 
 
 if __name__ == "__main__":

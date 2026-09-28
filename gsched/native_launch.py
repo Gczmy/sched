@@ -411,6 +411,113 @@ def _create_bound_native_session_log(
         raise
 
 
+def _attest_native_session_log_fd(
+    session: sqlite3.Row,
+    *,
+    session_id: str,
+    project_root_fd: int,
+    log_fd: int,
+    require_unconsumed: bool,
+) -> os.stat_result:
+    """Recheck the retained log, its one path, and its durable session inode."""
+    _fd(project_root_fd, "project_root_fd")
+    _fd(log_fd, "log_fd")
+    if (
+        session["evaluation_domain"] != "isolated_integration"
+        or session["owner_kind"] != "unbound"
+        or session["phase"] != "log_bound"
+        or session["log_attempted_at"] is None
+        or (require_unconsumed and session["monitor_launch_attempted_at"] is not None)
+        or session["log_relative_path"] != f"logs/sched-native-{session_id}.log"
+    ):
+        raise NativeLaunchPlanError("native session has no unconsumed monitor launch intent")
+    _validate_project_root_fd(
+        project_root_fd,
+        session["project_root_path"],
+        session["project_root_identity_sha256"],
+    )
+    try:
+        log_stat = os.fstat(log_fd)
+        descriptor_flags = fcntl.fcntl(log_fd, fcntl.F_GETFD)
+        log_flags = fcntl.fcntl(log_fd, fcntl.F_GETFL)
+    except OSError as exc:
+        raise NativeLaunchPlanError("native monitor launch log FD cannot be inspected") from exc
+    if (
+        not stat.S_ISREG(log_stat.st_mode)
+        or stat.S_IMODE(log_stat.st_mode) != 0o600
+        or descriptor_flags & fcntl.FD_CLOEXEC == 0
+        or (log_flags & os.O_ACCMODE) != os.O_WRONLY
+        or log_flags & os.O_APPEND == 0
+        or (str(log_stat.st_dev), str(log_stat.st_ino))
+        != (session["log_dev"], session["log_ino"])
+    ):
+        raise NativeLaunchPlanError("native monitor launch log FD differs from durable binding")
+    _validate_project_local_log(project_root_fd, session["log_relative_path"], log_stat)
+    _validate_project_root_fd(
+        project_root_fd,
+        session["project_root_path"],
+        session["project_root_identity_sha256"],
+    )
+    return log_stat
+
+
+def _commit_native_monitor_launch_intent(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    project_root_fd: int,
+    log_fd: int,
+) -> sqlite3.Row:
+    """Commit one isolated M-birth intent before any native owner can start.
+
+    The borrowed root and log FDs remain caller-owned.  A commit failure or
+    uncertain result returns no intent, even if the CAS reached disk.  A
+    successful return records consumption only: cancellation/timeout and the
+    original native owner must still be rechecked before any M birth or V/P
+    exec.  This helper neither creates an M owner nor calls the dispatcher.
+    """
+    from . import state
+
+    if not isinstance(conn, sqlite3.Connection) or conn.in_transaction:
+        raise NativeLaunchPlanError(
+            "native monitor launch requires a separately committed log binding"
+        )
+    session = state.get_native_session(conn, session_id)
+    if session is None:
+        raise NativeLaunchPlanError("native monitor launch session does not exist")
+    log_stat = _attest_native_session_log_fd(
+        session, session_id=session_id,
+        project_root_fd=project_root_fd, log_fd=log_fd,
+        require_unconsumed=True,
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent = state.mark_native_monitor_launch_attempted(
+            conn, session_id, log_stat.st_dev, log_stat.st_ino
+        )
+        conn.commit()
+        if conn.in_transaction:
+            raise NativeLaunchPlanError("native monitor launch intent commit is unresolved")
+        # A path/FD replacement after the CAS consumes this attempt; it never
+        # grants a second chance to launch on a different inode.
+        committed = state.get_native_session(conn, session_id)
+        if (
+            committed is None
+            or committed["monitor_launch_attempted_at"]
+            != intent["monitor_launch_attempted_at"]
+        ):
+            raise NativeLaunchPlanError("native monitor launch intent commit could not be re-attested")
+        _attest_native_session_log_fd(
+            committed, session_id=session_id,
+            project_root_fd=project_root_fd, log_fd=log_fd,
+            require_unconsumed=False,
+        )
+        return intent
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _validate_project_local_log(
     project_root_fd: int,
     log_relative_path: str,

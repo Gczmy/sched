@@ -1677,6 +1677,8 @@ class ReviewLocalQueryOnlyTests(TempStateCase):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(database + suffix)
         schema = state.SCHEMA
+        if version in (2, 3):
+            schema = schema.replace("  monitor_launch_attempted_at TEXT,\n", "", 1)
         if version == 2:
             schema = schema.replace("  log_attempted_at TEXT,\n", "", 1)
             self.assertNotEqual(state.SCHEMA, schema)
@@ -1698,9 +1700,9 @@ class ReviewLocalQueryOnlyTests(TempStateCase):
             with contextlib.suppress(FileNotFoundError):
                 os.chmod(database + suffix, 0o600)
 
-    def test_complete_v1_v2_local_status_and_task_do_not_migrate(self) -> None:
+    def test_complete_v1_v2_v3_local_status_and_task_do_not_migrate(self) -> None:
         database = state.db_path()
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 self._replace_with_complete_legacy_schema(version)
                 self.seed_batch(job_status="pending")
