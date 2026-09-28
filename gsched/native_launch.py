@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import socket
 import stat
 import struct
@@ -339,6 +340,63 @@ def _open_project_local_log_fd(
             os.close(log_fd)
         if cursor_owned:
             os.close(cursor)
+
+
+def _create_bound_native_session_log(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    project_root_fd: int,
+) -> int:
+    """Create and durably bind one candidate session's retained log FD.
+
+    The claim/session transaction must already be committed.  An open or
+    indeterminate transaction cannot make the new file's reservation durable.
+    Any failure keeps the O_EXCL file, closes its FD, and forbids path reuse.
+    This helper does not arm a launch or grant a native monitor owner.
+    """
+    from . import state
+
+    if not isinstance(conn, sqlite3.Connection) or conn.in_transaction:
+        raise NativeLaunchPlanError(
+            "native session reservation must be committed before log creation"
+        )
+    session = state.get_native_session(conn, session_id)
+    if (
+        session is None
+        or session["phase"] != "reserved"
+        or session["evaluation_domain"] != "isolated_integration"
+        or session["owner_kind"] != "unbound"
+    ):
+        raise NativeLaunchPlanError("native session has no unbound log reservation")
+    log_fd = _open_project_local_log_fd(
+        project_root_fd=project_root_fd,
+        project_root_path=session["project_root_path"],
+        project_root_identity_sha256=session["project_root_identity_sha256"],
+        log_relative_path=session["log_relative_path"],
+    )
+    try:
+        log_stat = os.fstat(log_fd)
+        _validate_project_local_log(
+            project_root_fd, session["log_relative_path"], log_stat
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        state.bind_native_session_log(
+            conn, session_id, log_stat.st_dev, log_stat.st_ino
+        )
+        conn.commit()
+        if conn.in_transaction:
+            raise NativeLaunchPlanError("native log binding commit is unresolved")
+        _validate_project_local_log(
+            project_root_fd, session["log_relative_path"], log_stat
+        )
+        return log_fd
+    except BaseException:
+        try:
+            conn.rollback()
+        finally:
+            os.close(log_fd)
+        raise
 
 
 def _validate_project_local_log(

@@ -125,8 +125,19 @@ plan factory 并立即关闭该源端；peer 端由创建进程私有保留，�
 direct-parent lifecycle。
 隔离式 `NativeStep5DRequestOwner.prepare()` 省略 `log_fd` 时，会在已复核的项目 root 下
 以 `O_EXCL` 创建 `logs/` 内的私有 `0600` 日志；plan 保留独立 FD，调用方的 root FD
-仍归调用方所有。后续失败保留已创建的日志。正式 dispatcher 的每次 attempt 日志路径持久绑定、
-CLI 查询路径和 native session 尚未接入。
+仍归调用方所有。后续失败保留已创建的日志。内部 `native_sessions` 预留目前只服务
+`isolated_integration`，owner 固定为 `unbound`，不代表 M 所有权或正式执行授权。
+`claim_native_session_candidate()` 在同一 SQLite writer 事务中对 active/latest/pending 的
+V2 job 执行 `running` CAS 并插入唯一 session；调用方必须先完成冻结合同复核，并在
+任何 FD 或子进程创建前提交该事务。随后 `_create_bound_native_session_log()` 只从已
+提交的预留行读取项目 root 与 `logs/sched-native-<session-id>.log`，经 retained root FD
+以 `O_EXCL` 创建日志，把实际 `st_dev/st_ino` 写为 `log_bound` 并提交后才返回 FD。
+`reserved` 与 `log_bound` 都是已消费且未决的状态；缺失目录、路径占用、创建失败、
+回写失败或重启均不得换 session、覆盖日志、回到 pending 或推断成功。已创建的日志
+在后续失败时保留。正式 dispatcher 不调用这些 helper；其 attempt 日志查询路径、
+native cancel/timeout/崩溃接管、启动前 one-shot intent 与可信终态证据仍未接入。
+CLI `task/log/diag` 仍按既有 state 目录版本路径查询，不能用其读取 native session 日志。
+内部 DB `user_version=2` 与公开 CLI JSON 的 `schema_version:1` 是不同版本号。
 
 `gsched.native_step5d_alignment.foundation_alignment_projection()` 提供只读、可 JSON 序列化的
 `digest_and_direct_parent_endpoint_foundation_only` 声明；其值从生产 launch 常量、

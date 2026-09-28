@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
-import os
 import hashlib
+import json
+import os
+import re
 import sqlite3
 import shutil
 import stat
@@ -67,6 +69,33 @@ CREATE TABLE IF NOT EXISTS jobs (
   git_rev     TEXT,
   submitted_at TEXT, started_at TEXT, finished_at TEXT,
   UNIQUE (batch_id, task_id, version)
+);
+
+-- Candidate-only native reservation.  This is neither an M owner nor formal
+-- execution authority.  A job/version consumes at most one native session.
+CREATE TABLE IF NOT EXISTS native_sessions (
+  session_id TEXT PRIMARY KEY
+    CHECK (length(session_id)=32 AND session_id NOT GLOB '*[^0-9a-f]*'),
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  job_version INTEGER NOT NULL CHECK (job_version > 0),
+  evaluation_domain TEXT NOT NULL CHECK (evaluation_domain='isolated_integration'),
+  owner_kind TEXT NOT NULL CHECK (owner_kind='unbound'),
+  profile_id TEXT NOT NULL,
+  profile_sha256 TEXT NOT NULL,
+  project_root_path TEXT NOT NULL,
+  project_root_identity_sha256 TEXT NOT NULL,
+  log_relative_path TEXT NOT NULL,
+  log_dev TEXT,
+  log_ino TEXT,
+  phase TEXT NOT NULL CHECK (phase IN ('reserved', 'log_bound')),
+  created_at TEXT NOT NULL,
+  log_bound_at TEXT,
+  UNIQUE (project_root_identity_sha256, log_relative_path),
+  CHECK (
+    (phase='reserved' AND log_dev IS NULL AND log_ino IS NULL AND log_bound_at IS NULL)
+    OR (phase='log_bound' AND log_dev IS NOT NULL AND log_ino IS NOT NULL
+        AND log_bound_at IS NOT NULL)
+  )
 );
 
 CREATE TABLE IF NOT EXISTS gpus (
@@ -143,13 +172,14 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
         "batches",
         "tasks",
         "jobs",
+        "native_sessions",
         "gpus",
         "gpu_jobs",
         "profile_cache",
@@ -180,6 +210,12 @@ _REQUIRED_MIGRATED_COLUMNS = {
     "batches": {"notify", "project", "priority", "revision"},
     "tasks": {"project"},
     "jobs": {"project", "progress"},
+    "native_sessions": {
+        "session_id", "job_id", "job_version", "evaluation_domain",
+        "owner_kind", "profile_id", "profile_sha256", "project_root_path",
+        "project_root_identity_sha256", "log_relative_path", "log_dev",
+        "log_ino", "phase", "created_at", "log_bound_at",
+    },
     "gpus": {"mem_total_gib", "revision"},
     "operation_requests": {"output_compacted"},
 }
@@ -1437,6 +1473,162 @@ def insert_job(
             project,
         ),
     )
+
+
+_NATIVE_SESSION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+_NATIVE_SESSION_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_NATIVE_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def get_native_session(
+    conn: sqlite3.Connection, session_id: str,
+) -> sqlite3.Row | None:
+    """Read a candidate reservation; this row grants no execution authority."""
+    if conn.row_factory is not sqlite3.Row:
+        raise StateError("native session requires sqlite3.Row connections")
+    return conn.execute(
+        "SELECT * FROM native_sessions WHERE session_id=?", (session_id,)
+    ).fetchone()
+
+
+def claim_native_session_candidate(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    job_version: int,
+    session_id: str,
+    profile_id: str,
+    profile_sha256: str,
+    project_root_path: str,
+    project_root_identity_sha256: str,
+) -> sqlite3.Row:
+    """Atomically claim one V2 job and reserve an isolated, ownerless session.
+
+    The caller must first reattest the frozen V2 contract and must commit this
+    transaction before creating any FD or native child.  No dispatcher path
+    calls this candidate-only API while V2 lifecycle handling is unavailable.
+    A failed claim or insert rolls back both changes to this savepoint.
+    """
+    if type(job_id) is not str or not job_id:
+        raise StateError("native session job id is invalid")
+    if type(job_version) is not int or job_version < 1:
+        raise StateError("native session job version is invalid")
+    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
+        raise StateError("native session id must be 32 lowercase hexadecimal characters")
+    if type(profile_id) is not str or _NATIVE_PROFILE_ID_RE.fullmatch(profile_id) is None:
+        raise StateError("native session profile id is invalid")
+    if (
+        type(profile_sha256) is not str
+        or _NATIVE_SESSION_DIGEST_RE.fullmatch(profile_sha256) is None
+        or type(project_root_identity_sha256) is not str
+        or _NATIVE_SESSION_DIGEST_RE.fullmatch(project_root_identity_sha256) is None
+    ):
+        raise StateError("native session digest is invalid")
+    if (
+        type(project_root_path) is not str
+        or project_root_path == os.path.sep
+        or not os.path.isabs(project_root_path)
+        or os.path.normpath(project_root_path) != project_root_path
+    ):
+        raise StateError("native session project root path is invalid")
+
+    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
+        raise StateError("native session claim requires a caller-owned writer transaction")
+    binding = conn.execute(
+        "SELECT j.version, t.spec FROM jobs j"
+        " JOIN batches b ON b.id=j.batch_id"
+        " JOIN tasks t ON t.batch_id=j.batch_id"
+        "  AND t.id=j.task_id AND t.version=j.version"
+        " WHERE j.id=? AND j.version=? AND b.mode='strict'",
+        (job_id, job_version),
+    ).fetchone()
+    if binding is None:
+        raise StateError("native session requires an existing strict job version")
+    try:
+        spec = json.loads(binding["spec"])
+    except (TypeError, ValueError) as error:
+        raise StateError("native session task spec is invalid") from error
+    if (
+        type(spec) is not dict
+        or type(spec.get("_native_exec_contract_v2")) is not dict
+        or spec.get("_native_exec_profile_id") != profile_id
+        or spec.get("_native_exec_profile_sha256") != profile_sha256
+        or spec.get("_native_exec_project_root_identity_sha256")
+        != project_root_identity_sha256
+        or spec.get("cwd_abs") != project_root_path
+    ):
+        raise StateError("native session differs from the persisted V2 binding")
+
+    conn.execute("SAVEPOINT native_session_claim")
+    try:
+        claimed = conn.execute(
+            "UPDATE jobs SET status='running', started_at=?, gpu=NULL,"
+            " pgid=NULL, kill_reason=NULL"
+            " WHERE id=? AND version=? AND status='pending'"
+            " AND gpu IS NULL AND pgid IS NULL AND kill_reason IS NULL"
+            " AND retries=0 AND rc IS NULL AND started_at IS NULL"
+            " AND EXISTS (SELECT 1 FROM batches b WHERE b.id=jobs.batch_id"
+            "   AND b.status='active' AND b.mode='strict')"
+            " AND version=(SELECT MAX(j2.version) FROM jobs j2"
+            "   WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)"
+            " AND NOT EXISTS (SELECT 1 FROM native_sessions n WHERE n.job_id=jobs.id)",
+            (now(), job_id, job_version),
+        )
+        if claimed.rowcount != 1:
+            raise StateError("native session claim lost active/latest/pending CAS")
+        conn.execute(
+            "INSERT INTO native_sessions ("
+            "session_id,job_id,job_version,evaluation_domain,owner_kind,"
+            "profile_id,profile_sha256,project_root_path,"
+            "project_root_identity_sha256,log_relative_path,phase,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                session_id, job_id, job_version, "isolated_integration", "unbound",
+                profile_id, profile_sha256, project_root_path,
+                project_root_identity_sha256,
+                f"logs/sched-native-{session_id}.log", "reserved", now(),
+            ),
+        )
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT native_session_claim")
+        conn.execute("RELEASE SAVEPOINT native_session_claim")
+        raise
+    conn.execute("RELEASE SAVEPOINT native_session_claim")
+    session = get_native_session(conn, session_id)
+    if session is None:
+        raise StateError("native session reservation disappeared")
+    return session
+
+
+def bind_native_session_log(
+    conn: sqlite3.Connection, session_id: str, log_dev: int, log_ino: int,
+) -> sqlite3.Row:
+    """Bind one validated O_EXCL log inode; never open or reuse an old path."""
+    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
+        raise StateError("native session id is invalid")
+    if type(log_dev) is not int or log_dev < 0 or type(log_ino) is not int or log_ino <= 0:
+        raise StateError("native log inode identity is invalid")
+    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
+        raise StateError("native log bind requires a caller-owned writer transaction")
+    changed = conn.execute(
+        "UPDATE native_sessions SET phase='log_bound', log_dev=?, log_ino=?,"
+        " log_bound_at=? WHERE session_id=? AND phase='reserved'"
+        " AND EXISTS (SELECT 1 FROM jobs j JOIN batches b ON b.id=j.batch_id"
+        "   WHERE j.id=native_sessions.job_id"
+        "   AND j.version=native_sessions.job_version"
+        "   AND j.status='running' AND j.pgid IS NULL"
+        "   AND j.kill_reason IS NULL AND b.status='active'"
+        "   AND b.mode='strict'"
+        "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+        "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))",
+        (str(log_dev), str(log_ino), now(), session_id),
+    )
+    if changed.rowcount != 1:
+        raise StateError("native log binding is no longer an active reservation")
+    session = get_native_session(conn, session_id)
+    if session is None:
+        raise StateError("native log binding disappeared")
+    return session
 
 
 def update_job(conn: sqlite3.Connection, job_id: str, **fields: Any) -> None:
