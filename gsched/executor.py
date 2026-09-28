@@ -744,6 +744,7 @@ class Executor:
         # Native M is a direct child, not a process group or job-result owner.
         self._native_monitors: dict[str, Any] = {}
         self._native_monitor_ids: set[str] = set()
+        self._native_monitor_start_attempts: set[str] = set()
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
 
     def reserve_native_monitor(self, session_id: str) -> None:
@@ -775,6 +776,8 @@ class Executor:
 
         This only finds the original in-memory owner. It cannot reconstruct
         wait authority after daemon restart or from a disk PID/job record.
+        A recovered pin is conservatively treated as start-consumed: an
+        interrupted Python call cannot prove that native start never ran.
         """
         if session_id in self._native_monitors:
             return
@@ -783,6 +786,7 @@ class Executor:
         for owner in _m2b_scheduler_native.retained_owners():
             if json.loads(owner.snapshot())["session_id"] == session_id:
                 self._native_monitor_ids.add(session_id)
+                self._native_monitor_start_attempts.add(session_id)
                 self._native_monitors[session_id] = owner
                 return
         raise KeyError("no original native monitor owner on this process/thread")
@@ -797,6 +801,11 @@ class Executor:
         if type(plan) is not NativeMonitorLaunch:
             raise TypeError("native monitor start requires NativeMonitorLaunch")
         owner = self._native_monitors[session_id]
+        if session_id in self._native_monitor_start_attempts:
+            raise ValueError("native monitor start already attempted")
+        # Consume before crossing into C. A second call must not turn the
+        # native duplicate-start rejection into cancellation of the first M.
+        self._native_monitor_start_attempts.add(session_id)
         try:
             owner.start(*plan.native_arguments())
         except BaseException as start_error:

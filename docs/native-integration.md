@@ -48,6 +48,9 @@ owner 必须显式接收配置，不从请求获取预期值。迁移方式和�
 `gsched._m2b_scheduler_native` 扩展。其 C 源码和专用构建/验收脚本位于
 配套研究仓库 `MPC_OTSF`，不随 `sched` 包构建或安装；普通 daemon 不依赖它。
 整合不修改该仓库的冻结合同，也不把历史 native 运行记录当作当前验证。
+`Executor.start_native_monitor()` 对同一 session 只允许一次 native 调用；重复调用
+在 Python 边界拒绝，不会因底层拒绝而误取消原 M。从 native pin 恢复的 owner
+一律视为启动尝试已消费，不能用恢复动作重放启动。
 
 Step 5E 的跨仓协议测试从 `M2B_STEP5E_CONTRACT_ROOT` 读取冻结向量、合同和
 勘误，校验其 SHA-256。未设置此变量时仅跳过外部向量测试；一旦设置，
