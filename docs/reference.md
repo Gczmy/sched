@@ -123,6 +123,10 @@ plan factory 并立即关闭该源端；peer 端由创建进程私有保留，�
 进程前拒绝，V2 提交闸门因此仍未解除。adapter 不含 launch、control protocol、nonce、publication
 或 daemon route；接入前仍必须完成原子的 final validate/map/FD-exec 与经过审查的真实
 direct-parent lifecycle。
+隔离式 `NativeStep5DRequestOwner.prepare()` 省略 `log_fd` 时，会在已复核的项目 root 下
+以 `O_EXCL` 创建 `logs/` 内的私有 `0600` 日志；plan 保留独立 FD，调用方的 root FD
+仍归调用方所有。后续失败保留已创建的日志。正式 dispatcher 的每次 attempt 日志路径持久绑定、
+CLI 查询路径和 native session 尚未接入。
 
 `gsched.native_step5d_alignment.foundation_alignment_projection()` 提供只读、可 JSON 序列化的
 `digest_and_direct_parent_endpoint_foundation_only` 声明；其值从生产 launch 常量、

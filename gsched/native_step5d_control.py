@@ -23,7 +23,11 @@ from typing import Any
 from . import _native_step5d_linux as linux
 from . import native_step5d_protocol as protocol
 from . import native_step5d_wire as wire
-from .native_launch import NativeLaunchPlan, _project_root_identity
+from .native_launch import (
+    NativeLaunchPlan,
+    _open_project_local_log_fd,
+    _project_root_identity,
+)
 from .native_deployment import NativeDeployment, require_deployment
 from .native_step5d import _create_step5d_no_data_launch_owner
 
@@ -206,7 +210,7 @@ class NativeStep5DRequestOwner:
     def prepare(
         self, *, target_phase_profile: str, run_id: str, launch_marker: str,
         project_root_path: str, project_root_fd: int, launcher_fd: int,
-        launcher_sha256: str, log_relative_path: str, log_fd: int,
+        launcher_sha256: str, log_relative_path: str, log_fd: int | None = None,
     ) -> NativeStep5DPreparedStop:
         self._require_owner()
         _require_linux()
@@ -229,24 +233,35 @@ class NativeStep5DRequestOwner:
         request_fds: list[int] = []
         transport_owner = None
         retained_root = -1
+        source_log_fd = -1
         try:
             request_fd, request_fds = linux._sealed_readonly_request(frame)
             retained_root = os.dup(project_root_fd)
             os.set_inheritable(retained_root, False)
+            root_digest = _project_root_identity(
+                project_root_path, os.fstat(retained_root)
+            )
+            if log_fd is None:
+                source_log_fd = _open_project_local_log_fd(
+                    project_root_fd=retained_root,
+                    project_root_path=project_root_path,
+                    project_root_identity_sha256=root_digest,
+                    log_relative_path=log_relative_path,
+                )
             transport_owner = _create_step5d_no_data_launch_owner(
                 profile_id="m2b-step5d-" + target_phase_profile,
                 profile_sha256=hashlib.sha256(protocol.canonical_json_bytes(
                     list(self._deployment.argv(target_phase_profile))
                 )).hexdigest(),
-                project_root_identity_sha256=_project_root_identity(
-                    project_root_path, os.fstat(retained_root)
-                ), project_root_path=project_root_path,
+                project_root_identity_sha256=root_digest,
+                project_root_path=project_root_path,
                 logical_submitted_argv=self._deployment.argv(target_phase_profile),
                 launcher_sha256=launcher_sha256,
                 request_frame_sha256=digests.request_frame_sha256,
                 request_body_sha256=digests.request_body_sha256,
                 log_relative_path=log_relative_path, launcher_fd=launcher_fd,
-                request_fd=request_fd, project_root_fd=retained_root, log_fd=log_fd,
+                request_fd=request_fd, project_root_fd=retained_root,
+                log_fd=source_log_fd if log_fd is None else log_fd,
             )
             session = NativeStep5DPreparedStop(
                 _SESSION_AUTHORITY, transport_owner, retained_root, body, frame, peer, root,
@@ -256,6 +271,8 @@ class NativeStep5DRequestOwner:
             retained_root = -1
             return session
         finally:
+            if source_log_fd >= 0:
+                os.close(source_log_fd)
             if transport_owner is not None:
                 transport_owner.close()
             if retained_root >= 0:
