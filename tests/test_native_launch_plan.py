@@ -33,6 +33,7 @@ from gsched.native_launch import (
     NativeLaunchPlanError,
     NativeLaunchUnavailable,
     _create_native_launch_plan,
+    _copy_retained_source_fd,
     _open_project_local_log_fd,
 )
 
@@ -398,6 +399,50 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
         self.assertEqual(os.lseek(plan.request_fd, 0, os.SEEK_CUR), 0)
         plan.validate_live_fds()
         self.assertEqual(os.lseek(plan.request_fd, 0, os.SEEK_CUR), 0)
+
+    def test_interrupted_request_copy_closes_reopened_fd(self) -> None:
+        copied: list[int] = []
+        original_open = os.open
+
+        def capture_open(*args, **kwargs):
+            fd = original_open(*args, **kwargs)
+            copied.append(fd)
+            return fd
+
+        with mock.patch("gsched.native_launch.os.open", side_effect=capture_open):
+            with mock.patch("gsched.native_launch.os.lseek", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    _copy_retained_source_fd(self.request_fd, request=True)
+
+        self.assertEqual(1, len(copied))
+        with self.assertRaises(OSError):
+            os.fstat(copied[0])
+        os.fstat(self.request_fd)
+
+    def test_interrupted_plan_factory_closes_partial_retained_fds(self) -> None:
+        copied: list[int] = []
+        original_copy = _copy_retained_source_fd
+
+        def interrupt_after_two(source_fd: int, *, request: bool) -> int:
+            if len(copied) == 2:
+                raise KeyboardInterrupt
+            fd = original_copy(source_fd, request=request)
+            copied.append(fd)
+            return fd
+
+        with mock.patch(
+            "gsched.native_launch._copy_retained_source_fd",
+            side_effect=interrupt_after_two,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.plan()
+
+        self.assertEqual(2, len(copied))
+        for fd in copied:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        for fd in self.original_fds:
+            os.fstat(fd)
 
     def test_request_seals_are_required_before_the_frame_snapshot_is_read(self) -> None:
         unsealed_builder = os.memfd_create(

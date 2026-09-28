@@ -583,7 +583,7 @@ def _copy_retained_source_fd(source_fd: int, *, request: bool) -> int:
             )
             os.lseek(copied, 0, os.SEEK_SET)
             return copied
-        except Exception:
+        except BaseException:
             if copied >= 0:
                 try:
                     os.close(copied)
@@ -1017,7 +1017,7 @@ def _create_native_launch_plan(
         )
         plan.validate_live_fds()
         return plan
-    except Exception:
+    except BaseException:
         if plan is not None:
             plan.close()
         else:
