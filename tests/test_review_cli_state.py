@@ -307,6 +307,47 @@ class ReviewLifecycleRaceTests(TempStateCase):
         self.assertIn("SIGTERM 发送失败", message)
         signal.assert_called_once_with(4242, daemon.signal.SIGTERM)
 
+    def test_stop_refuses_signal_when_shutdown_marker_cannot_be_published(
+        self,
+    ) -> None:
+        owner = {
+            "schema_version": 1,
+            "lease_id": "lease-local",
+            "pid": 4242,
+            "start_token": "proc:lease",
+            "physical_host": "local-host",
+        }
+
+        for failure in ("lock", "marker"):
+            with self.subTest(failure=failure):
+                def submission_lock():
+                    if failure == "lock":
+                        raise OSError("lock unavailable")
+                    return contextlib.nullcontext()
+
+                with mock.patch.object(
+                    daemon, "_read_lease_owner", return_value=owner
+                ), mock.patch("socket.gethostname", return_value="local-host"), mock.patch.object(
+                    daemon, "_pid_alive", return_value=True
+                ), mock.patch.object(
+                    daemon, "process_start_token", return_value="proc:lease"
+                ), mock.patch.object(
+                    state, "submission_lock", side_effect=submission_lock
+                ), mock.patch.object(
+                    state, "mark_idle_shutdown", side_effect=OSError("marker unavailable")
+                ) as mark_shutdown, mock.patch.object(
+                    daemon.os, "kill"
+                ) as signal:
+                    message = daemon.stop()
+
+                self.assertIn("shutdown marker 发布失败", message)
+                self.assertIn("拒绝发送信号", message)
+                signal.assert_not_called()
+                if failure == "lock":
+                    mark_shutdown.assert_not_called()
+                else:
+                    mark_shutdown.assert_called_once_with()
+
     def test_stop_rejects_symlink_lease_directory_before_pid_probe(self) -> None:
         owner = {
             "schema_version": 1,

@@ -474,8 +474,11 @@ def stop() -> str:
     try:
         with state.submission_lock():
             stop_token = state.mark_idle_shutdown()
-    except OSError:
-        pass
+    except OSError as exc:
+        return (
+            f"daemon pid={pid} shutdown marker 发布失败: {exc}; "
+            "拒绝发送信号并保留 ownership 状态"
+        )
 
     def clear_stop_token() -> None:
         if stop_token is None:
