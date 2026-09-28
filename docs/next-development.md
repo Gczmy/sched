@@ -14,10 +14,12 @@ inbox 仍在落库前拒绝 V2，dispatcher 即使遇到内部 V2 task，也在 
 经冻结附件约束的 V/P 执行接口、可信完成证据与取消／超时权威；调度器随后要
 接入正式 native session 生命周期、崩溃接管及资源结算，并用真实 Linux C bridge
 做跨仓端到端验收。当前内部 helper 仅在 `isolated_integration` 域完成 T1
-active/latest/pending 同事务抢占与 owner-unbound session 预留，以及项目内唯一日志
-FD 的 inode 持久绑定；dispatcher 不调用它们。T2 启动前 one-shot intent、T3 exec
+active/latest/pending 同事务抢占与 owner-unbound session 预留，以及日志打开前独立提交
+的 `log_attempted_at` CAS 和项目内唯一日志 FD 的 inode 持久绑定；dispatcher 不调用它们。
+这个日志意图不等于 T2 启动意图。T2 启动前 one-shot intent、T3 exec
 前重验耐久 cancel/timeout、T4 以实际 END/wait 和完整证据原子发布终态都未实现。
-`reserved` 或 `log_bound` 在崩溃/日志故障后仍属已消费未决，不能自动回队或重放。
+`reserved` 在日志尝试失败后保留非空 `log_attempted_at`，同一 session 不可再次打开；
+它与 `log_bound` 在崩溃/日志故障后均属已消费未决，不能自动回队或重放。
 现有 monitor close 不代表 formal phase 完成，不能用作 `done` 判据。
 
 ## 已完成的开发项

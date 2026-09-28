@@ -129,15 +129,20 @@ direct-parent lifecycle。
 `isolated_integration`，owner 固定为 `unbound`，不代表 M 所有权或正式执行授权。
 `claim_native_session_candidate()` 在同一 SQLite writer 事务中对 active/latest/pending 的
 V2 job 执行 `running` CAS 并插入唯一 session；调用方必须先完成冻结合同复核，并在
-任何 FD 或子进程创建前提交该事务。随后 `_create_bound_native_session_log()` 只从已
-提交的预留行读取项目 root 与 `logs/sched-native-<session-id>.log`，经 retained root FD
-以 `O_EXCL` 创建日志，把实际 `st_dev/st_ino` 写为 `log_bound` 并提交后才返回 FD。
-`reserved` 与 `log_bound` 都是已消费且未决的状态；缺失目录、路径占用、创建失败、
-回写失败或重启均不得换 session、覆盖日志、回到 pending 或推断成功。已创建的日志
-在后续失败时保留。正式 dispatcher 不调用这些 helper；其 attempt 日志查询路径、
+任何 FD 或子进程创建前提交该事务。随后 `_create_bound_native_session_log()` 先以独立
+writer 事务 CAS 写入并提交唯一 `log_attempted_at`；只有确认提交后才经 retained root FD
+对 `logs/sched-native-<session-id>.log` 尝试 `O_EXCL` 创建，并将实际 `st_dev/st_ino`
+写为 `log_bound`、提交后返回 FD。绑定要求此前已记录 attempt 意图；两个 CAS 都拒绝
+同一 job 已入库的 cancel 请求。`reserved` 且
+`log_attempted_at` 非空表示文件尝试已消费但绑定未决；目录缺失、路径占用、创建或回写
+失败后同一 session 不能再打开日志，即使之后修复目录或移走占用文件。v2→v3 迁移将
+所有旧 session 保守标为已尝试，因为旧 `reserved` 无法区分是否发生过失败的文件打开；
+迁移填入的时间只表示已消费，不应解读为真实打开时间。
+`reserved` 与 `log_bound` 都不能自动换 session、回到 pending、重放或推断成功；已创建
+的日志在后续失败时保留。正式 dispatcher 不调用这些 helper；其 attempt 日志查询路径、
 native cancel/timeout/崩溃接管、启动前 one-shot intent 与可信终态证据仍未接入。
 CLI `task/log/diag` 仍按既有 state 目录版本路径查询，不能用其读取 native session 日志。
-内部 DB `user_version=2` 与公开 CLI JSON 的 `schema_version:1` 是不同版本号。
+内部 DB `user_version=3` 与公开 CLI JSON 的 `schema_version:1` 是不同版本号。
 
 `gsched.native_step5d_alignment.foundation_alignment_projection()` 提供只读、可 JSON 序列化的
 `digest_and_direct_parent_endpoint_foundation_only` 声明；其值从生产 launch 常量、
@@ -387,7 +392,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 - 配置的 `node` 之外执行查询时，CLI 不初始化、不迁移、也不写源 DB；无论源目录当时是否存在 WAL/SHM，都先复制出稳定的私有 DB（及存在的 WAL）快照，再以 `mode=ro` 打开。绝不对仍可变化的 live DB 使用 `immutable=1`。`daemon status` 也可跨主机只读；`daemon start/stop/check/drain/resume` 默认拒绝。
 - `daemon status --json` 是不打开数据库的只读查询，输出 `schema_version:1` 与和 `status.daemon_health` 相同的健康字段：`node`、`query_host`、`pid`、`observed_at`（Unix 秒）、`process_state`（`running/stopped/unknown`）、`health_state`（`healthy/delayed/stalled/stopped/unknown`）、`heartbeat_age_s`、`tick_ok_age_s`、`frozen`、`draining`、`read_error`。年龄不可读或不存在时为 null；`read_error` 为 null、`health_file_unreadable` 或 `timestamp_in_future`。同物理节点且 lease 与进程启动标识一致才确认进程存活，跨节点不探测本机同号 PID。原进程退出/被复用或目标本机确认 lease、PID、心跳均不存在才确认 stopped。健康要求心跳 <60 秒且成功 tick ≤90 秒；tick >90 秒为 stalled，心跳新鲜不能掩盖 tick 停滞；已确认 stopped 与读错误优先。draining 是独立派发状态，不覆盖健康故障。这个查询结果只用于展示，不改变生命周期、租约或写操作校验。
 - 看板 daemon 提示必须消费结构化健康数据；不解析中文展示文本。SSH/API 错误、格式错误、缓存过期或浏览器本地 TTL 到期均显示状态未知并禁用 daemon 操作；旧采样可保留供查看。只有新鲜且确认 stopped 的状态可启用 start，不能把心跳过期当成启动依据。旧 CLI 不支持该 JSON 命令时提示未知，需配套升级查询 CLI。
-- 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以只读方式核验 schema 版本、必需对象/列与 WAL 文件头；schema 已是当前版本时，查询连接固定使用私有快照上的 `mode=ro + query_only`，不再对源库执行 `journal_mode=WAL`、`BEGIN IMMEDIATE` 或幂等迁移。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、旧 schema、非 WAL 库或权限漂移才进入带有界锁重试的 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 以及 `config get` 不检查或打开数据库。
+- 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以私有只读快照核验 schema 版本、必需对象/列与 WAL 文件头；完整、私有的 v1/v2/v3 WAL 库均直接进入私有快照上的 `mode=ro + query_only` 查询，不对源库执行迁移或 writer 事务。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、缺损 schema、非 WAL 库或权限漂移仍进入带有界锁重试的现有 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 以及 `config get` 不检查或打开数据库。混版部署时，必须先由用户人工完成旧 daemon 切换，再运行 `init_db` 或任何可能触发迁移的写命令；只读查询不会代替这个部署步骤。
 - `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop/drain/resume` 与 `config set`；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
 - 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒只在提交后发生，marker 由 daemon 按数据库权威状态协调。`retry`/`resubmit` 的最终事务、`clean` 的发布重跑阶段以及 `cancel` 的任务分类与写入，都会在读取权威状态前取得 SQLite writer claim，防止 daemon 在状态校验与首个 job/task mutation 之间收敛或派发任务。daemon 的节点重启恢复、接管终态判定与重试发布也使用同一 writer 顺序；已落库的 cancel request 或 `kill_reason=cancelled` 永远优先于自动重试/恢复回队。`daemon start/stop/drain/resume` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。
 - 本地 `submit` 与网关 inbox payload 都可在 submission gate 外做预览校验和计算指纹，但最终写入前必须在同一 gate 内按最新同名代际重验依赖存在性、完整依赖图、批次 ID 与同名终态，并原子提交批次/任务/job（inbox 同时提交请求回执）。因此并发提交不能分别基于旧快照发布 `A → B`、`B → A` 环，也不会在 `clean` 两阶段之间或 `retry`/`resubmit` 事务中途插入第二个同名非终态批次；反向顺序会在重开旧批次前拒绝已有的同名非终态实例，`clean` 在删产物前和发布重跑前各重验一次。daemon 退出门禁生效时 payload 与 pending 请求保留供恢复后重试。

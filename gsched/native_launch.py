@@ -352,8 +352,10 @@ def _create_bound_native_session_log(
 
     The claim/session transaction must already be committed.  An open or
     indeterminate transaction cannot make the new file's reservation durable.
-    Any failure keeps the O_EXCL file, closes its FD, and forbids path reuse.
-    This helper does not arm a launch or grant a native monitor owner.
+    A separate committed CAS consumes the sole log-open attempt before any
+    filesystem open.  Any later failure leaves that attempt consumed and keeps
+    an O_EXCL file if one was created.  This helper does not arm a launch or
+    grant a native monitor owner.
     """
     from . import state
 
@@ -365,10 +367,20 @@ def _create_bound_native_session_log(
     if (
         session is None
         or session["phase"] != "reserved"
+        or session["log_attempted_at"] is not None
         or session["evaluation_domain"] != "isolated_integration"
         or session["owner_kind"] != "unbound"
     ):
         raise NativeLaunchPlanError("native session has no unbound log reservation")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        session = state.mark_native_session_log_attempted(conn, session_id)
+        conn.commit()
+        if conn.in_transaction:
+            raise NativeLaunchPlanError("native log attempt commit is unresolved")
+    except BaseException:
+        conn.rollback()
+        raise
     log_fd = _open_project_local_log_fd(
         project_root_fd=project_root_fd,
         project_root_path=session["project_root_path"],

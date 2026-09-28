@@ -4506,8 +4506,9 @@ def main(argv: list[str] | None = None) -> int:
             state.set_query_only(False)
             return 1
     # Local query commands use a coherent private WAL snapshot and never open
-    # the NFS-backed source through SQLite.  Initialization above still creates
-    # or migrates a fresh/legacy DB before query-only mode is enabled.
+    # the NFS-backed source through SQLite.  Complete private WAL schemas from
+    # older builds remain queryable without migration; fresh or incomplete
+    # state still follows the existing initialization path above.
     state.set_query_only(local_db_read and not dry_run)
     try:
         return args.fn(args)

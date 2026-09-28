@@ -1671,6 +1671,79 @@ class ReviewResubmitStateTests(TempStateCase):
 
 
 class ReviewLocalQueryOnlyTests(TempStateCase):
+    def _replace_with_complete_legacy_schema(self, version: int) -> None:
+        database = state.db_path()
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(database + suffix)
+        schema = state.SCHEMA
+        if version == 2:
+            schema = schema.replace("  log_attempted_at TEXT,\n", "", 1)
+            self.assertNotEqual(state.SCHEMA, schema)
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(schema)
+            state.migrate_gpu_jobs(conn)
+            state.migrate_project_columns(conn)
+            state.migrate_incidents(conn)
+            state.migrate_job_progress(conn)
+            state.migrate_operation_requests(conn)
+            state.migrate_revisions(conn)
+            if version == 1:
+                conn.execute("DROP TABLE native_sessions")
+            conn.execute(f"PRAGMA user_version={version}")
+            conn.commit()
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.chmod(database + suffix, 0o600)
+
+    def test_complete_v1_v2_local_status_and_task_do_not_migrate(self) -> None:
+        database = state.db_path()
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self._replace_with_complete_legacy_schema(version)
+                self.seed_batch(job_status="pending")
+                before = {
+                    suffix: (os.stat(database + suffix).st_size,
+                             os.stat(database + suffix).st_mtime_ns)
+                    for suffix in ("", "-wal", "-shm")
+                    if os.path.exists(database + suffix)
+                }
+                with mock.patch(
+                    "socket.gethostname", return_value="review-node"
+                ), mock.patch.object(
+                    state, "init_db",
+                    side_effect=AssertionError("legacy query must not migrate"),
+                ) as init_db:
+                    status_rc, status_out, status_err = self.capture(
+                        cli.main, ["status", "--json"]
+                    )
+                    task_rc, task_out, task_err = self.capture(
+                        cli.main,
+                        ["task", "batch-20260829-000000:task", "--json"],
+                    )
+                self.assertEqual(0, status_rc, status_err)
+                self.assertEqual(0, task_rc, task_err)
+                self.assertEqual(
+                    "batch-20260829-000000", json.loads(status_out)["batches"][0]["id"]
+                )
+                self.assertEqual(
+                    "batch-20260829-000000", json.loads(task_out)["batch_id"]
+                )
+                init_db.assert_not_called()
+                after = {
+                    suffix: (os.stat(database + suffix).st_size,
+                             os.stat(database + suffix).st_mtime_ns)
+                    for suffix in ("", "-wal", "-shm")
+                    if os.path.exists(database + suffix)
+                }
+                self.assertEqual(before, after)
+                with contextlib.closing(sqlite3.connect(database)) as conn:
+                    self.assertEqual(
+                        version, conn.execute("PRAGMA user_version").fetchone()[0]
+                    )
+
     def test_run_dry_run_routes_through_main_without_mutating_state(self) -> None:
         configured = dict(self.cfg)
         configured["venvs"] = {"python": sys.executable}

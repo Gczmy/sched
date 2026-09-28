@@ -27,8 +27,10 @@ V2 profile 的提交入口仍在持久化和启动前拒绝。内部已具备冻
 `Executor.launch_native(plan)` 仍抛出 `NativeLaunchUnavailable`，不会回退到
 路径执行。Step 5D/5E/5F 的协议、传输和生命周期组件作为实验基础保留，
 不构成正式 MPC_OTSF 执行链，也没有接入常规 dispatcher 的 V2 调度路径。
-内部另有 isolated-only 的 native session 抢占/预留和项目日志 inode 绑定 helper；
-它们未接入 dispatcher，owner 仍未绑定，不能作为生产授权、启动或完成证据。
+内部另有 isolated-only 的 native session 抢占/预留、日志打开前独立提交的一次性
+`log_attempted_at` CAS 和项目日志 inode 绑定 helper。文件打开失败也永久消费本
+session 的日志尝试；它们未接入 dispatcher，owner 仍未绑定，不能作为生产授权、启动
+或完成证据。
 
 ## 外部依赖
 
