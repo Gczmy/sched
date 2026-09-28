@@ -177,6 +177,170 @@ def _project_root_identity(path: str, root_stat: os.stat_result) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_project_root_fd(
+    project_root_fd: int,
+    project_root_path: str,
+    project_root_identity_sha256: str,
+) -> None:
+    """Re-attest a borrowed root FD before and after project-local I/O."""
+    _fd(project_root_fd, "project_root_fd")
+    _digest(
+        project_root_identity_sha256,
+        "native launch project-root identity sha256",
+    )
+    if (
+        type(project_root_path) is not str
+        or project_root_path == "/"
+        or not os.path.isabs(project_root_path)
+        or os.path.normpath(project_root_path) != project_root_path
+        or os.path.realpath(project_root_path) != project_root_path
+    ):
+        raise NativeLaunchPlanError(
+            "native launch project-root path must be canonical, non-root, and absolute"
+        )
+    try:
+        root_stat = os.fstat(project_root_fd)
+        descriptor_flags = fcntl.fcntl(project_root_fd, fcntl.F_GETFD)
+        root_flags = fcntl.fcntl(project_root_fd, fcntl.F_GETFL)
+    except OSError as exc:
+        raise NativeLaunchPlanError(
+            "native project-root FD cannot be inspected"
+        ) from exc
+    if descriptor_flags & fcntl.FD_CLOEXEC == 0:
+        raise NativeLaunchPlanError(
+            "native project-root FD must remain CLOEXEC"
+        )
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise NativeLaunchPlanError("native project-root FD must be a directory")
+    if root_stat.st_nlink == 0:
+        raise NativeLaunchPlanError("native project-root FD is unlinked")
+    if root_flags & _LINUX_O_PATH:
+        raise NativeLaunchPlanError("native project-root FD must not use O_PATH")
+    if (root_flags & os.O_ACCMODE) != os.O_RDONLY:
+        raise NativeLaunchPlanError("native project-root FD must be read-only")
+    try:
+        path_stat = os.stat(project_root_path, follow_symlinks=False)
+    except OSError as exc:
+        raise NativeLaunchPlanError(
+            "native project-root path cannot be re-attested"
+        ) from exc
+    if (
+        not stat.S_ISDIR(path_stat.st_mode)
+        or (path_stat.st_dev, path_stat.st_ino)
+        != (root_stat.st_dev, root_stat.st_ino)
+    ):
+        raise NativeLaunchPlanError("native project-root path identity drifted")
+    if (
+        _project_root_identity(project_root_path, root_stat)
+        != project_root_identity_sha256
+    ):
+        raise NativeLaunchPlanError("native project-root FD identity drifted")
+
+
+def _open_project_local_log_fd(
+    *,
+    project_root_fd: int,
+    project_root_path: str,
+    project_root_identity_sha256: str,
+    log_relative_path: str,
+) -> int:
+    """Create one fresh private log below a borrowed, re-attested root FD.
+
+    The caller owns the returned source FD and must close it after the plan
+    factory has made its retained copy. This helper never closes the borrowed
+    root FD or removes a created log after a later validation failure.
+    """
+    if not sys.platform.startswith("linux"):
+        raise NativeLaunchUnavailable(
+            "native retained log creation requires Linux; no fallback is allowed"
+        )
+    _validate_project_root_fd(
+        project_root_fd, project_root_path, project_root_identity_sha256
+    )
+    relative_log = _log_relative_path(log_relative_path)
+    parts = relative_log.split("/")
+    cursor = project_root_fd
+    cursor_owned = False
+    log_fd = -1
+    try:
+        for component in parts[:-1]:
+            try:
+                next_cursor = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    dir_fd=cursor,
+                )
+            except OSError as exc:
+                raise NativeLaunchPlanError(
+                    "native log parent must be a retained non-symlink directory"
+                ) from exc
+            try:
+                parent_stat = os.fstat(next_cursor)
+                if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_nlink == 0:
+                    raise NativeLaunchPlanError(
+                        "native log parent directory identity is invalid"
+                    )
+            except BaseException:
+                os.close(next_cursor)
+                raise
+            previous_cursor = cursor
+            previous_owned = cursor_owned
+            cursor = next_cursor
+            cursor_owned = True
+            if previous_owned:
+                os.close(previous_cursor)
+        try:
+            log_fd = os.open(
+                parts[-1],
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_APPEND
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+                dir_fd=cursor,
+            )
+        except OSError as exc:
+            raise NativeLaunchPlanError(
+                "native log path must be fresh and creatable below retained root"
+            ) from exc
+        try:
+            os.fchmod(log_fd, 0o600)
+            log_stat = os.fstat(log_fd)
+            descriptor_flags = fcntl.fcntl(log_fd, fcntl.F_GETFD)
+            log_flags = fcntl.fcntl(log_fd, fcntl.F_GETFL)
+        except OSError as exc:
+            raise NativeLaunchPlanError("native log FD setup failed") from exc
+        if (
+            not stat.S_ISREG(log_stat.st_mode)
+            or log_stat.st_nlink != 1
+            or stat.S_IMODE(log_stat.st_mode) != 0o600
+            or descriptor_flags & fcntl.FD_CLOEXEC == 0
+            or (log_flags & os.O_ACCMODE) != os.O_WRONLY
+            or log_flags & os.O_APPEND == 0
+        ):
+            raise NativeLaunchPlanError("native log FD is not private append-only")
+        _validate_project_local_log(project_root_fd, relative_log, log_stat)
+        _validate_project_root_fd(
+            project_root_fd, project_root_path, project_root_identity_sha256
+        )
+        if cursor_owned:
+            os.close(cursor)
+            cursor_owned = False
+        owned = log_fd
+        log_fd = -1
+        return owned
+    finally:
+        if log_fd >= 0:
+            os.close(log_fd)
+        if cursor_owned:
+            os.close(cursor)
+
+
 def _validate_project_local_log(
     project_root_fd: int,
     log_relative_path: str,
@@ -566,36 +730,11 @@ class NativeLaunchPlan:
             else:
                 channel.close()
 
-        try:
-            root_stat = os.fstat(self.project_root_fd)
-        except OSError as exc:
-            raise NativeLaunchPlanError("native project-root FD cannot be fstat'ed") from exc
-        if not stat.S_ISDIR(root_stat.st_mode):
-            raise NativeLaunchPlanError("native project-root FD must be a directory")
-        if root_stat.st_nlink == 0:
-            raise NativeLaunchPlanError("native project-root FD is unlinked")
-        root_flags = fcntl.fcntl(self.project_root_fd, fcntl.F_GETFL)
-        if root_flags & _LINUX_O_PATH:
-            raise NativeLaunchPlanError("native project-root FD must not use O_PATH")
-        if (root_flags & os.O_ACCMODE) != os.O_RDONLY:
-            raise NativeLaunchPlanError("native project-root FD must be read-only")
-        try:
-            path_stat = os.stat(self.project_root_path, follow_symlinks=False)
-        except OSError as exc:
-            raise NativeLaunchPlanError(
-                "native project-root path cannot be re-attested"
-            ) from exc
-        if (
-            not stat.S_ISDIR(path_stat.st_mode)
-            or (path_stat.st_dev, path_stat.st_ino)
-            != (root_stat.st_dev, root_stat.st_ino)
-        ):
-            raise NativeLaunchPlanError("native project-root path identity drifted")
-        if (
-            _project_root_identity(self.project_root_path, root_stat)
-            != self.project_root_identity_sha256
-        ):
-            raise NativeLaunchPlanError("native project-root FD identity drifted")
+        _validate_project_root_fd(
+            self.project_root_fd,
+            self.project_root_path,
+            self.project_root_identity_sha256,
+        )
 
         try:
             log_stat = os.fstat(self.log_fd)
@@ -603,9 +742,11 @@ class NativeLaunchPlan:
             raise NativeLaunchPlanError("native log FD cannot be fstat'ed") from exc
         if not stat.S_ISREG(log_stat.st_mode):
             raise NativeLaunchPlanError("native log FD must be a regular file")
+        if stat.S_IMODE(log_stat.st_mode) != 0o600:
+            raise NativeLaunchPlanError("native log FD must have mode 0600")
         log_flags = fcntl.fcntl(self.log_fd, fcntl.F_GETFL)
-        if (log_flags & os.O_ACCMODE) not in (os.O_WRONLY, os.O_RDWR):
-            raise NativeLaunchPlanError("native log FD must be writable")
+        if (log_flags & os.O_ACCMODE) != os.O_WRONLY:
+            raise NativeLaunchPlanError("native log FD must be write-only")
         if log_flags & os.O_APPEND == 0:
             raise NativeLaunchPlanError("native log FD must use append mode")
         _validate_project_local_log(
@@ -656,12 +797,13 @@ def _create_native_launch_plan(
     )
     if (
         type(project_root_path) is not str
+        or project_root_path == "/"
         or not os.path.isabs(project_root_path)
         or os.path.normpath(project_root_path) != project_root_path
         or os.path.realpath(project_root_path) != project_root_path
     ):
         raise NativeLaunchPlanError(
-            "native launch project-root path must be canonical and absolute"
+            "native launch project-root path must be canonical, non-root, and absolute"
         )
     logical_argv = _logical_argv(logical_submitted_argv)
     relative_log = _log_relative_path(log_relative_path)
