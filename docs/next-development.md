@@ -20,6 +20,8 @@ active/latest/pending 同事务抢占与 owner-unbound session 预留，以及�
 dispatcher 不调用这些 helper，T2a 不创建或启动 M owner；其提交后仍须重验新到的
 cancel/timeout。真正的 T2 M 启动及原始 pidfd/wait 所有权、T3 在 V/P exec 前
 重验耐久 cancel/timeout、T4 以实际 END/wait 和完整证据原子发布终态都未实现。
+隔离域 native session 已在 legacy dispatcher 的恢复、取消和停止路径保守保留；
+尚无原始 owner/wait、timeout 与终态通路，不能视为正式可运行。
 `reserved` 在日志尝试失败后保留非空 `log_attempted_at`，同一 session 不可再次打开；
 它与 `log_bound` 在崩溃/日志故障后均属已消费未决，不能自动回队或重放。T2a
 提交结果不明或提交后失去 owner 时也不重试 M 启动。

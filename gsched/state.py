@@ -1657,6 +1657,26 @@ def claim_native_session_candidate(
         )
         if claimed.rowcount != 1:
             raise StateError("native session claim lost active/latest/pending CAS")
+        # The CAS holds the main database writer even when the caller started
+        # a DEFERRED transaction.  Check the external stop marker only now;
+        # the savepoint rolls back this claim if shutdown was published first.
+        # A failed marker inspection must also deny this one-shot claim.
+        try:
+            os.lstat(submission_shutdown_marker())
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise StateError("native session claim cannot inspect shutdown marker") from error
+        else:
+            raise StateError("native session claim rejected during daemon shutdown")
+        try:
+            os.lstat(launch_marker_path(job_id))
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise StateError("native session claim cannot inspect legacy launch marker") from error
+        else:
+            raise StateError("native session claim rejected by legacy launch marker")
         conn.execute(
             "INSERT INTO native_sessions ("
             "session_id,job_id,job_version,evaluation_domain,owner_kind,"
