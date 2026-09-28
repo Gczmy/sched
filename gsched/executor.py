@@ -22,6 +22,9 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
+import weakref
+from contextlib import contextmanager
 from typing import Any, Callable, NamedTuple
 from . import state
 
@@ -729,6 +732,53 @@ def _launch_marker_command(
     return " ".join(shlex.quote(argument) for argument in argv) + ' "$$"'
 
 
+_native_monitor_claims: dict[str, tuple[weakref.ReferenceType[Executor], threading.Thread]] = {}
+_native_monitor_claims_lock = threading.Lock()
+_native_monitor_claims_local = threading.local()
+
+
+@contextmanager
+def _locked_native_monitor_claims():
+    if getattr(_native_monitor_claims_local, "active", False):
+        raise RuntimeError("native monitor claim operation is not reentrant")
+    try:
+        _native_monitor_claims_local.active = True
+        with _native_monitor_claims_lock:
+            yield
+    finally:
+        _native_monitor_claims_local.active = False
+
+
+def _native_monitor_claimant(session_id: str) -> Executor | None:
+    claim = _native_monitor_claims.get(session_id)
+    return claim[0]() if claim is not None else None
+
+
+def _claim_native_monitor(session_id: str, executor: Executor, *, recover: bool = False) -> bool:
+    with _locked_native_monitor_claims():
+        claimant = _native_monitor_claimant(session_id)
+        claim = _native_monitor_claims.get(session_id)
+        if claim is not None:
+            if claim[1] is not threading.current_thread():
+                raise ValueError("native monitor session is claimed on another thread")
+            if not recover:
+                raise ValueError("native monitor session already claimed")
+            if claimant is executor:
+                return False
+            if claimant is not None:
+                raise ValueError("native monitor session is claimed by another Executor")
+        _native_monitor_claims[session_id] = (weakref.ref(executor), threading.current_thread())
+        return True
+
+
+def _release_native_monitor_claim(session_id: str, executor: Executor) -> None:
+    with _locked_native_monitor_claims():
+        claim = _native_monitor_claims.get(session_id)
+        if (claim is not None and _native_monitor_claimant(session_id) is executor
+                and claim[1] is threading.current_thread()):
+            del _native_monitor_claims[session_id]
+
+
 class Executor:
     def __init__(
         self,
@@ -758,14 +808,35 @@ class Executor:
             raise ValueError("native monitor session key must be 32 lowercase hexadecimal characters")
         if session_id in self._native_monitor_ids:
             raise ValueError("native monitor session key already consumed")
-        self._native_monitor_ids.add(session_id)
-        from . import _m2b_scheduler_native
-
-        owner = _m2b_scheduler_native.create_empty(session_id)
+        native_module = None
+        acquired = False
         try:
-            self._native_monitors[session_id] = owner
+            acquired = _claim_native_monitor(session_id, self)
+            self._native_monitor_ids.add(session_id)
+            from . import _m2b_scheduler_native as native_module
+
+            owner = native_module.create_empty(session_id)
+            try:
+                self._native_monitors[session_id] = owner
+            except BaseException:
+                owner.discard_empty()  # native check proves no start/FD/wait owner
+                raise
         except BaseException:
-            owner.discard_empty()  # native check proves no start/FD/wait owner
+            # Keep the claim if an interrupted C/Python boundary left a pin.
+            # A failed pin inspection is also unresolved ownership.
+            pinned = True
+            if native_module is None:
+                pinned = False
+            else:
+                try:
+                    pinned = any(
+                        json.loads(candidate.snapshot())["session_id"] == session_id
+                        for candidate in native_module.retained_owners()
+                    )
+                except BaseException:
+                    pass
+            if acquired and not pinned:
+                _release_native_monitor_claim(session_id, self)
             raise
 
     def native_monitor_sessions(self) -> tuple[str, ...]:
@@ -781,10 +852,18 @@ class Executor:
         """
         if session_id in self._native_monitors:
             return
+        with _locked_native_monitor_claims():
+            claimant = _native_monitor_claimant(session_id)
+            claim = _native_monitor_claims.get(session_id)
+            if claim is not None and claim[1] is not threading.current_thread():
+                raise ValueError("native monitor session is claimed on another thread")
+            if claimant is not None and claimant is not self:
+                raise ValueError("native monitor session is claimed by another Executor")
         from . import _m2b_scheduler_native
 
         for owner in _m2b_scheduler_native.retained_owners():
             if json.loads(owner.snapshot())["session_id"] == session_id:
+                _claim_native_monitor(session_id, self, recover=True)
                 self._native_monitor_ids.add(session_id)
                 self._native_monitor_start_attempts.add(session_id)
                 self._native_monitors[session_id] = owner
@@ -834,11 +913,13 @@ class Executor:
         owner = self._native_monitors[session_id]
         owner.retire()  # actual cleanup + latest native record durably exported
         del self._native_monitors[session_id]
+        _release_native_monitor_claim(session_id, self)
 
     def discard_empty_native_monitor(self, session_id: str) -> None:
         owner = self._native_monitors[session_id]
         owner.discard_empty()
         del self._native_monitors[session_id]
+        _release_native_monitor_claim(session_id, self)
 
     def has_process(self, pgid: int) -> bool:
         """Whether this executor still owns the Popen handle for a process group."""
