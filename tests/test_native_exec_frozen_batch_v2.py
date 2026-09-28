@@ -10,12 +10,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 from gsched import cli
+from gsched.dispatcher import Dispatcher, _inbox_task_spec, _native_root_identities
 from gsched.native_exec import (
     NATIVE_EXEC_PROFILE_V2_SCHEMA,
     NATIVE_EXEC_V2_CONTRACT_FIELD,
     NATIVE_EXEC_V2_ROOT_KEYS,
     NATIVE_EXEC_V2_TASK_KEYS,
     NativeExecProfileError,
+    native_exec_project_roots,
     native_exec_profile_sha256,
     reattest_native_exec_profile,
     resolve_native_exec_profile,
@@ -162,6 +164,48 @@ class FrozenBatchProfileV2Tests(unittest.TestCase):
                 submitted_argv=self.argv,
                 batch_contract=drifted,
             )
+
+    def test_v2_durable_contract_is_reattested_against_batch_and_task(self) -> None:
+        task = validate_batch(self.batch(), self.cfg)["tasks"][0]
+        spec = _inbox_task_spec(task, task["cmd"], None)
+        self.assertEqual(self.contract(), spec[NATIVE_EXEC_V2_CONTRACT_FIELD])
+        local_spec = {}
+        cli._persist_native_exec_metadata(task, local_spec)
+        self.assertEqual(self.contract(), local_spec[NATIVE_EXEC_V2_CONTRACT_FIELD])
+
+        dispatcher = Dispatcher.__new__(Dispatcher)
+        dispatcher.cfg = self.cfg
+        dispatcher._native_exec_project_roots = native_exec_project_roots(self.cfg)
+        dispatcher._native_exec_project_root_identities = _native_root_identities(
+            dispatcher._native_exec_project_roots
+        )
+        batch = {
+            "mode": "strict", "project": "p", "name": "frozen-v2",
+            "cwd": "{PROJECT:p}", "depends_on": "[]",
+            "env": json.dumps(self.batch_env), "notify": None, "priority": 0,
+        }
+        job = {"project": "p", "task_id": "probe"}
+        resolved = dispatcher._reattest_native_launch(batch, job, spec, "p")
+        self.assertEqual(NATIVE_EXEC_PROFILE_V2_SCHEMA, resolved["schema"])
+
+        mutations = (
+            ("missing_contract", "spec", lambda item: item.pop(NATIVE_EXEC_V2_CONTRACT_FIELD)),
+            ("protocol", "spec", lambda item: item[NATIVE_EXEC_V2_CONTRACT_FIELD].__setitem__("_protocol", "other")),
+            ("runtime", "spec", lambda item: item.__setitem__("runtime_prefix", self.root)),
+            ("duration", "spec", lambda item: item.__setitem__("duration_min", 1)),
+            ("batch_env", "batch", lambda item: item.__setitem__("env", "{}")),
+            ("batch_cwd", "batch", lambda item: item.__setitem__("cwd", self.root)),
+            ("dependencies", "batch", lambda item: item.__setitem__("depends_on", '["other"]')),
+        )
+        for label, target, mutate in mutations:
+            with self.subTest(label=label):
+                changed_batch = copy.deepcopy(batch)
+                changed_spec = copy.deepcopy(spec)
+                mutate(changed_spec if target == "spec" else changed_batch)
+                with self.assertRaises(NativeExecProfileError):
+                    dispatcher._reattest_native_launch(
+                        changed_batch, job, changed_spec, "p"
+                    )
 
     def test_root_and_task_keysets_are_exact_and_git_must_be_absent(self) -> None:
         for key in sorted(NATIVE_EXEC_V2_ROOT_KEYS):

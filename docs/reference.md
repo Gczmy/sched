@@ -101,8 +101,10 @@ Popen rc 可成功结算；权威丢失时 fail-closed blocked，RC sidecar 对 
 root/task 公共 keyset，以及 raw `{PROJECT:...}` cwd、空依赖、`_protocol`、非空 batch env、
 空 task env、prefix runtime、整数 duration、`max_retry=0`、raw CPU resources、空 artifacts、
 公共 task `git` 缺席和未改写 logical argv。local submit 与 daemon inbox 均在依赖/指纹、
-批次或名称耐久写入、running claim、进程创建之前 fail-closed。V2 当前不落库、不做 launch-time
-reattest，也不授权 Popen；retained/bootstrap launcher 接入是后续独立步骤。
+批次或名称耐久写入、running claim、进程创建之前 fail-closed。V2 当前不落库，也不授权
+Popen。内部 task spec 构造器现可保留 schema 生成的冻结合同；启动前复核函数可对照
+持久化 batch/task 字段与管理员冷 profile，但正常提交路径不会触发该函数。正式
+retained/bootstrap launcher 与完整生命周期接入后，才能考虑解除提交闸门。
 
 后续接口目前也仅是 fail-closed plan foundation：scheduler 私有的一次性
 `NativeLaunchPlan` 持有并复核 retained launcher FD、全封印 request memfd、已连接
@@ -234,7 +236,8 @@ sched resubmit <batch-ref>:<task>        # batch-ref: 完整 id 优先，否则�
 ### R4 强制全部重跑（跳过 SKIP）
 
 batch.json 加 `"force_rerun": true` 后重新 submit；或清指纹：
-`sched clean <batch-ref> --yes`（删除每个最新 `skip` task spec 声明的产物）。
+`sched clean <batch-ref> --yes`（删除每个最新 `skip` task spec 声明的产物）；
+一次性 `strict` native 批次不允许 clean。
 clean 会清除该批所有版本的指纹，但只把每个 task 的最新 `skip` 版本重新排队；
 仅允许 `done/blocked` 终态批次，并且节点上不能有任何 running 任务或其他 `active`
 批次（不同批次也可能声明同一路径，在尚无 producer/path ownership 元数据前按
@@ -329,7 +332,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `resubmit <batch-ref>:<task>` / `<batch-ref> [--failed\|--all] [--dry-run]` | 新版本排队尾；支持批次级批量 | discarded/queued 守卫；done/blocked 自动回 active |
 | `cancel <batch-ref>[:task] --yes` / `cancel --project P --yes` | 取消 | 后者遍历该项目 queued/active/blocked 批次 |
 | `discard <batch-ref> --yes` | 退役 blocked/queued 批次 | 仅拒 running；证据保留 |
-| `clean <batch-ref> --yes` | 清全部指纹+删最新 skip spec 产物 | 仅终态批次；仅重排最新 skip；done 自动回 active |
+| `clean <batch-ref> --yes` | 清全部指纹+删最新 skip spec 产物 | 仅非 strict 终态批次；仅重排最新 skip；done 自动回 active |
 | `list-gpus` | GPU 视图（packed=n/cap）| |
 | `gpu-set-mem <idx> <GiB>` | 临时覆盖 state/list-gpus 中的 GPU 容量 | 重启时会被 config 或硬件探测覆盖 |
 | `gpu-ok <idx>` / `gpu-ignore <idx>` | 解除 quarantine / 静默 unmanaged 告警 | 未知 idx 拒绝；不等同于强制释放 |

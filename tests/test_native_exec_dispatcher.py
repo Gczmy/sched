@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from gsched import state
+from gsched import cli, state
 from gsched.dispatcher import (
     CONFIG_COLD_KEYS,
     Dispatcher,
@@ -15,9 +17,11 @@ from gsched.dispatcher import (
 )
 from gsched.fingerprint import compute_fingerprint
 from gsched.native_exec import (
+    NATIVE_EXEC_PROFILE_V2_SCHEMA,
     NativeExecProfileError,
     native_exec_project_roots,
 )
+from gsched.native_launch import NativeLaunchUnavailable
 from gsched.schema import validate_batch
 
 
@@ -193,6 +197,42 @@ class NativeExecDispatcherCase(unittest.TestCase):
 
 
 class NativeExecDispatcherLaunchTests(NativeExecDispatcherCase):
+    def test_v2_cannot_reach_running_claim_without_formal_backend(self) -> None:
+        job_id, _spec = self._seed_native_job()
+        dispatcher = self._dispatcher()
+        dispatcher._reattest_native_launch = mock.Mock(
+            return_value={"schema": NATIVE_EXEC_PROFILE_V2_SCHEMA}
+        )
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            with self.assertRaises(NativeLaunchUnavailable):
+                dispatcher._launch_job(conn, job, None)
+        dispatcher._prepare_launch_marker.assert_not_called()
+        dispatcher.executor.launch.assert_not_called()
+        with state.connect() as conn:
+            self.assertEqual("pending", state.get_job(conn, job_id)["status"])
+
+    def test_clean_rejects_terminal_strict_batch_without_requeue(self) -> None:
+        job_id, _spec = self._seed_native_job()
+        with state.connect() as conn:
+            conn.execute(
+                "UPDATE batches SET status='done' WHERE id='native-batch-id'"
+            )
+            conn.execute(
+                "UPDATE jobs SET status='skip' WHERE id=?", (job_id,)
+            )
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = cli.cmd_clean(
+                SimpleNamespace(batch="native-batch-id", yes=True)
+            )
+        self.assertEqual(1, result)
+        self.assertIn("strict native", stderr.getvalue())
+        with state.connect() as conn:
+            self.assertEqual("skip", state.get_job(conn, job_id)["status"])
+            self.assertEqual(
+                "submission-fingerprint", state.get_job(conn, job_id)["fingerprint"]
+            )
+
     def test_native_profile_registry_is_a_daemon_cold_key(self) -> None:
         self.assertIn("native_exec_profiles", CONFIG_COLD_KEYS)
 

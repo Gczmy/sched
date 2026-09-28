@@ -48,12 +48,14 @@ from .fingerprint import compute_fingerprint
 from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template, task_environment, project_gpu_enabled
 from .schema import SchemaError, validate_batch, validate_persisted_dependencies, validate_project_gpu_access
 from .native_exec import (
+    NATIVE_EXEC_PROFILE_V2_SCHEMA,
     NATIVE_EXEC_V2_CONTRACT_FIELD,
     NativeExecProfileError,
     native_exec_project_roots,
     native_exec_project_root_identity_sha256,
     reattest_native_exec_profile,
 )
+from .native_launch import NativeLaunchUnavailable
 from .templates import expand_cmd
 
 POLL_SEC = 10
@@ -183,12 +185,21 @@ def _native_exec_metadata(spec: dict) -> dict[str, Any] | None:
     """Return a complete persisted tuple, rejecting partial internal state."""
     present = [key for key in _NATIVE_EXEC_METADATA_KEYS if key in spec]
     if not present:
+        if NATIVE_EXEC_V2_CONTRACT_FIELD in spec:
+            raise NativeExecProfileError(
+                "persisted native V2 contract is missing its metadata tuple"
+            )
         return None
     if len(present) != len(_NATIVE_EXEC_METADATA_KEYS):
         raise NativeExecProfileError(
             "persisted native execution metadata is incomplete"
         )
-    return {key: spec[key] for key in _NATIVE_EXEC_METADATA_KEYS}
+    metadata = {key: spec[key] for key in _NATIVE_EXEC_METADATA_KEYS}
+    if NATIVE_EXEC_V2_CONTRACT_FIELD in spec:
+        metadata[NATIVE_EXEC_V2_CONTRACT_FIELD] = spec[
+            NATIVE_EXEC_V2_CONTRACT_FIELD
+        ]
+    return metadata
 
 
 def _native_exec_fingerprint_kwargs(spec: dict) -> dict[str, str]:
@@ -4228,15 +4239,65 @@ class Dispatcher:
             raise NativeExecProfileError(
                 "persisted native batch environment is invalid"
             ) from exc
-        if batch_env or spec.get("env"):
+        v2_contract = metadata.get(NATIVE_EXEC_V2_CONTRACT_FIELD)
+        is_v2 = NATIVE_EXEC_V2_CONTRACT_FIELD in metadata
+        if is_v2:
+            if not isinstance(v2_contract, dict):
+                raise NativeExecProfileError(
+                    "persisted native V2 contract must be an object"
+                )
+            runtime = v2_contract.get("runtime")
+            resources = spec.get("resources")
+            if not isinstance(runtime, dict) or not isinstance(resources, dict):
+                raise NativeExecProfileError(
+                    "persisted native V2 runtime or resources are invalid"
+                )
+            try:
+                depends_on = json.loads(batch["depends_on"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise NativeExecProfileError(
+                    "persisted native V2 batch dependencies are invalid"
+                ) from exc
+            if (
+                batch["cwd"] != v2_contract.get("cwd")
+                or depends_on != v2_contract.get("depends_on")
+                or batch_env != v2_contract.get("batch_env")
+                or spec.get("env") != v2_contract.get("task_env")
+                or spec.get("runtime") != v2_contract.get("runtime")
+                or spec.get("runtime_prefix") != runtime.get("prefix")
+                or type(spec.get("duration_min")) is not int
+                or spec.get("duration_min") != v2_contract.get("duration_min")
+                or spec.get("max_retry") != v2_contract.get("max_retry")
+                or spec.get("artifacts") != v2_contract.get("artifacts")
+                or spec.get("id") != job["task_id"]
+                or spec.get("_force_rerun") is not None
+                or spec.get("max_parallel") is not None
+                or spec.get("progress_regex") is not None
+                or spec.get("paths_escape") is not False
+                or not isinstance(v2_contract.get("resources"), dict)
+                or {"gpu": resources.get("gpu"), "cpus": resources.get("cpus")}
+                != v2_contract["resources"]
+                or batch.get("gpus") is not None
+                or batch["notify"] is not None
+                or type(batch["priority"]) is not int
+                or batch["priority"] != 0
+            ):
+                raise NativeExecProfileError(
+                    "persisted native V2 batch/task fields differ from frozen contract"
+                )
+        elif batch_env or spec.get("env"):
             raise NativeExecProfileError(
                 "persisted native execution must have empty batch/task env"
             )
-        if spec.get("resources") != {
-            "gpu": 0,
-            "cpus": 1,
-            "gpu_share": False,
-        }:
+        resources = spec.get("resources")
+        if (
+            not isinstance(resources, dict)
+            or frozenset(resources) != {"gpu", "cpus", "gpu_share"}
+            or type(resources["gpu"]) is not int
+            or type(resources["cpus"]) is not int
+            or type(resources["gpu_share"]) is not bool
+            or resources != {"gpu": 0, "cpus": 1, "gpu_share": False}
+        ):
             raise NativeExecProfileError(
                 "persisted native execution resources must remain CPU-only"
             )
@@ -4282,7 +4343,7 @@ class Dispatcher:
             raise NativeExecProfileError(
                 "persisted native project-root identity digest drifted"
             )
-        if (
+        if not is_v2 and (
             spec.get("runtime") is not None
             or spec.get("runtime_prefix") is not None
         ):
@@ -4317,7 +4378,7 @@ class Dispatcher:
             raise NativeExecProfileError(
                 "persisted native project binding is inconsistent"
             )
-        return reattest_native_exec_profile(
+        resolved = reattest_native_exec_profile(
             self.cfg,
             mode=batch["mode"],
             project=batch["project"],
@@ -4326,7 +4387,13 @@ class Dispatcher:
             profile_id=metadata["_native_exec_profile_id"],
             profile_sha256=metadata["_native_exec_profile_sha256"],
             submitted_argv=submitted_argv,
+            batch_contract=v2_contract if is_v2 else None,
         )
+        if is_v2 != (resolved.get("schema") == NATIVE_EXEC_PROFILE_V2_SCHEMA):
+            raise NativeExecProfileError(
+                "persisted native contract schema differs from cold profile"
+            )
+        return resolved
 
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
@@ -4388,6 +4455,13 @@ class Dispatcher:
             spec,
             task_project,
         )
+        if (
+            native_binding is not None
+            and native_binding.get("schema") == NATIVE_EXEC_PROFILE_V2_SCHEMA
+        ):
+            raise NativeLaunchUnavailable(
+                "native V2 formal launcher and lifecycle are not connected"
+            )
         if native_binding is not None and gpu is not None:
             raise NativeExecProfileError(
                 "native CPU-only execution received a GPU assignment"

@@ -22,7 +22,8 @@ V1 `strict` 只接受管理员冷 profile 精确绑定的单个 CPU 任务；已
 `SCHED_BATCH_ID` 沿用既有环境契约，值是批次名称；CLI JSON 的 `batch_id`
 才是持久化批次 ID。完整限制见 [reference.md](reference.md)。
 
-V2 profile 只有校验器，提交入口在持久化和启动前拒绝。
+V2 profile 的提交入口仍在持久化和启动前拒绝。内部已具备冻结合同随 task spec
+保存和启动前逐项复核的基础，但正常提交流程不会写入 V2；它不构成正式执行链。
 `Executor.launch_native(plan)` 仍抛出 `NativeLaunchUnavailable`，不会回退到
 路径执行。Step 5D/5E/5F 的协议、传输和生命周期组件作为实验基础保留，
 不构成正式 MPC_OTSF 执行链，也没有接入常规 dispatcher 的 V2 调度路径。

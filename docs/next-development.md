@@ -8,6 +8,14 @@ M2B 实验分支已整合，后续仍需接通 V2 的 retained-FD 启动后端�
 这些工作尚未实现或排期；当前合并不授权正式研究任务执行。
 范围与依赖见 [native-integration.md](native-integration.md)。
 
+V2 冻结合同的内部持久化构造与启动前复核已补齐；正常 local submit 和 daemon
+inbox 仍在落库前拒绝 V2，dispatcher 即使遇到内部 V2 task，也在 running claim
+前拒绝。`strict` 批次现在不能通过 `clean` 重排。正式放行还需要研究仓库提供
+经冻结附件约束的 V/P 执行接口、可信完成证据与取消／超时权威；调度器随后要
+接入独立的 native session 持久状态、项目内 retained 日志 FD、崩溃接管及资源
+结算，并用真实 Linux C bridge 做跨仓端到端验收。现有 monitor close 不代表
+formal phase 完成，不能用作 `done` 判据。
+
 ## 进行中的开发项
 
 P2 看板维护操作的调度器接口已补齐：`request` 支持 `daemon drain`、
