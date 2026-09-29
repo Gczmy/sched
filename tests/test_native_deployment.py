@@ -190,8 +190,14 @@ def test_step5f_owner_preserves_nonce_and_single_use_guards(deployment):
         f.RequestOwner()
 
 
-def test_step5d_owner_retains_cold_bindings_without_launch(deployment, tmp_path):
+@pytest.mark.parametrize("trailing_empty_arg", [False, True])
+def test_step5d_owner_retains_cold_bindings_without_launch(deployment, tmp_path,
+                                                            trailing_empty_arg):
     from gsched.native_step5d_control import NativeStep5DRequestOwner
+    if trailing_empty_arg:
+        value = json.loads(EXAMPLE.read_bytes())
+        value["logical_argv_profiles"]["preparation"].append("")
+        deployment = parse(value)
     root = tmp_path.resolve()
     launcher = root / "launcher"
     launcher.write_bytes(b"synthetic-launcher-not-executed")
@@ -220,6 +226,101 @@ def test_step5d_owner_retains_cold_bindings_without_launch(deployment, tmp_path)
             prepared.close()
         for fd in (root_fd, launcher_fd, log_fd):
             os.close(fd)
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.fixture
+def step5d_local_log_inputs(deployment, tmp_path):
+    root = tmp_path.resolve()
+    launcher = root / "launcher"
+    launcher.write_bytes(b"synthetic-launcher-not-executed")
+    launcher.chmod(0o755)
+    (root / "logs").mkdir()
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    launcher_fd = os.open(launcher, os.O_RDONLY)
+    try:
+        yield root, dict(
+            target_phase_profile="preparation", run_id="example-run",
+            launch_marker="example-launch", project_root_path=str(root),
+            project_root_fd=root_fd, launcher_fd=launcher_fd,
+            launcher_sha256=hashlib.sha256(launcher.read_bytes()).hexdigest(),
+            log_relative_path="logs/native.log",
+        )
+    finally:
+        os.close(launcher_fd)
+        os.close(root_fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="retained FD launch requires Linux")
+def test_step5d_owner_creates_and_retains_local_log(deployment, step5d_local_log_inputs, monkeypatch):
+    from gsched import native_step5d_control as control
+
+    root, inputs = step5d_local_log_inputs
+    log = root / "logs/native.log"
+    assert not log.exists()
+    before = set(os.listdir("/proc/self/fd"))
+    source_fds = []
+    factory = control._create_step5d_no_data_launch_owner
+
+    def capturing_factory(**kwargs):
+        source_fds.append(kwargs["log_fd"])
+        return factory(**kwargs)
+
+    monkeypatch.setattr(control, "_create_step5d_no_data_launch_owner", capturing_factory)
+    prepared = control.NativeStep5DRequestOwner(deployment=deployment).prepare(**inputs)
+    try:
+        assert len(source_fds) == 1
+        with pytest.raises(OSError):
+            os.fstat(source_fds[0])
+        assert prepared.plan.log_fd != source_fds[0]
+        prepared.plan.validate_live_fds()
+        assert log.read_bytes() == b""
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+        assert os.fstat(prepared.plan.log_fd).st_ino == log.stat().st_ino
+    finally:
+        prepared.close()
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="retained FD launch requires Linux")
+def test_step5d_owner_rejects_preexisting_local_log(deployment, step5d_local_log_inputs):
+    from gsched.native_launch import NativeLaunchPlanError
+    from gsched.native_step5d_control import NativeStep5DRequestOwner
+
+    root, inputs = step5d_local_log_inputs
+    log = root / "logs/native.log"
+    log.write_bytes(b"existing log must remain")
+    before = set(os.listdir("/proc/self/fd"))
+    with pytest.raises(NativeLaunchPlanError, match="fresh"):
+        NativeStep5DRequestOwner(deployment=deployment).prepare(**inputs)
+    assert log.read_bytes() == b"existing log must remain"
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="retained FD launch requires Linux")
+def test_step5d_owner_factory_failure_keeps_empty_log_without_fd_leak(
+    deployment, step5d_local_log_inputs, monkeypatch,
+):
+    from gsched import native_step5d_control as control
+
+    root, inputs = step5d_local_log_inputs
+    log = root / "logs/native.log"
+    before = set(os.listdir("/proc/self/fd"))
+    source_fds = []
+
+    def failing_factory(**kwargs):
+        source_fds.append(kwargs["log_fd"])
+        assert os.fstat(kwargs["log_fd"]).st_size == 0
+        raise RuntimeError("injected factory failure")
+
+    monkeypatch.setattr(control, "_create_step5d_no_data_launch_owner", failing_factory)
+    with pytest.raises(RuntimeError, match="injected factory failure"):
+        control.NativeStep5DRequestOwner(deployment=deployment).prepare(**inputs)
+    assert len(source_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(source_fds[0])
+    assert log.read_bytes() == b""
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
     assert set(os.listdir("/proc/self/fd")) == before
 
 

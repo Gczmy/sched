@@ -22,10 +22,19 @@ V1 `strict` 只接受管理员冷 profile 精确绑定的单个 CPU 任务；已
 `SCHED_BATCH_ID` 沿用既有环境契约，值是批次名称；CLI JSON 的 `batch_id`
 才是持久化批次 ID。完整限制见 [reference.md](reference.md)。
 
-V2 profile 只有校验器，提交入口在持久化和启动前拒绝。
+V2 profile 的提交入口仍在持久化和启动前拒绝。内部已具备冻结合同随 task spec
+保存和启动前逐项复核的基础，但正常提交流程不会写入 V2；它不构成正式执行链。
 `Executor.launch_native(plan)` 仍抛出 `NativeLaunchUnavailable`，不会回退到
 路径执行。Step 5D/5E/5F 的协议、传输和生命周期组件作为实验基础保留，
 不构成正式 MPC_OTSF 执行链，也没有接入常规 dispatcher 的 V2 调度路径。
+内部另有 isolated-only 的 native session 抢占/预留、日志打开前独立提交的一次性
+`log_attempted_at` CAS、项目日志 inode 绑定，以及 T2a 的一次性
+`monitor_launch_attempted_at` 启动前 CAS。文件打开失败永久消费本 session 的日志
+尝试；启动意图提交结果不明也不得重试。隔离域 session 超过 `duration_min`
+时，dispatcher 只持久写入 `timed_out` 意图，阻止后续启动前 CAS，不发信号或
+结算任务；已提交 T2a 意图的会话在 M 启动前仍须再次检查。上述 helper 未接入正式
+V2 派发，owner 仍未绑定，
+不创建或启动 M，不能作为生产授权、启动或完成证据。
 
 ## 外部依赖
 
@@ -39,12 +48,19 @@ owner 必须显式接收配置，不从请求获取预期值。迁移方式和�
 `gsched._m2b_scheduler_native` 扩展。其 C 源码和专用构建/验收脚本位于
 配套研究仓库 `MPC_OTSF`，不随 `sched` 包构建或安装；普通 daemon 不依赖它。
 整合不修改该仓库的冻结合同，也不把历史 native 运行记录当作当前验证。
+`Executor.start_native_monitor()` 在原线程原子消费一次性启动令牌；重复或跨线程
+调用在 Python 边界拒绝，不会因底层拒绝而误取消原 M。从 native pin 恢复的 owner
+一律视为启动尝试已消费，不能用恢复动作重放启动。同一进程内的 session
+由仍存活的原 `Executor` 独占认领，其他实例不能同时接管同一 C pin；原实例
+失去所有引用后，可由原线程的新实例恢复。成功退役或丢弃空 owner 后释放
+认领；创建结果不明时，原实例继续存活则保留认领直到 pin 状态确认。
 
 Step 5E 的跨仓协议测试从 `M2B_STEP5E_CONTRACT_ROOT` 读取冻结向量、合同和
 勘误，校验其 SHA-256。未设置此变量时仅跳过外部向量测试；一旦设置，
 路径错误、文件缺失或摘要不符均导致失败。Step5D／5E／5F 的身份与 argv 仍按
-管理员绑定精确匹配，没有开放请求可指定的任意项目 API。外部隔离启动器若升级
-源码，需要同步显式配置参数和固定源码清单；本次没有运行这些启动器。
+管理员绑定精确匹配，没有开放请求可指定的任意项目 API。外部隔离启动器已在
+`MPC_OTSF` 的 `d8164bf` 同步显式配置参数和固定源码清单；本地 Step5E
+root/C 回归 42 项通过，这不代替 HPDC 正式任务验收。
 
 ## 本地验证与复现
 
@@ -66,9 +82,11 @@ bash tests/run_docs_refs_accept.sh
 ```
 
 跨仓向量验证使用的本地 `MPC_OTSF` 提交为
-`8405c879f5b30982510d4e82c64770530e2820db`。它只提供冻结测试数据，
-并未执行该仓库的生产或集群脚本。新增 native 验收使用临时目录和真实
-CPU 子进程，检查 drain、GPU 禁用时的 CPU 执行、环境隔离、完成与禁止重放。
+`8405c879f5b30982510d4e82c64770530e2820db`。后续调用方迁移提交为
+`d8164bfe35f0556d582dc0051fcec8417fdbda75`；旧冻结测试数据原字节保留。
+调度器 native 验收使用临时目录和真实 CPU 子进程，检查 drain、GPU 禁用时的
+CPU 执行、环境隔离、完成与禁止重放。
 
-本次没有构建或运行外部 C bridge，没有完成正式 FD-exec 后端和研究项目
-全链路验收，也没有连接、部署或重启远程 HPDC。
+研究仓库已在本地 GCC 11 环境构建并运行外部 C bridge 的十项 S/M 生命周期
+用例。正式 FD-exec 后端和研究项目全链路验收仍未完成；没有连接、部署或重启
+远程 HPDC。

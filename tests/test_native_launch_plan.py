@@ -33,6 +33,8 @@ from gsched.native_launch import (
     NativeLaunchPlanError,
     NativeLaunchUnavailable,
     _create_native_launch_plan,
+    _copy_retained_source_fd,
+    _open_project_local_log_fd,
 )
 
 
@@ -110,6 +112,7 @@ class NativeLaunchPlanContractTests(unittest.TestCase):
             {"request_fd": True},
             {"control_fd": 10},
             {"log_relative_path": "../outside.log"},
+            {"project_root_path": "/"},
         )
         for mutation in mutations:
             values = dict(base)
@@ -195,6 +198,7 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
             | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
+        os.fchmod(self.log_fd, 0o600)
         self.original_fds = (
             self.launcher_fd,
             self.request_fd,
@@ -240,6 +244,125 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
         values.update(overrides)
         return _create_native_launch_plan(**values)
 
+    def test_private_log_is_root_relative_and_plan_retains_a_copy(self) -> None:
+        relative = "logs/fresh-native.log"
+        source_fd = _open_project_local_log_fd(
+            project_root_fd=self.root_fd,
+            project_root_path=self.root,
+            project_root_identity_sha256=(
+                native_exec_project_root_identity_sha256(self.root)
+            ),
+            log_relative_path=relative,
+        )
+        try:
+            source_stat = os.fstat(source_fd)
+            path_stat = os.stat(os.path.join(self.root, relative))
+            self.assertEqual(
+                (source_stat.st_dev, source_stat.st_ino),
+                (path_stat.st_dev, path_stat.st_ino),
+            )
+            self.assertEqual(1, source_stat.st_nlink)
+            self.assertEqual(0o600, source_stat.st_mode & 0o777)
+            self.assertTrue(fcntl.fcntl(source_fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC)
+            self.assertTrue(fcntl.fcntl(source_fd, fcntl.F_GETFL) & os.O_APPEND)
+            plan = self.plan(log_relative_path=relative, log_fd=source_fd)
+        finally:
+            os.close(source_fd)
+        try:
+            plan.validate_live_fds()
+            os.fstat(self.root_fd)  # The helper borrowed the root FD.
+        finally:
+            plan.close()
+
+    def test_private_log_rejects_existing_leaf_and_symlinked_parent(self) -> None:
+        expected_root = native_exec_project_root_identity_sha256(self.root)
+        with self.assertRaisesRegex(NativeLaunchPlanError, "fresh"):
+            _open_project_local_log_fd(
+                project_root_fd=self.root_fd,
+                project_root_path=self.root,
+                project_root_identity_sha256=expected_root,
+                log_relative_path=self.log_relative_path,
+            )
+        os.symlink(".", os.path.join(self.root, "logs", "linked"))
+        with self.assertRaisesRegex(NativeLaunchPlanError, "parent"):
+            _open_project_local_log_fd(
+                project_root_fd=self.root_fd,
+                project_root_path=self.root,
+                project_root_identity_sha256=expected_root,
+                log_relative_path="logs/linked/never-created.log",
+            )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.root, "logs", "never-created.log"))
+        )
+        os.fstat(self.root_fd)
+
+    def test_private_log_rejects_root_drift_before_file_creation(self) -> None:
+        with self.assertRaisesRegex(NativeLaunchPlanError, "identity drifted"):
+            _open_project_local_log_fd(
+                project_root_fd=self.root_fd,
+                project_root_path=self.root,
+                project_root_identity_sha256="0" * 64,
+                log_relative_path="logs/no-root-authority.log",
+            )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.root, "logs", "no-root-authority.log"))
+        )
+        os.fstat(self.root_fd)
+
+    def test_private_log_rejects_filesystem_root_before_creation(self) -> None:
+        filesystem_root_fd = os.open(
+            "/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        self.addCleanup(os.close, filesystem_root_fd)
+        with mock.patch("gsched.native_launch.os.open") as opened:
+            with self.assertRaisesRegex(NativeLaunchPlanError, "non-root"):
+                _open_project_local_log_fd(
+                    project_root_fd=filesystem_root_fd,
+                    project_root_path="/",
+                    project_root_identity_sha256=(
+                        native_exec_project_root_identity_sha256("/")
+                    ),
+                    log_relative_path="logs/never-create-from-root.log",
+                )
+        opened.assert_not_called()
+
+    def test_private_log_setup_failure_closes_new_descriptors(self) -> None:
+        before = len(os.listdir("/proc/self/fd"))
+        with mock.patch(
+            "gsched.native_launch.os.fchmod", side_effect=OSError("injected")
+        ):
+            with self.assertRaisesRegex(NativeLaunchPlanError, "setup failed"):
+                _open_project_local_log_fd(
+                    project_root_fd=self.root_fd,
+                    project_root_path=self.root,
+                    project_root_identity_sha256=(
+                        native_exec_project_root_identity_sha256(self.root)
+                    ),
+                    log_relative_path="logs/setup-failed.log",
+                )
+        self.assertEqual(before, len(os.listdir("/proc/self/fd")))
+        os.fstat(self.root_fd)
+
+    def test_plan_rejects_readwrite_log_source(self) -> None:
+        readwrite_fd = os.open(
+            self.log_path,
+            os.O_RDWR | os.O_APPEND | os.O_CLOEXEC,
+        )
+        self.addCleanup(os.close, readwrite_fd)
+        with self.assertRaisesRegex(NativeLaunchPlanError, "write-only"):
+            self.plan(log_fd=readwrite_fd)
+        os.fstat(readwrite_fd)  # Factory failure must not close caller ownership.
+
+    def test_plan_rechecks_private_log_mode(self) -> None:
+        plan = self.plan()
+        try:
+            os.fchmod(self.log_fd, 0o644)
+            with self.assertRaisesRegex(NativeLaunchPlanError, "mode 0600"):
+                plan.validate_live_fds()
+        finally:
+            plan.close()
+        os.fstat(self.log_fd)
+
     def test_plan_owns_distinct_copies_and_keeps_fixed_actual_contract(self) -> None:
         plan = self.plan()
         self.addCleanup(plan.close)
@@ -276,6 +399,50 @@ class NativeLaunchPlanLinuxTests(unittest.TestCase):
         self.assertEqual(os.lseek(plan.request_fd, 0, os.SEEK_CUR), 0)
         plan.validate_live_fds()
         self.assertEqual(os.lseek(plan.request_fd, 0, os.SEEK_CUR), 0)
+
+    def test_interrupted_request_copy_closes_reopened_fd(self) -> None:
+        copied: list[int] = []
+        original_open = os.open
+
+        def capture_open(*args, **kwargs):
+            fd = original_open(*args, **kwargs)
+            copied.append(fd)
+            return fd
+
+        with mock.patch("gsched.native_launch.os.open", side_effect=capture_open):
+            with mock.patch("gsched.native_launch.os.lseek", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    _copy_retained_source_fd(self.request_fd, request=True)
+
+        self.assertEqual(1, len(copied))
+        with self.assertRaises(OSError):
+            os.fstat(copied[0])
+        os.fstat(self.request_fd)
+
+    def test_interrupted_plan_factory_closes_partial_retained_fds(self) -> None:
+        copied: list[int] = []
+        original_copy = _copy_retained_source_fd
+
+        def interrupt_after_two(source_fd: int, *, request: bool) -> int:
+            if len(copied) == 2:
+                raise KeyboardInterrupt
+            fd = original_copy(source_fd, request=request)
+            copied.append(fd)
+            return fd
+
+        with mock.patch(
+            "gsched.native_launch._copy_retained_source_fd",
+            side_effect=interrupt_after_two,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.plan()
+
+        self.assertEqual(2, len(copied))
+        for fd in copied:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        for fd in self.original_fds:
+            os.fstat(fd)
 
     def test_request_seals_are_required_before_the_frame_snapshot_is_read(self) -> None:
         unsealed_builder = os.memfd_create(

@@ -135,11 +135,17 @@ def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
         destination.update(
             {key: source[key] for key in _NATIVE_EXEC_METADATA_KEYS}
         )
+        if NATIVE_EXEC_V2_CONTRACT_FIELD in source:
+            destination[NATIVE_EXEC_V2_CONTRACT_FIELD] = source[
+                NATIVE_EXEC_V2_CONTRACT_FIELD
+            ]
 
 
 def _native_exec_metadata_error(task: dict, expanded_cmd: Any) -> str | None:
     """Reject partial or command-drifted native metadata before persistence."""
     present = [key for key in _NATIVE_EXEC_METADATA_KEYS if key in task]
+    if NATIVE_EXEC_V2_CONTRACT_FIELD in task and not present:
+        return "native exec V2 contract requires a complete metadata tuple"
     if present and len(present) != len(_NATIVE_EXEC_METADATA_KEYS):
         return "native exec metadata must be an all-or-none tuple"
     if present and (
@@ -2579,11 +2585,17 @@ def cmd_clean(args: argparse.Namespace) -> int:
     with state.submission_lock():
         with state.submission_connect() as conn:
             batch_row = conn.execute(
-                "SELECT status FROM batches WHERE id=?",
+                "SELECT status, mode FROM batches WHERE id=?",
                 (b,),
             ).fetchone()
             if not batch_row:
                 print(f"错误: 批次不存在: {args.batch}", file=sys.stderr)
+                return 1
+            if batch_row["mode"] == "strict":
+                print(
+                    "错误: strict native 批次是一次性执行，不能 clean 或重新排队",
+                    file=sys.stderr,
+                )
                 return 1
             if batch_row["status"] not in ("done", "blocked"):
                 print(
@@ -4494,8 +4506,9 @@ def main(argv: list[str] | None = None) -> int:
             state.set_query_only(False)
             return 1
     # Local query commands use a coherent private WAL snapshot and never open
-    # the NFS-backed source through SQLite.  Initialization above still creates
-    # or migrates a fresh/legacy DB before query-only mode is enabled.
+    # the NFS-backed source through SQLite.  Complete private WAL schemas from
+    # older builds remain queryable without migration; fresh or incomplete
+    # state still follows the existing initialization path above.
     state.set_query_only(local_db_read and not dry_run)
     try:
         return args.fn(args)

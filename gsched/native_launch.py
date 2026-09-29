@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import socket
 import stat
 import struct
@@ -74,9 +75,10 @@ def _logical_argv(value: Any) -> tuple[str, ...]:
         raise NativeLaunchPlanError("logical submitted argv must be non-empty")
     detached: list[str] = []
     for index, token in enumerate(value):
-        if type(token) is not str or not token or "\0" in token:
+        if type(token) is not str or "\0" in token or (index == 0 and not token):
+            requirement = "non-empty NUL-free" if index == 0 else "NUL-free"
             raise NativeLaunchPlanError(
-                f"logical submitted argv[{index}] must be a non-empty NUL-free string"
+                f"logical submitted argv[{index}] must be a {requirement} string"
             )
         detached.append(token)
     if not os.path.isabs(detached[0]) or os.path.normpath(detached[0]) != detached[0]:
@@ -177,6 +179,346 @@ def _project_root_identity(path: str, root_stat: os.stat_result) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_project_root_fd(
+    project_root_fd: int,
+    project_root_path: str,
+    project_root_identity_sha256: str,
+) -> None:
+    """Re-attest a borrowed root FD before and after project-local I/O."""
+    _fd(project_root_fd, "project_root_fd")
+    _digest(
+        project_root_identity_sha256,
+        "native launch project-root identity sha256",
+    )
+    if (
+        type(project_root_path) is not str
+        or project_root_path == "/"
+        or not os.path.isabs(project_root_path)
+        or os.path.normpath(project_root_path) != project_root_path
+        or os.path.realpath(project_root_path) != project_root_path
+    ):
+        raise NativeLaunchPlanError(
+            "native launch project-root path must be canonical, non-root, and absolute"
+        )
+    try:
+        root_stat = os.fstat(project_root_fd)
+        descriptor_flags = fcntl.fcntl(project_root_fd, fcntl.F_GETFD)
+        root_flags = fcntl.fcntl(project_root_fd, fcntl.F_GETFL)
+    except OSError as exc:
+        raise NativeLaunchPlanError(
+            "native project-root FD cannot be inspected"
+        ) from exc
+    if descriptor_flags & fcntl.FD_CLOEXEC == 0:
+        raise NativeLaunchPlanError(
+            "native project-root FD must remain CLOEXEC"
+        )
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise NativeLaunchPlanError("native project-root FD must be a directory")
+    if root_stat.st_nlink == 0:
+        raise NativeLaunchPlanError("native project-root FD is unlinked")
+    if root_flags & _LINUX_O_PATH:
+        raise NativeLaunchPlanError("native project-root FD must not use O_PATH")
+    if (root_flags & os.O_ACCMODE) != os.O_RDONLY:
+        raise NativeLaunchPlanError("native project-root FD must be read-only")
+    try:
+        path_stat = os.stat(project_root_path, follow_symlinks=False)
+    except OSError as exc:
+        raise NativeLaunchPlanError(
+            "native project-root path cannot be re-attested"
+        ) from exc
+    if (
+        not stat.S_ISDIR(path_stat.st_mode)
+        or (path_stat.st_dev, path_stat.st_ino)
+        != (root_stat.st_dev, root_stat.st_ino)
+    ):
+        raise NativeLaunchPlanError("native project-root path identity drifted")
+    if (
+        _project_root_identity(project_root_path, root_stat)
+        != project_root_identity_sha256
+    ):
+        raise NativeLaunchPlanError("native project-root FD identity drifted")
+
+
+def _open_project_local_log_fd(
+    *,
+    project_root_fd: int,
+    project_root_path: str,
+    project_root_identity_sha256: str,
+    log_relative_path: str,
+) -> int:
+    """Create one fresh private log below a borrowed, re-attested root FD.
+
+    The caller owns the returned source FD and must close it after the plan
+    factory has made its retained copy. This helper never closes the borrowed
+    root FD or removes a created log after a later validation failure.
+    """
+    if not sys.platform.startswith("linux"):
+        raise NativeLaunchUnavailable(
+            "native retained log creation requires Linux; no fallback is allowed"
+        )
+    _validate_project_root_fd(
+        project_root_fd, project_root_path, project_root_identity_sha256
+    )
+    relative_log = _log_relative_path(log_relative_path)
+    parts = relative_log.split("/")
+    cursor = project_root_fd
+    cursor_owned = False
+    log_fd = -1
+    try:
+        for component in parts[:-1]:
+            try:
+                next_cursor = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    dir_fd=cursor,
+                )
+            except OSError as exc:
+                raise NativeLaunchPlanError(
+                    "native log parent must be a retained non-symlink directory"
+                ) from exc
+            try:
+                parent_stat = os.fstat(next_cursor)
+                if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_nlink == 0:
+                    raise NativeLaunchPlanError(
+                        "native log parent directory identity is invalid"
+                    )
+            except BaseException:
+                os.close(next_cursor)
+                raise
+            previous_cursor = cursor
+            previous_owned = cursor_owned
+            cursor = next_cursor
+            cursor_owned = True
+            if previous_owned:
+                os.close(previous_cursor)
+        try:
+            log_fd = os.open(
+                parts[-1],
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_APPEND
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+                dir_fd=cursor,
+            )
+        except OSError as exc:
+            raise NativeLaunchPlanError(
+                "native log path must be fresh and creatable below retained root"
+            ) from exc
+        try:
+            os.fchmod(log_fd, 0o600)
+            log_stat = os.fstat(log_fd)
+            descriptor_flags = fcntl.fcntl(log_fd, fcntl.F_GETFD)
+            log_flags = fcntl.fcntl(log_fd, fcntl.F_GETFL)
+        except OSError as exc:
+            raise NativeLaunchPlanError("native log FD setup failed") from exc
+        if (
+            not stat.S_ISREG(log_stat.st_mode)
+            or log_stat.st_nlink != 1
+            or stat.S_IMODE(log_stat.st_mode) != 0o600
+            or descriptor_flags & fcntl.FD_CLOEXEC == 0
+            or (log_flags & os.O_ACCMODE) != os.O_WRONLY
+            or log_flags & os.O_APPEND == 0
+        ):
+            raise NativeLaunchPlanError("native log FD is not private append-only")
+        _validate_project_local_log(project_root_fd, relative_log, log_stat)
+        _validate_project_root_fd(
+            project_root_fd, project_root_path, project_root_identity_sha256
+        )
+        if cursor_owned:
+            os.close(cursor)
+            cursor_owned = False
+        owned = log_fd
+        log_fd = -1
+        return owned
+    finally:
+        if log_fd >= 0:
+            os.close(log_fd)
+        if cursor_owned:
+            os.close(cursor)
+
+
+def _create_bound_native_session_log(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    project_root_fd: int,
+) -> int:
+    """Create and durably bind one candidate session's retained log FD.
+
+    The claim/session transaction must already be committed.  An open or
+    indeterminate transaction cannot make the new file's reservation durable.
+    A separate committed CAS consumes the sole log-open attempt before any
+    filesystem open.  Any later failure leaves that attempt consumed and keeps
+    an O_EXCL file if one was created.  This helper does not arm a launch or
+    grant a native monitor owner.
+    """
+    from . import state
+
+    if not isinstance(conn, sqlite3.Connection) or conn.in_transaction:
+        raise NativeLaunchPlanError(
+            "native session reservation must be committed before log creation"
+        )
+    session = state.get_native_session(conn, session_id)
+    if (
+        session is None
+        or session["phase"] != "reserved"
+        or session["log_attempted_at"] is not None
+        or session["evaluation_domain"] != "isolated_integration"
+        or session["owner_kind"] != "unbound"
+    ):
+        raise NativeLaunchPlanError("native session has no unbound log reservation")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        session = state.mark_native_session_log_attempted(conn, session_id)
+        conn.commit()
+        if conn.in_transaction:
+            raise NativeLaunchPlanError("native log attempt commit is unresolved")
+    except BaseException:
+        conn.rollback()
+        raise
+    log_fd = _open_project_local_log_fd(
+        project_root_fd=project_root_fd,
+        project_root_path=session["project_root_path"],
+        project_root_identity_sha256=session["project_root_identity_sha256"],
+        log_relative_path=session["log_relative_path"],
+    )
+    try:
+        log_stat = os.fstat(log_fd)
+        _validate_project_local_log(
+            project_root_fd, session["log_relative_path"], log_stat
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        state.bind_native_session_log(
+            conn, session_id, log_stat.st_dev, log_stat.st_ino
+        )
+        conn.commit()
+        if conn.in_transaction:
+            raise NativeLaunchPlanError("native log binding commit is unresolved")
+        _validate_project_local_log(
+            project_root_fd, session["log_relative_path"], log_stat
+        )
+        return log_fd
+    except BaseException:
+        try:
+            conn.rollback()
+        finally:
+            os.close(log_fd)
+        raise
+
+
+def _attest_native_session_log_fd(
+    session: sqlite3.Row,
+    *,
+    session_id: str,
+    project_root_fd: int,
+    log_fd: int,
+    require_unconsumed: bool,
+) -> os.stat_result:
+    """Recheck the retained log, its one path, and its durable session inode."""
+    _fd(project_root_fd, "project_root_fd")
+    _fd(log_fd, "log_fd")
+    if (
+        session["evaluation_domain"] != "isolated_integration"
+        or session["owner_kind"] != "unbound"
+        or session["phase"] != "log_bound"
+        or session["log_attempted_at"] is None
+        or (require_unconsumed and session["monitor_launch_attempted_at"] is not None)
+        or session["log_relative_path"] != f"logs/sched-native-{session_id}.log"
+    ):
+        raise NativeLaunchPlanError("native session has no unconsumed monitor launch intent")
+    _validate_project_root_fd(
+        project_root_fd,
+        session["project_root_path"],
+        session["project_root_identity_sha256"],
+    )
+    try:
+        log_stat = os.fstat(log_fd)
+        descriptor_flags = fcntl.fcntl(log_fd, fcntl.F_GETFD)
+        log_flags = fcntl.fcntl(log_fd, fcntl.F_GETFL)
+    except OSError as exc:
+        raise NativeLaunchPlanError("native monitor launch log FD cannot be inspected") from exc
+    if (
+        not stat.S_ISREG(log_stat.st_mode)
+        or stat.S_IMODE(log_stat.st_mode) != 0o600
+        or descriptor_flags & fcntl.FD_CLOEXEC == 0
+        or (log_flags & os.O_ACCMODE) != os.O_WRONLY
+        or log_flags & os.O_APPEND == 0
+        or (str(log_stat.st_dev), str(log_stat.st_ino))
+        != (session["log_dev"], session["log_ino"])
+    ):
+        raise NativeLaunchPlanError("native monitor launch log FD differs from durable binding")
+    _validate_project_local_log(project_root_fd, session["log_relative_path"], log_stat)
+    _validate_project_root_fd(
+        project_root_fd,
+        session["project_root_path"],
+        session["project_root_identity_sha256"],
+    )
+    return log_stat
+
+
+def _commit_native_monitor_launch_intent(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    project_root_fd: int,
+    log_fd: int,
+) -> sqlite3.Row:
+    """Commit one isolated M-birth intent before any native owner can start.
+
+    The borrowed root and log FDs remain caller-owned.  A commit failure or
+    uncertain result returns no intent, even if the CAS reached disk.  A
+    successful return records consumption only: cancellation/timeout and the
+    original native owner must still be rechecked before any M birth or V/P
+    exec.  This helper neither creates an M owner nor calls the dispatcher.
+    """
+    from . import state
+
+    if not isinstance(conn, sqlite3.Connection) or conn.in_transaction:
+        raise NativeLaunchPlanError(
+            "native monitor launch requires a separately committed log binding"
+        )
+    session = state.get_native_session(conn, session_id)
+    if session is None:
+        raise NativeLaunchPlanError("native monitor launch session does not exist")
+    log_stat = _attest_native_session_log_fd(
+        session, session_id=session_id,
+        project_root_fd=project_root_fd, log_fd=log_fd,
+        require_unconsumed=True,
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent = state.mark_native_monitor_launch_attempted(
+            conn, session_id, log_stat.st_dev, log_stat.st_ino
+        )
+        conn.commit()
+        if conn.in_transaction:
+            raise NativeLaunchPlanError("native monitor launch intent commit is unresolved")
+        # A path/FD replacement after the CAS consumes this attempt; it never
+        # grants a second chance to launch on a different inode.
+        committed = state.get_native_session(conn, session_id)
+        if (
+            committed is None
+            or committed["monitor_launch_attempted_at"]
+            != intent["monitor_launch_attempted_at"]
+        ):
+            raise NativeLaunchPlanError("native monitor launch intent commit could not be re-attested")
+        _attest_native_session_log_fd(
+            committed, session_id=session_id,
+            project_root_fd=project_root_fd, log_fd=log_fd,
+            require_unconsumed=False,
+        )
+        return intent
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _validate_project_local_log(
     project_root_fd: int,
     log_relative_path: str,
@@ -241,7 +583,7 @@ def _copy_retained_source_fd(source_fd: int, *, request: bool) -> int:
             )
             os.lseek(copied, 0, os.SEEK_SET)
             return copied
-        except Exception:
+        except BaseException:
             if copied >= 0:
                 try:
                     os.close(copied)
@@ -566,36 +908,11 @@ class NativeLaunchPlan:
             else:
                 channel.close()
 
-        try:
-            root_stat = os.fstat(self.project_root_fd)
-        except OSError as exc:
-            raise NativeLaunchPlanError("native project-root FD cannot be fstat'ed") from exc
-        if not stat.S_ISDIR(root_stat.st_mode):
-            raise NativeLaunchPlanError("native project-root FD must be a directory")
-        if root_stat.st_nlink == 0:
-            raise NativeLaunchPlanError("native project-root FD is unlinked")
-        root_flags = fcntl.fcntl(self.project_root_fd, fcntl.F_GETFL)
-        if root_flags & _LINUX_O_PATH:
-            raise NativeLaunchPlanError("native project-root FD must not use O_PATH")
-        if (root_flags & os.O_ACCMODE) != os.O_RDONLY:
-            raise NativeLaunchPlanError("native project-root FD must be read-only")
-        try:
-            path_stat = os.stat(self.project_root_path, follow_symlinks=False)
-        except OSError as exc:
-            raise NativeLaunchPlanError(
-                "native project-root path cannot be re-attested"
-            ) from exc
-        if (
-            not stat.S_ISDIR(path_stat.st_mode)
-            or (path_stat.st_dev, path_stat.st_ino)
-            != (root_stat.st_dev, root_stat.st_ino)
-        ):
-            raise NativeLaunchPlanError("native project-root path identity drifted")
-        if (
-            _project_root_identity(self.project_root_path, root_stat)
-            != self.project_root_identity_sha256
-        ):
-            raise NativeLaunchPlanError("native project-root FD identity drifted")
+        _validate_project_root_fd(
+            self.project_root_fd,
+            self.project_root_path,
+            self.project_root_identity_sha256,
+        )
 
         try:
             log_stat = os.fstat(self.log_fd)
@@ -603,9 +920,11 @@ class NativeLaunchPlan:
             raise NativeLaunchPlanError("native log FD cannot be fstat'ed") from exc
         if not stat.S_ISREG(log_stat.st_mode):
             raise NativeLaunchPlanError("native log FD must be a regular file")
+        if stat.S_IMODE(log_stat.st_mode) != 0o600:
+            raise NativeLaunchPlanError("native log FD must have mode 0600")
         log_flags = fcntl.fcntl(self.log_fd, fcntl.F_GETFL)
-        if (log_flags & os.O_ACCMODE) not in (os.O_WRONLY, os.O_RDWR):
-            raise NativeLaunchPlanError("native log FD must be writable")
+        if (log_flags & os.O_ACCMODE) != os.O_WRONLY:
+            raise NativeLaunchPlanError("native log FD must be write-only")
         if log_flags & os.O_APPEND == 0:
             raise NativeLaunchPlanError("native log FD must use append mode")
         _validate_project_local_log(
@@ -656,12 +975,13 @@ def _create_native_launch_plan(
     )
     if (
         type(project_root_path) is not str
+        or project_root_path == "/"
         or not os.path.isabs(project_root_path)
         or os.path.normpath(project_root_path) != project_root_path
         or os.path.realpath(project_root_path) != project_root_path
     ):
         raise NativeLaunchPlanError(
-            "native launch project-root path must be canonical and absolute"
+            "native launch project-root path must be canonical, non-root, and absolute"
         )
     logical_argv = _logical_argv(logical_submitted_argv)
     relative_log = _log_relative_path(log_relative_path)
@@ -697,7 +1017,7 @@ def _create_native_launch_plan(
         )
         plan.validate_live_fds()
         return plan
-    except Exception:
+    except BaseException:
         if plan is not None:
             plan.close()
         else:

@@ -48,12 +48,14 @@ from .fingerprint import compute_fingerprint
 from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template, task_environment, project_gpu_enabled
 from .schema import SchemaError, validate_batch, validate_persisted_dependencies, validate_project_gpu_access
 from .native_exec import (
+    NATIVE_EXEC_PROFILE_V2_SCHEMA,
     NATIVE_EXEC_V2_CONTRACT_FIELD,
     NativeExecProfileError,
     native_exec_project_roots,
     native_exec_project_root_identity_sha256,
     reattest_native_exec_profile,
 )
+from .native_launch import NativeLaunchUnavailable
 from .templates import expand_cmd
 
 POLL_SEC = 10
@@ -183,12 +185,21 @@ def _native_exec_metadata(spec: dict) -> dict[str, Any] | None:
     """Return a complete persisted tuple, rejecting partial internal state."""
     present = [key for key in _NATIVE_EXEC_METADATA_KEYS if key in spec]
     if not present:
+        if NATIVE_EXEC_V2_CONTRACT_FIELD in spec:
+            raise NativeExecProfileError(
+                "persisted native V2 contract is missing its metadata tuple"
+            )
         return None
     if len(present) != len(_NATIVE_EXEC_METADATA_KEYS):
         raise NativeExecProfileError(
             "persisted native execution metadata is incomplete"
         )
-    return {key: spec[key] for key in _NATIVE_EXEC_METADATA_KEYS}
+    metadata = {key: spec[key] for key in _NATIVE_EXEC_METADATA_KEYS}
+    if NATIVE_EXEC_V2_CONTRACT_FIELD in spec:
+        metadata[NATIVE_EXEC_V2_CONTRACT_FIELD] = spec[
+            NATIVE_EXEC_V2_CONTRACT_FIELD
+        ]
+    return metadata
 
 
 def _native_exec_fingerprint_kwargs(spec: dict) -> dict[str, str]:
@@ -814,8 +825,9 @@ class Dispatcher:
         with state.submission_lock():
             try:
                 state.mark_idle_shutdown()
-            except OSError:
-                pass
+            except OSError as error:
+                self.log_line(f"stop 无法发布 shutdown 栅栏: {error}")
+                return False
             return self._stop_locked()
 
     def _stop_locked(self) -> bool:
@@ -826,11 +838,19 @@ class Dispatcher:
                 rows = conn.execute(
                     "SELECT * FROM jobs WHERE status='running'"
                 ).fetchall()
+                native_session_ids = {
+                    row["job_id"]
+                    for row in conn.execute("SELECT job_id FROM native_sessions")
+                }
         except sqlite3.Error as error:
             self.log_line(f"stop 读取 running jobs 失败: {error}")
             return False
 
-        for job in rows:
+        # A native session can only be claimed from pending, so no session can
+        # attach to these already-running rows after this snapshot.  Recheck
+        # inside the settlement writer transaction as well.
+        legacy_rows = [j for j in rows if j["id"] not in native_session_ids]
+        for job in legacy_rows:
             if not job["pgid"]:
                 continue
             process_state = self._job_process_state(job)
@@ -846,20 +866,24 @@ class Dispatcher:
                 )
 
         after_term = self._wait_for_job_states(
-            rows,
+            legacy_rows,
             JOB_STOP_TERM_GRACE_SEC,
         )
-        for job in rows:
+        for job in legacy_rows:
             if after_term.get(str(job["id"])) != "alive":
                 continue
             self._signal_job(job, signal.SIGKILL)
-        self._wait_for_job_states(rows, JOB_STOP_KILL_GRACE_SEC)
+        self._wait_for_job_states(legacy_rows, JOB_STOP_KILL_GRACE_SEC)
 
         settled_rows = []
         settlement_ok = False
+        remaining_running = 1
+        unresolved_native = 1
         for attempt in range(3):
             try:
                 with state.connect() as conn:
+                    if not conn.in_transaction:
+                        conn.execute("BEGIN IMMEDIATE")
                     settled_rows = []
                     for original in rows:
                         current = state.get_job(conn, original["id"])
@@ -868,6 +892,12 @@ class Dispatcher:
                         if current["pgid"] != original["pgid"]:
                             self.log_line(
                                 f"stop 保留 job {original['id']}: DB pgid 已变化"
+                            )
+                            continue
+                        if self._has_native_session(conn, current["id"]):
+                            self.log_line(
+                                f"stop 保留 native session job {current['id']}: "
+                                "无原始 owner/wait 证明"
                             )
                             continue
                         if (
@@ -901,6 +931,17 @@ class Dispatcher:
                         if current["gpu"] is not None:
                             self._release_in_tx(conn, current["id"])
                         settled_rows.append(current)
+                    # A native claim can commit after the initial running
+                    # snapshot.  Decide stop completion from this writer's
+                    # current state, not only from the old row count.
+                    remaining_running = conn.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE status='running'"
+                    ).fetchone()[0]
+                    unresolved_native = conn.execute(
+                        "SELECT COUNT(*) FROM native_sessions n"
+                        " JOIN jobs j ON j.id=n.job_id"
+                        " WHERE j.status='running'"
+                    ).fetchone()[0]
                 settlement_ok = True
                 break
             except sqlite3.OperationalError as error:
@@ -921,6 +962,8 @@ class Dispatcher:
         completed = (
             settlement_ok
             and len(settled_rows) == len(rows)
+            and remaining_running == 0
+            and unresolved_native == 0
             and not self._unresolved_launch_markers()
         )
         if completed:
@@ -943,7 +986,7 @@ class Dispatcher:
         self.log_line(
             f"dispatcher 启动 (pid={os.getpid()}, fake={self.fake}, gpus={self.allocator.gpu_list})"
         )
-        # 接管: running 任务 pgid 存活则继续等 (A3/3.2b)
+        # 接管 legacy running；持久 native session 留待原始 owner/wait 路径。
         self._recover_launch_markers()
         self._adopt_running()
 
@@ -1019,17 +1062,18 @@ class Dispatcher:
             return False  # Explicit drain controls its own shutdown boundary.
         if self.idle_timeout_min <= 0:
             return False  # 0 = 禁用
+        activity_query = (
+            "SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id=j.batch_id"
+            " WHERE j.status='running' OR ("
+            "   b.status IN ('active','queued')"
+            "   AND j.status IN ('pending','waiting_quota','waiting_dep')"
+            "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+            "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id)"
+            " )"
+        )
         with state.submission_lock():
             with state.connect() as conn:
-                n = conn.execute(
-                    "SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id=j.batch_id"
-                    " WHERE j.status='running' OR ("
-                    "   b.status IN ('active','queued')"
-                    "   AND j.status IN ('pending','waiting_quota','waiting_dep')"
-                    "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
-                    "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id)"
-                    " )"
-                ).fetchone()[0]
+                n = conn.execute(activity_query).fetchone()[0]
                 pending_control = conn.execute(
                     "SELECT COUNT(*) FROM control_requests WHERE status='pending'"
                 ).fetchone()[0]
@@ -1040,7 +1084,21 @@ class Dispatcher:
                 self.last_activity = now
                 return False
             if now - self.last_activity >= self.idle_timeout_min * 60:
-                state.mark_idle_shutdown()
+                # File/inbox checks stay outside the writer.  Recheck DB
+                # activity under the writer and publish the stop marker before
+                # releasing it so a native claim cannot appear in between.
+                with state.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if (
+                        conn.execute(activity_query).fetchone()[0] > 0
+                        or conn.execute(
+                            "SELECT 1 FROM control_requests"
+                            " WHERE status='pending' LIMIT 1"
+                        ).fetchone() is not None
+                    ):
+                        self.last_activity = now
+                        return False
+                    state.mark_idle_shutdown()
                 self.log_line(
                     f"连续 {self.idle_timeout_min}min 无任务 (idle_timeout_min), 自动退出"
                 )
@@ -1094,8 +1152,8 @@ class Dispatcher:
         # Revisit every running row that still lacks a pgid on every tick, not
         # only when a marker was claimed in this tick.  This also converges
         # safely after "claim succeeded, DB settlement failed": on the next
-        # tick the marker is absent, and startup adoption already defines that
-        # state as a pre-Popen failure rather than a live process.
+        # tick the marker is absent.  Legacy adoption then settles the
+        # pre-Popen failure; a durable native session remains unresolved.
         self._adopt_running(unidentified_only=True)
         self._reap_finished_jobs()
         _freed, _to = self.allocator.settle_releasing()
@@ -1472,7 +1530,7 @@ class Dispatcher:
                 uptime = float(f.read().split()[0])
             boot_ts = time.time() - uptime
             if boot_ts > hb_ts:
-                self.log_line("D4: 检测到节点重启, running 任务标 interrupted (不计 retries)")
+                self.log_line("D4: 检测到节点重启, legacy running 任务标 interrupted (不计 retries)")
                 cleanup_jobs: list[dict] = []
                 with state.connect() as conn:
                     # A cancel command takes the same SQLite writer claim before
@@ -1485,6 +1543,12 @@ class Dispatcher:
                         "SELECT * FROM jobs WHERE status='running'"
                     ).fetchall()
                     for j in rows:
+                        if self._has_native_session(conn, j["id"]):
+                            self.log_line(
+                                f"D4: native session job {j['id']} 无原始 owner/wait 证明; "
+                                "保留 running 与取消意图"
+                            )
+                            continue
                         state.update_job(
                             conn, j["id"], status="interrupted",
                         )
@@ -1494,6 +1558,22 @@ class Dispatcher:
                     self._drop_launch_marker(job)
         except (OSError, ValueError):
             pass
+
+    @staticmethod
+    def _has_native_session(conn, job_id: str) -> bool:
+        """Legacy Popen recovery cannot settle a durable native session."""
+        return conn.execute(
+            "SELECT 1 FROM native_sessions WHERE job_id=?",
+            (job_id,),
+        ).fetchone() is not None
+
+    def _has_native_v2_contract(self, conn, job) -> bool:
+        """A V2 candidate must never be handled through a legacy marker."""
+        try:
+            return NATIVE_EXEC_V2_CONTRACT_FIELD in self._load_task_spec(conn, job)
+        except ValueError:
+            return False
+
     def _job_rc_prefix(self, job) -> str:
         return hashlib.sha256(str(job["id"]).encode("utf-8")).hexdigest()[:24]
 
@@ -1789,6 +1869,18 @@ class Dispatcher:
                         f"launch marker 无对应 job, 拒绝信号并保留: {path}"
                     )
                     continue
+                # A pending V2 job may be claimed concurrently after the job
+                # snapshot.  Its persisted spec already identifies it as V2;
+                # no legacy marker may be cleaned or signalled for that job.
+                if (
+                    self._has_native_session(conn, row["id"])
+                    or self._has_native_v2_contract(conn, row)
+                ):
+                    self.log_line(
+                        f"job {row['id']} native V2/session 已入库; "
+                        "忽略 legacy launch marker 恢复"
+                    )
+                    continue
                 if row["status"] != "running":
                     self._prepare_launch_marker(row)
                     continue
@@ -1900,6 +1992,12 @@ class Dispatcher:
                 query += " AND pgid IS NULL"
             rows = conn.execute(query).fetchall()
             for j in rows:
+                if self._has_native_session(conn, j["id"]):
+                    self.log_line(
+                        f"A3: native session job {j['id']} 无原始 owner/wait 证明; "
+                        "保留 running、资源与取消意图"
+                    )
+                    continue
                 native_exec = self._job_uses_native_exec(conn, j)
                 if not j["pgid"] and self._prepare_launch_marker(j):
                     self.log_line(
@@ -2248,6 +2346,40 @@ class Dispatcher:
             thread for thread in self._notify_threads if thread.is_alive()
         ]
 
+    def _commit_native_cancel_under_gate(self, request_id: int) -> bool:
+        """Order a native cancel intent with the future M-birth gate.
+
+        The caller must release its writer before entering.  Re-read every
+        binding after taking submission_lock, then take the SQLite writer in
+        the same order as native timeout and shutdown.
+        """
+        with state.submission_lock():
+            with state.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                request = conn.execute(
+                    "SELECT job_id, op, status FROM control_requests WHERE id=?",
+                    (request_id,),
+                ).fetchone()
+                if (
+                    request is None
+                    or request["op"] != "cancel"
+                    or request["status"] != "pending"
+                ):
+                    return False
+                job = state.get_job(conn, request["job_id"])
+                if job is None or job["status"] != "running":
+                    return False
+                session = conn.execute(
+                    "SELECT 1 FROM native_sessions"
+                    " WHERE job_id=? AND job_version=?",
+                    (job["id"], job["version"]),
+                ).fetchone()
+                if session is None:
+                    return False
+                if job["kill_reason"] != "cancelled":
+                    state.update_job(conn, job["id"], kill_reason="cancelled")
+                return True
+
     def _process_control_requests(self) -> None:
         """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.
         CLI (登录节点) 看不到计算节点进程组 (PID namespace 跨节点, 定案 44 同类),
@@ -2268,7 +2400,42 @@ class Dispatcher:
             seen_cancel_jobs: set[str] = set()
             for r in reqs:
                 if r["op"] == "cancel":
+                    # A previous request may have left this connection with a
+                    # writer.  Release it before native cancel takes the
+                    # submission gate; never invert gate -> writer ordering.
+                    conn.commit()
+                    if self._commit_native_cancel_under_gate(int(r["id"])):
+                        self.log_line(
+                            f"cancel req {r['id']}: native session job "
+                            f"{r['job_id']} 保留请求与 cancel intent，等待原始 owner/wait"
+                        )
+                        continue
+                    # Claim the writer before observing job/session state.
+                    # An owner settlement must not race between that read and
+                    # publication of a native cancellation intent.
+                    if not conn.in_transaction:
+                        conn.execute("BEGIN IMMEDIATE")
+                    else:
+                        # in_transaction may mean DEFERRED read-only so far.
+                        conn.execute("UPDATE jobs SET status=status WHERE 0")
+                    current_req = conn.execute(
+                        "SELECT status FROM control_requests WHERE id=?",
+                        (r["id"],),
+                    ).fetchone()
+                    if current_req is None or current_req["status"] != "pending":
+                        continue
                     if r["job_id"] in seen_cancel_jobs:
+                        current = state.get_job(conn, r["job_id"])
+                        if (
+                            current is not None
+                            and current["status"] == "running"
+                            and self._has_native_session(conn, current["id"])
+                        ):
+                            self.log_line(
+                                f"cancel req {r['id']}: native session job "
+                                f"{r['job_id']} 保留重复请求与取消意图"
+                            )
+                            continue
                         state.finish_control_request(conn, r["id"], "同轮重复取消, 已跳过")
                         self.log_line(f"cancel req {r['id']}: job {r['job_id']} 同轮重复, 跳过")
                         continue
@@ -2509,6 +2676,15 @@ class Dispatcher:
                     state.finish_control_request(conn, r["id"], "job 非 running, 无需 kill")
                     self.log_line(f"cancel req {r['id']}: job {r['job_id']} 非 running, 跳过")
                     continue
+                if j["status"] == "running" and self._has_native_session(conn, j["id"]):
+                    # A session may have appeared after the gated re-read.
+                    # Do not publish a native intent through this legacy
+                    # writer.  The next tick retries under the gate.
+                    self.log_line(
+                        f"cancel req {r['id']}: native session job {j['id']} "
+                        "留待下轮在 submission gate 内提交 cancel intent"
+                    )
+                    continue
                 if j["status"] != "running" or not j["pgid"]:
                     if j["status"] in (
                         "pending",
@@ -2614,6 +2790,8 @@ class Dispatcher:
                 " AND kill_reason='timed_out' AND pgid IS NOT NULL"
             ).fetchall()
             for j in escal:
+                if self._has_native_session(conn, j["id"]):
+                    continue
                 if self._job_process_state(j) == "alive":
                     signal_intents.append(
                         (dict(j), signal.SIGKILL, None)
@@ -2624,6 +2802,8 @@ class Dispatcher:
                 " AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
+                if self._has_native_session(conn, j["id"]):
+                    continue
                 try:
                     spec = self._load_task_spec(conn, j)
                     dur = spec.get("duration_min")
@@ -2666,6 +2846,67 @@ class Dispatcher:
                     "保留 timed_out intent 等待重试"
                 )
 
+        self._check_native_timeouts()
+
+    def _check_native_timeouts(self) -> None:
+        """Persist timeout intent for isolated sessions without a process group.
+
+        The native owner has not been connected to the dispatcher.  The intent
+        only closes later launch CAS gates; it must not imply a signal or a
+        completed job.
+        """
+        expired_jobs: list[tuple[str, str, int, str]] = []
+        with state.connect() as conn:
+            rows = conn.execute(
+                "SELECT j.*, n.session_id FROM jobs j"
+                " JOIN native_sessions n ON n.job_id=j.id AND n.job_version=j.version"
+                " WHERE j.status='running' AND j.kill_reason IS NULL"
+                " AND j.pgid IS NULL AND j.started_at IS NOT NULL"
+                " AND n.evaluation_domain='isolated_integration'"
+                " AND n.owner_kind='unbound'"
+                " AND NOT EXISTS (SELECT 1 FROM control_requests c"
+                "   WHERE c.job_id=j.id AND c.op='cancel')"
+            ).fetchall()
+            for job in rows:
+                try:
+                    spec = self._load_task_spec(conn, job)
+                    duration = spec.get("duration_min")
+                    if type(duration) is not int or duration <= 0:
+                        raise ValueError("native duration_min 必须为正整数")
+                    started = time.mktime(
+                        time.strptime(job["started_at"], "%Y-%m-%d %H:%M:%S")
+                    )
+                except (TypeError, ValueError) as error:
+                    self.log_line(
+                        f"job {job['id']} native duration 规则非法, 已忽略: {error}"
+                    )
+                    continue
+                if time.time() - started <= duration * 60:
+                    continue
+                expired_jobs.append(
+                    (job["session_id"], job["id"], job["version"], job["started_at"])
+                )
+
+        for session_id, job_id, job_version, started_at in expired_jobs:
+            # Re-enter the same ordering domain as CLI cancel and daemon
+            # shutdown before claiming the writer. The CAS rechecks any stale
+            # snapshot after the read connection has been released.
+            with state.submission_lock():
+                with state.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    timed_out = state.mark_native_session_timed_out(
+                        conn,
+                        session_id=session_id,
+                        job_id=job_id,
+                        job_version=job_version,
+                        started_at=started_at,
+                    )
+            if timed_out:
+                self.log_line(
+                    f"job {job_id} native session 超时; "
+                    "保留未结算任务及 timed_out intent"
+                )
+
     def _check_probes(self) -> None:
         """L6 probes 日志门控 (§3.4d R3): 运行中任务按声明匹配日志模式.
 
@@ -2694,6 +2935,8 @@ class Dispatcher:
             ).fetchall()
             escal_ids = {j["id"] for j in escal}
             for j in escal:
+                if self._has_native_session(conn, j["id"]):
+                    continue
                 if self._job_process_state(j) == "alive":
                     signal_intents.append((dict(j), signal.SIGKILL, None))
 
@@ -2702,6 +2945,8 @@ class Dispatcher:
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in running:
+                if self._has_native_session(conn, j["id"]):
+                    continue
                 if j["id"] in escal_ids:
                     continue
                 try:
@@ -2823,6 +3068,8 @@ class Dispatcher:
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
+                if self._has_native_session(conn, j["id"]):
+                    continue
                 native_exec = self._job_uses_native_exec(conn, j)
                 known_proc = self.executor.has_process(j["pgid"])
                 if native_exec and known_proc:
@@ -3892,7 +4139,31 @@ class Dispatcher:
                         )
                 except Exception as e:
                     self.log_line(f"LAUNCH FAIL job {j['id']} gpu={gpu}: {e}")
-                    if self._prepare_launch_marker(j):
+                    if not conn.in_transaction:
+                        conn.execute("BEGIN IMMEDIATE")
+                    else:
+                        conn.execute("UPDATE jobs SET status=status WHERE 0")
+                    current = state.get_job(conn, j["id"])
+                    eligible = conn.execute(
+                        "SELECT 1 FROM jobs j JOIN batches b ON b.id=j.batch_id"
+                        " WHERE j.id=? AND j.status IN ('pending','waiting_quota','running')"
+                        " AND b.status='active'"
+                        " AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
+                        "   WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id)",
+                        (j["id"],),
+                    ).fetchone()
+                    if (
+                        current is None
+                        or self._has_native_session(conn, current["id"])
+                        or self._has_native_v2_contract(conn, current)
+                        or eligible is None
+                    ):
+                        self.log_line(
+                            f"LAUNCH FAIL job {j['id']}: 状态/代际已变化; "
+                            "保留当前 job/resource/marker"
+                        )
+                        continue
+                    if self._prepare_launch_marker(current):
                         self.log_line(
                             f"LAUNCH FAIL job {j['id']}: orphan identity 未决; "
                             "保留 running/resource/marker"
@@ -3918,11 +4189,17 @@ class Dispatcher:
             request = admission.drain_state()
             if not request or not request.get("stop") or request.get("invalid"):
                 return False
-            with state.connect() as conn:
-                running = conn.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone()
-            if running or self._unresolved_launch_markers():
+            if self._unresolved_launch_markers():
                 return False
-            state.mark_idle_shutdown()
+            with state.connect() as conn:
+                # Hold the SQLite writer through marker publication.  A T1
+                # claim that wins first is visible here; a later claim sees
+                # the marker after its own running CAS and rolls back.
+                conn.execute("BEGIN IMMEDIATE")
+                running = conn.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone()
+                if running:
+                    return False
+                state.mark_idle_shutdown()
             self.log_line("排空完成，停止 daemon；保留 pending 与排空请求，resume 后恢复派发")
             return True
 
@@ -4228,15 +4505,65 @@ class Dispatcher:
             raise NativeExecProfileError(
                 "persisted native batch environment is invalid"
             ) from exc
-        if batch_env or spec.get("env"):
+        v2_contract = metadata.get(NATIVE_EXEC_V2_CONTRACT_FIELD)
+        is_v2 = NATIVE_EXEC_V2_CONTRACT_FIELD in metadata
+        if is_v2:
+            if not isinstance(v2_contract, dict):
+                raise NativeExecProfileError(
+                    "persisted native V2 contract must be an object"
+                )
+            runtime = v2_contract.get("runtime")
+            resources = spec.get("resources")
+            if not isinstance(runtime, dict) or not isinstance(resources, dict):
+                raise NativeExecProfileError(
+                    "persisted native V2 runtime or resources are invalid"
+                )
+            try:
+                depends_on = json.loads(batch["depends_on"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise NativeExecProfileError(
+                    "persisted native V2 batch dependencies are invalid"
+                ) from exc
+            if (
+                batch["cwd"] != v2_contract.get("cwd")
+                or depends_on != v2_contract.get("depends_on")
+                or batch_env != v2_contract.get("batch_env")
+                or spec.get("env") != v2_contract.get("task_env")
+                or spec.get("runtime") != v2_contract.get("runtime")
+                or spec.get("runtime_prefix") != runtime.get("prefix")
+                or type(spec.get("duration_min")) is not int
+                or spec.get("duration_min") != v2_contract.get("duration_min")
+                or spec.get("max_retry") != v2_contract.get("max_retry")
+                or spec.get("artifacts") != v2_contract.get("artifacts")
+                or spec.get("id") != job["task_id"]
+                or spec.get("_force_rerun") is not None
+                or spec.get("max_parallel") is not None
+                or spec.get("progress_regex") is not None
+                or spec.get("paths_escape") is not False
+                or not isinstance(v2_contract.get("resources"), dict)
+                or {"gpu": resources.get("gpu"), "cpus": resources.get("cpus")}
+                != v2_contract["resources"]
+                or batch.get("gpus") is not None
+                or batch["notify"] is not None
+                or type(batch["priority"]) is not int
+                or batch["priority"] != 0
+            ):
+                raise NativeExecProfileError(
+                    "persisted native V2 batch/task fields differ from frozen contract"
+                )
+        elif batch_env or spec.get("env"):
             raise NativeExecProfileError(
                 "persisted native execution must have empty batch/task env"
             )
-        if spec.get("resources") != {
-            "gpu": 0,
-            "cpus": 1,
-            "gpu_share": False,
-        }:
+        resources = spec.get("resources")
+        if (
+            not isinstance(resources, dict)
+            or frozenset(resources) != {"gpu", "cpus", "gpu_share"}
+            or type(resources["gpu"]) is not int
+            or type(resources["cpus"]) is not int
+            or type(resources["gpu_share"]) is not bool
+            or resources != {"gpu": 0, "cpus": 1, "gpu_share": False}
+        ):
             raise NativeExecProfileError(
                 "persisted native execution resources must remain CPU-only"
             )
@@ -4282,7 +4609,7 @@ class Dispatcher:
             raise NativeExecProfileError(
                 "persisted native project-root identity digest drifted"
             )
-        if (
+        if not is_v2 and (
             spec.get("runtime") is not None
             or spec.get("runtime_prefix") is not None
         ):
@@ -4317,7 +4644,7 @@ class Dispatcher:
             raise NativeExecProfileError(
                 "persisted native project binding is inconsistent"
             )
-        return reattest_native_exec_profile(
+        resolved = reattest_native_exec_profile(
             self.cfg,
             mode=batch["mode"],
             project=batch["project"],
@@ -4326,7 +4653,13 @@ class Dispatcher:
             profile_id=metadata["_native_exec_profile_id"],
             profile_sha256=metadata["_native_exec_profile_sha256"],
             submitted_argv=submitted_argv,
+            batch_contract=v2_contract if is_v2 else None,
         )
+        if is_v2 != (resolved.get("schema") == NATIVE_EXEC_PROFILE_V2_SCHEMA):
+            raise NativeExecProfileError(
+                "persisted native contract schema differs from cold profile"
+            )
+        return resolved
 
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
@@ -4388,6 +4721,13 @@ class Dispatcher:
             spec,
             task_project,
         )
+        if (
+            native_binding is not None
+            and native_binding.get("schema") == NATIVE_EXEC_PROFILE_V2_SCHEMA
+        ):
+            raise NativeLaunchUnavailable(
+                "native V2 formal launcher and lifecycle are not connected"
+            )
         if native_binding is not None and gpu is not None:
             raise NativeExecProfileError(
                 "native CPU-only execution received a GPU assignment"

@@ -15,7 +15,8 @@ verifier 已支持新部署；它仍须独立持有并检查同一组经审查�
 格式见 [虚构示例](../examples/native-deployment.example.json)。五个顶层字段全部
 必需，拒绝额外字段、重复字段和未知版本。`logical_argv_profiles` 必须完整覆盖
 三个阶段；每个 argv 使用绝对解释器路径和 `-I -S`。两个名称模板各包含一个
-`{phase}`，展开后逐项精确匹配，不是请求可选择的通配模式。
+`{phase}`，展开后逐项精确匹配，不是请求可选择的通配模式。脚本路径后的
+空字符串参数按 Step5D wire 原样保留，不在 launch plan 中丢弃或拒绝。
 
 ```python
 from gsched.native_deployment import load_deployment
