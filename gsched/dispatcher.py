@@ -2346,6 +2346,40 @@ class Dispatcher:
             thread for thread in self._notify_threads if thread.is_alive()
         ]
 
+    def _commit_native_cancel_under_gate(self, request_id: int) -> bool:
+        """Order a native cancel intent with the future M-birth gate.
+
+        The caller must release its writer before entering.  Re-read every
+        binding after taking submission_lock, then take the SQLite writer in
+        the same order as native timeout and shutdown.
+        """
+        with state.submission_lock():
+            with state.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                request = conn.execute(
+                    "SELECT job_id, op, status FROM control_requests WHERE id=?",
+                    (request_id,),
+                ).fetchone()
+                if (
+                    request is None
+                    or request["op"] != "cancel"
+                    or request["status"] != "pending"
+                ):
+                    return False
+                job = state.get_job(conn, request["job_id"])
+                if job is None or job["status"] != "running":
+                    return False
+                session = conn.execute(
+                    "SELECT 1 FROM native_sessions"
+                    " WHERE job_id=? AND job_version=?",
+                    (job["id"], job["version"]),
+                ).fetchone()
+                if session is None:
+                    return False
+                if job["kill_reason"] != "cancelled":
+                    state.update_job(conn, job["id"], kill_reason="cancelled")
+                return True
+
     def _process_control_requests(self) -> None:
         """事故记录 4 (2026-08-17): 处理 cancel 转发请求 — 在**计算节点本地**执行 kill.
         CLI (登录节点) 看不到计算节点进程组 (PID namespace 跨节点, 定案 44 同类),
@@ -2366,6 +2400,16 @@ class Dispatcher:
             seen_cancel_jobs: set[str] = set()
             for r in reqs:
                 if r["op"] == "cancel":
+                    # A previous request may have left this connection with a
+                    # writer.  Release it before native cancel takes the
+                    # submission gate; never invert gate -> writer ordering.
+                    conn.commit()
+                    if self._commit_native_cancel_under_gate(int(r["id"])):
+                        self.log_line(
+                            f"cancel req {r['id']}: native session job "
+                            f"{r['job_id']} 保留请求与 cancel intent，等待原始 owner/wait"
+                        )
+                        continue
                     # Claim the writer before observing job/session state.
                     # An owner settlement must not race between that read and
                     # publication of a native cancellation intent.
@@ -2633,10 +2677,12 @@ class Dispatcher:
                     self.log_line(f"cancel req {r['id']}: job {r['job_id']} 非 running, 跳过")
                     continue
                 if j["status"] == "running" and self._has_native_session(conn, j["id"]):
-                    state.update_job(conn, j["id"], kill_reason="cancelled")
+                    # A session may have appeared after the gated re-read.
+                    # Do not publish a native intent through this legacy
+                    # writer.  The next tick retries under the gate.
                     self.log_line(
                         f"cancel req {r['id']}: native session job {j['id']} "
-                        "保留请求与 cancel intent，等待原始 owner/wait"
+                        "留待下轮在 submission gate 内提交 cancel intent"
                     )
                     continue
                 if j["status"] != "running" or not j["pgid"]:

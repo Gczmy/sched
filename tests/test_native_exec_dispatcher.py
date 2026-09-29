@@ -741,6 +741,8 @@ class NativeExecDispatcherRecoveryTests(NativeExecDispatcherCase):
         original_get_job = state.get_job
 
         def read_job_under_writer(conn, current_id):
+            self.assertEqual(1, state._submission_lock_depth.get())
+            self.assertTrue(conn.in_transaction)
             with closing(sqlite3.connect(state.db_path(), timeout=0.0)) as other:
                 with self.assertRaises(sqlite3.OperationalError):
                     other.execute("BEGIN IMMEDIATE")
@@ -764,6 +766,71 @@ class NativeExecDispatcherRecoveryTests(NativeExecDispatcherCase):
         self.assertEqual("pending", request["status"])
         dispatcher._prepare_launch_marker.assert_not_called()
         dispatcher._drop_launch_marker.assert_not_called()
+
+    def test_native_cancel_releases_previous_writer_before_submission_gate(self) -> None:
+        job_id = self._seed_isolated_native_session()
+        dispatcher = self._dispatcher()
+        with state.connect() as conn:
+            missing_request = state.insert_control_request(conn, "missing-job")
+            native_request = state.insert_control_request(conn, job_id)
+
+        original_lock = state.submission_lock
+        observed_gate_entries = []
+
+        def assert_writer_released_before_gate():
+            with closing(sqlite3.connect(state.db_path(), timeout=0.0)) as other:
+                other.execute("BEGIN IMMEDIATE")
+                other.rollback()
+            observed_gate_entries.append(True)
+            return original_lock()
+
+        with mock.patch.object(
+            state, "submission_lock", side_effect=assert_writer_released_before_gate
+        ):
+            dispatcher._process_control_requests()
+
+        self.assertEqual(2, len(observed_gate_entries))
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            requests = conn.execute(
+                "SELECT id, status FROM control_requests WHERE id IN (?,?) ORDER BY id",
+                (missing_request, native_request),
+            ).fetchall()
+        self.assertEqual("cancelled", job["kill_reason"])
+        self.assertEqual(["done", "pending"], [r["status"] for r in requests])
+
+    def test_native_session_appearing_after_gate_defers_legacy_cancel(self) -> None:
+        job_id, spec = self._seed_v2_candidate()
+        dispatcher = self._dispatcher()
+        dispatcher._signal_job_result = mock.Mock()
+        with state.connect() as conn:
+            request_id = state.insert_control_request(conn, job_id)
+
+        original_commit = dispatcher._commit_native_cancel_under_gate
+
+        def claim_after_gate(current_request_id):
+            committed = original_commit(current_request_id)
+            self.assertFalse(committed)
+            with state.submission_lock():
+                with state.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._claim_isolated_native_session(conn, job_id, spec)
+            return committed
+
+        with mock.patch.object(
+            dispatcher, "_commit_native_cancel_under_gate", side_effect=claim_after_gate
+        ):
+            dispatcher._process_control_requests()
+
+        with state.connect() as conn:
+            job = state.get_job(conn, job_id)
+            request = conn.execute(
+                "SELECT status FROM control_requests WHERE id=?", (request_id,)
+            ).fetchone()
+        self.assertEqual("running", job["status"])
+        self.assertIsNone(job["kill_reason"])
+        self.assertEqual("pending", request["status"])
+        dispatcher._signal_job_result.assert_not_called()
 
     def test_cancel_requests_survive_tick_adoption_even_with_stale_pgid(self) -> None:
         job_id = self._seed_isolated_native_session()
