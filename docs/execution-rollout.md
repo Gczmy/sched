@@ -4,7 +4,8 @@
 
 0.2.1 运维实现已合并到 `main`（`9056253`），
 [合并提交 CI](https://github.com/Gczmy/sched/actions/runs/36760744711) 已通过。
-正式 Release、发布标签与生产切换均尚未执行。
+0.2.1 正式发布提交和产物以
+[GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 为准；生产切换独立安排。
 
 ## 发布验收
 
@@ -17,7 +18,9 @@
 候选目录保存 `manifest.json`、源码归档、两种 wheel、安装说明和 `RELEASE_NOTES.md`；
 manifest 记录完整 commit、构建 Python/平台、各文件 SHA-256 与独立安装证据。
 发布标签应指向最终验收提交，不能只凭包版本
-判断新旧源码；本轮只准备候选，不创建发布标签或切换实例。
+判断新旧源码。候选构建本身不创建发布标签、Release 或生产切换。
+manifest 的 candidate/published/deployed 记录构建时状态；之后的正式发布事实由
+Release 与 tag 记录，发布时保留已经验收的包与 manifest 原始字节。
 
 ## CI 产物与下载验证
 

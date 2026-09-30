@@ -1,7 +1,11 @@
 # Changelog
 
-## 0.2.1 (candidate)
+## 0.2.1
 
+- Add passive cross-task execution browsing with project/batch/backend/phase/owner
+  filters, bounded live keyset pagination and explicit completeness semantics.
+- Add local execution capability JSON and structured daemon preflight checks;
+  declared capabilities never imply verified availability, and host guards remain.
 - Replace full owner-history scans and an unbounded acknowledgement cache with
   an indexed durable queue: at most eight historical acknowledgements per tick,
   a soft two-second start budget and ten-second retry backoff.
@@ -30,5 +34,6 @@
   status/task/history schema 1 unchanged. The new backend requires explicit support
   for the `sched_execution_owner_identity/v1` FD4 wrapper.
 
-This candidate is not a production deployment or a published release. Installation
-and rollback constraints are documented in [execution-rollout.md](docs/execution-rollout.md).
+0.2.0 remained an unpublished candidate. The published source and assets for 0.2.1
+are recorded in [GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1).
+Installation and rollback constraints are documented in [execution-rollout.md](docs/execution-rollout.md).

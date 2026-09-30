@@ -81,7 +81,7 @@
 ## 调度器操作契约
 
 - 只走 CLI，禁止直接修改 `state.db` 或 state 目录文件，不用手写 SQL 绕过 WAL 和并发协议。没有对应子命令时先提出接口需求。
-- 脚本或 Agent 解析结构化结果时使用命令支持的 `--json`。`config get` 本身输出 JSON；`diag`、`log`、`verify` 等没有该选项，不虚构参数，也不把展示文本当稳定字段。
+- 脚本或 Agent 解析结构化结果时使用命令支持的 `--json`。`config get` 本身输出 JSON；`diag`、`log`、`verify` 等没有该选项，不虚构参数，也不把展示文本当稳定字段。`capabilities --json` 只报告查询本机的能力；`daemon check --json` 仍受计算节点守卫约束。
 - `cancel`、`discard`、`clean`、`config set`、`gpu-free` 必须带 `--yes`。缺少该参数时返回码 `1` 表示未确认；参数要求不等于需要向已有授权的用户再问一次。
 - 查询可在登录／网关节点执行；数据库查询由 CLI 获取私有只读 DB/WAL 快照，不能自行用 SQLite 打开共享源库。节点目录取自 `config.node`，不要用网关的 `hostname` 推导。
 - `sched daemon start/stop/check/drain/resume` 必须在计算节点执行，包括 `request` 包装的调用；登录节点可用 `sched daemon status`。其他写操作受主机守卫约束，不把 `SCHED_ALLOW_FOREIGN_WRITE=1` 当作日常工作流。
@@ -111,6 +111,8 @@
 | `sched status [batch] --json` | 当前态；支持 `--project`、`--limit`、`--cursor`、`--job-cursor` |
 | `sched task <batch>:<task> --json` | 单任务与各版本详情 |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
+| `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
+| `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；只使用 verified 能力，不解析展示文本 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |

@@ -592,49 +592,53 @@ def _cleanup(expected_owner: dict[str, Any] | None) -> bool:
 
 # ---------- H2 前置检查 (M0) ----------
 
-def check(fake: bool = False) -> list[dict[str, str]]:
-    """返回检查项列表 [{item, detail, level: ok|warn|fail}]. fake 模式跳过 GPU/磁盘."""
-    issues: list[dict[str, str]] = []
+def check(fake: bool = False) -> list[dict[str, Any]]:
+    """Return identified checks and display details; fake skips resource probes."""
+    issues: list[dict[str, Any]] = []
     cfg: dict[str, Any] | None = None
     try:
         cfg = load_config()
     except ConfigError as e:
-        issues.append({"item": "config.json", "detail": str(e), "level": "fail"})
+        issues.append({"id": "configuration", "subject": None, "performed": True,
+                       "item": "config.json", "detail": str(e), "level": "fail"})
         return issues
 
-    def add(item: str, detail: str, level: str = "ok") -> None:
-        issues.append({"item": item, "detail": detail, "level": level})
+    def add(item: str, detail: str, level: str = "ok", *, check_id: str,
+            subject: str | None = None, performed: bool = True) -> None:
+        issues.append({"id": check_id, "subject": subject, "performed": performed,
+                       "item": item, "detail": detail, "level": level})
 
     if cfg.get("execution_backends"):
-        from .execution import BackendUnavailable, LinuxFdBackend
-        try:
-            backend = LinuxFdBackend()
-            add("execution backend", ", ".join(sorted(backend.capabilities)))
-        except BackendUnavailable as error:
-            add("execution backend", str(error), "fail")
+        from .execution.capabilities import snapshot
+        capabilities = snapshot()["backends"]
+        for kind in sorted({b["kind"] for b in cfg["execution_backends"].values()}):
+            result = capabilities[kind]
+            add("execution backend", ", ".join(result["verified"]) if result["status"] == "available"
+                else result["reason"], "ok" if result["status"] == "available" else "fail",
+                check_id="execution_backend", subject=kind)
 
     # 用户身份 (H2)
     import getpass
 
     who = getpass.getuser()
     if who == cfg.get("user"):
-        add("用户身份", f"whoami={who} == config.user", "ok")
+        add("用户身份", f"whoami={who} == config.user", "ok", check_id="user_identity")
     else:
-        add("用户身份", f"whoami={who} != config.user={cfg.get('user')}", "fail")
+        add("用户身份", f"whoami={who} != config.user={cfg.get('user')}", "fail", check_id="user_identity")
 
     # ROOT / state 可写
-    for label, p in (
-        ("state 目录", state.default_state_dir()),
-        ("node state 目录", _host_dir()),
+    for label, p, check_id in (
+        ("state 目录", state.default_state_dir(), "state_writable"),
+        ("node state 目录", _host_dir(), "node_state_writable"),
     ):
         try:
             state.ensure_private_directory(p)
             test = os.path.join(p, ".write_test")
             state.open_private_text(test, "x").close()
             os.unlink(test)
-            add(label, f"可写 {p}", "ok")
+            add(label, f"可写 {p}", "ok", check_id=check_id)
         except (OSError, state.StateError) as e:
-            add(label, f"不可写: {e}", "fail")
+            add(label, f"不可写: {e}", "fail", check_id=check_id)
 
     # nvidia-smi (2026-08-15: CPU-only 环境降级) —— config.gpus 空 = 纯 CPU 部署,
     # 无 GPU 需求时 nvidia-smi 缺失合法 (warn); 声明了 GPU 但本机无 nvidia-smi 才 fail
@@ -642,26 +646,26 @@ def check(fake: bool = False) -> list[dict[str, str]]:
 
     gpus, _, _ = parse_gpus(cfg)
     if fake:
-        add("nvidia-smi", "fake 模式跳过", "ok")
+        add("nvidia-smi", "fake 模式跳过", "ok", check_id="gpu_probe", performed=False)
     elif shutil.which("nvidia-smi"):
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
-        add("nvidia-smi", "可查询" if r.returncode == 0 else r.stderr.strip(), "ok" if r.returncode == 0 else "fail")
+        add("nvidia-smi", "可查询" if r.returncode == 0 else r.stderr.strip(), "ok" if r.returncode == 0 else "fail", check_id="gpu_probe")
     elif not gpus:
-        add("nvidia-smi", "未找到 (config.gpus 为空, 纯 CPU 部署合法)", "warn")
+        add("nvidia-smi", "未找到 (config.gpus 为空, 纯 CPU 部署合法)", "warn", check_id="gpu_probe")
     else:
-        add("nvidia-smi", f"未找到 (config.gpus={gpus} 声明了 GPU, 但本机无 nvidia-smi)", "fail")
+        add("nvidia-smi", f"未找到 (config.gpus={gpus} 声明了 GPU, 但本机无 nvidia-smi)", "fail", check_id="gpu_probe")
 
     # venv
     for name, path in cfg.get("venvs", {}).items():
         if os.path.isfile(path):
-            add(f"venv {name}", f"可执行 {path}", "ok")
+            add(f"venv {name}", f"可执行 {path}", "ok", check_id="venv", subject=name)
         else:
-            add(f"venv {name}", f"不存在 {path}", "fail")
+            add(f"venv {name}", f"不存在 {path}", "fail", check_id="venv", subject=name)
 
     # git 仓库 (A2 指纹)
     for name, proj in cfg.get("projects", {}).items():
         if not proj.get("git"):
-            add(f"git {name}", "git:false 跳过", "ok")
+            add(f"git {name}", "git:false 跳过", "ok", check_id="project_git", subject=name, performed=False)
             continue
         root = proj.get("root", "")
         r = subprocess.run(
@@ -669,9 +673,9 @@ def check(fake: bool = False) -> list[dict[str, str]]:
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0:
-            add(f"git {name}", f"{root} rev={r.stdout.strip()[:8]}", "ok")
+            add(f"git {name}", f"{root} rev={r.stdout.strip()[:8]}", "ok", check_id="project_git", subject=name)
         else:
-            add(f"git {name}", f"{root} 不是 git 仓库", "fail")
+            add(f"git {name}", f"{root} 不是 git 仓库", "fail", check_id="project_git", subject=name)
 
     # ulimit -n (H2, 定案 13: >= 8192)
     if not fake:
@@ -679,20 +683,20 @@ def check(fake: bool = False) -> list[dict[str, str]]:
 
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if soft >= 8192 or hard >= 8192:
-            add("ulimit -n", f"soft={soft} hard={hard}", "ok")
+            add("ulimit -n", f"soft={soft} hard={hard}", "ok", check_id="file_limit")
         else:
             try:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (8192, hard))
-                add("ulimit -n", f"已自提 soft 8192 (hard={hard})", "ok")
+                add("ulimit -n", f"已自提 soft 8192 (hard={hard})", "ok", check_id="file_limit")
             except (ValueError, OSError):
-                add("ulimit -n", f"soft={soft} < 8192 且自提失败 (torch 多 worker 可能报 Too many open files)", "warn")
+                add("ulimit -n", f"soft={soft} < 8192 且自提失败 (torch 多 worker 可能报 Too many open files)", "warn", check_id="file_limit")
 
     # 磁盘 (B8: 剩余 >= 20GB)
     if not fake:
         try:
             st = os.statvfs(state.default_state_dir())
             free_gb = st.f_bavail * st.f_frsize / 1e9
-            add("磁盘", f"剩余 {free_gb:.1f}GB", "ok" if free_gb >= 20 else "warn")
+            add("磁盘", f"剩余 {free_gb:.1f}GB", "ok" if free_gb >= 20 else "warn", check_id="disk_free")
         except OSError:
             pass
 
@@ -707,6 +711,6 @@ def check(fake: bool = False) -> list[dict[str, str]]:
     for t in ("tmux", "screen", "setsid"):
         if shutil.which(t):
             tools.append(t)
-    add("终端工具", " > ".join(tools) + " (托管选层: systemd user > tmux > screen > setsid)", "ok")
+    add("终端工具", " > ".join(tools) + " (托管选层: systemd user > tmux > screen > setsid)", "ok", check_id="terminal_tools")
 
     return issues

@@ -1,6 +1,6 @@
 # 通用 execution API
 
-> 本文对应已合并的 0.2.1 运维候选，写库 schema 7；尚未正式发布或切换生产实例。
+> 本文对应 0.2.1，写库 schema 7；发布提交和产物以 GitHub Release 为准。
 
 普通任务继续使用默认 subprocess 执行。需要固定可执行文件和输入 FD 的任务，
 通过管理员冷配置的 `linux_fd` backend 使用通用执行层。backend 注册值和其引用的
@@ -166,6 +166,65 @@ cleanup 为未知；job 的 rc、PID、日志及应用结果不能填补缺失�
 进程、不恢复 owner、不删除记录、不重放任务。
 phase 与业务成功分别解释；启动或 wait 权威不明时不能据此推断 `done`。
 公共 `status/task/history` 继续按现有契约使用，详情通过此专用查询取得。
+
+### 跨任务列表
+
+```bash
+sched execution list --project documents --limit 50 --json
+sched execution list --batch <full-batch-id> --backend text-worker --phase unresolved --json
+sched execution list --owner-status unreachable --json
+```
+
+列表查询支持 `--project`、`--batch`、`--backend`、`--phase`、`--owner-status`、
+`--limit`（1–500，默认 50）和 `--cursor`；不接受 `--version`。
+`--batch` 按现有规则解析完整 ID 或同名最新批次；续页须解析到同一个 ID。
+backend 筛选实际 attempt 的 `backend_id`；phase 筛选已保存 attempt 或旧 session 的
+phase（`prepared/launching/running/exited/not_started/unresolved/reserved/log_bound`）。
+尚无 attempt 的 `not_reserved` 等诊断标签不是已保存 phase。
+owner 状态取已记录的 `unknown/responsive/unreachable/lost`，无持久 owner 为
+`not_applicable`。全部历史 job/version 均可浏览，包括普通任务与旧 session。
+
+顶层为 `schema_version:1,query:execution_list`，包含 `database_schema`、Unix 秒
+`observed_at`、`consistency:live`、`complete`、`filters`、`limit`、`items`、
+`truncated` 与 `next_cursor`。每项带 batch ID/name/revision、project、task/job ID/version、
+owner_status、`attempt`、`legacy_session` 和同一版本的 `diagnostics`；不存在的记录为 null。
+公开 owner 不含 token/endpoint，不输出原始 task spec 或旧客户路径。
+
+按 job 的固定插入顺序向后分页；cursor 绑定筛选、node/state 和第一页的上界 job，
+拒绝参数漂移或上界身份丢失。续页不纳入后来插入的 job，重新从第一页查询才能看到。
+每页使用自己的私有只读快照；期间已有记录的状态或筛选归属可能变化，页面不会重复
+返回已走过的插入位置，但多页不是冻结快照。`complete:true` 仅用于一次查询返回全部
+匹配项的第一页；续页即使 `truncated:false` 也保持 `complete:false`。
+多页结果用于历史浏览，不能合并后作为完整当前态或写操作前置条件。
+查询兼容 schema 1–7，不升级完整旧库，不连接、重建或清理 owner。
+
+### 本机能力与前置检查
+
+```bash
+sched capabilities --json
+sched daemon check --json
+```
+
+`capabilities` 不读取配置或 state，不启动 child 或连接 owner，只报告执行查询的本机。
+顶层为 `schema_version:1,query:execution_capabilities`，带 sched/interface version、
+query_host 和 observed_at。`backends` 为 `subprocess/linux_fd/linux_fd_owner`，每项含
+`status:available|unavailable|unknown`、稳定的 `reason`、`declared` 和 `verified`。
+只有 available 才填充 verified；声明的能力不能当作实际可用证据。
+reason 为 null、`non_posix/non_linux/native_unavailable/native_interface_mismatch/`
+`kernel_fd_exec_unavailable/owner_primitives_unavailable/probe_failed`。
+native 检查编译接口及 execveat/close_range；持久 owner 另检查封印 FD、/proc 身份、
+abstract UNIX socket、peer credentials 和 poll。不返回进程身份值或异常原文。
+这是本机前置能力证据，不证明某个 executable、输入、配置或未来 child 已可执行。
+
+`daemon check --json` 复用现有检查并保留计算节点限制。顶层为
+`schema_version:1,query:daemon_check`，包含 sched_version、node、query_host、observed_at、
+fake、passed、summary（ok/warn/fail 计数）与 checks。检查项保留 item/detail/level，
+增加稳定 id、可空 subject 和 performed；展示文本不作为机器字段解释。
+id 为 `configuration/execution_backend/user_identity/state_writable/node_state_writable/`
+`gpu_probe/venv/project_git/file_limit/disk_free/terminal_tools`；subject 标识 backend kind、
+venv 或 project。fake 模式跳过的检查不能作为实际验收证据。
+有 fail 时返回 1，其余返回 0；主机守卫拒绝仍为 2。文本输出保持现有格式。
+该命令包含原有的目录写入与资源检查，不属于纯只读查询；网关不得执行。
 
 `request` 保留原写命令的 stdout、stderr 和返回码。`cancel` 及其 request 包装
 没有 `--json` 选项；客户端保留原始输出，不能将展示文字作为稳定结果字段。
