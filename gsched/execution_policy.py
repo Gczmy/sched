@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import PurePosixPath
 import re
@@ -15,6 +16,8 @@ INTERNAL_FIELD = "_execution_binding"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
+OWNER_DEFAULTS = {"prepare_timeout_sec": 30, "terminal_retention_sec": 3600}
+OWNER_LIMITS = {"prepare_timeout_sec": (1, 300), "terminal_retention_sec": (60, 604800)}
 
 
 class ExecutionPolicyError(ValueError):
@@ -51,10 +54,18 @@ def validate_backends(cfg: dict) -> dict[str, dict]:
         if not isinstance(backend_id, str) or _IDENTIFIER.fullmatch(backend_id) is None:
             raise ExecutionPolicyError("execution backend id is invalid")
         required = {"kind", "executable", "sha256", "argv", "env", "projects", "input_slots"}
-        if not isinstance(profile, dict) or set(profile) != required:
-            raise ExecutionPolicyError(f"execution_backends.{backend_id}: requires exact keys {sorted(required)}")
+        if not isinstance(profile, dict) or not required <= set(profile) or set(profile) - required - {"owner"}:
+            raise ExecutionPolicyError(f"execution_backends.{backend_id}: requires keys {sorted(required)} with optional owner")
         if profile["kind"] not in ("linux_fd", "linux_fd_owner"):
             raise ExecutionPolicyError("only built-in linux_fd and linux_fd_owner backends are supported")
+        if "owner" in profile:
+            owner = profile["owner"]
+            if profile["kind"] != "linux_fd_owner" or type(owner) is not dict or set(owner) - set(OWNER_LIMITS):
+                raise ExecutionPolicyError("owner settings require linux_fd_owner and known retention keys")
+            for key, value in owner.items():
+                minimum, maximum = OWNER_LIMITS[key]
+                if type(value) not in (int, float) or not minimum <= value <= maximum or not math.isfinite(value):
+                    raise ExecutionPolicyError(f"owner.{key} must be finite and within {minimum}..{maximum} seconds")
         executable = _text(profile["executable"], "executable")
         if not os.path.isabs(executable) or os.path.normpath(executable) != executable:
             raise ExecutionPolicyError("backend executable must be a normalized absolute path")

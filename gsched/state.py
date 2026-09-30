@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   submitted_at TEXT, started_at TEXT, finished_at TEXT,
   UNIQUE (batch_id, task_id, version)
 );
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
 -- Candidate-only native reservation.  This is neither an M owner nor formal
 -- execution authority.  A job/version consumes at most one native session.
@@ -174,7 +175,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 6
+DB_SCHEMA_VERSION = 7
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -184,6 +185,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "native_sessions",
         "execution_attempts",
         "execution_owners",
+        "execution_owner_operations",
         "gpus",
         "gpu_jobs",
         "profile_cache",
@@ -191,7 +193,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "control_requests",
         "operation_requests",
     },
-    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu"},
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status"},
     "trigger": {
         "revision_batch_status",
         "revision_task_insert",
@@ -216,6 +218,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "execution_owner_operations": {"job_id", "connection_status", "last_observed_at", "cleanup_state", "cleanup_attempts",
+                                   "retry_after", "last_cleanup_at", "cleanup_error", "acknowledged_at", "acknowledgement"},
     "execution_owners": {"job_id", "binding"},
     "execution_attempts": {"attempt_id", "job_id", "job_version", "backend_id", "backend_config_sha256", "phase", "identity", "observation", "cancel_reason", "created_at", "launch_intent_at", "finished_at"},
     "batches": {"notify", "project", "priority", "revision"},
@@ -446,6 +450,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 7:
+        required_objects["table"].remove("execution_owner_operations")
+        required_objects["index"].remove("execution_owner_cleanup_due")
+        required_objects["index"].remove("idx_jobs_status")
+        del required_columns["execution_owner_operations"]
     if version < 6:
         required_objects["table"].remove("execution_owners")
         required_objects["trigger"].remove("execution_owner_binding_immutable")
@@ -928,9 +937,11 @@ def _require_wal_snapshot(database: str) -> None:
 def _initialize_database() -> None:
     """Run one atomic schema initialization/migration attempt."""
     ensure_private_directory(os.path.dirname(db_path()))
-    from .execution_state import SCHEMA as EXECUTION_SCHEMA, OWNER_SCHEMA
+    from .execution_state import SCHEMA as EXECUTION_SCHEMA, OWNER_SCHEMA, OWNER_OPERATIONS_SCHEMA, migrate_owner_operations
     with connect() as conn:
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA)
+        needs_owner_backfill = (conn.execute("PRAGMA user_version").fetchone()[0] < 7 or
+            conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
@@ -940,13 +951,15 @@ def _initialize_database() -> None:
         migrate_native_monitor_launch_attempts(conn)
         migrate_revisions(conn)
         migrate_legacy_job_statuses(conn)
+        if needs_owner_backfill:
+            migrate_owner_operations(conn)
         conn.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
 
 
 def ensure_db_initialized() -> str:
     """Initialize only when the read-only schema probe finds work to do.
 
-    Query commands accept complete private WAL schemas v1-v6 without entering
+    Query commands accept complete private WAL schemas v1-v7 without entering
     init_db() or requesting ``BEGIN IMMEDIATE``.  A fresh, stale, partially
     copied, non-WAL, or permission-drifted state still takes the existing full
     atomic initialization path.

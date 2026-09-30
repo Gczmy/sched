@@ -43,7 +43,7 @@
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
 | `docs/execution-boundary.md` | 通用执行层、客户程序、旧兼容守卫与各仓库独立发布边界 |
 | `docs/execution-api.md` | 公开 execution backend 注册、输入 FD 与可选 native 构建 |
-| `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连与恢复约束 |
+| `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连、冷配置保留期与已记录健康 |
 | `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
 | `docs/native-integration.md` | 旧实验接口的持久态保护与迁移限制 |
 | `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
@@ -110,7 +110,7 @@
 | `sched run` | 计算节点提交单任务；GPU 用 `--gpus 1`，CPU 用 `--cpu-only` |
 | `sched status [batch] --json` | 当前态；支持 `--project`、`--limit`、`--cursor`、`--job-cursor` |
 | `sched task <batch>:<task> --json` | 单任务与各版本详情 |
-| `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实 |
+| `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |

@@ -116,6 +116,7 @@ class PersistentOwner:
         self._closed = False
         self._last = None
         self.cancel_reason = None
+        self.close_outcome = None
 
     def _rpc(self, op, **parameters):
         if self._closed:
@@ -191,12 +192,16 @@ class PersistentOwner:
 
     def close(self):
         if self._closed:
+            if self._process is not None:
+                self._process.wait(timeout=3)
             return
         try:
             self._rpc("close")
+            self.close_outcome = "closed"
         except OwnerUnavailable as error:
             if not error.lost:
                 raise
+            self.close_outcome = "owner_lost"
         self._closed = True
         if self._process is not None:
             self._process.wait(timeout=3)

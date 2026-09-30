@@ -3237,10 +3237,13 @@ class Dispatcher:
             if owner is not None and attempt["phase"] not in ("exited", "not_started"):
                 try:
                     observation = asdict(owner.poll())
+                    if binding is not None:
+                        execution_state.owner_observed(conn, job["id"], "responsive")
                     if observation["status"] == "prepared" and binding is not None:
                         # Recovery consumes an unused preparation; it never starts.
                         observation = asdict(owner.abandon_prepared())
                 except OwnerUnavailable as error:
+                    execution_state.owner_observed(conn, job["id"], "lost" if error.lost else "unreachable")
                     if not error.lost:
                         execution_state.observe(conn, job["id"], {
                             "status": "authority_lost", "pid": job["pgid"],
@@ -3311,7 +3314,7 @@ class Dispatcher:
                 cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
                 conn.commit()
                 if owner is not None:
-                    self._ack_configured_owner(job["id"])
+                    self._ack_configured_owner(conn, job["id"])
                 continue
             if observation["status"] != "exited" or observation.get("group_clean") is not True:
                 continue
@@ -3320,35 +3323,41 @@ class Dispatcher:
             cleanup.extend(self._handle_job_done(conn, job, rc, process_exit_authoritative=True))
             conn.commit()
             if owner is not None:
-                self._ack_configured_owner(job["id"])
+                self._ack_configured_owner(conn, job["id"])
         # If the daemon died after committing the terminal facts, close the
         # original service without rewriting the already settled job.
         conn.commit()
-        settled = conn.execute("SELECT e.job_id FROM execution_attempts e JOIN jobs j ON j.id=e.job_id"
-                               " JOIN execution_owners o ON o.job_id=e.job_id"
-                               " WHERE j.status!='running' AND e.phase IN ('exited','not_started')").fetchall()
-        for row in settled:
-            job_id = row["job_id"]
-            if job_id in getattr(self, "_execution_acknowledged", set()):
-                continue
-            self.executor.restore_configured_owner(job_id, execution_state.get_owner_binding(conn, job_id))
-            self._ack_configured_owner(job_id)
+        self._reap_owner_cleanup(conn)
         return cleanup
+
+    def _reap_owner_cleanup(self, conn):
+        # The index selects pending work only, not every historical binding.
+        # A failed endpoint gets durable backoff so it cannot starve new work.
+        deadline = time.monotonic() + 2
+        for row in execution_state.due_owner_cleanup(conn, limit=8):
+            if time.monotonic() >= deadline:
+                break
+            job_id = row["job_id"]
+            self.executor.restore_configured_owner(job_id, execution_state.get_owner_binding(conn, job_id))
+            self._ack_configured_owner(conn, job_id)
 
     @staticmethod
     def _execution_boot_id():
         from .execution.persistent import boot_id
         return boot_id()
 
-    def _ack_configured_owner(self, job_id):
+    def _ack_configured_owner(self, conn, job_id):
+        error_code = None
         try:
-            self.executor.retire_configured_execution(job_id)
-        except (OwnerUnavailable, TimeoutError) as error:
+            outcome = self.executor.retire_configured_execution(job_id)
+        except (OwnerUnavailable, subprocess.TimeoutExpired, RuntimeError) as error:
+            error_code = ("owner_unreachable" if isinstance(error, OwnerUnavailable) else
+                          "close_timeout" if isinstance(error, subprocess.TimeoutExpired) else "owner_rejected")
             self.log_line(f"execution {job_id} terminal owner acknowledgement deferred: {error}")
-            return
-        if not hasattr(self, "_execution_acknowledged"):
-            self._execution_acknowledged = set()
-        self._execution_acknowledged.add(job_id)
+        if execution_state.get_owner_binding(conn, job_id) is not None:
+            execution_state.owner_cleanup_result(conn, job_id,
+                error=error_code, outcome=None if error_code else outcome)
+            conn.commit()
 
     def _handle_job_done(
         self,
@@ -4964,7 +4973,7 @@ class Dispatcher:
                 self._release_gpu_for_job(conn, job)
                 conn.commit()
                 if owner is not None:
-                    self.executor.retire_configured_execution(job["id"])
+                    self._ack_configured_owner(conn, job["id"])
                 self.log_line(f"execution {job['id']} rejected before child creation: {error}")
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
@@ -4974,6 +4983,9 @@ class Dispatcher:
         if pid is not None:
             state.update_job(conn, job["id"], pgid=pid)
         execution_state.observe(conn, job["id"], observation)
+        if hasattr(owner, "binding"):
+            execution_state.owner_observed(conn, job["id"],
+                "unreachable" if observation.get("owner_unreachable") else "responsive")
         conn.commit()
         self.log_line(f"LAUNCH execution job {job['id']} attempt={identity['attempt_id']} pid={pid}")
         return True

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sched"
-version = "0.2.0"
+version = "0.2.1"
 description = "sched — node-level GPU/CPU batch scheduler: one-job-per-GPU, batch semantics, artifact fingerprinting, co-location packing, multi-project quotas"
 keywords = ["gpu", "scheduler", "hpc", "slurm", "batch-scheduling", "deep-learning", "mlops"]
 requires-python = ">=3.10"

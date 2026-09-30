@@ -94,7 +94,8 @@ class Acceptance:
                 "input_slots": {"3": {"max_bytes": 4096}},
             }
         self.cfg["execution_backends"]["hold-owner"] = {
-            **self.cfg["execution_backends"]["hold"], "kind": "linux_fd_owner"}
+            **self.cfg["execution_backends"]["hold"], "kind": "linux_fd_owner",
+            "owner": {"prepare_timeout_sec": 10, "terminal_retention_sec": 120}}
         self.config_path = root / "config.json"
         self.config_path.write_text(json.dumps(self.cfg))
         self.env = dict(os.environ, SCHED_STATE=str(root / "state"), SCHED_CONFIG=str(self.config_path),
@@ -157,6 +158,11 @@ class Acceptance:
         assert diagnostic["attempt_id"] == attempts[0]["attempt_id"], response
         assert diagnostic["phase"] == attempts[0]["phase"], response
         assert diagnostic["replay_blocked"] is True, response
+        if "owner" in attempts[0]:
+            health = attempts[0]["owner_health"]
+            assert health["source"] == "recorded", health
+            assert health["connection_status"] in ("unknown", "responsive", "unreachable", "lost"), health
+            assert "token" not in attempts[0]["owner"] and "endpoint" not in attempts[0]["owner"], response
         return attempts[0]
 
     def wait_ready(self, batch, project="text"):
@@ -170,6 +176,17 @@ class Acceptance:
             except (OSError, ValueError, KeyError): pass
             time.sleep(.01)
         raise AssertionError("native fixture failed to install its signal behavior")
+
+    def wait_owner_acknowledgement(self, batch):
+        # Job settlement and service acknowledgement intentionally commit in
+        # separate transactions. Observe both without assuming atomicity.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            attempt = self.attempt(batch)
+            if attempt["owner_health"]["cleanup_state"] == "acknowledged":
+                return attempt
+            time.sleep(.5)
+        raise AssertionError(attempt)
 
     def start(self):
         self.cli("daemon", "start", "--fake")
@@ -413,10 +430,12 @@ class Acceptance:
         before = (self.projects["text"] / "runs.txt").read_text()
         (self.projects["text"] / "release").touch()
         self.wait_job(normal_batch, {"done"})
-        final = self.attempt(normal_batch)
+        final = self.wait_owner_acknowledgement(normal_batch)
         assert final["attempt_id"] == original["attempt_id"] and final["owner"] == original["owner"]
         assert final["observation"]["returncode"] == 0 and final["observation"]["group_clean"] is True
         assert final["observation"]["rusage"] is not None
+        assert final["owner_health"]["cleanup_state"] == "acknowledged", final
+        assert final["owner_health"]["acknowledgement"] == "closed", final
         assert (self.projects["text"] / "runs.txt").read_text() == before
         assert self.snapshot()["cpu"]["used"] == 0, self.snapshot()
         for pid in services:
@@ -458,6 +477,7 @@ class Acceptance:
         assert final["attempt_id"] == original["attempt_id"] and final["owner"] == original["owner"]
         assert final["observation"]["returncode"] is None and final["observation"]["rusage"] is None
         assert final["observation"]["group_clean"] is True and self.snapshot()["cpu"]["used"] == 0
+        assert final["owner_health"]["connection_status"] == "lost", final
         assert (project / "runs.txt").read_text() == before
         print("PASS: lost persistent owner retains resources until vanished group, records unknown wait and never replays", flush=True)
 
