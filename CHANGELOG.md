@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 (candidate)
+
+- Replace full owner-history scans and an unbounded acknowledgement cache with
+  an indexed durable queue: at most eight historical acknowledgements per tick,
+  a soft two-second start budget and ten-second retry backoff.
+- Add bounded, cold `linux_fd_owner` preparation and terminal retention settings.
+- Add recorded owner connection and acknowledgement health to `sched execution`.
+  Queries remain passive; acknowledgement metadata never changes original wait facts.
+- Write database schema 7 and read schemas 1–7 without query migration. Migrate
+  existing bindings once without replaying attempts or deleting their history.
+- Add a fixed-commit candidate builder with independent default/native installs,
+  source and wheel hashes, ABI evidence and installation/rollback notes.
+
 ## 0.2.0 (candidate)
 
 - Add `sched --version` for installation and release verification without opening state.

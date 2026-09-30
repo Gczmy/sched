@@ -28,7 +28,7 @@ daemon 重启后，凭持久绑定重连仍存活的原 owner，继续取得它�
 wait/rusage 和进程组清理事实。已提交意图但 owner 仍处于 prepared 时，将其
 消费为 not_started；不能借恢复启动。prepared 有限期自动废弃，已运行 child
 不因连接断开而停止。声明的 duration 和已接受的取消升级由 owner 自己驱动。
-当前 prepared 默认保留 30 秒，清理完成的终局默认保留 3600 秒等待确认；
+prepared 默认保留 30 秒，清理完成的终局默认保留 3600 秒等待确认；
 运行中的 child 不因这些保留期停止，未声明 duration 的任务继续运行。
 
 连接暂时不可用时保持 unknown，保留 running 和资源，并在后续 tick 重查。
@@ -38,13 +38,48 @@ owner 确实消失时进入既有 authority_lost 守卫；只有进程组确已�
 
 终局观察和任务状态提交后，daemon 才确认并关闭 owner。终局等待确认有有限
 保留期；超过保留期而没有持久终局的记录仍属于未知结果，不补造成功。
-数据库写 schema 为 6，新增不可变的 owner binding；只读查询兼容 schema 1–5
+0.2.0 使用写 schema 6，0.2.1 候选使用 schema 7；只读查询兼容 schema 1–7
 且不升级，旧尝试没有 owner binding 时仍按原守卫处理。
+
+## 保留配置与运维观察（0.2.1 候选）
+
+`execution_backends[ID].owner` 仅适用于 `linux_fd_owner`，属于冷配置：
+
+```json
+{
+  "owner": {
+    "prepare_timeout_sec": 30,
+    "terminal_retention_sec": 3600
+  }
+}
+```
+
+`prepare_timeout_sec` 允许 1–300 秒，`terminal_retention_sec` 允许 60–604800 秒；
+均须为有限数字，布尔值不接受。字段省略时使用默认值，省略整个 `owner` 不改变
+旧配置的绑定摘要。修改须排空 daemon 后重启；既有服务继续使用启动时的值。
+保留期只约束未启动准备和已完成清理的终局，不终止 running child。
+
+schema 7 增加独立的运维记录，保留原不可变 binding 和 wait。终局与任务状态提交后
+进入确认队列；每轮从索引选择最多 8 条到期记录，2 秒后不再开始新的确认。
+已开始的 RPC 与本地服务 wait 使用各自有限超时，因此 2 秒不是整轮硬上限。
+失败记录持久退避 10 秒，重启后继续确认；成功记录不再进入扫描或内存历史集合。
+迁移只回填一次旧 binding 的确认状态，不删除历史，不补发 start。
+
+`sched execution ... --json` 的持久尝试增加 `owner_health`，所有字段来自已提交记录，
+`source:"recorded"` 明确表示查询不连接 owner，也不能据此判断当前服务是否存活。
+连接值为 `unknown/responsive/unreachable/lost`，同时返回 `last_observed_at`。
+确认状态 `active/pending/acknowledged` 描述关闭 owner 的工作，不是 child 进程组清理状态；
+`active` 也不证明服务存活。旧 schema 缺少记录时为 `unknown`，其他字段为 null。
+确认成功分别记录 `closed`（取得关闭响应）或 `owner_lost`（原服务已消失）；后者不提供
+新的退出事实。`cleanup_attempts`、`retry_after`、`last_cleanup_at`、`cleanup_error`、
+`acknowledged_at` 和 `acknowledgement` 用于跟踪确认与重试，不能替代原始 observation。
 
 ## 验收
 
 本地独立 Linux 夹具覆盖真实 child wait、daemon 重启重连、取消与超时独立升级、
 重复 start、提交后丢失响应、连接中断、错误认证、owner 丢失、尚未启动的恢复、
-终局提交前后崩溃、资源释放及独立 wheel 安装。status/task/history 契约保持 schema 1；
-execution 仅追加公开 owner 元数据和连接不确定原因。配套客户端只核对公开契约。
+终局提交前后崩溃、资源释放及独立 wheel 安装。运维验收覆盖确认后元数据提交失败、
+保留期到期、冷配置边界、schema 6 只读与迁移，以及一万条已确认历史记录下的有界队列。
+status/task/history 契约保持 schema 1；execution 仅追加公开 owner 元数据和已记录健康。
+配套客户端只核对公开契约。
 生产部署仍按 [execution-rollout.md](execution-rollout.md) 的维护与回退要求执行。

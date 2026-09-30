@@ -52,6 +52,7 @@ class PersistentStateTests(TempStateCase):
         dispatcher.executor = mock.Mock()
         dispatcher.executor.configured_owner.return_value = None
         dispatcher.executor.restore_configured_owner.return_value = owner
+        dispatcher.executor.retire_configured_execution.return_value = "closed"
         dispatcher._release_gpu_for_job = mock.Mock()
         dispatcher._handle_job_done = mock.Mock(side_effect=lambda conn, job, rc, **kw:
             state.update_job(conn, job["id"], status="done", rc=rc, finished_at=state.now()) or [])
@@ -98,6 +99,7 @@ class PersistentStateTests(TempStateCase):
                 self.assertFalse(conn.in_transaction)
                 self.assertEqual("interrupted", state.get_job(conn, job_id)["status"])
                 self.assertEqual("not_started", execution_state.get(conn, job_id)["phase"])
+                return "closed"
             dispatcher.executor.retire_configured_execution.side_effect = acknowledge
             dispatcher._reap_configured_executions(conn)
         owner.abandon_prepared.assert_called_once()
@@ -179,7 +181,7 @@ class PersistentStateTests(TempStateCase):
             state.set_query_only(False)
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(6, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertIsNone(execution_state.get_owner_binding(conn, job_id))
 
 
@@ -310,6 +312,33 @@ class PersistentBackendTests(unittest.TestCase):
         self.assertEqual("not_started", prepared.owner.poll().status)
         self.assertEqual("not_started", prepared.owner._rpc("start").status)
         self.assertFalse((self.root / "runs.txt").exists())
+
+    def test_terminal_retention_expiry_drops_service_without_restarting_child(self):
+        owner = self.prepare(terminal_retention=.2).launch()
+        self.ready()
+        (self.root / "release").touch()
+        original_wait = owner.wait(10)
+        self.assertEqual(0, original_wait.returncode)
+        owner._process.wait(timeout=3)
+        replacement = PersistentOwner(owner.binding)
+        with self.assertRaises(OwnerUnavailable) as error:
+            replacement.poll()
+        self.assertTrue(error.exception.lost)
+        replacement.close()
+        self.assertEqual("owner_lost", replacement.close_outcome)
+        self.assertEqual("run\n", (self.root / "runs.txt").read_text())
+
+    def test_close_retry_reaps_process_after_first_wait_timeout(self):
+        process = mock.Mock()
+        owner = PersistentOwner(PersistentStateTests.owner_binding(self, {"attempt_id": "1" * 32}), process=process)
+        process.wait.side_effect = [subprocess.TimeoutExpired("private-owner", 3), 0]
+        with mock.patch.object(owner, "_rpc") as rpc:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                owner.close()
+            owner.close()
+        rpc.assert_called_once_with("close")
+        self.assertEqual(2, process.wait.call_count)
+        self.assertEqual("closed", owner.close_outcome)
 
     def test_owner_loss_is_unknown_instead_of_synthetic_exit(self):
         # Kill only the prepared service of this private fixture (no child exists).

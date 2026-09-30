@@ -1,6 +1,6 @@
 # 通用 execution API
 
-> 本文对应 0.2.0 候选实现；尚未发布或切换生产实例。
+> 本文对应 0.2.1 运维候选；0.2.0 已合并，两者均尚未发布或切换生产实例。
 
 普通任务继续使用默认 subprocess 执行。需要固定可执行文件和输入 FD 的任务，
 通过管理员冷配置的 `linux_fd` backend 使用通用执行层。backend 注册值和其引用的
@@ -40,6 +40,10 @@ backend 缺失、文件漂移、输入不匹配或 native 能力缺失时明确�
 其 FD4 为 `sched_execution_owner_identity/v1`，封装原始 attempt identity 与实际
 owner 身份；客户端必须明确支持此封装。绑定与崩溃窗口见
 [persistent-execution-owner.md](persistent-execution-owner.md)。
+
+0.2.1 候选允许该 backend 的可选冷配置 `owner.prepare_timeout_sec`（1–300 秒，默认 30）
+与 `owner.terminal_retention_sec`（60–604800 秒，默认 3600）。省略字段使用默认值；
+其他 backend 不接受 `owner`，未知字段、布尔值和非有限数值拒绝。热更新不改变既有绑定。
 
 ## 任务输入
 
@@ -127,6 +131,14 @@ child 的 `exited` 仅是进程事实；仍有同组后代时状态为 `cleanup_
 cancel reason 和时间；没有发生通用尝试的任务返回空数组。
 持久尝试另有 `owner`，仅含 schema、owner ID、PID/start ticks、boot ID 和 attempt ID；
 私有 endpoint 和认证 token 不输出。
+0.2.1 候选还返回 `owner_health`：`source:recorded`、`connection_status`、
+`last_observed_at`、`cleanup_state`、`cleanup_attempts`、`retry_after`、
+`last_cleanup_at`、`cleanup_error`、`acknowledged_at` 和 `acknowledgement`。
+连接值为 `unknown/responsive/unreachable/lost`；确认状态为 `active/pending/acknowledged`，
+旧库无记录时为 `unknown`，其余字段为 null。`retry_after` 是 Unix 秒，其他时间为 UTC
+记录时间。错误为 `owner_unreachable/owner_rejected/close_timeout` 或 null；确认结果为
+`closed/owner_lost` 或 null。查询不探测服务，记录可能过期；确认状态与下面 diagnostics
+的进程组 `cleanup_state` 含义不同，确认元数据不改变原始 wait/rusage。
 只读诊断另有 `diagnostics` 和 `legacy_sessions` 数组，按 job version 升序排列；
 `--version N` 同时过滤这三个数组。新增字段不改变原始 `attempts` 或
 `status/task/history` 的 schema 1 契约，也不执行 schema 升级。
@@ -163,7 +175,7 @@ phase 与业务成功分别解释；启动或 wait 权威不明时不能据此�
 节点重启重排均禁用。daemon 原 owner 丢失时保留未解决尝试和资源；确认进程组
 消失后记 `interrupted`，不推断真实退出码或成功。意图提交前的崩溃记 `not_started`。
 `linux_fd_owner` 在原服务存活时可以恢复真实 wait；恢复发现 prepared 时废弃该准备，
-不补发 start。只读查询兼容写 schema 1–6，不迁移旧库或探测服务。
+不补发 start。0.2.1 候选只读查询兼容写 schema 1–7，不迁移旧库或探测服务。
 
 ## 可选 Linux native 构建
 

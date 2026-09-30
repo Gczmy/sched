@@ -1562,7 +1562,8 @@ def cmd_execution(args: argparse.Namespace) -> int:
         for job in jobs:
             row = execution_state.get(conn, job["id"])
             attempt = (execution_state.public(
-                row, owner_binding=execution_state.get_owner_binding(conn, job["id"]))
+                row, owner_binding=execution_state.get_owner_binding(conn, job["id"]),
+                owner_health_record=execution_state.owner_health(conn, job["id"]))
                 if row is not None else None)
             if row is not None:
                 attempts.append(attempt)

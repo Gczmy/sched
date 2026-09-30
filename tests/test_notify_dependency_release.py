@@ -160,13 +160,16 @@ class NotifyDependencyReleaseTests(unittest.TestCase):
     def test_older_terminal_generation_that_loses_marker_ownership_does_not_notify(
         self,
     ) -> None:
-        self._insert_batch(
-            "shared-old",
-            "shared",
-            status="active",
-            job_status="done",
-        )
-        self._insert_batch("shared-new", "shared", status="done")
+        # Exercise rowid ordering for equal-second generations, independently
+        # of wall-clock adjustments or crossing a second while seeding state.
+        with mock.patch.object(state, "now", return_value="2026-01-01 00:00:00"):
+            self._insert_batch(
+                "shared-old",
+                "shared",
+                status="active",
+                job_status="done",
+            )
+            self._insert_batch("shared-new", "shared", status="done")
         dispatcher = self._dispatcher()
         dispatcher._write_marker = mock.Mock()
         dispatcher._notify_batch = mock.Mock()

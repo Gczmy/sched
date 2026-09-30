@@ -10,7 +10,7 @@
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [execution-boundary.md](execution-boundary.md) | 通用执行层、项目 adapter 和独立发布边界 |
 | [execution-api.md](execution-api.md) | backend 冷注册、输入 FD 和自包含可选 native |
-| [persistent-execution-owner.md](persistent-execution-owner.md) | 持久 owner、认证重连和崩溃恢复证据 |
+| [persistent-execution-owner.md](persistent-execution-owner.md) | 持久 owner、认证重连、运维确认与崩溃恢复证据 |
 | [execution-rollout.md](execution-rollout.md) | 独立发布、安装与 schema 回退边界 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |

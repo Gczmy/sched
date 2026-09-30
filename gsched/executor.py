@@ -786,8 +786,12 @@ class Executor:
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
                 options = {}
                 if profile["kind"] == "linux_fd_owner":
+                    from .execution_policy import OWNER_DEFAULTS
+                    retention = {**OWNER_DEFAULTS, **profile.get("owner", {})}
                     options = {"identity": identity, "duration_seconds":
-                               spec["duration_min"] * 60 if spec.get("duration_min") is not None else None}
+                               spec["duration_min"] * 60 if spec.get("duration_min") is not None else None,
+                               "prepare_timeout": retention["prepare_timeout_sec"],
+                               "terminal_retention": retention["terminal_retention_sec"]}
                 prepared = backend.prepare(ExecutionEnvelope(tuple(profile["argv"]), env),
                                            executable_fd=executable, cwd_fd=root, fd_bindings=bindings, **options)
             self._execution_prepared[job_id] = prepared
@@ -806,7 +810,7 @@ class Executor:
             self._execution_owners[job_id] = PersistentOwner(binding)
         return self._execution_owners[job_id]
 
-    def retire_configured_execution(self, job_id: str) -> None:
+    def retire_configured_execution(self, job_id: str):
         owner = self._execution_owners.get(job_id)
         if owner is not None:
             owner.close()
@@ -814,6 +818,7 @@ class Executor:
         if prepared is not None:
             prepared.close()
         self._execution_owners.pop(job_id, None)
+        return getattr(owner, "close_outcome", "closed")
 
     def forget_lost_configured_owner(self, job_id: str) -> None:
         # The caller has proved that the bound service disappeared. Keep the
