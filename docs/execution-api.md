@@ -1,6 +1,6 @@
 # 通用 execution API
 
-> 本文对应 execution isolation 分支的 v1 实现；尚未发布或切换生产实例。
+> 本文对应 0.2.0 候选实现；尚未发布或切换生产实例。
 
 普通任务继续使用默认 subprocess 执行。需要固定可执行文件和输入 FD 的任务，
 通过管理员冷配置的 `linux_fd` backend 使用通用执行层。backend 注册值和其引用的
@@ -34,6 +34,12 @@
 `env` 不继承宿主环境，不能覆盖 `SCHED_*` 或 `CUDA_VISIBLE_DEVICES`。
 backend 缺失、文件漂移、输入不匹配或 native 能力缺失时明确拒绝，
 不能回退到路径执行、shell 或默认 subprocess。
+
+需要跨 daemon 重启保留原始 wait 时，管理员可显式选择 `kind:linux_fd_owner`。
+它使用同样的 executable/argv/env/input 冷配置，新增独立原始 owner 和认证重连。
+其 FD4 为 `sched_execution_owner_identity/v1`，封装原始 attempt identity 与实际
+owner 身份；客户端必须明确支持此封装。绑定与崩溃窗口见
+[persistent-execution-owner.md](persistent-execution-owner.md)。
 
 ## 任务输入
 
@@ -75,6 +81,9 @@ child FD4 是封印的 `sched_execution_identity/v1` JSON，含 `interface_versi
 `gsched.execution` 导出 `ExecutionEnvelope`、`ExecutionObservation`、
 `SubprocessBackend`、`LinuxFdBackend`、`Prepared`、`Owner` 和
 `retained_owners()`；接口版本为 `sched-execution/v1`。
+另导出 `PersistentLinuxFdBackend`、`PersistentOwner` 和 `OwnerUnavailable`。
+持久 backend 的 `prepare` 额外接收不可变 `identity`，可传 `duration_seconds`；
+`PersistentOwner(binding)` 仅重连原服务，不能创建替代服务或 child。
 它不接受项目回调或协议字段。以下独立调用演示普通 child wait：
 
 ```python
@@ -100,6 +109,9 @@ child 的 `exited` 仅是进程事实；仍有同组后代时状态为 `cleanup_
 `cancel()` 请求终止并由 poll 驱动期限后升级；`wait(timeout=...)` 的等待期限
 本身不等于取消 child。owner 必须在原进程、原线程使用，未解决 owner 不能 close。
 `retained_owners()` 只列出原进程保留对象，不能按 PID 重建权威。
+持久服务独立驱动取消升级与 duration，不要求 daemon 持续 poll；代理连接失败
+抛出 `OwnerUnavailable`。`lost:false` 为当前无法认证或通信，仍须保留资源重查；
+`lost:true` 只表示绑定的服务进程已消失、身份被替换或主机重启，不能提供 child wait。
 
 ## CLI 查询
 
@@ -113,6 +125,8 @@ child 的 `exited` 仅是进程事实；仍有同组后代时状态为 `cleanup_
 调用方同时读取 `task` 时应核对 `batch_revision`，不合并不同 revision 的结果。
 每项包含 attempt/job/version、backend 绑定、phase、identity、observation、
 cancel reason 和时间；没有发生通用尝试的任务返回空数组。
+持久尝试另有 `owner`，仅含 schema、owner ID、PID/start ticks、boot ID 和 attempt ID；
+私有 endpoint 和认证 token 不输出。
 只读诊断另有 `diagnostics` 和 `legacy_sessions` 数组，按 job version 升序排列；
 `--version N` 同时过滤这三个数组。新增字段不改变原始 `attempts` 或
 `status/task/history` 的 schema 1 契约，也不执行 schema 升级。
@@ -131,7 +145,7 @@ generic 尚未保留尝试时 phase 为 `not_reserved`，旧入口无 session �
 只取自原始 `group_clean`，退出码为 0 不等于清理已完成。旧 session 的 wait 和
 cleanup 为未知；job 的 rc、PID、日志及应用结果不能填补缺失事实。
 `uncertainty_reason` 为 `legacy_wait_unavailable`、`owner_authority_lost`、
-`record_invalid` 或 null；尚在正常执行的任务不因未退出就标为 authority lost。
+`owner_unreachable`、`record_invalid` 或 null；尚在正常执行的任务不因未退出就标为 authority lost。
 
 `legacy_sessions` 只展示 session/job/version、phase、owner kind 与记录时间，
 不输出旧项目路径、log 路径或客户协议。旧 schema 缺少的时间字段为 null，
@@ -148,6 +162,8 @@ phase 与业务成功分别解释；启动或 wait 权威不明时不能据此�
 终态后创建新 job/version 和新 attempt，保留旧观察。启动后的自动失败重试与
 节点重启重排均禁用。daemon 原 owner 丢失时保留未解决尝试和资源；确认进程组
 消失后记 `interrupted`，不推断真实退出码或成功。意图提交前的崩溃记 `not_started`。
+`linux_fd_owner` 在原服务存活时可以恢复真实 wait；恢复发现 prepared 时废弃该准备，
+不补发 start。只读查询兼容写 schema 1–6，不迁移旧库或探测服务。
 
 ## 可选 Linux native 构建
 

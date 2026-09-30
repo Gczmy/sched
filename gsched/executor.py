@@ -758,7 +758,11 @@ class Executor:
                                      identity: dict, gpu: int | None, log_path: str):
         if job_id in self._execution_prepared or job_id in self._execution_owners:
             raise ValueError("execution attempt is already retained")
-        backend = LinuxFdBackend()
+        if profile["kind"] == "linux_fd_owner":
+            from .execution.persistent import PersistentLinuxFdBackend
+            backend = PersistentLinuxFdBackend()
+        else:
+            backend = LinuxFdBackend()
         descriptors = []
         try:
             root = os.open(spec["cwd_abs"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -780,8 +784,12 @@ class Executor:
                 bindings[0] = null
                 env = dict(profile["env"])
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
+                options = {}
+                if profile["kind"] == "linux_fd_owner":
+                    options = {"identity": identity, "duration_seconds":
+                               spec["duration_min"] * 60 if spec.get("duration_min") is not None else None}
                 prepared = backend.prepare(ExecutionEnvelope(tuple(profile["argv"]), env),
-                                           executable_fd=executable, cwd_fd=root, fd_bindings=bindings)
+                                           executable_fd=executable, cwd_fd=root, fd_bindings=bindings, **options)
             self._execution_prepared[job_id] = prepared
             self._execution_owners[job_id] = prepared.owner
             return prepared
@@ -792,6 +800,12 @@ class Executor:
     def configured_owner(self, job_id: str):
         return self._execution_owners.get(job_id)
 
+    def restore_configured_owner(self, job_id, binding):
+        from .execution.persistent import PersistentOwner
+        if job_id not in self._execution_owners:
+            self._execution_owners[job_id] = PersistentOwner(binding)
+        return self._execution_owners[job_id]
+
     def retire_configured_execution(self, job_id: str) -> None:
         owner = self._execution_owners.get(job_id)
         if owner is not None:
@@ -800,6 +814,14 @@ class Executor:
         if prepared is not None:
             prepared.close()
         self._execution_owners.pop(job_id, None)
+
+    def forget_lost_configured_owner(self, job_id: str) -> None:
+        # The caller has proved that the bound service disappeared. Keep the
+        # immutable database binding and resource guard; drop only local handles.
+        self._execution_owners.pop(job_id, None)
+        prepared = self._execution_prepared.pop(job_id, None)
+        if prepared is not None:
+            prepared.close()
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
 
 

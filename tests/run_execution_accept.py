@@ -93,6 +93,8 @@ class Acceptance:
                 "argv": ["generic-worker", name], "env": {}, "projects": ["text", "math"],
                 "input_slots": {"3": {"max_bytes": 4096}},
             }
+        self.cfg["execution_backends"]["hold-owner"] = {
+            **self.cfg["execution_backends"]["hold"], "kind": "linux_fd_owner"}
         self.config_path = root / "config.json"
         self.config_path.write_text(json.dumps(self.cfg))
         self.env = dict(os.environ, SCHED_STATE=str(root / "state"), SCHED_CONFIG=str(self.config_path),
@@ -162,7 +164,8 @@ class Acceptance:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
-                if json.loads((self.projects[project] / "ready.json").read_text())["attempt_id"] == attempt_id:
+                identity = json.loads((self.projects[project] / "ready.json").read_text())
+                if identity.get("attempt", identity)["attempt_id"] == attempt_id:
                     return
             except (OSError, ValueError, KeyError): pass
             time.sleep(.01)
@@ -324,30 +327,7 @@ class Acceptance:
         os.kill(scheduler, signal.SIGKILL)
         self.reap_known(scheduler)
         self.orphans.add(child)
-        print("INFO: injected local daemon crash; waiting for its public heartbeat lease to expire", flush=True)
-        # Some virtualized hosts move wall time backwards after a clock sync.
-        # A null age can then mean timestamp_in_future, not an expired lease.
-        # Wait for actual public lease expiry without forcing start or editing it.
-        deadline = time.monotonic() + 180
-        while time.monotonic() < deadline:
-            health = self.data("daemon", "status", "--json")
-            if (health["read_error"] is None and health["process_state"] == "stopped"
-                    and (health["heartbeat_age_s"] is None or health["heartbeat_age_s"] > 61)):
-                # Retire the dead instance through CLI before starting its
-                # successor. Another wall-clock correction between status and
-                # start must not turn an idempotent "already running" reply
-                # into evidence that a new dispatcher actually started.
-                stopped = self.cli("daemon", "stop", expect=None)
-                if stopped.returncode == 0:
-                    break
-                again = self.data("daemon", "status", "--json")
-                assert (again["read_error"] == "timestamp_in_future" or
-                        (again["heartbeat_age_s"] is not None and
-                         again["heartbeat_age_s"] < 60)), (stopped, again)
-            time.sleep(1)
-        else: raise AssertionError(health)
-        self.start()
-        assert self.daemon_pid != scheduler, self.data("daemon", "status", "--json")
+        self.restart_crashed(scheduler)
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             current = self.attempt(batch)
@@ -374,10 +354,117 @@ class Acceptance:
         assert (project / "runs.txt").read_text() == before
         print("PASS: daemon restart never reconstructs wait authority, releases only vanished group, records interrupted without replay", flush=True)
 
+    def restart_crashed(self, scheduler):
+        print("INFO: injected local daemon crash; waiting for its public heartbeat lease to expire", flush=True)
+        # Some virtualized hosts move wall time backwards after a clock sync.
+        # A null age can then mean timestamp_in_future, not an expired lease.
+        # Wait for actual public lease expiry without forcing start or editing it.
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            health = self.data("daemon", "status", "--json")
+            if (health["read_error"] is None and health["process_state"] == "stopped"
+                    and (health["heartbeat_age_s"] is None or health["heartbeat_age_s"] > 61)):
+                # Retire the dead instance through CLI before starting its
+                # successor. Another wall-clock correction between status and
+                # start must not turn an idempotent "already running" reply
+                # into evidence that a new dispatcher actually started.
+                stopped = self.cli("daemon", "stop", expect=None)
+                if stopped.returncode == 0:
+                    break
+                again = self.data("daemon", "status", "--json")
+                assert (again["read_error"] == "timestamp_in_future" or
+                        (again["heartbeat_age_s"] is not None and
+                         again["heartbeat_age_s"] < 60)), (stopped, again)
+            time.sleep(1)
+        else: raise AssertionError(health)
+        self.start()
+        assert self.daemon_pid != scheduler, self.data("daemon", "status", "--json")
+
+    def persistent_restart(self):
+        for path in self.projects.values(): (path / "release").unlink(missing_ok=True)
+        _, normal, _ = self.batch("text", "hold-owner", b"reconnect\n", duration=5)
+        normal_batch = self.submit(normal)
+        self.wait_job(normal_batch, {"running"})
+        self.wait_ready(normal_batch)
+        original = self.attempt(normal_batch)
+        identity = json.loads((self.projects["text"] / "identity.json").read_text())
+        assert identity["schema"] == "sched_execution_owner_identity/v1", identity
+        assert identity["attempt"] == original["identity"] and identity["owner"] == original["owner"]
+        assert int((self.projects["text"] / "parent.txt").read_text()) == original["owner"]["pid"]
+        _, timeout, _ = self.batch("math", "hold-owner", b"ignore\n", duration=.01)
+        timeout_batch = self.submit(timeout)
+        self.wait_job(timeout_batch, {"running"})
+        self.wait_ready(timeout_batch, "math")
+        timed_attempt = self.attempt(timeout_batch)
+        scheduler = original["identity"]["scheduler_pid"]
+        assert scheduler == self.daemon_pid
+        os.kill(scheduler, signal.SIGKILL)
+        self.reap_known(scheduler)
+        services = {original["owner"]["pid"], timed_attempt["owner"]["pid"]}
+        self.orphans.update(services)
+        self.restart_crashed(scheduler)
+        timed = self.wait_job(timeout_batch, {"timed_out"})
+        assert timed["version"] == 1
+        timed_observation = self.attempt(timeout_batch)["observation"]
+        assert timed_observation["returncode"] == -signal.SIGKILL and timed_observation["group_clean"] is True, timed_observation
+        assert self.wait_job(normal_batch, {"running"})["version"] == 1
+        assert self.snapshot()["cpu"]["used"] == 1, self.snapshot()
+        assert self.attempt(normal_batch)["attempt_id"] == original["attempt_id"]
+        before = (self.projects["text"] / "runs.txt").read_text()
+        (self.projects["text"] / "release").touch()
+        self.wait_job(normal_batch, {"done"})
+        final = self.attempt(normal_batch)
+        assert final["attempt_id"] == original["attempt_id"] and final["owner"] == original["owner"]
+        assert final["observation"]["returncode"] == 0 and final["observation"]["group_clean"] is True
+        assert final["observation"]["rusage"] is not None
+        assert (self.projects["text"] / "runs.txt").read_text() == before
+        assert self.snapshot()["cpu"]["used"] == 0, self.snapshot()
+        for pid in services:
+            self.reap_known(pid)
+            self.orphans.discard(pid)
+        print("PASS: original persistent owners survive daemon crash, timeout independently, reconnect real wait and never replay", flush=True)
+
+    def persistent_loss(self):
+        project = self.projects["text"]
+        (project / "release").unlink(missing_ok=True)
+        _, path, _ = self.batch("text", "hold-owner", b"lost-owner\n", duration=5)
+        batch = self.submit(path)
+        self.wait_job(batch, {"running"})
+        self.wait_ready(batch)
+        original = self.attempt(batch)
+        service, child = original["owner"]["pid"], original["observation"]["pid"]
+        assert service != self.daemon_pid and child is not None
+        # Fault injection targets only this fixture's exact FD4-bound service.
+        from gsched.execution.persistent import start_ticks
+        assert start_ticks(service) == original["owner"]["start_ticks"]
+        os.kill(service, signal.SIGKILL)
+        self.orphans.add(child)
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            attempt = self.attempt(batch)
+            if attempt["phase"] == "unresolved": break
+            time.sleep(.5)
+        else: raise AssertionError(attempt)
+        assert attempt["observation"]["returncode"] is None and attempt["observation"]["group_clean"] is False
+        assert self.wait_job(batch, {"running"})["version"] == 1
+        assert self.snapshot()["cpu"]["used"] == 1
+        before = (project / "runs.txt").read_text()
+        (project / "release").touch()
+        self.reap_known(child)
+        self.orphans.discard(child)
+        job = self.wait_job(batch, {"interrupted"})
+        assert job["failure"] == "execution_authority_lost" and job["version"] == 1
+        final = self.attempt(batch)
+        assert final["attempt_id"] == original["attempt_id"] and final["owner"] == original["owner"]
+        assert final["observation"]["returncode"] is None and final["observation"]["rusage"] is None
+        assert final["observation"]["group_clean"] is True and self.snapshot()["cpu"]["used"] == 0
+        assert (project / "runs.txt").read_text() == before
+        print("PASS: lost persistent owner retains resources until vanished group, records unknown wait and never replays", flush=True)
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", action="append", choices=("basic", "rejection", "cancel", "duration", "drain", "drift", "ordinary", "missing", "restart"))
+    parser.add_argument("--case", action="append", choices=("basic", "rejection", "cancel", "duration", "drain", "drift", "ordinary", "missing", "restart", "persistent_restart", "persistent_loss"))
     args = parser.parse_args()
     if sys.platform != "linux": raise SystemExit("acceptance requires local Linux")
     from gsched.execution import BackendUnavailable, LinuxFdBackend
@@ -388,11 +475,11 @@ def main():
         if os.environ.get("SCHED_REQUIRE_NATIVE") == "1":
             raise
         native_available = False
-    cases = args.case or (("rejection", "basic", "drain", "cancel", "duration", "drift", "ordinary", "missing", "restart")
+    cases = args.case or (("rejection", "basic", "drain", "cancel", "duration", "drift", "ordinary", "missing", "restart", "persistent_restart", "persistent_loss")
                           if native_available else ("ordinary", "missing"))
     if not native_available and any(case not in ("ordinary", "missing") for case in cases):
         raise SystemExit("requested acceptance case requires an explicitly built native backend")
-    if "restart" in cases:
+    if set(cases).intersection(("restart", "persistent_restart", "persistent_loss")):
         # Adopt only descendants of this isolated acceptance process so the
         # injected crash cannot leak worker zombies into the host's init.
         import ctypes

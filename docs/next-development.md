@@ -18,10 +18,16 @@ execution API 以 [execution-api.md](execution-api.md) 及其同仓验收为准�
 进程组清理与未知结果。查询不升级数据库，不重建 owner，不改变 replay 守卫。
 字段和旧 schema 兼容限制见 [execution-api.md](execution-api.md)。
 
+0.2.0 候选增加显式 `linux_fd_owner`：独立服务持有原始 child、wait 和清理，
+daemon 通过认证绑定恢复查询；准备恢复不重放，取消与 duration 由服务独立升级。
+设计与故障验收见 [persistent-execution-owner.md](persistent-execution-owner.md)。
+候选仍需完成当前分支 CI 和合并审查；发布与生产切换另按
+[execution-rollout.md](execution-rollout.md) 执行。
+
 ## 后续候选
 
-- 完整的跨 daemon 重启执行服务：需独立定义 owner 存活、认证重连、未知结果和
-  cleanup 证据，不能从 PID、日志或业务 receipt 重建 wait 权威。
+- 持久 owner 的长期运维能力：终局保留期限可配置化、连接健康观测与大量历史绑定的
+  分页清理查询。不能借运维扩展删除绑定、重放尝试或补造 wait。
 - 更多平台能力：需明确 capabilities 和不支持时的拒绝语义，不回退到权限或
   文件绑定较弱的执行方式。
 - 配套客户端展示通用诊断：需单独增加 execution 查询与 UI，不改写 scheduler 语义。

@@ -252,7 +252,7 @@ class LegacyExecutionMigrationTests(TempStateCase):
                     state.set_query_only(False)
                 state.init_db()
                 with state.connect() as conn:
-                    self.assertEqual(5, conn.execute("PRAGMA user_version").fetchone()[0])
+                    self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
                     self.assertEqual("done", state.get_job(conn, job_id)["status"])
 
     def test_v4_session_is_preserved_and_new_legacy_launch_is_rejected(self):

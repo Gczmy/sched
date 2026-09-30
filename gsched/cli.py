@@ -1561,7 +1561,9 @@ def cmd_execution(args: argparse.Namespace) -> int:
         legacy_sessions = []
         for job in jobs:
             row = execution_state.get(conn, job["id"])
-            attempt = execution_state.public(row) if row is not None else None
+            attempt = (execution_state.public(
+                row, owner_binding=execution_state.get_owner_binding(conn, job["id"]))
+                if row is not None else None)
             if row is not None:
                 attempts.append(attempt)
             legacy = legacy_session(conn, job["id"])
@@ -4253,6 +4255,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
     )
+    ap.add_argument("--version", action="version", version=f"sched {__version__}")
     # Keep the parser's routing key separate from subcommand payload fields.
     # `run` intentionally exposes a positional `cmd` remainder; reusing that
     # name for the selected subcommand replaces "run" with a list and breaks

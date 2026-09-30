@@ -43,6 +43,8 @@
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
 | `docs/execution-boundary.md` | 通用执行层、客户程序、旧兼容守卫与各仓库独立发布边界 |
 | `docs/execution-api.md` | 公开 execution backend 注册、输入 FD 与可选 native 构建 |
+| `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连与恢复约束 |
+| `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
 | `docs/native-integration.md` | 旧实验接口的持久态保护与迁移限制 |
 | `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
@@ -56,6 +58,8 @@
 `sched`（Python 包名 `gsched`）是节点级 GPU/CPU 批量任务调度器，要求 Python >= 3.10，运行时零第三方依赖。调度器保持“无意识”：只提供标准接口，不含 Agent 逻辑。Agent 操作调度器的唯一入口是 `sched` CLI（`gsched.cli:main`）。
 
 调度器的源码、构建、公共回归与发布独立维护。通用 `gsched.execution` 负责可执行文件和输入 FD 绑定、直接子进程 owner、真实 wait、取消与清理；可选 native 源码在本仓库。daemon 不导入客户模块、动态项目 backend 或由客户仓库提供的 `gsched` 扩展。客户协议、科学阶段、研究合同、研究 gate 与科学加载验证归客户仓库，不作为 sched 发布前置条件。
+
+`linux_fd_owner` 由独立原始 owner 持有 child，允许 daemon 凭不可变绑定认证重连；恢复不能重新 start。该 backend 的 FD4 使用显式 owner identity 封装，不能自动替换 `linux_fd` 的 v1 identity。连接不确定时保留任务与资源；owner 丢失时仍禁止用 PID、日志或应用产物推断 wait。
 
 新提交使用公开 `execution` 接口；旧 strict/native 输入仅供历史识别，不能授予执行权。历史 session、名称消费与未知尝试的兼容守卫必须保留，不能因清理专用代码重放或删除旧运行记录。源码与必要测试的边界检查使用 `python scripts/check_execution_boundary.py`。
 

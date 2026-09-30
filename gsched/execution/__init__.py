@@ -17,9 +17,11 @@ from .backend import (
     SubprocessBackend,
     retained_owners,
 )
+from .persistent import PersistentLinuxFdBackend, PersistentOwner, OwnerUnavailable
 
 __all__ = [
     "INTERFACE_VERSION", "BackendUnavailable", "ExecutionEnvelope",
     "ExecutionObservation", "LinuxFdBackend", "Owner", "Prepared",
     "SubprocessBackend", "retained_owners",
+    "PersistentLinuxFdBackend", "PersistentOwner", "OwnerUnavailable",
 ]
