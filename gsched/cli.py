@@ -1538,6 +1538,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_execution(args: argparse.Namespace) -> int:
     from . import execution_state
+    from .execution_diagnostics import legacy_session, summarize
     batch, task = _resolve_task_ref(args.task)
     if args.version is not None and args.version < 1:
         print("错误: version 必须为正整数", file=sys.stderr)
@@ -1549,19 +1550,30 @@ def cmd_execution(args: argparse.Namespace) -> int:
             print("错误: 批次不存在", file=sys.stderr)
             return 1
         batch_revision = batch_row["revision"]
-        jobs = conn.execute("SELECT id FROM jobs WHERE batch_id=? AND task_id=?" +
+        jobs = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=?" +
                             (" AND version=?" if args.version is not None else "") + " ORDER BY version",
                             (batch, task, args.version) if args.version is not None else (batch, task)).fetchall()
         if not jobs:
             print("错误: 任务或版本不存在", file=sys.stderr)
             return 1
         attempts = []
+        diagnostics = []
+        legacy_sessions = []
         for job in jobs:
             row = execution_state.get(conn, job["id"])
+            attempt = execution_state.public(row) if row is not None else None
             if row is not None:
-                attempts.append(execution_state.public(row))
+                attempts.append(attempt)
+            legacy = legacy_session(conn, job["id"])
+            if legacy is not None:
+                legacy_sessions.append(legacy)
+            spec = conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?",
+                                (batch, task, job["version"])).fetchone()
+            diagnostics.append(summarize(job, spec["spec"] if spec else None,
+                                         batch_row["mode"], attempt, legacy))
     output = {"schema_version": 1, "batch_id": batch, "batch_revision": batch_revision,
-              "task_id": task, "attempts": attempts}
+              "task_id": task, "attempts": attempts, "diagnostics": diagnostics,
+              "legacy_sessions": legacy_sessions}
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 

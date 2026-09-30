@@ -12,13 +12,19 @@ execution API 以 [execution-api.md](execution-api.md) 及其同仓验收为准�
 旧 strict/native 持久态保留兼容守卫，新任务使用通用公开接口。
 责任与证据边界见 [execution-boundary.md](execution-boundary.md)。
 
+## 本次新增交付
+
+`sched execution` 已补充逐版本只读诊断和旧 session 摘要，区分原始 wait、
+进程组清理与未知结果。查询不升级数据库，不重建 owner，不改变 replay 守卫。
+字段和旧 schema 兼容限制见 [execution-api.md](execution-api.md)。
+
 ## 后续候选
 
 - 完整的跨 daemon 重启执行服务：需独立定义 owner 存活、认证重连、未知结果和
   cleanup 证据，不能从 PID、日志或业务 receipt 重建 wait 权威。
 - 更多平台能力：需明确 capabilities 和不支持时的拒绝语义，不回退到权限或
   文件绑定较弱的执行方式。
-- 通用执行记录的操作与诊断：保持 CLI/JSON 契约，并同步核对配套客户端。
+- 配套客户端展示通用诊断：需单独增加 execution 查询与 UI，不改写 scheduler 语义。
 
 这些候选没有自动授权部署，也不因某个研究项目需要而成为 sched 发布阻塞项。
 MPC_OTSF 的科学加载、G1–G6 矩阵、冻结合同重审、正式实验和研究部署包，

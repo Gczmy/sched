@@ -147,8 +147,14 @@ class Acceptance:
         return result["batch_id"]
 
     def attempt(self, batch):
-        attempts = self.data("execution", f"{batch}:work", "--json")["attempts"]
+        response = self.data("execution", f"{batch}:work", "--json")
+        attempts = response["attempts"]
         assert len(attempts) == 1, attempts
+        diagnostic = next(d for d in response["diagnostics"]
+                          if d["job_version"] == attempts[0]["job_version"])
+        assert diagnostic["attempt_id"] == attempts[0]["attempt_id"], response
+        assert diagnostic["phase"] == attempts[0]["phase"], response
+        assert diagnostic["replay_blocked"] is True, response
         return attempts[0]
 
     def wait_ready(self, batch, project="text"):
@@ -361,6 +367,10 @@ class Acceptance:
         final = self.attempt(batch)
         assert final["attempt_id"] == attempt["attempt_id"] and final["phase"] == "unresolved", final
         assert final["observation"]["returncode"] is None and final["observation"]["group_clean"] is True, final
+        diagnostic = self.data("execution", f"{batch}:work", "--json")["diagnostics"][0]
+        assert diagnostic["uncertainty_reason"] == "owner_authority_lost", diagnostic
+        assert diagnostic["wait_result_available"] is False and diagnostic["returncode"] is None, diagnostic
+        assert diagnostic["cleanup_state"] == "confirmed", diagnostic
         assert (project / "runs.txt").read_text() == before
         print("PASS: daemon restart never reconstructs wait authority, releases only vanished group, records interrupted without replay", flush=True)
 

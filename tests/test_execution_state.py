@@ -113,6 +113,72 @@ class ExecutionStateTests(TempStateCase):
         self.assertEqual(1, code, error)
         self.assertIn("不存在", error)
 
+    def query(self, *, version=None):
+        code, output, error = self.capture(cli.cmd_execution,
+            argparse.Namespace(task="batch-20260829-000000:task", version=version, json=True))
+        self.assertEqual(0, code, error)
+        return json.loads(output)
+
+    def test_query_records_cancel_wait_and_cleanup_without_changing_raw_attempt(self):
+        job_id, _ = self.reserve()
+        observation = {"status": "exited", "pid": 1234, "returncode": -15,
+                       "rusage": {"ru_utime": .1}, "group_clean": True}
+        with state.connect() as conn:
+            execution_state.launch_intent(conn, job_id)
+            execution_state.cancel_intent(conn, job_id, "cancelled")
+            execution_state.observe(conn, job_id, observation)
+            before = execution_state.public(execution_state.get(conn, job_id))
+        result = self.query()
+        self.assertEqual([before], result["attempts"])
+        diagnostic = result["diagnostics"][0]
+        self.assertEqual("exited", diagnostic["phase"])
+        self.assertEqual("cancelled", diagnostic["cancel_reason"])
+        self.assertTrue(diagnostic["wait_result_available"])
+        self.assertEqual(-15, diagnostic["returncode"])
+        self.assertEqual(observation["rusage"], diagnostic["rusage"])
+        self.assertEqual("confirmed", diagnostic["cleanup_state"])
+        self.assertTrue(diagnostic["replay_blocked"])
+        self.assertIsNone(diagnostic["uncertainty_reason"])
+
+    def test_query_distinguishes_wait_from_pending_cleanup_and_lost_authority(self):
+        job_id, _ = self.reserve()
+        with state.connect() as conn:
+            execution_state.launch_intent(conn, job_id)
+            execution_state.observe(conn, job_id, {"status": "cleanup_pending", "pid": 1234,
+                "returncode": 0, "rusage": {"ru_stime": .2}, "group_clean": False})
+        diagnostic = self.query()["diagnostics"][0]
+        self.assertTrue(diagnostic["wait_result_available"])
+        self.assertEqual("pending", diagnostic["cleanup_state"])
+        with state.connect() as conn:
+            # A vanished group and a job rc are not the lost original wait.
+            execution_state.observe(conn, job_id, {"status": "authority_lost", "pid": 1234,
+                "returncode": None, "rusage": None, "group_clean": True})
+            state.update_job(conn, job_id, status="interrupted", rc=0)
+        diagnostic = self.query()["diagnostics"][0]
+        self.assertEqual("owner_authority_lost", diagnostic["uncertainty_reason"])
+        self.assertEqual("confirmed", diagnostic["cleanup_state"])
+        self.assertFalse(diagnostic["wait_result_available"])
+        self.assertIsNone(diagnostic["returncode"])
+
+    def test_query_selects_version_and_does_not_invent_subprocess_observations(self):
+        job_id = self.seed_batch(job_status="done")
+        with state.connect() as conn:
+            spec = json.loads(conn.execute("SELECT spec FROM tasks").fetchone()["spec"])
+            spec["execution"] = {"backend": "generic"}
+            state.insert_task(conn, "batch-20260829-000000", "task", 2, spec, 0, "p")
+            state.insert_job(conn, "second-job", "batch-20260829-000000", "task", 2, "fp2", None, "p")
+        result = self.query()
+        self.assertEqual([1, 2], [d["job_version"] for d in result["diagnostics"]])
+        ordinary, pending = result["diagnostics"]
+        self.assertEqual(job_id, ordinary["job_id"])
+        self.assertEqual("subprocess", ordinary["execution_kind"])
+        self.assertFalse(ordinary["wait_result_available"])
+        self.assertIsNone(ordinary["returncode"])
+        self.assertEqual("unknown", ordinary["cleanup_state"])
+        self.assertEqual("not_reserved", pending["phase"])
+        self.assertFalse(pending["replay_blocked"])
+        self.assertEqual([pending], self.query(version=2)["diagnostics"])
+
     def test_consumed_attempt_cannot_be_reset_by_manual_retry(self):
         job_id, identity = self.reserve()
         with state.connect() as conn:
@@ -141,6 +207,10 @@ class ExecutionStateTests(TempStateCase):
             self.assertEqual("not_started", attempt["phase"])
             self.assertEqual(identity["attempt_id"], attempt["attempt_id"])
             self.assertIsNone(attempt["launch_intent_at"])
+        diagnostic = self.query()["diagnostics"][0]
+        self.assertEqual("not_started", diagnostic["phase"])
+        self.assertFalse(diagnostic["wait_result_available"])
+        self.assertEqual("confirmed", diagnostic["cleanup_state"])
         dispatcher._release_gpu_for_job.assert_called_once()
 
 
@@ -174,6 +244,7 @@ class LegacyExecutionMigrationTests(TempStateCase):
                             argparse.Namespace(task=f"{batch}:task", version=None))
                         self.assertEqual(0, result, error)
                         self.assertEqual([], json.loads(output)["attempts"])
+                        self.assertEqual("subprocess", json.loads(output)["diagnostics"][0]["execution_kind"])
                         with state.connect() as conn:
                             self.assertEqual("done", state.get_job(conn, job_id)["status"])
                             self.assertEqual(version, conn.execute("PRAGMA user_version").fetchone()[0])
@@ -198,3 +269,54 @@ class LegacyExecutionMigrationTests(TempStateCase):
             self.assertEqual(before, dict(state.get_native_session(conn, "a" * 32)))
             with self.assertRaisesRegex(state.StateError, "retired"):
                 state.mark_native_monitor_launch_attempted(conn, "a" * 32, 1, 2)
+
+    def test_legacy_v2_v3_v4_queries_do_not_migrate_or_infer_wait_from_job_rc(self):
+        for version in (2, 3, 4):
+            with self.subTest(version=version):
+                state.init_db()
+                batch = f"old-session-{version}"
+                job_id = self.seed_batch(batch_id=batch, name=batch, job_status="done")
+                session_id = f"{version:032x}"
+                with state.connect() as conn:
+                    conn.execute("INSERT INTO native_sessions(session_id,job_id,job_version,evaluation_domain,"
+                        "owner_kind,profile_id,profile_sha256,project_root_path,project_root_identity_sha256,"
+                        "log_relative_path,phase,created_at) VALUES(?,?,1,'isolated_integration','unbound',"
+                        "'old',?,?,?,'logs/old.log','reserved',?)",
+                        (session_id, job_id, "b" * 64, self.tmp.name, f"{version:064x}", state.now()))
+                self.legacy_schema(version)
+                state.set_query_only(True)
+                try:
+                    with mock.patch.object(state, "_initialize_database", side_effect=AssertionError("migrated")):
+                        code, output, error = self.capture(cli.cmd_execution,
+                            argparse.Namespace(task=f"{batch}:task", version=1, json=True))
+                    self.assertEqual(0, code, error)
+                    result = json.loads(output)
+                    self.assertEqual([], result["attempts"])
+                    self.assertNotIn("project_root_path", result["legacy_sessions"][0])
+                    self.assertIsNone(result["legacy_sessions"][0]["monitor_launch_attempted_at"])
+                    diagnostic = result["diagnostics"][0]
+                    self.assertEqual(session_id, diagnostic["legacy_session_id"])
+                    self.assertEqual("legacy", diagnostic["execution_kind"])
+                    self.assertEqual("legacy_wait_unavailable", diagnostic["uncertainty_reason"])
+                    self.assertTrue(diagnostic["replay_blocked"])
+                    self.assertFalse(diagnostic["wait_result_available"])
+                    self.assertIsNone(diagnostic["returncode"])
+                    self.assertEqual("unknown", diagnostic["cleanup_state"])
+                    with state.connect() as conn:
+                        self.assertEqual(version, conn.execute("PRAGMA user_version").fetchone()[0])
+                        self.assertEqual("done", state.get_job(conn, job_id)["status"])
+                finally:
+                    state.set_query_only(False)
+
+    def test_strict_history_without_session_stays_retired(self):
+        job_id = self.seed_batch(job_status="done")
+        with state.connect() as conn:
+            conn.execute("UPDATE batches SET mode='strict'")
+        code, output, error = self.capture(cli.cmd_execution,
+            argparse.Namespace(task="batch:task", version=None, json=True))
+        self.assertEqual(0, code, error)
+        diagnostic = json.loads(output)["diagnostics"][0]
+        self.assertEqual(job_id, diagnostic["job_id"])
+        self.assertEqual("retired", diagnostic["phase"])
+        self.assertEqual("legacy_wait_unavailable", diagnostic["uncertainty_reason"])
+        self.assertTrue(diagnostic["replay_blocked"])
