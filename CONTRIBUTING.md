@@ -15,6 +15,12 @@ python tests/run_execution_accept.py
 mode、项目 GPU 开关和文档引用验收。另有独立 Linux native job，显式设置
 `SCHED_BUILD_NATIVE=1` 从本仓库源码构建并运行 native 与调度器回归。
 默认安装不需要编译器，固定 FD backend 不可用时必须明确拒绝。
+
+全部检查成功后，Candidate job 在 Python 3.10、3.14 上从同一固定提交分别构建
+默认/native wheel 并独立安装，保存 30 天的候选 artifact。产物包含源码、manifest、
+安装证据和 Release 草稿；不自动创建标签或发布。下载校验与 ABI 限制见
+[execution-rollout.md](docs/execution-rollout.md)。开发构建工具固定版本在 workflow 中，
+不影响运行时零第三方依赖。
 两条路径均不读取客户合同路径，不要求另一个仓库存在。
 客户 adapter、研究协议、科学加载和研究 gate 由客户自己的 CI 验证，
 不能因其未通过把 sched 的通用公共验收跳过。
@@ -73,6 +79,7 @@ git config core.hooksPath .githooks
 ```bash
 python3 -m unittest discover -s scripts -p test_repository_check.py -v
 python3 -m unittest discover -s scripts -p test_execution_boundary.py -v
+python3 -m unittest discover -s scripts -p test_release_candidate.py -v
 ```
 
 检查器、测试和 `.githooks/pre-commit` 在 `sched` 与 `dsh-node-sched` 中保持逐字节

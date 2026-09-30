@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -32,6 +33,8 @@ jobs:
         run: python -m unittest discover -s scripts -p test_repository_check.py -v
       - name: Check execution boundary scanner
         run: python -m unittest discover -s scripts -p test_execution_boundary.py -v
+      - name: Check candidate integrity and CI admission
+        run: python -m unittest discover -s scripts -p test_release_candidate.py -v
       - name: Check runtime and required-test independence
         run: python scripts/check_execution_boundary.py
       - name: Check privacy, Markdown references and commit whitespace
@@ -60,6 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -92,6 +96,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -108,3 +113,64 @@ jobs:
         run: python -m pytest -q -rs tests
       - name: Public execution CLI lifecycle
         run: python tests/run_execution_accept.py
+
+  candidate:
+    name: Candidate Python ${{ matrix.python }}
+    needs: [repository, python, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install development build tools
+        run: python -m pip install pip==26.2.1 setuptools==84.0.0 wheel==0.48.0 packaging==26.3
+      - name: Build and verify candidates from the validated commit
+        id: build
+        env:
+          SCHED_CI_VALIDATED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SCHED_CI_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python scripts/build_release_candidate.py --commit "$SCHED_CI_VALIDATED_SHA" --native
+          python scripts/verify_release_candidate.py "dist/candidate-${SCHED_CI_VALIDATED_SHA:0:7}" --commit "$SCHED_CI_VALIDATED_SHA" --require-ci
+          python - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          commit = os.environ['SCHED_CI_VALIDATED_SHA']
+          directory = Path('dist') / ('candidate-' + commit[:7])
+          digest = hashlib.sha256((directory / 'manifest.json').read_bytes()).hexdigest()
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'commit={commit}\ndirectory={directory}\nmanifest_sha256={digest}\n')
+          PY
+      - name: Save immutable candidate packet
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sched-candidate-${{ steps.build.outputs.commit }}-python-${{ matrix.python }}-attempt-${{ github.run_attempt }}
+          path: ${{ steps.build.outputs.directory }}/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+      - name: Record artifact provenance
+        env:
+          SOURCE_COMMIT: ${{ steps.build.outputs.commit }}
+          MANIFEST_SHA256: ${{ steps.build.outputs.manifest_sha256 }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_SHA256: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          python - <<'PY'
+          import os
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('Candidate only; no tag, release or deployment was created.\n\n')
+              for key in ('SOURCE_COMMIT', 'MANIFEST_SHA256', 'ARTIFACT_ID', 'ARTIFACT_URL', 'ARTIFACT_SHA256'):
+                  summary.write(f"- {key}: `{os.environ[key]}`\n")
+          PY
