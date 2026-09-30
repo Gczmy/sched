@@ -45,7 +45,9 @@ session 记录不能作为新任务执行授权；已消费或结果不明的旧
 daemon 重启不能从磁盘 PID 恢复已失去的 wait 权威；进程组尚存或无法确认时，
 保留未解决尝试与资源。确认原进程组消失后，仅按 `interrupted` 结算资源，
 保留未知退出码和 rusage，不重放已消费的尝试，也不将 PID 消失解释为成功。
-后续若需要长期存活的执行服务或可恢复委派，必须单独定义身份、重连和证据合同。
+显式 `linux_fd_owner` 可凭不可变绑定重连仍存活的原 owner；它不重建 wait 权威，
+也不重发 start。身份封装、认证与终局确认合同见
+[persistent-execution-owner.md](persistent-execution-owner.md)。
 
 ## 发布与工作目标
 

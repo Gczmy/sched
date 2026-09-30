@@ -68,6 +68,27 @@ def main():
             )
             observed = run([sys.executable, "-c", probe], cwd=unrelated, environment=runtime_env)
             assert Path(json.loads(observed)["file"]).is_relative_to(target)
+            if native:
+                # The service uses isolated Python and must load native from the
+                # installed wheel, even when no repository is on its path.
+                owner_probe = """
+import os, secrets
+from gsched.execution import ExecutionEnvelope, PersistentLinuxFdBackend, PersistentOwner
+executable = os.open('/bin/true', os.O_RDONLY | os.O_CLOEXEC)
+cwd = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+try:
+    prepared = PersistentLinuxFdBackend().prepare(ExecutionEnvelope(('true',)),
+        executable_fd=executable, cwd_fd=cwd, fd_bindings={},
+        identity={'schema': 'sched_execution_identity/v1', 'attempt_id': secrets.token_hex(16)})
+finally:
+    os.close(cwd); os.close(executable)
+owner = prepared.launch()
+observation = PersistentOwner(owner.binding).wait(10)
+assert observation.returncode == 0 and observation.group_clean is True
+assert observation.rusage is not None
+owner.close(); prepared.close()
+"""
+                run([sys.executable, "-c", owner_probe], cwd=unrelated, environment=runtime_env)
             print("PASS:", label, "installed public CLI works independently; native =", native, flush=True)
 
         install(False, "default-clean")

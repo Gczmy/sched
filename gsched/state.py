@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 5
+DB_SCHEMA_VERSION = 6
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -183,6 +183,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "jobs",
         "native_sessions",
         "execution_attempts",
+        "execution_owners",
         "gpus",
         "gpu_jobs",
         "profile_cache",
@@ -207,12 +208,15 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "native_session_monitor_launch_immutable",
         "execution_attempt_identity_immutable",
         "execution_attempt_terminal_immutable",
+        "execution_owner_binding_immutable",
+        "execution_owner_binding_retained",
     },
 }
 
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "execution_owners": {"job_id", "binding"},
     "execution_attempts": {"attempt_id", "job_id", "job_version", "backend_id", "backend_config_sha256", "phase", "identity", "observation", "cancel_reason", "created_at", "launch_intent_at", "finished_at"},
     "batches": {"notify", "project", "priority", "revision"},
     "tasks": {"project"},
@@ -442,6 +446,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 6:
+        required_objects["table"].remove("execution_owners")
+        required_objects["trigger"].remove("execution_owner_binding_immutable")
+        required_objects["trigger"].remove("execution_owner_binding_retained")
+        del required_columns["execution_owners"]
     if version < 5:
         required_objects["table"].remove("execution_attempts")
         required_objects["trigger"].remove("execution_attempt_identity_immutable")
@@ -919,9 +928,9 @@ def _require_wal_snapshot(database: str) -> None:
 def _initialize_database() -> None:
     """Run one atomic schema initialization/migration attempt."""
     ensure_private_directory(os.path.dirname(db_path()))
-    from .execution_state import SCHEMA as EXECUTION_SCHEMA
+    from .execution_state import SCHEMA as EXECUTION_SCHEMA, OWNER_SCHEMA
     with connect() as conn:
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
@@ -937,7 +946,7 @@ def _initialize_database() -> None:
 def ensure_db_initialized() -> str:
     """Initialize only when the read-only schema probe finds work to do.
 
-    Query commands accept complete private WAL schemas v1-v5 without entering
+    Query commands accept complete private WAL schemas v1-v6 without entering
     init_db() or requesting ``BEGIN IMMEDIATE``.  A fresh, stale, partially
     copied, non-WAL, or permission-drifted state still takes the existing full
     atomic initialization path.

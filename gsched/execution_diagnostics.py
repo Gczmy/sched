@@ -46,6 +46,7 @@ def summarize(job, spec_text, batch_mode, attempt, legacy) -> dict:
              "not_reserved" if kind == "generic" else None)
     uncertainty = ("legacy_wait_unavailable" if retired else
                    "record_invalid" if spec is None else
+                   "owner_unreachable" if observation.get("owner_unreachable") is True else
                    "owner_authority_lost" if phase == "unresolved" else None)
     return {
         "job_id": job["id"], "job_version": job["version"], "job_status": job["status"],

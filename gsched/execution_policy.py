@@ -53,8 +53,8 @@ def validate_backends(cfg: dict) -> dict[str, dict]:
         required = {"kind", "executable", "sha256", "argv", "env", "projects", "input_slots"}
         if not isinstance(profile, dict) or set(profile) != required:
             raise ExecutionPolicyError(f"execution_backends.{backend_id}: requires exact keys {sorted(required)}")
-        if profile["kind"] != "linux_fd":
-            raise ExecutionPolicyError("only the built-in linux_fd backend is supported")
+        if profile["kind"] not in ("linux_fd", "linux_fd_owner"):
+            raise ExecutionPolicyError("only built-in linux_fd and linux_fd_owner backends are supported")
         executable = _text(profile["executable"], "executable")
         if not os.path.isabs(executable) or os.path.normpath(executable) != executable:
             raise ExecutionPolicyError("backend executable must be a normalized absolute path")

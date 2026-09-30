@@ -57,6 +57,7 @@ from ._legacy_execution import (
 )
 from .execution_policy import ExecutionPolicyError, revalidate_binding
 from .execution_policy import digest as execution_digest, project_roots as _execution_project_roots
+from .execution.persistent import OwnerUnavailable
 
 def native_exec_project_roots(cfg):
     return {**_legacy_project_roots(cfg), **_execution_project_roots(cfg)}
@@ -3228,6 +3229,27 @@ class Dispatcher:
         for job in rows:
             attempt = execution_state.get(conn, job["id"])
             owner = self.executor.configured_owner(job["id"])
+            binding = execution_state.get_owner_binding(conn, job["id"])
+            previous = json.loads(attempt["observation"] or "{}")
+            observation = None
+            if owner is None and binding is not None:
+                owner = self.executor.restore_configured_owner(job["id"], binding)
+            if owner is not None and attempt["phase"] not in ("exited", "not_started"):
+                try:
+                    observation = asdict(owner.poll())
+                    if observation["status"] == "prepared" and binding is not None:
+                        # Recovery consumes an unused preparation; it never starts.
+                        observation = asdict(owner.abandon_prepared())
+                except OwnerUnavailable as error:
+                    if not error.lost:
+                        execution_state.observe(conn, job["id"], {
+                            "status": "authority_lost", "pid": job["pgid"],
+                            "returncode": None, "rusage": None, "group_clean": None,
+                            "launch_error": None, "owner_unreachable": True,
+                        })
+                        continue
+                    self.executor.forget_lost_configured_owner(job["id"])
+                    owner = None
             if owner is None:
                 if attempt["launch_intent_at"] is None and not job["pgid"]:
                     # The durable launch intent must commit before child birth.
@@ -3242,13 +3264,12 @@ class Dispatcher:
                     self._release_gpu_for_job(conn, job)
                     cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
                     continue
-                previous = json.loads(attempt["observation"] or "{}")
-                if previous.get("status") == "exited" and previous.get("group_clean") is True:
+                if previous.get("status") in ("exited", "not_started") and previous.get("group_clean") is True:
                     observation = previous
                 else:
                     # Lost wait ownership is never recreated from PID or sidecars.
                     # A vanished managed group proves cleanup, not successful exit.
-                    clean = False
+                    clean = bool(binding and binding["boot_id"] != self._execution_boot_id())
                     if job["pgid"]:
                         try:
                             os.killpg(job["pgid"], 0)
@@ -3266,14 +3287,32 @@ class Dispatcher:
                         cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
                     continue
             else:
-                observation = asdict(owner.poll())
+                observation = previous if attempt["phase"] in ("exited", "not_started") else observation
                 execution_state.observe(conn, job["id"], observation)
                 if observation.get("pid") is not None and job["pgid"] != observation["pid"]:
                     state.update_job(conn, job["id"], pgid=observation["pid"])
+            owner_reason = getattr(owner, "cancel_reason", None) if binding is not None else None
+            if owner_reason in ("cancelled", "timed_out"):
+                execution_state.cancel_intent(conn, job["id"], owner_reason)
+                if not job["kill_reason"]:
+                    state.update_job(conn, job["id"], kill_reason=owner_reason)
             if job["kill_reason"]:
                 execution_state.cancel_intent(conn, job["id"], job["kill_reason"])
                 if owner is not None and observation["status"] in ("running", "cleanup_pending"):
-                    owner.cancel(JOB_STOP_TERM_GRACE_SEC)
+                    try:
+                        owner.cancel(JOB_STOP_TERM_GRACE_SEC)
+                    except OwnerUnavailable:
+                        pass  # Keep the durable intent and retry the original owner.
+            if observation["status"] == "not_started" and observation.get("group_clean") is True:
+                current = state.get_job(conn, job["id"])
+                state.update_job(conn, job["id"], status="cancelled" if current["kill_reason"] == "cancelled" else "interrupted",
+                                 failure="execution_not_started", finished_at=state.now())
+                self._release_gpu_for_job(conn, job)
+                cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
+                conn.commit()
+                if owner is not None:
+                    self._ack_configured_owner(job["id"])
+                continue
             if observation["status"] != "exited" or observation.get("group_clean") is not True:
                 continue
             rc = observation["returncode"]
@@ -3281,8 +3320,35 @@ class Dispatcher:
             cleanup.extend(self._handle_job_done(conn, job, rc, process_exit_authoritative=True))
             conn.commit()
             if owner is not None:
-                self.executor.retire_configured_execution(job["id"])
+                self._ack_configured_owner(job["id"])
+        # If the daemon died after committing the terminal facts, close the
+        # original service without rewriting the already settled job.
+        conn.commit()
+        settled = conn.execute("SELECT e.job_id FROM execution_attempts e JOIN jobs j ON j.id=e.job_id"
+                               " JOIN execution_owners o ON o.job_id=e.job_id"
+                               " WHERE j.status!='running' AND e.phase IN ('exited','not_started')").fetchall()
+        for row in settled:
+            job_id = row["job_id"]
+            if job_id in getattr(self, "_execution_acknowledged", set()):
+                continue
+            self.executor.restore_configured_owner(job_id, execution_state.get_owner_binding(conn, job_id))
+            self._ack_configured_owner(job_id)
         return cleanup
+
+    @staticmethod
+    def _execution_boot_id():
+        from .execution.persistent import boot_id
+        return boot_id()
+
+    def _ack_configured_owner(self, job_id):
+        try:
+            self.executor.retire_configured_execution(job_id)
+        except (OwnerUnavailable, TimeoutError) as error:
+            self.log_line(f"execution {job_id} terminal owner acknowledgement deferred: {error}")
+            return
+        if not hasattr(self, "_execution_acknowledged"):
+            self._execution_acknowledged = set()
+        self._execution_acknowledged.add(job_id)
 
     def _handle_job_done(
         self,
@@ -4860,6 +4926,8 @@ class Dispatcher:
         try:
             prepared = self.executor.prepare_configured_execution(job["id"], spec, profile, identity, gpu, log_path)
             conn.execute("BEGIN IMMEDIATE")
+            if hasattr(prepared.owner, "binding"):
+                execution_state.bind_owner(conn, job["id"], prepared.owner.binding)
             execution_state.launch_intent(conn, job["id"])
             conn.commit()
             owner = prepared.launch()
@@ -4870,12 +4938,22 @@ class Dispatcher:
                 observation = {"status": "not_started", "pid": None, "returncode": None,
                                "rusage": None, "launch_error": getattr(error, "errno", None), "group_clean": True}
             else:
-                observation = asdict(owner.poll())
+                try:
+                    observation = asdict(owner.poll())
+                except OwnerUnavailable:
+                    observation = {"status": "authority_lost", "pid": None, "returncode": None,
+                                   "rusage": None, "launch_error": None, "group_clean": None,
+                                   "owner_unreachable": True}
                 if observation["status"] == "prepared":
+                    if hasattr(owner, "binding"):
+                        owner.abandon_prepared()
                     observation["status"] = "not_started"
                     observation["group_clean"] = True
-                elif observation["status"] in ("running", "cleanup_pending"):
-                    owner.cancel(JOB_STOP_TERM_GRACE_SEC)
+                elif observation["status"] in ("running", "cleanup_pending") and not isinstance(error, OwnerUnavailable):
+                    try:
+                        owner.cancel(JOB_STOP_TERM_GRACE_SEC)
+                    except OwnerUnavailable:
+                        pass
             if conn.in_transaction:
                 conn.rollback()
             if observation["status"] == "not_started":

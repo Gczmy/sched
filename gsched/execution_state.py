@@ -39,6 +39,39 @@ WHEN OLD.phase IN ('exited','not_started') AND (
 BEGIN SELECT RAISE(ABORT, 'terminal execution observation is immutable'); END;
 """
 
+OWNER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS execution_owners (
+  job_id TEXT PRIMARY KEY REFERENCES execution_attempts(job_id),
+  binding TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS execution_owner_binding_immutable
+BEFORE UPDATE ON execution_owners
+BEGIN SELECT RAISE(ABORT, 'execution owner binding is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS execution_owner_binding_retained
+BEFORE DELETE ON execution_owners
+BEGIN SELECT RAISE(ABORT, 'execution owner binding must be retained'); END;
+"""
+
+
+def get_owner_binding(conn, job_id):
+    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owners'").fetchone()
+    if not exists:
+        return None
+    row = conn.execute("SELECT binding FROM execution_owners WHERE job_id=?", (job_id,)).fetchone()
+    return json.loads(row["binding"]) if row is not None else None
+
+
+def bind_owner(conn, job_id, binding):
+    from .execution.persistent import validate_binding
+    binding = validate_binding(binding)
+    _current_authorization(conn, job_id)
+    attempt = get(conn, job_id)
+    if (attempt is None or attempt["phase"] != "prepared" or attempt["launch_intent_at"] is not None
+            or binding["attempt_id"] != attempt["attempt_id"]):
+        raise state.StateError("owner binding requires the original prepared attempt")
+    conn.execute("INSERT INTO execution_owners(job_id,binding) VALUES(?,?)",
+                 (job_id, canonical_bytes(binding).decode()))
+
 
 def get(conn: sqlite3.Connection, job_id: str):
     exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_attempts'").fetchone()
@@ -112,8 +145,11 @@ def cancel_intent(conn, job_id: str, reason: str) -> None:
     conn.execute("UPDATE execution_attempts SET cancel_reason=COALESCE(cancel_reason,?) WHERE job_id=?", (reason, job_id))
 
 
-def public(row) -> dict:
+def public(row, *, owner_binding=None) -> dict:
     value = dict(row)
     value["identity"] = json.loads(value["identity"])
     value["observation"] = json.loads(value["observation"]) if value["observation"] else None
+    if owner_binding is not None:
+        from .execution.persistent import public_binding
+        value["owner"] = public_binding(owner_binding)
     return value
