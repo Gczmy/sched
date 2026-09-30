@@ -28,19 +28,21 @@ daemon 通过认证绑定恢复查询；准备恢复不重放，取消与 durati
 持久确认队列。历史确认每轮最多 8 条，失败退避，不扫描已确认历史或删除 binding；
 覆盖一万条记录与确认提交故障。该实现已通过审查并合并到 `main`（`9056253`），
 [合并提交 CI](https://github.com/Gczmy/sched/actions/runs/36760744711) 已通过。
-0.2.1 写库 schema 7；正式发布和生产切换尚未执行。
+0.2.1 写库 schema 7；正式发布提交和产物以
+[GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 为准。
+生产切换独立安排。
 
 候选构建纳入公共 CI：Repository、Python 和 native 检查全部成功后，
 Python 3.10、3.14 分别从同一完整提交构建默认/native wheel，保存源码、安装说明、
 Release 草稿与带哈希和独立安装证据的 manifest。产物保留 30 天，不自动发布。
 下载验证和发布流程见 [execution-rollout.md](execution-rollout.md)。
 
+跨任务 `execution list` 与本机 `capabilities`、`daemon check --json` 已实现，
+新增版本化结果不修改 status/task/history 或现有逐任务 execution 契约。
+分页完整性、已记录状态与能力验证的语义见 [execution-api.md](execution-api.md)。
+
 ## 后续候选
 
-- 跨任务 execution 查询：按项目、批次和 owner 状态筛选，提供稳定分页，
-  保持只读、完整性标记与旧 schema 兼容，不在查询时连接或重建 owner。
-- 结构化 capability 和 daemon check 结果：供客户端判断 native 与内核能力，
-  在定义版本化 JSON 契约后复用现有检查，不根据展示文本判断可用性。
 - 更多平台能力：需明确 capabilities 和不支持时的拒绝语义，不回退到权限或
   文件绑定较弱的执行方式。
 - 配套客户端展示通用诊断：需单独增加 execution 查询与 UI，不改写 scheduler 语义。

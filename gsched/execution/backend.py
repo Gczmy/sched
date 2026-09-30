@@ -26,6 +26,10 @@ INTERFACE_VERSION = "sched-execution/v1"
 class BackendUnavailable(RuntimeError):
     """A requested backend is absent or lacks required kernel capabilities."""
 
+    def __init__(self, message="", *, reason="backend_unavailable"):
+        super().__init__(message)
+        self.reason = reason
+
 
 @dataclass(frozen=True)
 class ExecutionEnvelope:
@@ -344,17 +348,17 @@ class LinuxFdBackend:
 
     def __init__(self) -> None:
         if sys.platform != "linux":
-            raise BackendUnavailable("Linux FD backend requires Linux")
+            raise BackendUnavailable("Linux FD backend requires Linux", reason="non_linux")
         try:
             from . import _fdexec
         except ImportError as error:
-            raise BackendUnavailable("native backend is not explicitly built/installed") from error
+            raise BackendUnavailable("native backend is not explicitly built/installed", reason="native_unavailable") from error
         if _fdexec.interface_version != INTERFACE_VERSION:
-            raise BackendUnavailable("native execution interface version mismatch")
+            raise BackendUnavailable("native execution interface version mismatch", reason="native_interface_mismatch")
         try:
             _fdexec.check_capabilities()
         except OSError as error:
-            raise BackendUnavailable("kernel lacks required execveat/close_range support") from error
+            raise BackendUnavailable("kernel lacks required execveat/close_range support", reason="kernel_fd_exec_unavailable") from error
         self._module = _fdexec
 
     def prepare(self, envelope: ExecutionEnvelope, *, executable_fd: int,

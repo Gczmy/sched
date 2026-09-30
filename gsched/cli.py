@@ -1537,6 +1537,28 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_execution(args: argparse.Namespace) -> int:
+    if args.task == "list":
+        from .execution_queries import list_executions
+        if args.version is not None:
+            print("错误: execution list 不接受 --version", file=sys.stderr)
+            return 1
+        try:
+            with state.connect() as conn:
+                conn.execute("BEGIN")
+                batch = _resolve_batch_ref(args.batch, conn=conn) if args.batch else None
+                if args.batch and batch is None:
+                    raise ValueError("批次不存在")
+                output = list_executions(conn, project=args.project, batch=batch, backend=args.backend,
+                    phase=args.phase, owner_status=args.owner_status,
+                    limit=args.limit if args.limit is not None else 50, cursor=args.cursor)
+        except (ValueError, state.StateError) as error:
+            print(f"错误: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    if any(getattr(args, key, None) is not None for key in ("project", "batch", "backend", "phase", "owner_status", "limit", "cursor")):
+        print("错误: 列表筛选参数只用于 execution list", file=sys.stderr)
+        return 1
     from . import execution_state
     from .execution_diagnostics import legacy_session, summarize
     batch, task = _resolve_task_ref(args.task)
@@ -1578,6 +1600,17 @@ def cmd_execution(args: argparse.Namespace) -> int:
               "task_id": task, "attempts": attempts, "diagnostics": diagnostics,
               "legacy_sessions": legacy_sessions}
     print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    from .execution.capabilities import snapshot
+    result = snapshot()
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        for name, backend in result["backends"].items():
+            print(f"{name}: {backend['status']} ({backend['reason'] or ', '.join(backend['verified'])})")
     return 0
 
 
@@ -3607,8 +3640,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
 
     try:
-        if getattr(args, "json", False) and args.action != "status":
-            raise ValueError("--json 仅用于 daemon status")
+        if getattr(args, "json", False) and args.action not in ("status", "check"):
+            raise ValueError("--json 仅用于 daemon status/check")
         if getattr(args, "stop_when_idle", False) and args.action != "drain":
             raise ValueError("--stop-when-idle 仅用于 daemon drain")
         if args.action in ("drain", "resume"):
@@ -3649,12 +3682,18 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 print(daemon.status_str())
             return 0
         issues = daemon.check(fake=getattr(args, "fake", False))
-        failures = 0
+        failures = sum(issue["level"] == "fail" for issue in issues)
+        if getattr(args, "json", False):
+            import socket
+            print(json.dumps({"schema_version": 1, "query": "daemon_check", "sched_version": __version__,
+                "node": state.hostname(), "query_host": socket.gethostname(), "observed_at": time.time(),
+                "fake": bool(getattr(args, "fake", False)), "passed": failures == 0,
+                "summary": {level: sum(issue["level"] == level for issue in issues) for level in ("ok", "warn", "fail")},
+                "checks": issues}, ensure_ascii=False, indent=2))
+            return 1 if failures else 0
         for issue in issues:
             mark = {"ok": "✅", "warn": "⚠️", "fail": "❌"}[issue["level"]]
             print(f"  {mark} {issue['item']}: {issue['detail']}")
-            if issue["level"] == "fail":
-                failures += 1
         print(f"\n{failures} 项 FAIL" if failures else "\n全部通过 ✅")
         return 1 if failures else 0
     except Exception as error:
@@ -4325,10 +4364,22 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("execution", help="通用执行尝试与原始退出事实")
-    p.add_argument("task", help="<batch>:<task>")
+    p.add_argument("task", help="<batch>:<task> 或 list")
     p.add_argument("--version", type=int)
     p.add_argument("--json", action="store_true")
+    from .execution_queries import PHASES, OWNER_STATES
+    p.add_argument("--project")
+    p.add_argument("--batch")
+    p.add_argument("--backend")
+    p.add_argument("--phase", choices=PHASES)
+    p.add_argument("--owner-status", choices=OWNER_STATES)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--cursor")
     p.set_defaults(fn=cmd_execution)
+
+    p = sub.add_parser("capabilities", help="本机 execution 能力检查，不读取配置或状态库")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_capabilities)
 
     p = sub.add_parser("task", help="单任务详情")
     p.add_argument("task", help="<batch>:<task>")
@@ -4456,7 +4507,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("daemon", help="daemon 生命周期")
     p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume"])
-    p.add_argument("--json", action="store_true", help="status: 结构化只读健康状态")
+    p.add_argument("--json", action="store_true", help="status/check: 结构化健康状态或前置检查")
     p.add_argument("--stop-when-idle", action="store_true", help="drain: running 清空后退出，保留 pending")
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
     p.set_defaults(fn=cmd_daemon)
@@ -4486,6 +4537,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
+    if command == "capabilities":
+        return args.fn(args)
     daemon_action = getattr(args, "action", None) if command == "daemon" else None
     daemon_write_action = daemon_action
     if command == "request":

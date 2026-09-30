@@ -83,6 +83,15 @@ def main():
             observed = run([str(installed / "bin/sched"), "--version"], unrelated, runtime).strip()
             require(observed == "sched " + package_version, "installed CLI version mismatch")
             run([str(installed / "bin/sched"), "--help"], unrelated, runtime)
+            capability_evidence = None
+            if (source / "gsched/execution/capabilities.py").is_file():
+                capabilities = json.loads(run([str(installed / "bin/sched"), "capabilities", "--json"], unrelated, runtime))
+                capability_evidence = {k: v["status"] for k, v in capabilities["backends"].items()}
+                require(capability_evidence["subprocess"] == "available", "ordinary capability unavailable")
+                require(capability_evidence["linux_fd"] == ("available" if native else "unavailable"),
+                        "installed native capability mismatch")
+                require(capability_evidence["linux_fd_owner"] == ("available" if native else "unavailable"),
+                        "installed owner capability mismatch")
             probe = "import json,gsched; from gsched import state; print(json.dumps({'version':gsched.__version__,'schema':state.DB_SCHEMA_VERSION,'file':gsched.__file__})); "
             probe += "from gsched.execution import LinuxFdBackend,BackendUnavailable; "
             probe += "LinuxFdBackend()" if native else "\ntry: LinuxFdBackend()\nexcept BackendUnavailable: pass\nelse: raise AssertionError('unexpected native')"
@@ -112,11 +121,16 @@ owner.close();prepared.close()
 """], unrelated, runtime)
             evidence.append({"wheel": wheel.name, "native": native, "independent_install": True,
                              "cli_version": "sched " + package_version, "original_owner_wait": native})
+            if capability_evidence is not None:
+                evidence[-1]["capability_preflight"] = capability_evidence
             print("PASS:", label, "candidate installs independently", flush=True)
         release_notes = source / "docs" / "releases" / (package_version + ".md")
         if release_notes.is_file():
+            release_text = release_notes.read_text(encoding="utf-8").replace(
+                "(../execution-rollout.md)",
+                f"(https://github.com/Gczmy/sched/blob/{commit}/docs/execution-rollout.md)")
             (destination / "RELEASE_NOTES.md").write_text(
-                f"Source commit: `{commit}`.\n\n" + release_notes.read_text(encoding="utf-8"), encoding="utf-8")
+                f"Source commit: `{commit}`.\n\n" + release_text, encoding="utf-8")
     notes = destination / "INSTALL.md"
     notes.write_text(f"""# sched {package_version} candidate
 
