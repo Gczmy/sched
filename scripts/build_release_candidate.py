@@ -126,8 +126,11 @@ owner.close();prepared.close()
             print("PASS:", label, "candidate installs independently", flush=True)
         release_notes = source / "docs" / "releases" / (package_version + ".md")
         if release_notes.is_file():
+            release_text = release_notes.read_text(encoding="utf-8").replace(
+                "(../execution-rollout.md)",
+                f"(https://github.com/Gczmy/sched/blob/{commit}/docs/execution-rollout.md)")
             (destination / "RELEASE_NOTES.md").write_text(
-                f"Source commit: `{commit}`.\n\n" + release_notes.read_text(encoding="utf-8"), encoding="utf-8")
+                f"Source commit: `{commit}`.\n\n" + release_text, encoding="utf-8")
     notes = destination / "INSTALL.md"
     notes.write_text(f"""# sched {package_version} candidate
 

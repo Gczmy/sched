@@ -144,3 +144,46 @@ class ExecutionQueryTests(TempStateCase):
         code, text, error = self.capture(cli.cmd_execution, args)
         self.assertEqual(0, code, error)
         self.assertEqual("work", json.loads(text)["task_id"])
+
+    def test_schema6_owner_health_is_unknown_without_creating_operations(self):
+        self.attempted(1, owner=True)
+        with state.connect() as conn:
+            conn.execute("DROP TABLE execution_owner_operations")
+            conn.execute("PRAGMA user_version=6")
+        state.set_query_only(True)
+        try:
+            result = self.query(owner_status="unknown")
+            self.assertEqual(6, result["database_schema"])
+            health = result["items"][0]["attempt"]["owner_health"]
+            self.assertEqual("unknown", health["cleanup_state"])
+            self.assertIsNone(health["acknowledged_at"])
+            self.assertFalse(result["items"][0]["diagnostics"]["wait_result_available"])
+        finally:
+            state.set_query_only(False)
+        with state.connect() as conn:
+            self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE name='execution_owner_operations'").fetchone())
+
+    def test_schema2_legacy_session_hides_paths_and_preserves_unknown_wait(self):
+        job = self.seed_batch()
+        with state.connect() as conn:
+            conn.execute("INSERT INTO native_sessions(session_id,job_id,job_version,evaluation_domain,owner_kind,"
+                "profile_id,profile_sha256,project_root_path,project_root_identity_sha256,log_relative_path,phase,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("0" * 32, job, 1, "isolated_integration", "unbound",
+                "example", "1" * 64, "/opt/example/private-record", "2" * 64, "private-record.log", "reserved", state.now()))
+            for table in ("execution_owner_operations", "execution_owners", "execution_attempts"):
+                conn.execute("DROP TABLE " + table)
+            conn.execute("DROP TRIGGER native_session_monitor_launch_immutable")
+            conn.execute("ALTER TABLE native_sessions DROP COLUMN monitor_launch_attempted_at")
+            conn.execute("ALTER TABLE native_sessions DROP COLUMN log_attempted_at")
+            conn.execute("PRAGMA user_version=2")
+        state.set_query_only(True)
+        try:
+            result = self.query(phase="reserved")
+            self.assertEqual(2, result["database_schema"])
+            item = result["items"][0]
+            self.assertIsNone(item["legacy_session"]["log_attempted_at"])
+            self.assertEqual("legacy_wait_unavailable", item["diagnostics"]["uncertainty_reason"])
+            self.assertTrue(item["diagnostics"]["replay_blocked"])
+            self.assertNotIn("private-record", json.dumps(result))
+        finally:
+            state.set_query_only(False)
