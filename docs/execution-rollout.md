@@ -2,30 +2,63 @@
 
 本清单用于交付准备。当前生产版本、配置和运行状态尚未查询；执行本清单前须取得对应部署授权。
 
+0.2.1 运维实现已合并到 `main`（`9056253`），
+[合并提交 CI](https://github.com/Gczmy/sched/actions/runs/36760744711) 已通过。
+正式 Release、发布标签与生产切换均尚未执行。
+
 ## 发布验收
 
-- 确认 PR 的 Repository、Python 3.10、Python 3.14 和 Optional Linux native 检查全部通过。
+- 确认最终提交的 Repository、Python 3.10、Python 3.14、Optional Linux native 和两个 Candidate 检查全部通过。
 - 默认 wheel 不含 native extension，也没有第三方运行时依赖；native wheel 从本仓源码独立构建。
 - 记录合并提交、wheel SHA-256、Python ABI 和构建方式。配套客户端仍通过公开 CLI 使用调度器。
 
 候选产物必须从固定提交的独立源码副本构建，忽略本地 `.so`、测试状态与运行配置。
-默认产物为 `sched-0.2.0-py3-none-any.whl`；native wheel 的 ABI/平台以实际构建结果为准。
-0.2.1 运维候选使用不同版本与独立目录，不能将未合并分支包标为 0.2.0 合并发布。
-候选目录保存 `manifest.json`、源码归档、两种 wheel 和安装说明；manifest 记录完整
-commit、构建 Python/平台、各文件 SHA-256。发布标签应指向最终验收提交，不能只凭包版本
+当前默认产物为 `sched-0.2.1-py3-none-any.whl`；native wheel 的 ABI/平台以实际构建结果为准。
+候选目录保存 `manifest.json`、源码归档、两种 wheel、安装说明和 `RELEASE_NOTES.md`；
+manifest 记录完整 commit、构建 Python/平台、各文件 SHA-256 与独立安装证据。
+发布标签应指向最终验收提交，不能只凭包版本
 判断新旧源码；本轮只准备候选，不创建发布标签或切换实例。
+
+## CI 产物与下载验证
+
+所有 job 使用同一源码提交：PR 使用 head SHA，push 和手动运行使用事件 SHA。
+只有 Repository、Python 和 native 三组检查全部成功后，Candidate job 才开始。
+Python 3.10、3.14 各保存一份产物，名称含完整提交、Python 版本和运行 attempt，
+保留 30 天，不覆盖已有 artifact。每份包含默认 wheel 与对应 ABI 的 native wheel；
+两份中的默认 wheel 不要求逐字节一致，分别以各自 manifest 的哈希为准。
+
+manifest 的 `ci` 只保存公开的仓库、事件、源码/工作流提交、run 链接和前置 job 结果，
+不会把构建中的整次 workflow 标为成功。整次 run 完成后，另查最终结果；上传成功的
+artifact ID、URL、归档 SHA-256 和 manifest SHA-256 记录在 job summary。
+下载归档时先与 GitHub 记录的 artifact digest 核对；解包后使用已审查源码中的校验器：
+
+```bash
+python scripts/verify_release_candidate.py <candidate-directory> --commit <reviewed-full-commit> --require-ci
+```
+
+预期提交必须从已审查的 PR 或最终 `main` 独立选定，不能从待验 manifest 自行取值。
+校验器只读文件，不要求 Linux 或 native 模块；检查文件集合、哈希、归档提交、源码版本/
+schema、wheel 元数据/ABI 与安装证据。它不替代对 GitHub run 最终结果的核对。
+PR 产物对应该分支提交；合并后须使用新 `main` 提交的 CI 产物准备正式发布。
+CI 产物会过期，正式发布前须取得独立授权并保存已验收包、摘要与对应 CI 记录。
+
+## 本地候选
 
 在具备开发构建工具的本地 Linux 环境运行以下命令，可从指定完整提交生成并验证候选：
 
 ```bash
 python scripts/build_release_candidate.py --commit <full-40-character-commit> --native
+python scripts/verify_release_candidate.py dist/candidate-<commit-prefix> --commit <full-40-character-commit>
 ```
 
 脚本通过 `git archive` 获取固定源码，分别构建和独立安装两种 wheel，并实际验证
 持久 owner 的原始 wait。产物位于 `dist/candidate-<commit-prefix>`，已有目录拒绝覆盖。
-在 manifest 中附加该提交对应的 CI 证据后，再由维护者明确授权正式发布。
-默认 wheel 适用于 Python >= 3.10；本地已验证的 native 候选为 CPython 3.10/Linux x86_64，
-不声明 manylinux 通用兼容。其他 ABI 须单独构建、安装验收并记录；不能复用 cp310 wheel。
+本地构建不冒充 CI 产物，正式发布仍须核对该提交对应的完整 CI 并取得明确授权。
+开发构建工具版本见 workflow；它们不成为运行时依赖。
+默认 wheel 要求 Python >= 3.10，调度执行仍要求 Linux/POSIX。
+CI native 候选分别为 CPython 3.10、3.14/Linux x86_64，runner 为 Ubuntu 24.04；
+实际 libc 和 SOABI 写入各自 manifest，不声明 manylinux 通用兼容。
+其他 ABI 或 Linux 基础环境须单独构建、安装验收并记录；不能复用不匹配的 wheel。
 
 安装后从无关目录验证 `sched --version`、`sched --help` 和 native 能力。默认安装不需要
 编译器；native 安装须选择匹配解释器 ABI 的 wheel。两种安装都不需要客户仓库。
@@ -53,7 +86,7 @@ python scripts/build_release_candidate.py --commit <full-40-character-commit> --
 ## 回退边界
 
 切换前保留旧安装、原配置和经正式备份流程取得的恢复点。
-0.2.0 将写库 schema 升至 6，新增不可变 owner binding；0.2.1 候选升至 7，
+0.2.0 将写库 schema 升至 6，新增不可变 owner binding；当前 0.2.1 升至 7，
 新增确认队列与已记录健康。对应只读范围分别为 1–6 和 1–7。
 旧版本不能被假定为兼容新写库。回退须在 daemon 排空后，
 依据实际 schema 兼容性与已审查恢复方案执行，不能直接将旧代码覆盖到新库上。

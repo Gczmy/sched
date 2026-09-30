@@ -12,6 +12,9 @@
   existing bindings once without replaying attempts or deleting their history.
 - Add a fixed-commit candidate builder with independent default/native installs,
   source and wheel hashes, ABI evidence and installation/rollback notes.
+- Save immutable CI candidate artifacts for Python 3.10 and 3.14 after all prerequisite
+  checks pass. Bind checks and builds to the same source commit, record public CI
+  evidence, and verify downloaded packets against an independently selected commit.
 
 ## 0.2.0 (candidate)
 

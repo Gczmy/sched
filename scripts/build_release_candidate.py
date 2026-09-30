@@ -17,6 +17,8 @@ import sysconfig
 import tempfile
 import zipfile
 
+from verify_release_candidate import ci_evidence, require, verify_candidate
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -38,6 +40,8 @@ def main():
         parser.error("candidate installation verification requires local Linux")
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1")
     commit = run(["git", "rev-parse", args.commit + "^{commit}"], ROOT, env).strip()
+    head = run(["git", "rev-parse", "HEAD"], ROOT, env).strip()
+    ci = ci_evidence(commit, env, head)
     destination = ROOT / "dist" / ("candidate-" + commit[:7])
     destination.mkdir(parents=True, exist_ok=False)
     archive = destination / ("sched-" + commit[:7] + "-source.zip")
@@ -63,12 +67,12 @@ def main():
             wheel = next(dist.glob("*.whl"))
             with zipfile.ZipFile(wheel) as zipped:
                 files = zipped.namelist()
-                assert bool([n for n in files if n.endswith((".so", ".pyd"))]) is native
+                require(bool([n for n in files if n.endswith((".so", ".pyd"))]) is native, "incorrect wheel variant")
                 metadata = BytesParser().parsebytes(zipped.read(next(n for n in files if n.endswith("/METADATA"))))
-                assert metadata["Name"] == "sched"
-                assert not [v for v in metadata.get_all("Requires-Dist", []) if "extra ==" not in v]
+                require(metadata["Name"] == "sched", "incorrect package name")
+                require(not [v for v in metadata.get_all("Requires-Dist", []) if "extra ==" not in v], "runtime dependency")
                 if package_version is not None:
-                    assert package_version == metadata["Version"]
+                    require(package_version == metadata["Version"], "wheel version mismatch")
                 package_version = metadata["Version"]
             shutil.copy2(wheel, destination / wheel.name)
             installed = root / (label + "-installed")
@@ -77,13 +81,16 @@ def main():
             runtime = {k: v for k, v in env.items() if not k.startswith("SCHED_")}
             runtime["PYTHONPATH"] = str(installed)
             observed = run([str(installed / "bin/sched"), "--version"], unrelated, runtime).strip()
-            assert observed == "sched " + package_version
+            require(observed == "sched " + package_version, "installed CLI version mismatch")
             run([str(installed / "bin/sched"), "--help"], unrelated, runtime)
             probe = "import json,gsched; from gsched import state; print(json.dumps({'version':gsched.__version__,'schema':state.DB_SCHEMA_VERSION,'file':gsched.__file__})); "
             probe += "from gsched.execution import LinuxFdBackend,BackendUnavailable; "
             probe += "LinuxFdBackend()" if native else "\ntry: LinuxFdBackend()\nexcept BackendUnavailable: pass\nelse: raise AssertionError('unexpected native')"
             observed = json.loads(run([sys.executable, "-c", probe], unrelated, runtime))
-            assert observed["version"] == package_version and Path(observed["file"]).is_relative_to(installed)
+            require(observed["version"] == package_version and Path(observed["file"]).is_relative_to(installed),
+                    "installation imported a different source tree")
+            if database_schema is not None:
+                require(database_schema == observed["schema"], "installed database schema mismatch")
             database_schema = observed["schema"]
             if native:
                 run([sys.executable, "-c", """
@@ -99,16 +106,23 @@ finally:
     os.close(executable);os.close(cwd)
 owner=prepared.launch()
 observation=PersistentOwner(owner.binding).wait(10)
-assert observation.returncode==0 and observation.group_clean is True and observation.rusage is not None
+if not (observation.returncode==0 and observation.group_clean is True and observation.rusage is not None):
+    raise RuntimeError('original owner wait failed')
 owner.close();prepared.close()
 """], unrelated, runtime)
             evidence.append({"wheel": wheel.name, "native": native, "independent_install": True,
-                             "cli_version": "sched " + package_version})
+                             "cli_version": "sched " + package_version, "original_owner_wait": native})
             print("PASS:", label, "candidate installs independently", flush=True)
+        release_notes = source / "docs" / "releases" / (package_version + ".md")
+        if release_notes.is_file():
+            (destination / "RELEASE_NOTES.md").write_text(
+                f"Source commit: `{commit}`.\n\n" + release_notes.read_text(encoding="utf-8"), encoding="utf-8")
     notes = destination / "INSTALL.md"
     notes.write_text(f"""# sched {package_version} candidate
 
-Source commit: `{commit}`. Verify files against `manifest.json`.
+Source commit: `{commit}`. Select the expected commit independently from the reviewed PR/main.
+Use `scripts/verify_release_candidate.py <directory> --commit <full-commit>` from that source.
+For CI artifacts add `--require-ci` and inspect the linked run's final result and artifact digest.
 This directory is a candidate; no release tag, publication or deployment was performed.
 
 The default wheel needs Python >= 3.10 and no compiler or runtime dependencies.
@@ -138,7 +152,10 @@ installation used by live owners. `linux_fd_owner` needs explicit FD4 owner-wrap
                 "files": files,
                 "independent_installations": evidence,
                 "build_tools": {n: tool_version(n) for n in ("setuptools", "wheel", "pip", "packaging")}}
+    if ci is not None:
+        manifest["ci"] = ci
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    verify_candidate(destination, commit, require_ci=ci is not None)
     print(json.dumps({"directory": str(destination), "commit": commit, "version": package_version}), flush=True)
 
 
