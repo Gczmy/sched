@@ -135,8 +135,9 @@ cancel reason 和时间；没有发生通用尝试的任务返回空数组。
 `last_observed_at`、`cleanup_state`、`cleanup_attempts`、`retry_after`、
 `last_cleanup_at`、`cleanup_error`、`acknowledged_at` 和 `acknowledgement`。
 连接值为 `unknown/responsive/unreachable/lost`；确认状态为 `active/pending/acknowledged`，
-旧库无记录时为 `unknown`，其余字段为 null。`retry_after` 是 Unix 秒，其他时间为 UTC
-记录时间。错误为 `owner_unreachable/owner_rejected/close_timeout` 或 null；确认结果为
+旧库无记录时为 `unknown`，其余字段为 null。`retry_after` 是 Unix 秒，其他时间沿用
+调度节点的 `YYYY-MM-DD HH:MM:SS` 记录格式，不含时区。错误为
+`owner_unreachable/owner_rejected/close_timeout` 或 null；确认结果为
 `closed/owner_lost` 或 null。查询不探测服务，记录可能过期；确认状态与下面 diagnostics
 的进程组 `cleanup_state` 含义不同，确认元数据不改变原始 wait/rusage。
 只读诊断另有 `diagnostics` 和 `legacy_sessions` 数组，按 job version 升序排列；
