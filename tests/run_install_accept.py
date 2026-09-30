@@ -59,6 +59,8 @@ def main():
                  "--disable-pip-version-check", "--target", str(target), str(wheel)])
             runtime_env = {key: value for key, value in env.items() if not key.startswith("SCHED_")}
             runtime_env["PYTHONPATH"] = str(target)
+            observed_version = run([str(target / "bin/sched"), "--version"], cwd=unrelated, environment=runtime_env)
+            assert observed_version.strip() == "sched " + metadata["Version"]
             run([str(target / "bin/sched"), "--help"], cwd=unrelated, environment=runtime_env)
             probe = (
                 "import json,pathlib,gsched; from gsched.execution import LinuxFdBackend,BackendUnavailable; "

@@ -2,6 +2,7 @@
 
 ## 0.2.0 (candidate)
 
+- Add `sched --version` for installation and release verification without opening state.
 - Add the opt-in `linux_fd_owner` backend. An independent original child owner
   survives daemon crashes, authenticates reconnects and reports its actual wait,
   rusage and process-group cleanup. Recovery never launches a replacement child.

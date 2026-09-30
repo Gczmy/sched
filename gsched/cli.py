@@ -4255,6 +4255,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
     )
+    ap.add_argument("--version", action="version", version=f"sched {__version__}")
     # Keep the parser's routing key separate from subcommand payload fields.
     # `run` intentionally exposes a positional `cmd` remainder; reusing that
     # name for the selected subcommand replaces "run" with a list and breaks
