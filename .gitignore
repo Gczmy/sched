@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 *.egg-info/
+/build/
+/dist/
+/gsched/execution/_fdexec*.so
+/gsched/execution/_fdexec*.pyd
 .omc/
 tmp/
 

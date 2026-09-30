@@ -30,6 +30,10 @@ jobs:
           python-version: "3.12"
       - name: Check scanner against synthetic Git repositories
         run: python -m unittest discover -s scripts -p test_repository_check.py -v
+      - name: Check execution boundary scanner
+        run: python -m unittest discover -s scripts -p test_execution_boundary.py -v
+      - name: Check runtime and required-test independence
+        run: python scripts/check_execution_boundary.py
       - name: Check privacy, Markdown references and commit whitespace
         env:
           DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -53,7 +57,6 @@ jobs:
         python: ["3.10", "3.14"]
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-      M2B_STEP5E_CONTRACT_ROOT: ""
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -64,11 +67,44 @@ jobs:
       - run: python -m pip install -e '.[test]'
       - name: Public Linux regression suite
         run: python -m pytest -q -rs tests
+      - name: Independent default wheel installation without a compiler
+        if: matrix.python == '3.10'
+        run: |
+          python -m pip install 'setuptools>=61' wheel
+          python tests/run_install_accept.py
       - name: CPU acceptance and CLI contracts
         if: matrix.python == '3.10'
         run: |
-          python tests/run_native_integration_accept.py
+          python tests/run_execution_accept.py
           python tests/run_host_resources_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh
+
+  native:
+    name: Optional Linux native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      SCHED_BUILD_NATIVE: "1"
+      SCHED_REQUIRE_NATIVE: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - name: Build native from this repository
+        run: python -m pip install -e '.[test]'
+      - name: Require native backend availability
+        run: python -c 'from gsched.execution import LinuxFdBackend; LinuxFdBackend()'
+      - name: Independent native and subsequent default wheel installations
+        run: |
+          python -m pip install 'setuptools>=61' wheel
+          python tests/run_install_accept.py --native
+      - name: Independent native and scheduler regression suite
+        run: python -m pytest -q -rs tests
+      - name: Public execution CLI lifecycle
+        run: python tests/run_execution_accept.py

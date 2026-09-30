@@ -1,0 +1,38 @@
+# execution v1 发布与部署清单
+
+本清单用于交付准备。当前生产版本、配置和运行状态尚未查询；执行本清单前须取得对应部署授权。
+
+## 发布验收
+
+- 确认 PR 的 Repository、Python 3.10、Python 3.14 和 Optional Linux native 检查全部通过。
+- 默认 wheel 不含 native extension，也没有第三方运行时依赖；native wheel 从本仓源码独立构建。
+- 记录合并提交、wheel SHA-256、Python ABI 和构建方式。配套客户端仍通过公开 CLI 使用调度器。
+
+## 切换前核对
+
+通过已部署 CLI 的 `--version`、`config get`、`status --json`、`history --json`、
+`task <full-batch-id>:<task-id> --json` 和 `daemon status --json` 核对版本、配置和任务。
+真实配置、节点、任务名称与检查结果保存为私有运行记录，不加入本仓。
+
+旧 `strict` 和 native metadata 不会在新版本继续执行。切换前须处理旧队列与未解决启动，
+不能通过 retry、clean、删除记录或重建名称绕过兼容守卫。如果现有 CLI 无法证明旧 session
+状态，应先补充只读查询能力，再安排切换；不得直接读取共享源库或修改 state 文件。
+
+## 维护窗口
+
+登录统一使用 `ssh HPDC`；进入经实查确认的计算节点会话，核对主机与 `config.node`。
+按项目操作规则由获授权的维护者执行 `daemon drain --stop-when-idle`，等待 running 与未决启动
+清空、daemon 自然退出。`stop` 会取消任务，不能用它代替排空。
+
+在独立版本目录安装已验收产物。仅在计算节点执行 `daemon check`；通过后再执行
+`daemon resume` 和 `daemon start`，使用 CLI 检查健康与队列，运行另行授权的隔离 CPU 验收。
+配置 backend 前审查 ELF、固定 argv/env、项目 root 与输入 slot，注册值均为冷配置。
+
+## 回退边界
+
+切换前保留旧安装、原配置和经正式备份流程取得的恢复点。
+新版本会将写库 schema 升至 5；旧版本不能被假定为兼容新写库。回退须在 daemon 排空后，
+依据实际 schema 兼容性与已审查恢复方案执行，不能直接将旧代码覆盖到新库上。
+任何已消费或结果未知的 execution attempt 都必须继续保留，不能因回退再次启动。
+
+客户协议和科学验收由客户仓库独立发布；进程退出 0 不代表科学验证通过。

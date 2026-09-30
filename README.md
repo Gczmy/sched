@@ -143,7 +143,7 @@ preview currently requires an existing readable state database.
 {
   "name": "my_batch",                       // safe ASCII identifier, 1..128 chars
   "project": "vision",                      // required; must exist in config.projects
-  "mode": "mix",                            // default; strict is admin-profile-only
+  "mode": "mix",                            // default; legacy strict is not admitted
   "priority": 5,                            // larger integer is considered first; default 0
   "cwd": "{PROJECT:vision}",                // supports {PROJECT:name}/{ROOT}/{VENV:key}
   "env": {"NN_NO_CUDNN": "1"},              // string-valued batch environment (optional)
@@ -179,91 +179,22 @@ Template variables: `{ROOT}` = `default_project` root; `{PROJECT:<name>}` = expl
 
 Batch/task/dependency identifiers must match `[A-Za-z0-9][A-Za-z0-9._-]*` (not `.` or `..`). A `runtime` selects exactly one of `venv_alias`, `conda_env`, or `prefix`, and must resolve at submission. Unsupported batch `gpus`, task/stage `retry_transform`, and stage-level `probes` are rejected; put GPU demand in `resources.gpu` and probes at task level.
 
-The M2B components remain experimental; see [integration scope and external test dependencies](docs/native-integration.md). V2 submission and the FD-exec backend remain unavailable.
+The public execution interface registers a fixed executable, argument list,
+environment and allowed input FDs through administrator-owned cold configuration.
+The scheduler owns resources, launch and cancellation intents, child wait and cleanup;
+the external program owns its application protocol and result meaning.
+See [execution API](docs/execution-api.md) and [repository boundaries](docs/execution-boundary.md).
 
-Legacy V1 `mode: "strict"` is a deployment-only direct-exec path. It is accepted only
-when one cold `config.native_exec_profiles` entry exactly matches
-`(mode, project, batch_name, task_id, submitted_argv)`. The task must contain
-one `cmd`, use a normalized absolute executable, run from the configured
-project root, use exactly CPU-only `resources: {"gpu":0,"cpus":1}`, have empty
-batch/task `env`, omit `stages`, `sweep`, and `runtime`, and explicitly set
-`git: false` and `max_retry: 0`; scheduler artifact skip/cleanup rules and log
-probes are forbidden. Requiring `git: false` prevents a PATH-resolved Git
-subprocess from running before the reviewed native verifier; code-byte binding
-belongs to that verifier instead.
-The profile reserves its batch name from every mix path, including `sched run`,
-and consumes it permanently on the first durable strict insert, regardless of
-terminal status. A fresh submit, retry, resubmit, or automatic restart replay
-is rejected. An inbox redelivery with the same batch id is idempotent only when
-the durable immutable batch/task/job binding is an exact match; a same-name
-preclaim or persisted drift is rejected.
+The default subprocess installation requires no compiler or other repository.
+The optional Linux native backend is built entirely from this repository with
+`SCHED_BUILD_NATIVE=1`. Project programs run as child processes; the daemon does
+not import project adapters, dynamically load project Python modules or accept
+extensions injected into the `gsched` namespace.
 
-The scheduler persists both the profile digest and a canonical project-root
-device/inode digest, includes both in the fingerprint, and re-attests them
-before claiming the job. Referenced project roots and the profile registry are
-cold; hot changes are rejected. Native launch starts from an empty inherited
-environment, adds scheduler-owned identity/control keys and an empty
-`CUDA_VISIBLE_DEVICES`, and invokes the argv directly without the Bash/RC
-supervisor. Only an exit code from the exact `Popen` retained by the current
-daemon can complete successfully; after daemon authority is lost, the consumed
-job blocks instead of trusting an RC sidecar or replaying.
-
-This path is deliberately only a launcher foundation. It does **not** make
-pathname execution byte/FD exact or close the re-attestation-to-`Popen` TOCTOU
-window. The external retained-FD verifier/monitor and seven-field attestation
-are still required before formal execution. The current strict schema also
-rejects all user env, so the dedicated seven-field poison-overwrite probe is not
-yet runnable; its exact cold-profile exception belongs with that verifier.
-
-The explicitly versioned `sched_native_exec_profile_v2` is only that frozen
-batch compatibility validator. It exact-binds the public root/task keysets and
-values, including raw `{PROJECT:...}` cwd, empty dependencies, `_protocol`,
-non-empty batch env, empty task env, prefix runtime, integer duration, zero
-retry, raw CPU resources, empty artifacts, absent public task `git`, and the
-unchanged logical argv. A matching V2 batch is rejected by both local submit
-and daemon inbox handling before dependency/fingerprint work, durable batch or
-name consumption, running claim, or process creation. V2 currently persists
-nothing, has no launch-time re-attestation, and does not authorize `Popen`;
-those properties remain work for the retained/bootstrap launcher step.
-
-The next interface is present only as a fail-closed plan foundation. A private
-one-shot `NativeLaunchPlan` owns revalidated copies of a retained launcher FD,
-fully sealed request memfd, connected AF_UNIX stream control FD, retained
-project-root directory FD, and append-only log FD. The request copy has an
-independent zero offset; the root must be `O_RDONLY` and not `O_PATH`; and the
-single-link log FD must match a symlink-free relative path below the retained
-root's `logs/` directory. Its actual entry contract is fixed to argv
-`("m2b-exec-monitor[native-entry-v1]", "--native-entry-v1")`, an empty
-environment, and child request/control/root descriptors 3/4/5; the logical
-submitted argv is evidence inside the plan and is never appended to or used as
-the actual argv. The request body remains opaque and non-authoritative. The
-private generated/no-data `NativeStep5DNoDataLaunchOwner` adapter now creates
-the AF_UNIX socketpair itself, supplies only the native-side endpoint to the
-plan factory, immediately closes that source endpoint, and privately retains
-the peer endpoint in the creating process without a raw-FD or transfer API. It
-fixes the intended endpoint-construction shape but does not authenticate a
-scheduler role or claim that exclusive ownership can be inferred by the native
-peer. The plan names the SHA-256 of the complete sealed frame exclusively as
-`request_frame_sha256` and separately names the SHA-256 of its opaque body as
-`request_body_sha256`; the ambiguous `request_sha256` alias does not exist.
-`Executor.launch_native(plan)` currently closes the plan and fails before
-process creation because the Linux FD-exec backend is not yet connected. V2
-submission remains blocked as described above. The adapter has no launch,
-control-protocol, nonce, publication, or daemon route; atomic final
-validate/map/FD-exec and the reviewed real direct-parent lifecycle remain hard
-prerequisites for connecting that backend.
-
-`gsched.native_step5d_alignment.foundation_alignment_projection()` exposes a
-read-only, JSON-compatible
-`digest_and_direct_parent_endpoint_foundation_only` declaration derived from
-production launch constants, plan/owner slots, private factory signatures,
-and authority flags. It explicitly records canonical request construction,
-owner-lifetime nonce handling, the control protocol, and isolated runtime as
-`unimplemented`, with `step5d_complete=false`. The declaration imports no
-project protocol, creates no endpoint, and adds no launch, send, or daemon API;
-the main-repository validator independently reconstructs and traces the
-production foundation before accepting equality. This is an alignment aid,
-not completion evidence.
+New `mode: "strict"` submissions and old native input fields are rejected.
+Historical persisted records retain conservative compatibility guards; unresolved
+launches are not replayed. See [legacy compatibility](docs/native-integration.md).
+Customer research contracts and scientific acceptance belong to the customer repository.
 
 ## State Machine
 

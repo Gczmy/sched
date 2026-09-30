@@ -27,7 +27,8 @@ import time
 from datetime import datetime
 from typing import Any
 
-from . import notify, state
+from . import notify, state, execution_state
+from dataclasses import asdict
 from .artifacts import (
     bounded_regex_last_match,
     check_artifacts,
@@ -47,15 +48,19 @@ from .executor import (
 from .fingerprint import compute_fingerprint
 from .config import ConfigError, config_path, default_state_dir, load_config, parse_gpus, resolve_template, task_environment, project_gpu_enabled
 from .schema import SchemaError, validate_batch, validate_persisted_dependencies, validate_project_gpu_access
-from .native_exec import (
+from ._legacy_execution import (
+    NATIVE_EXEC_ALL_INTERNAL_FIELDS,
     NATIVE_EXEC_PROFILE_V2_SCHEMA,
     NATIVE_EXEC_V2_CONTRACT_FIELD,
     NativeExecProfileError,
-    native_exec_project_roots,
-    native_exec_project_root_identity_sha256,
-    reattest_native_exec_profile,
+    native_exec_project_roots as _legacy_project_roots,
 )
-from .native_launch import NativeLaunchUnavailable
+from .execution_policy import ExecutionPolicyError, revalidate_binding
+from .execution_policy import digest as execution_digest, project_roots as _execution_project_roots
+
+def native_exec_project_roots(cfg):
+    return {**_legacy_project_roots(cfg), **_execution_project_roots(cfg)}
+
 from .templates import expand_cmd
 
 POLL_SEC = 10
@@ -203,6 +208,8 @@ def _native_exec_metadata(spec: dict) -> dict[str, Any] | None:
 
 
 def _native_exec_fingerprint_kwargs(spec: dict) -> dict[str, str]:
+    if isinstance(spec.get("_execution_binding"), dict):
+        return {"execution_binding_sha256": execution_digest(spec["_execution_binding"])}
     """Bind complete native profile/root identity into fingerprints."""
     digest = spec.get("_native_exec_profile_sha256")
     root_digest = spec.get("_native_exec_project_root_identity_sha256")
@@ -215,6 +222,9 @@ def _native_exec_fingerprint_kwargs(spec: dict) -> dict[str, str]:
 
 
 def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
+    if source.get("execution") is not None:
+        destination["execution"] = source["execution"]
+        destination["_execution_binding"] = source["_execution_binding"]
     """Copy only a complete schema-issued native tuple into task storage."""
     metadata = _native_exec_metadata(source)
     if metadata is not None:
@@ -360,7 +370,7 @@ CONFIG_COLD_KEYS = (
     "state_dir",
     "user",
     "schema_version",
-    "native_exec_profiles",
+    "native_exec_profiles", "execution_backends",
 )
 
 
@@ -807,7 +817,9 @@ class Dispatcher:
         while True:
             states = {
                 str(job["id"]): (
-                    self._job_process_state(job) if job["pgid"] else "dead"
+                    self._job_process_state(job)
+                    if job["pgid"] or self.executor.configured_owner(job["id"]) is not None
+                    else "dead"
                 )
                 for job in jobs
             }
@@ -842,6 +854,10 @@ class Dispatcher:
                     row["job_id"]
                     for row in conn.execute("SELECT job_id FROM native_sessions")
                 }
+                for row in rows:
+                    if execution_state.get(conn, row["id"]) is not None:
+                        state.update_job(conn, row["id"], kill_reason="cancelled")
+                        execution_state.cancel_intent(conn, row["id"], "cancelled")
         except sqlite3.Error as error:
             self.log_line(f"stop 读取 running jobs 失败: {error}")
             return False
@@ -851,7 +867,7 @@ class Dispatcher:
         # inside the settlement writer transaction as well.
         legacy_rows = [j for j in rows if j["id"] not in native_session_ids]
         for job in legacy_rows:
-            if not job["pgid"]:
+            if not job["pgid"] and self.executor.configured_owner(job["id"]) is None:
                 continue
             process_state = self._job_process_state(job)
             if process_state == "alive":
@@ -888,6 +904,9 @@ class Dispatcher:
                     for original in rows:
                         current = state.get_job(conn, original["id"])
                         if current is None or current["status"] != "running":
+                            continue
+                        if execution_state.get(conn, current["id"]) is not None:
+                            self._reap_configured_executions(conn)
                             continue
                         if current["pgid"] != original["pgid"]:
                             self.log_line(
@@ -961,7 +980,6 @@ class Dispatcher:
         self._recover_launch_markers()
         completed = (
             settlement_ok
-            and len(settled_rows) == len(rows)
             and remaining_running == 0
             and unresolved_native == 0
             and not self._unresolved_launch_markers()
@@ -1543,6 +1561,11 @@ class Dispatcher:
                         "SELECT * FROM jobs WHERE status='running'"
                     ).fetchall()
                     for j in rows:
+                        if execution_state.get(conn, j["id"]) is not None:
+                            # Generic attempts retain their original identity.
+                            # The execution reaper records lost authority and
+                            # checks cleanup; reboot recovery never requeues one.
+                            continue
                         if self._has_native_session(conn, j["id"]):
                             self.log_line(
                                 f"D4: native session job {j['id']} 无原始 owner/wait 证明; "
@@ -1713,6 +1736,17 @@ class Dispatcher:
 
     def _job_process_state(self, job) -> str:
         """Return identity-aware process-group state without trusting a bare PID."""
+        owner = getattr(self.executor, "configured_owner", lambda job_id: None)(job["id"])
+        if owner is not None:
+            try:
+                observation = owner.poll()
+                if observation.status == "exited" and observation.group_clean is True:
+                    return "dead"
+                if observation.status in ("running", "cleanup_pending"):
+                    return "alive"
+                return "unknown"
+            except Exception:
+                return "unknown"
         identity = self._read_launch_identity(job)
         if identity is not None:
             return self._launch_identity_state(identity)
@@ -1728,6 +1762,19 @@ class Dispatcher:
         sig: int = signal.SIGTERM,
     ) -> str:
         """Signal only a twice-attested exact leader and classify the result."""
+        owner = getattr(self.executor, "configured_owner", lambda job_id: None)(job["id"])
+        if owner is not None:
+            try:
+                observation = owner.poll()
+                if observation.status == "exited" and observation.group_clean is True:
+                    return _SIGNAL_DEAD
+                owner.cancel(grace_period=0.0 if sig == signal.SIGKILL else JOB_STOP_TERM_GRACE_SEC)
+                return _SIGNAL_SENT
+            except Exception:
+                return _SIGNAL_UNKNOWN
+        with state.connect() as connection:
+            if execution_state.get(connection, job["id"]) is not None:
+                return _SIGNAL_UNKNOWN
         for attempt in range(2):
             process_state = self._job_process_state(job)
             if process_state in {"dead", "mismatch"}:
@@ -1875,6 +1922,7 @@ class Dispatcher:
                 if (
                     self._has_native_session(conn, row["id"])
                     or self._has_native_v2_contract(conn, row)
+                    or execution_state.get(conn, row["id"]) is not None
                 ):
                     self.log_line(
                         f"job {row['id']} native V2/session 已入库; "
@@ -1969,7 +2017,7 @@ class Dispatcher:
             spec = self._load_task_spec(conn, job)
         except (TypeError, ValueError):
             return False
-        return any(key in spec for key in _NATIVE_EXEC_METADATA_KEYS)
+        return any(key in spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS)
 
     def _drop_rc_path(self, path: str | None) -> None:
         if path is None:
@@ -1992,6 +2040,8 @@ class Dispatcher:
                 query += " AND pgid IS NULL"
             rows = conn.execute(query).fetchall()
             for j in rows:
+                if execution_state.get(conn, j["id"]) is not None:
+                    continue
                 if self._has_native_session(conn, j["id"]):
                     self.log_line(
                         f"A3: native session job {j['id']} 无原始 owner/wait 证明; "
@@ -3064,10 +3114,13 @@ class Dispatcher:
         drop_paths: list[str] = []
         cleanup_jobs: list[tuple[str, dict]] = []
         with state.connect() as conn:
+            cleanup_jobs.extend(self._reap_configured_executions(conn))
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE status='running' AND pgid IS NOT NULL"
             ).fetchall()
             for j in rows:
+                if execution_state.get(conn, j["id"]) is not None:
+                    continue
                 if self._has_native_session(conn, j["id"]):
                     continue
                 native_exec = self._job_uses_native_exec(conn, j)
@@ -3166,6 +3219,70 @@ class Dispatcher:
                 self._drop_profile(job)
         for path in drop_paths:
             self._drop_rc_path(path)
+
+    def _reap_configured_executions(self, conn) -> list:
+        cleanup = []
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='execution_attempts' AND type='table'").fetchone() is None:
+            return cleanup
+        rows = conn.execute("SELECT j.* FROM jobs j JOIN execution_attempts e ON e.job_id=j.id WHERE j.status='running'").fetchall()
+        for job in rows:
+            attempt = execution_state.get(conn, job["id"])
+            owner = self.executor.configured_owner(job["id"])
+            if owner is None:
+                if attempt["launch_intent_at"] is None and not job["pgid"]:
+                    # The durable launch intent must commit before child birth.
+                    # This crash window proves no launch, but never authorizes
+                    # replay of the consumed preparation under the same job.
+                    execution_state.observe(conn, job["id"], {
+                        "status": "not_started", "pid": None, "returncode": None,
+                        "rusage": None, "group_clean": True, "launch_error": None,
+                    })
+                    state.update_job(conn, job["id"], status="interrupted",
+                                     failure="execution_not_started", finished_at=state.now())
+                    self._release_gpu_for_job(conn, job)
+                    cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
+                    continue
+                previous = json.loads(attempt["observation"] or "{}")
+                if previous.get("status") == "exited" and previous.get("group_clean") is True:
+                    observation = previous
+                else:
+                    # Lost wait ownership is never recreated from PID or sidecars.
+                    # A vanished managed group proves cleanup, not successful exit.
+                    clean = False
+                    if job["pgid"]:
+                        try:
+                            os.killpg(job["pgid"], 0)
+                        except ProcessLookupError:
+                            clean = True
+                        except OSError:
+                            pass
+                    observation = {"status": "authority_lost", "pid": job["pgid"],
+                                   "returncode": None, "rusage": None, "group_clean": clean,
+                                   "launch_error": None}
+                    execution_state.observe(conn, job["id"], observation, phase="unresolved")
+                    if clean:
+                        state.update_job(conn, job["id"], status="interrupted", failure="execution_authority_lost", finished_at=state.now())
+                        self._release_gpu_for_job(conn, job)
+                        cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
+                    continue
+            else:
+                observation = asdict(owner.poll())
+                execution_state.observe(conn, job["id"], observation)
+                if observation.get("pid") is not None and job["pgid"] != observation["pid"]:
+                    state.update_job(conn, job["id"], pgid=observation["pid"])
+            if job["kill_reason"]:
+                execution_state.cancel_intent(conn, job["id"], job["kill_reason"])
+                if owner is not None and observation["status"] in ("running", "cleanup_pending"):
+                    owner.cancel(JOB_STOP_TERM_GRACE_SEC)
+            if observation["status"] != "exited" or observation.get("group_clean") is not True:
+                continue
+            rc = observation["returncode"]
+            state.update_job(conn, job["id"], rc=rc)
+            cleanup.extend(self._handle_job_done(conn, job, rc, process_exit_authoritative=True))
+            conn.commit()
+            if owner is not None:
+                self.executor.retire_configured_execution(job["id"])
+        return cleanup
 
     def _handle_job_done(
         self,
@@ -3627,7 +3744,9 @@ class Dispatcher:
             batch = state.get_batch(conn, j["batch_id"])
             if (
                 (batch is not None and batch["mode"] == "strict")
-                or any(key in spec for key in _NATIVE_EXEC_METADATA_KEYS)
+                or any(key in spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS)
+                or "execution" in spec
+                or execution_state.get(conn, j["id"]) is not None
             ):
                 state.update_job(conn, j["id"], status="blocked")
                 self.log_line(
@@ -3658,6 +3777,10 @@ class Dispatcher:
         行), 否则节点重启后卡仍 assigned 给已死 job, GPU 永久泄漏.
         """
         batch = state.get_batch(conn, j["batch_id"])
+        if execution_state.get(conn, j["id"]) is not None:
+            # Only the execution reaper may establish cleanup and settlement.
+            # A consumed attempt cannot enter legacy automatic restart logic.
+            return
         native_exec = batch is not None and batch["mode"] == "strict"
         if not native_exec:
             try:
@@ -3665,7 +3788,7 @@ class Dispatcher:
             except ValueError:
                 persisted_spec = {}
             native_exec = any(
-                key in persisted_spec for key in _NATIVE_EXEC_METADATA_KEYS
+                key in persisted_spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS
             )
         # Launch marker cleanup is owned by _check_node_restart after commit.
         if self._consume_pending_cancel_before_requeue(
@@ -4156,6 +4279,7 @@ class Dispatcher:
                         current is None
                         or self._has_native_session(conn, current["id"])
                         or self._has_native_v2_contract(conn, current)
+                        or execution_state.get(conn, current["id"]) is not None
                         or eligible is None
                     ):
                         self.log_line(
@@ -4482,184 +4606,6 @@ class Dispatcher:
             stage_fingerprints = {}
         return current_fp, stage_fingerprints, git_rev
 
-    def _reattest_native_launch(
-        self,
-        batch,
-        job,
-        spec: dict,
-        task_project: object,
-    ) -> dict[str, Any] | None:
-        """Re-attest one persisted native tuple before the running claim."""
-        metadata = _native_exec_metadata(spec)
-        if metadata is None:
-            if batch["mode"] == "strict":
-                raise NativeExecProfileError(
-                    "strict task is missing persisted native execution metadata"
-                )
-            return None
-        if spec.get("stages") is not None:
-            raise NativeExecProfileError("native execution profile forbids stages")
-        try:
-            batch_env = json.loads(batch["env"] or "{}")
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise NativeExecProfileError(
-                "persisted native batch environment is invalid"
-            ) from exc
-        v2_contract = metadata.get(NATIVE_EXEC_V2_CONTRACT_FIELD)
-        is_v2 = NATIVE_EXEC_V2_CONTRACT_FIELD in metadata
-        if is_v2:
-            if not isinstance(v2_contract, dict):
-                raise NativeExecProfileError(
-                    "persisted native V2 contract must be an object"
-                )
-            runtime = v2_contract.get("runtime")
-            resources = spec.get("resources")
-            if not isinstance(runtime, dict) or not isinstance(resources, dict):
-                raise NativeExecProfileError(
-                    "persisted native V2 runtime or resources are invalid"
-                )
-            try:
-                depends_on = json.loads(batch["depends_on"])
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise NativeExecProfileError(
-                    "persisted native V2 batch dependencies are invalid"
-                ) from exc
-            if (
-                batch["cwd"] != v2_contract.get("cwd")
-                or depends_on != v2_contract.get("depends_on")
-                or batch_env != v2_contract.get("batch_env")
-                or spec.get("env") != v2_contract.get("task_env")
-                or spec.get("runtime") != v2_contract.get("runtime")
-                or spec.get("runtime_prefix") != runtime.get("prefix")
-                or type(spec.get("duration_min")) is not int
-                or spec.get("duration_min") != v2_contract.get("duration_min")
-                or spec.get("max_retry") != v2_contract.get("max_retry")
-                or spec.get("artifacts") != v2_contract.get("artifacts")
-                or spec.get("id") != job["task_id"]
-                or spec.get("_force_rerun") is not None
-                or spec.get("max_parallel") is not None
-                or spec.get("progress_regex") is not None
-                or spec.get("paths_escape") is not False
-                or not isinstance(v2_contract.get("resources"), dict)
-                or {"gpu": resources.get("gpu"), "cpus": resources.get("cpus")}
-                != v2_contract["resources"]
-                or batch.get("gpus") is not None
-                or batch["notify"] is not None
-                or type(batch["priority"]) is not int
-                or batch["priority"] != 0
-            ):
-                raise NativeExecProfileError(
-                    "persisted native V2 batch/task fields differ from frozen contract"
-                )
-        elif batch_env or spec.get("env"):
-            raise NativeExecProfileError(
-                "persisted native execution must have empty batch/task env"
-            )
-        resources = spec.get("resources")
-        if (
-            not isinstance(resources, dict)
-            or frozenset(resources) != {"gpu", "cpus", "gpu_share"}
-            or type(resources["gpu"]) is not int
-            or type(resources["cpus"]) is not int
-            or type(resources["gpu_share"]) is not bool
-            or resources != {"gpu": 0, "cpus": 1, "gpu_share": False}
-        ):
-            raise NativeExecProfileError(
-                "persisted native execution resources must remain CPU-only"
-            )
-        configured_root = os.path.realpath(
-            os.path.expanduser(
-                resolve_template(f"{{PROJECT:{batch['project']}}}", self.cfg)
-            )
-        )
-        frozen_roots = getattr(self, "_native_exec_project_roots", None)
-        frozen_identities = getattr(
-            self, "_native_exec_project_root_identities", None
-        )
-        if not isinstance(frozen_roots, dict) or not isinstance(
-            frozen_identities, dict
-        ):
-            raise NativeExecProfileError(
-                "native project-root cold snapshot is unavailable"
-            )
-        frozen_root = frozen_roots.get(batch["project"])
-        frozen_identity = frozen_identities.get(batch["project"])
-        try:
-            current_stat = os.stat(configured_root)
-            current_identity = (current_stat.st_dev, current_stat.st_ino)
-        except OSError as exc:
-            raise NativeExecProfileError(
-                "current native project root cannot be attested"
-            ) from exc
-        if (
-            configured_root != frozen_root
-            or current_identity != frozen_identity
-            or spec.get("cwd_abs") != frozen_root
-        ):
-            raise NativeExecProfileError(
-                "persisted native cwd differs from frozen project-root identity"
-            )
-        current_root_identity_sha256 = (
-            native_exec_project_root_identity_sha256(configured_root)
-        )
-        if (
-            metadata["_native_exec_project_root_identity_sha256"]
-            != current_root_identity_sha256
-        ):
-            raise NativeExecProfileError(
-                "persisted native project-root identity digest drifted"
-            )
-        if not is_v2 and (
-            spec.get("runtime") is not None
-            or spec.get("runtime_prefix") is not None
-        ):
-            raise NativeExecProfileError(
-                "persisted native execution unexpectedly declares a runtime"
-            )
-        if spec.get("git") is not False:
-            raise NativeExecProfileError(
-                "persisted native execution git binding must remain exactly false"
-            )
-        if spec.get("artifacts") or spec.get("paths_escape"):
-            raise NativeExecProfileError(
-                "persisted native execution declares artifact cleanup rules"
-            )
-        if spec.get("probes") is not None:
-            raise NativeExecProfileError(
-                "persisted native execution declares scheduler log probes"
-            )
-        if type(spec.get("max_retry")) is not int or spec["max_retry"] != 0:
-            raise NativeExecProfileError(
-                "persisted native execution max_retry must remain exactly zero"
-            )
-        submitted_argv = metadata["_native_exec_submitted_argv"]
-        if spec.get("cmd") != submitted_argv:
-            raise NativeExecProfileError(
-                "persisted native command differs from submitted argv"
-            )
-        if (
-            job["project"] != batch["project"]
-            or task_project != batch["project"]
-        ):
-            raise NativeExecProfileError(
-                "persisted native project binding is inconsistent"
-            )
-        resolved = reattest_native_exec_profile(
-            self.cfg,
-            mode=batch["mode"],
-            project=batch["project"],
-            batch_name=batch["name"],
-            task_id=job["task_id"],
-            profile_id=metadata["_native_exec_profile_id"],
-            profile_sha256=metadata["_native_exec_profile_sha256"],
-            submitted_argv=submitted_argv,
-            batch_contract=v2_contract if is_v2 else None,
-        )
-        if is_v2 != (resolved.get("schema") == NATIVE_EXEC_PROFILE_V2_SCHEMA):
-            raise NativeExecProfileError(
-                "persisted native contract schema differs from cold profile"
-            )
-        return resolved
 
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
@@ -4696,42 +4642,14 @@ class Dispatcher:
         persisted_spec, task_project = self._load_task_launch_binding(conn, j)
         spec_cache = getattr(self, "_ready_task_specs", {})
         cached_spec = spec_cache.pop(j["id"], None)
-        native_candidate = (
-            b["mode"] == "strict"
-            or any(key in persisted_spec for key in _NATIVE_EXEC_METADATA_KEYS)
-            or (
-                cached_spec is not None
-                and any(
-                    key in cached_spec for key in _NATIVE_EXEC_METADATA_KEYS
-                )
-            )
-        )
-        if (
-            native_candidate
-            and cached_spec is not None
-            and cached_spec != persisted_spec
-        ):
-            raise NativeExecProfileError(
-                "persisted native task spec drifted after fingerprint snapshot"
-            )
-        spec = persisted_spec if native_candidate else (cached_spec or persisted_spec)
-        native_binding = self._reattest_native_launch(
-            b,
-            j,
-            spec,
-            task_project,
-        )
-        if (
-            native_binding is not None
-            and native_binding.get("schema") == NATIVE_EXEC_PROFILE_V2_SCHEMA
-        ):
-            raise NativeLaunchUnavailable(
-                "native V2 formal launcher and lifecycle are not connected"
-            )
-        if native_binding is not None and gpu is not None:
-            raise NativeExecProfileError(
-                "native CPU-only execution received a GPU assignment"
-            )
+        if self._job_uses_native_exec(conn, j):
+            raise NativeExecProfileError("retired execution task cannot be launched or replayed")
+        spec = persisted_spec if "execution" in persisted_spec else (cached_spec or persisted_spec)
+        if "execution" in spec and cached_spec is not None and cached_spec != persisted_spec:
+            raise ExecutionPolicyError("persisted execution task changed after admission snapshot")
+        native_binding = None
+        if "execution" in spec:
+            revalidate_binding(spec, self.cfg, str(b["project"]), json.loads(b["env"] or "{}"))
 
         if self._prepare_launch_marker(j):
             self.log_line(
@@ -4823,6 +4741,9 @@ class Dispatcher:
             current_fingerprint=current_fp,
             stage_fingerprints=stage_fingerprints,
         )
+
+        if spec.get("execution") is not None:
+            return self._launch_configured_job(conn, j, b, spec, gpu, log_path)
 
         # The scheduler-owned profile path is a reserved control channel.
         # Batch, task, and deployment defaults may not redirect it.
@@ -4918,6 +4839,65 @@ class Dispatcher:
             # the job back for a log sink failure can detach a still-live group
             # from its GPU lease and make the outer abort path leak gpu_jobs.
             pass
+        return True
+
+    def _launch_configured_job(self, conn, job, batch, spec, gpu, log_path) -> bool:
+        profile = revalidate_binding(spec, self.cfg, str(batch["project"]), json.loads(batch["env"] or "{}"))
+        root_stat = os.stat(spec["cwd_abs"])
+        frozen = getattr(self, "_native_exec_project_root_identities", {}).get(batch["project"])
+        if frozen is not None and frozen != (root_stat.st_dev, root_stat.st_ino):
+            raise ExecutionPolicyError("configured project root identity changed")
+        token = process_start_token(os.getpid())
+        if token is None or not token.startswith("proc:"):
+            raise ExecutionPolicyError("native execution requires actual Linux scheduler identity")
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        identity = execution_state.reserve(conn, job["id"], spec["_execution_binding"], profile,
+                                            str(self.cfg["node"]), int(token[5:]))
+        conn.commit()
+        prepared = None
+        try:
+            prepared = self.executor.prepare_configured_execution(job["id"], spec, profile, identity, gpu, log_path)
+            conn.execute("BEGIN IMMEDIATE")
+            execution_state.launch_intent(conn, job["id"])
+            conn.commit()
+            owner = prepared.launch()
+            observation = asdict(owner.poll())
+        except BaseException as error:
+            owner = self.executor.configured_owner(job["id"])
+            if owner is None:
+                observation = {"status": "not_started", "pid": None, "returncode": None,
+                               "rusage": None, "launch_error": getattr(error, "errno", None), "group_clean": True}
+            else:
+                observation = asdict(owner.poll())
+                if observation["status"] == "prepared":
+                    observation["status"] = "not_started"
+                    observation["group_clean"] = True
+                elif observation["status"] in ("running", "cleanup_pending"):
+                    owner.cancel(JOB_STOP_TERM_GRACE_SEC)
+            if conn.in_transaction:
+                conn.rollback()
+            if observation["status"] == "not_started":
+                execution_state.observe(conn, job["id"], observation, phase="not_started")
+                current = state.get_job(conn, job["id"])
+                state.update_job(conn, job["id"], status="cancelled" if current["kill_reason"] == "cancelled" else "failed",
+                                 failure="execution_admission", finished_at=state.now())
+                self._release_gpu_for_job(conn, job)
+                conn.commit()
+                if owner is not None:
+                    self.executor.retire_configured_execution(job["id"])
+                self.log_line(f"execution {job['id']} rejected before child creation: {error}")
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                return False
+            self.log_line(f"execution {job['id']} interrupted at launch boundary; original owner retained: {error}")
+        pid = observation.get("pid")
+        if pid is not None:
+            state.update_job(conn, job["id"], pgid=pid)
+        execution_state.observe(conn, job["id"], observation)
+        conn.commit()
+        self.log_line(f"LAUNCH execution job {job['id']} attempt={identity['attempt_id']} pid={pid}")
         return True
 
     def _should_skip(

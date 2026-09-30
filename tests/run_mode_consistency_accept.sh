@@ -1,5 +1,5 @@
 #!/bin/bash
-# L2: strict mode is available only through an exact admin cold profile.
+# L2: ordinary mix admission is preserved; legacy strict is read-only compatibility.
 set -u
 cd "$(dirname "$0")/.."
 source tests/acceptance_cleanup.sh
@@ -37,7 +37,7 @@ try:
 except SchemaError:
     pass
 else:
-    raise AssertionError("strict mode accepted without an exact cold profile")
+    raise AssertionError("legacy strict accepted as a new submission")
 
 profile_cfg = deepcopy(cfg)
 profile_cfg["native_exec_profiles"] = {
@@ -49,12 +49,14 @@ profile_cfg["native_exec_profiles"] = {
         "submitted_argv": ["/bin/echo", "ok"],
     }
 }
-normalized = validate_batch(strict, profile_cfg)
-task = normalized["tasks"][0]
-assert normalized["mode"] == "strict"
-assert task["_native_exec_profile_id"] == "mode-test-v1"
-assert len(task["_native_exec_profile_sha256"]) == 64
-assert len(task["_native_exec_project_root_identity_sha256"]) == 64
-assert task["_native_exec_submitted_argv"] == ["/bin/echo", "ok"]
-print("L2 strict mode requires one exact admin cold native-exec profile")
+try:
+    validate_batch(strict, profile_cfg)
+except SchemaError:
+    pass
+else:
+    raise AssertionError("legacy cold profile re-enabled strict admission")
+ordinary = deepcopy(base)
+ordinary["name"] = "ordinary-mode"
+assert validate_batch(ordinary, cfg)["mode"] == "mix"
+print("L2 mix admission preserved; legacy strict admission rejected")
 PY

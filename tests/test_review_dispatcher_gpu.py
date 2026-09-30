@@ -92,6 +92,7 @@ class DispatcherStateCase(unittest.TestCase):
         dispatcher._launch_inflight = {}
         dispatcher.host_dir = state.host_dir()
         dispatcher.executor = mock.Mock()
+        dispatcher.executor.configured_owner.return_value = None
         dispatcher._launch_marker_alive = mock.Mock(return_value=False)
         dispatcher.log_line = mock.Mock()
         dispatcher._maybe_retry = mock.Mock()

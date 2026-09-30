@@ -264,6 +264,7 @@ def compute_fingerprint(
     native_exec_profile_sha256: str | None = None,
     native_exec_project_root_identity_sha256: str | None = None,
     *,
+    execution_binding_sha256: str | None = None,
     execution_env: dict[str, str] | None = None,
     artifacts: dict | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
@@ -290,6 +291,9 @@ def compute_fingerprint(
         raise ValueError(
             "native_exec_project_root_identity_sha256 must be a 64-hex digest"
         )
+
+    if execution_binding_sha256 is not None and (not isinstance(execution_binding_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", execution_binding_sha256) is None):
+        raise ValueError("execution_binding_sha256 must be a SHA-256")
 
     # venv 路径: 把 cmd 里的 {VENV:name} 解析为实际解释器路径入指纹
     def resolve_venv(tok: str) -> str:
@@ -343,6 +347,8 @@ def compute_fingerprint(
             fingerprint_payload[
                 "native_exec_project_root_identity_sha256"
             ] = native_exec_project_root_identity_sha256
+        if execution_binding_sha256 is not None:
+            fingerprint_payload["execution_binding_sha256"] = execution_binding_sha256
         payload = json.dumps(fingerprint_payload, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
 

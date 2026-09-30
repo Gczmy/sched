@@ -41,8 +41,10 @@
 | 来源 | 用途 |
 | --- | --- |
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
-| `docs/native-integration.md` | M2B 分支整合范围、实验接口限制与外部测试依赖 |
-| `docs/native-deployment.md` | 实验协议的私有部署绑定、显式调用参数与冻结报文兼容性 |
+| `docs/execution-boundary.md` | 通用执行层、客户程序、旧兼容守卫与各仓库独立发布边界 |
+| `docs/execution-api.md` | 公开 execution backend 注册、输入 FD 与可选 native 构建 |
+| `docs/native-integration.md` | 旧实验接口的持久态保护与迁移限制 |
+| `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
 | `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
@@ -53,6 +55,10 @@
 
 `sched`（Python 包名 `gsched`）是节点级 GPU/CPU 批量任务调度器，要求 Python >= 3.10，运行时零第三方依赖。调度器保持“无意识”：只提供标准接口，不含 Agent 逻辑。Agent 操作调度器的唯一入口是 `sched` CLI（`gsched.cli:main`）。
 
+调度器的源码、构建、公共回归与发布独立维护。通用 `gsched.execution` 负责可执行文件和输入 FD 绑定、直接子进程 owner、真实 wait、取消与清理；可选 native 源码在本仓库。daemon 不导入客户模块、动态项目 backend 或由客户仓库提供的 `gsched` 扩展。客户协议、科学阶段、研究合同、研究 gate 与科学加载验证归客户仓库，不作为 sched 发布前置条件。
+
+新提交使用公开 `execution` 接口；旧 strict/native 输入仅供历史识别，不能授予执行权。历史 session、名称消费与未知尝试的兼容守卫必须保留，不能因清理专用代码重放或删除旧运行记录。源码与必要测试的边界检查使用 `python scripts/check_execution_boundary.py`。
+
 `dsh-node-sched` 是 dsh 插件：`packages/node-sched` 负责 SSH 传输、查询、写操作转发与审计，`packages/node-sched-ui` 负责看板。调度和状态语义由 `sched` 实现，配套插件不重新实现调度逻辑。
 
 | 代码 | 职责 |
@@ -61,6 +67,8 @@
 | `gsched/state.py` | SQLite WAL、私有只读快照、事务、revision 与请求记录 |
 | `gsched/daemon.py`、`gsched/dispatcher.py` | 生命周期、inbox 消费、恢复、依赖解锁与派发 |
 | `gsched/allocator.py`、`gsched/executor.py` | GPU 探测与分配、任务启动和进程组管理 |
+| `gsched/execution/`、`gsched/execution_policy.py` | 自包含通用执行实现、backend 冷注册与任务文件绑定 |
+| `gsched/_legacy_execution.py` | 历史持久态识别与禁止重放的兼容守卫 |
 | `gsched/schema.py`、`gsched/config.py`、`gsched/templates.py` | 批次与配置校验、runtime 解析、模板展开 |
 | `gsched/fingerprint.py`、`gsched/artifacts.py`、`gsched/notify.py` | 指纹与产物校验、终态通知 |
 
@@ -98,6 +106,7 @@
 | `sched run` | 计算节点提交单任务；GPU 用 `--gpus 1`，CPU 用 `--cpu-only` |
 | `sched status [batch] --json` | 当前态；支持 `--project`、`--limit`、`--cursor`、`--job-cursor` |
 | `sched task <batch>:<task> --json` | 单任务与各版本详情 |
+| `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |
