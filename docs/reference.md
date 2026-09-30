@@ -86,6 +86,7 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 旧合同迁移限制见 [native-integration.md](native-integration.md)。
 内部数据库 schema 与公开 CLI JSON 的 `schema_version:1` 分别演进。
 `sched execution <batch>:<task> --json` 单独返回通用尝试、identity 与原始 observation，
+并附逐版本只读诊断、旧 session 摘要；可用 `--version N` 过滤。
 不改变既有 `status/task/history` 的字段契约；JSON 详见 execution API。
 
 ### config.json 相关（代理只读，调参报告用户）

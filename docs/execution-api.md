@@ -113,6 +113,30 @@ child 的 `exited` 仅是进程事实；仍有同组后代时状态为 `cleanup_
 调用方同时读取 `task` 时应核对 `batch_revision`，不合并不同 revision 的结果。
 每项包含 attempt/job/version、backend 绑定、phase、identity、observation、
 cancel reason 和时间；没有发生通用尝试的任务返回空数组。
+只读诊断另有 `diagnostics` 和 `legacy_sessions` 数组，按 job version 升序排列；
+`--version N` 同时过滤这三个数组。新增字段不改变原始 `attempts` 或
+`status/task/history` 的 schema 1 契约，也不执行 schema 升级。
+
+`diagnostics` 每版本包含 job ID/version/status、`execution_kind`、`phase`、
+attempt/session ID、原始 `cancel_reason`、`job_kill_reason`、`job_failure`、
+`observation_status`、`wait_result_available`、`returncode`、`rusage`、
+`launch_error`、`cleanup_state`、`uncertainty_reason` 与 `replay_blocked`。
+kind 为 `generic`、`legacy`、`subprocess` 或无法读取 spec 时的 `unknown`；
+generic 尚未保留尝试时 phase 为 `not_reserved`，旧入口无 session 时为 `retired`，
+普通任务没有通用 phase。`replay_blocked` 标识已消费尝试、旧入口或无法读取 spec，
+不能把它为 false 当作新的执行或 retry 授权，写操作仍执行自己的完整校验。
+
+只有原始 observation 为 `exited/cleanup_pending` 且 returncode 为整数时，
+`wait_result_available` 才为 true。`cleanup_state` 为 `confirmed/pending/unknown`，
+只取自原始 `group_clean`，退出码为 0 不等于清理已完成。旧 session 的 wait 和
+cleanup 为未知；job 的 rc、PID、日志及应用结果不能填补缺失事实。
+`uncertainty_reason` 为 `legacy_wait_unavailable`、`owner_authority_lost`、
+`record_invalid` 或 null；尚在正常执行的任务不因未退出就标为 authority lost。
+
+`legacy_sessions` 只展示 session/job/version、phase、owner kind 与记录时间，
+不输出旧项目路径、log 路径或客户协议。旧 schema 缺少的时间字段为 null，
+其 null 不证明旧 monitor 从未启动。旧 session 和名称消费继续保留，查询不探测
+进程、不恢复 owner、不删除记录、不重放任务。
 phase 与业务成功分别解释；启动或 wait 权威不明时不能据此推断 `done`。
 公共 `status/task/history` 继续按现有契约使用，详情通过此专用查询取得。
 
