@@ -201,7 +201,7 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             raise ConfigError(f"{p}: projects.{proj_name}.max_jobs 必须是正整数"
                               f" (该项目任务在单卡上的打包数上限)")
     if "native_exec_profiles" in cfg:
-        from .native_exec import (
+        from ._legacy_execution import (
             NativeExecProfileError,
             validate_native_exec_profiles,
         )
@@ -216,6 +216,11 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             )
         except NativeExecProfileError as exc:
             raise ConfigError(str(exc)) from exc
+    from .execution_policy import ExecutionPolicyError, validate_backends
+    try:
+        validate_backends(cfg)
+    except ExecutionPolicyError as error:
+        raise ConfigError(f"{p}: {error}") from error
     # 全局 co_locate_max_jobs 的范围校验在下方定案 39 范围表 ([2,64]), 不在此重复
     tde = cfg.get("task_default_env")
     if tde is not None:

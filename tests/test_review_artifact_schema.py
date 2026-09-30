@@ -693,6 +693,9 @@ class ReviewExecutorLifecycleTests(unittest.TestCase):
         proc = mock.Mock(pid=4242)
         proc.poll.return_value = 7
         log_stream = mock.Mock()
+        log_fd = os.open(os.devnull, os.O_WRONLY)
+        self.addCleanup(os.close, log_fd)
+        log_stream.fileno.return_value = log_fd
         marker = os.path.join(self.tmp.name, "launch", "job.launch")
         with mock.patch.object(
             state,
@@ -717,7 +720,7 @@ class ReviewExecutorLifecycleTests(unittest.TestCase):
                     log_path=os.path.join(self.tmp.name, "job.log"),
                 )
 
-        killpg.assert_not_called()
+        self.assertEqual([], [call for call in killpg.call_args_list if call.args[1] != 0])
         proc.wait.assert_called_once_with(timeout=1)
 
     def test_plain_command_without_sidecars_remains_direct_exec(self) -> None:

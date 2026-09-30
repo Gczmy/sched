@@ -22,15 +22,12 @@ import signal
 import stat
 import subprocess
 import sys
-import threading
-import weakref
-from contextlib import contextmanager
 from typing import Any, Callable, NamedTuple
 from . import state
 
 from .artifacts import all_pass, check_artifacts
-from .native_launch import NativeLaunchPlan, NativeLaunchUnavailable
-from .native_monitor import NativeMonitorLaunch
+from .execution import ExecutionEnvelope, LinuxFdBackend, SubprocessBackend, Owner
+from .execution_policy import sealed_bytes, snapshot_file, canonical_bytes, MAX_EXECUTABLE_BYTES
 
 # 常见进度行: "Epoch 5/30", "epoch: 5, loss: 0.12", "trial 3/20"
 PROGRESS_RE = re.compile(
@@ -732,51 +729,14 @@ def _launch_marker_command(
     return " ".join(shlex.quote(argument) for argument in argv) + ' "$$"'
 
 
-_native_monitor_claims: dict[str, tuple[weakref.ReferenceType[Executor], threading.Thread]] = {}
-_native_monitor_claims_lock = threading.Lock()
-_native_monitor_claims_local = threading.local()
 
 
-@contextmanager
-def _locked_native_monitor_claims():
-    if getattr(_native_monitor_claims_local, "active", False):
-        raise RuntimeError("native monitor claim operation is not reentrant")
-    try:
-        _native_monitor_claims_local.active = True
-        with _native_monitor_claims_lock:
-            yield
-    finally:
-        _native_monitor_claims_local.active = False
 
 
-def _native_monitor_claimant(session_id: str) -> Executor | None:
-    claim = _native_monitor_claims.get(session_id)
-    return claim[0]() if claim is not None else None
 
 
-def _claim_native_monitor(session_id: str, executor: Executor, *, recover: bool = False) -> bool:
-    with _locked_native_monitor_claims():
-        claimant = _native_monitor_claimant(session_id)
-        claim = _native_monitor_claims.get(session_id)
-        if claim is not None:
-            if claim[1] is not threading.current_thread():
-                raise ValueError("native monitor session is claimed on another thread")
-            if not recover:
-                raise ValueError("native monitor session already claimed")
-            if claimant is executor:
-                return False
-            if claimant is not None:
-                raise ValueError("native monitor session is claimed by another Executor")
-        _native_monitor_claims[session_id] = (weakref.ref(executor), threading.current_thread())
-        return True
 
 
-def _release_native_monitor_claim(session_id: str, executor: Executor) -> None:
-    with _locked_native_monitor_claims():
-        claim = _native_monitor_claims.get(session_id)
-        if (claim is not None and _native_monitor_claimant(session_id) is executor
-                and claim[1] is threading.current_thread()):
-            del _native_monitor_claims[session_id]
 
 
 class Executor:
@@ -791,141 +751,66 @@ class Executor:
         self.sanitize_env = sanitize_env
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
         self._dead_pgroups: set[int] = set()
-        # Native M is a direct child, not a process group or job-result owner.
-        self._native_monitors: dict[str, Any] = {}
-        self._native_monitor_ids: set[str] = set()
-        self._native_monitor_start_attempts: set[str] = set()
+        self._execution_prepared: dict[str, Any] = {}
+        self._execution_owners: dict[str, Any] = {}
+
+    def prepare_configured_execution(self, job_id: str, spec: dict, profile: dict,
+                                     identity: dict, gpu: int | None, log_path: str):
+        if job_id in self._execution_prepared or job_id in self._execution_owners:
+            raise ValueError("execution attempt is already retained")
+        backend = LinuxFdBackend()
+        descriptors = []
+        try:
+            root = os.open(spec["cwd_abs"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            descriptors.append(root)
+            executable = snapshot_file(profile["executable"], profile["sha256"], MAX_EXECUTABLE_BYTES)
+            descriptors.append(executable)
+            bindings = {4: sealed_bytes(canonical_bytes(identity), "sched-execution-identity")}
+            descriptors.append(bindings[4])
+            for slot, entry in spec["_execution_binding"]["inputs"].items():
+                descriptor = snapshot_file(entry["path"], entry["sha256"],
+                                           profile["input_slots"][slot]["max_bytes"], root_fd=root)
+                descriptors.append(descriptor)
+                bindings[int(slot)] = descriptor
+            state.ensure_private_directory(os.path.dirname(log_path))
+            with state.open_private_text(log_path, "a") as log:
+                bindings[1] = bindings[2] = log.fileno()
+                null = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+                descriptors.append(null)
+                bindings[0] = null
+                env = dict(profile["env"])
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
+                prepared = backend.prepare(ExecutionEnvelope(tuple(profile["argv"]), env),
+                                           executable_fd=executable, cwd_fd=root, fd_bindings=bindings)
+            self._execution_prepared[job_id] = prepared
+            self._execution_owners[job_id] = prepared.owner
+            return prepared
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def configured_owner(self, job_id: str):
+        return self._execution_owners.get(job_id)
+
+    def retire_configured_execution(self, job_id: str) -> None:
+        owner = self._execution_owners.get(job_id)
+        if owner is not None:
+            owner.close()
+        prepared = self._execution_prepared.pop(job_id, None)
+        if prepared is not None:
+            prepared.close()
+        self._execution_owners.pop(job_id, None)
         # D2: _rces 死字段已删 (全仓无读写, rc 读取走 _procs[pgid].poll())
 
-    def reserve_native_monitor(self, session_id: str) -> None:
-        """Register an empty native owner before any child can be created.
 
-        Caller supplies a fresh 128-bit hexadecimal session key before calling
-        start, so even an interrupted return cannot hide the cleanup handle.
-        The bridge is imported only on explicit native use, with no fallback.
-        """
-        if type(session_id) is not str or re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
-            raise ValueError("native monitor session key must be 32 lowercase hexadecimal characters")
-        if session_id in self._native_monitor_ids:
-            raise ValueError("native monitor session key already consumed")
-        native_module = None
-        acquired = False
-        try:
-            acquired = _claim_native_monitor(session_id, self)
-            self._native_monitor_ids.add(session_id)
-            from . import _m2b_scheduler_native as native_module
 
-            owner = native_module.create_empty(session_id)
-            try:
-                self._native_monitors[session_id] = owner
-            except BaseException:
-                owner.discard_empty()  # native check proves no start/FD/wait owner
-                raise
-        except BaseException:
-            # Keep the claim if an interrupted C/Python boundary left a pin.
-            # A failed pin inspection is also unresolved ownership.
-            pinned = True
-            if native_module is None:
-                pinned = False
-            else:
-                try:
-                    pinned = any(
-                        json.loads(candidate.snapshot())["session_id"] == session_id
-                        for candidate in native_module.retained_owners()
-                    )
-                except BaseException:
-                    pass
-            if acquired and not pinned:
-                _release_native_monitor_claim(session_id, self)
-            raise
 
-    def native_monitor_sessions(self) -> tuple[str, ...]:
-        return tuple(self._native_monitors)
 
-    def recover_native_monitor(self, session_id: str) -> None:
-        """Recover a native pin after an interrupted registry update, same TID.
 
-        This only finds the original in-memory owner. It cannot reconstruct
-        wait authority after daemon restart or from a disk PID/job record.
-        A recovered pin is conservatively treated as start-consumed: an
-        interrupted Python call cannot prove that native start never ran.
-        """
-        if session_id in self._native_monitors:
-            return
-        with _locked_native_monitor_claims():
-            claimant = _native_monitor_claimant(session_id)
-            claim = _native_monitor_claims.get(session_id)
-            if claim is not None and claim[1] is not threading.current_thread():
-                raise ValueError("native monitor session is claimed on another thread")
-            if claimant is not None and claimant is not self:
-                raise ValueError("native monitor session is claimed by another Executor")
-        from . import _m2b_scheduler_native
 
-        for owner in _m2b_scheduler_native.retained_owners():
-            if json.loads(owner.snapshot())["session_id"] == session_id:
-                _claim_native_monitor(session_id, self, recover=True)
-                self._native_monitor_ids.add(session_id)
-                self._native_monitor_start_attempts.add(session_id)
-                self._native_monitors[session_id] = owner
-                return
-        raise KeyError("no original native monitor owner on this process/thread")
 
-    def start_native_monitor(self, session_id: str, plan: NativeMonitorLaunch) -> None:
-        """Start real M through the already registered native owner.
 
-        Any start/return exception triggers native cancellation while retaining
-        the entry. The caller still owns the borrowed input FDs. No Popen,
-        process-group signalling, or job-success publication is involved.
-        """
-        if type(plan) is not NativeMonitorLaunch:
-            raise TypeError("native monitor start requires NativeMonitorLaunch")
-        with _locked_native_monitor_claims():
-            claim = _native_monitor_claims.get(session_id)
-            if claim is None or _native_monitor_claimant(session_id) is not self:
-                raise RuntimeError("native monitor start requires its claimed Executor")
-            if claim[1] is not threading.current_thread():
-                raise RuntimeError("native monitor start requires its original thread")
-            owner = self._native_monitors[session_id]
-            if session_id in self._native_monitor_start_attempts:
-                raise ValueError("native monitor start already attempted")
-            # Consume atomically before crossing into C. A second call must
-            # not cancel the first M after a native duplicate-start rejection.
-            self._native_monitor_start_attempts.add(session_id)
-        try:
-            owner.start(*plan.native_arguments())
-        except BaseException as start_error:
-            try:
-                owner.cancel()
-            except BaseException as cleanup_error:
-                raise start_error from cleanup_error
-            raise
 
-    def poll_native_monitor(self, session_id: str) -> dict[str, Any]:
-        """Return actual native wait observations, never inferred exit codes."""
-        return json.loads(self._native_monitors[session_id].poll())
-
-    def close_native_monitor(self, session_id: str) -> None:
-        self._native_monitors[session_id].close()
-
-    def cancel_native_monitor(self, session_id: str) -> None:
-        self._native_monitors[session_id].cancel()
-
-    def persist_native_monitor(self, session_id: str) -> dict[str, Any]:
-        owner = self._native_monitors[session_id]
-        owner.persist()
-        return owner.publication_status()
-
-    def retire_native_monitor(self, session_id: str) -> None:
-        owner = self._native_monitors[session_id]
-        owner.retire()  # actual cleanup + latest native record durably exported
-        del self._native_monitors[session_id]
-        _release_native_monitor_claim(session_id, self)
-
-    def discard_empty_native_monitor(self, session_id: str) -> None:
-        owner = self._native_monitors[session_id]
-        owner.discard_empty()
-        del self._native_monitors[session_id]
-        _release_native_monitor_claim(session_id, self)
 
     def has_process(self, pgid: int) -> bool:
         """Whether this executor still owns the Popen handle for a process group."""
@@ -980,25 +865,6 @@ class Executor:
         ldl = merged_env.get("LD_LIBRARY_PATH", "")
         merged_env["LD_LIBRARY_PATH"] = f"{lib}:{ldl}" if ldl else lib
 
-    def launch_native(self, plan: NativeLaunchPlan) -> int:
-        """Consume one retained native plan or fail without a fallback.
-
-        The actual entry argv and empty environment are properties of the
-        scheduler-owned plan.  This interface intentionally accepts no public
-        ``cmd``, pathname executable, environment, cwd, or shell input.  The
-        reviewed Linux FD-exec backend is a later step, so the current method
-        closes every plan-owned descriptor and raises before process creation.
-        """
-        if not isinstance(plan, NativeLaunchPlan):
-            raise TypeError("launch_native requires a NativeLaunchPlan")
-        try:
-            plan.validate_live_fds()
-            raise NativeLaunchUnavailable(
-                "native FD-exec backend is not connected; no pathname or logical-argv "
-                "fallback is allowed"
-            )
-        finally:
-            plan.close()
 
     def launch(
         self,
@@ -1036,54 +902,7 @@ class Executor:
         )
         native_exec = any(value is not None for value in native_values)
         if native_exec:
-            if any(value is None for value in native_values):
-                raise ValueError("native-exec metadata must be all present or all absent")
-            if (
-                not isinstance(native_exec_profile_id, str)
-                or re.fullmatch(
-                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
-                    native_exec_profile_id,
-                )
-                is None
-            ):
-                raise ValueError("native-exec profile id is invalid")
-            if (
-                not isinstance(native_exec_profile_sha256, str)
-                or re.fullmatch(r"[0-9a-f]{64}", native_exec_profile_sha256)
-                is None
-            ):
-                raise ValueError("native-exec profile digest is invalid")
-            if (
-                not isinstance(native_exec_submitted_argv, list)
-                or not native_exec_submitted_argv
-                or any(
-                    not isinstance(token, str) or not token or "\0" in token
-                    for token in native_exec_submitted_argv
-                )
-            ):
-                raise ValueError("native-exec submitted argv is invalid")
-            if (
-                not os.path.isabs(native_exec_submitted_argv[0])
-                or os.path.normpath(native_exec_submitted_argv[0])
-                != native_exec_submitted_argv[0]
-            ):
-                raise ValueError(
-                    "native-exec executable must be a normalized absolute path"
-                )
-            if conda_env_dir is not None:
-                raise ValueError("native-exec launch forbids an explicit runtime")
-            if gpu is not None:
-                raise ValueError("native-exec launch is CPU-only")
-            if stages is not None:
-                raise ValueError("native-exec launch forbids stages")
-            if cmd != native_exec_submitted_argv:
-                raise ValueError("native-exec command differs from submitted argv")
-            unexpected_env = sorted(set(env) - NATIVE_EXEC_ALLOWED_ENV_KEYS)
-            if unexpected_env:
-                raise ValueError(
-                    "native-exec environment contains non-scheduler keys: "
-                    f"{unexpected_env}"
-                )
+            raise ValueError("legacy exact-profile execution is retired")
         if stages is not None and stage_checkpoint_dir:
             state.ensure_private_directory(stage_checkpoint_dir)
         state.ensure_private_directory(os.path.dirname(log_path))
@@ -1223,6 +1042,7 @@ class Executor:
 
         intent: _LaunchIntent | None = None
         proc: subprocess.Popen | None = None
+        prepared = None
         marker_token: str | None = None
         try:
             launch_script = ""
@@ -1254,7 +1074,12 @@ class Executor:
             )
             if intent is not None:
                 popen_kwargs["pass_fds"] = (intent.fd,)
-            proc = subprocess.Popen(wrapper_cmd, **popen_kwargs)
+            prepared = SubprocessBackend().prepare(
+                ExecutionEnvelope(tuple(wrapper_cmd), merged_env, cwd),
+                stdout_fd=log_f.fileno(), stderr_fd=log_f.fileno(),
+                pass_fds=tuple(popen_kwargs.get("pass_fds", ())), start_new_session=True,
+            )
+            proc = prepared.launch().process
             self._dead_pgroups.discard(proc.pid)
             if launch_marker:
                 assert intent is not None
@@ -1299,8 +1124,16 @@ class Executor:
                     proc.wait(timeout=1)
                 except Exception:
                     pass
+                self._close_process_owner(proc)
+            if proc is None and prepared is not None:
+                try:
+                    prepared.owner.close()
+                except (OSError, RuntimeError):
+                    pass  # Unknown launch authority must remain retained.
             raise
         finally:
+            if prepared is not None:
+                prepared.close()
             if intent is not None:
                 try:
                     os.close(intent.fd)
@@ -1320,6 +1153,7 @@ class Executor:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             self._procs.pop(pgid, None)
+            self._close_process_owner(proc)
             return rc
         except PermissionError:
             if len(self._dead_pgroups) >= 1024:
@@ -1330,6 +1164,16 @@ class Executor:
         except OSError:
             return None
         return None
+
+    @staticmethod
+    def _close_process_owner(proc) -> None:
+        owner = getattr(proc, "_sched_execution_owner", None)
+        if isinstance(owner, Owner):
+            try:
+                owner.close()
+            except (OSError, RuntimeError):
+                # A surviving group or lost authority remains retained.
+                pass
 
     # ---------- 组级 kill ----------
 
@@ -1347,6 +1191,7 @@ class Executor:
                         proc.wait(timeout=1)
                     except Exception:
                         pass
+                    self._close_process_owner(proc)
                 if len(self._dead_pgroups) >= 1024:
                     self._dead_pgroups.clear()
                 self._dead_pgroups.add(pgid)
@@ -1378,6 +1223,7 @@ class Executor:
                             self._dead_pgroups.clear()
                         self._dead_pgroups.add(pgid)
                         self._procs.pop(pgid, None)
+                        self._close_process_owner(proc)
         return kill_sent
     def alive(self, pgid: int) -> bool:
         if pgid in self._dead_pgroups:

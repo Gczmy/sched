@@ -17,5 +17,5 @@ test = ["pytest>=8,<9"]
 [project.scripts]
 sched = "gsched.cli:main"
 
-[tool.setuptools]
-packages = ["gsched"]
+[tool.setuptools.packages.find]
+include = ["gsched", "gsched.*"]

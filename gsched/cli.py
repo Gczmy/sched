@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from . import state, __version__
+from . import state, execution_state, __version__
 from . import artifacts
 from .executor import PROGRESS_RE
 from .config import (
@@ -43,11 +43,20 @@ from .schema import (
     validate_persisted_dependencies,
     validate_project_gpu_access,
 )
+from .execution_policy import (
+    ExecutionPolicyError, digest as execution_digest,
+    project_roots as _execution_project_roots, revalidate_binding,
+)
+
+def native_exec_project_roots(cfg):
+    return {**_legacy_project_roots(cfg), **_execution_project_roots(cfg)}
+
 from .templates import expand_cmd
-from .native_exec import (
+from ._legacy_execution import (
+    NATIVE_EXEC_ALL_INTERNAL_FIELDS,
     NATIVE_EXEC_V2_CONTRACT_FIELD,
     NativeExecProfileError,
-    native_exec_project_roots,
+    native_exec_project_roots as _legacy_project_roots,
     native_exec_reserved_batch_names,
 )
 
@@ -116,6 +125,8 @@ _NATIVE_EXEC_METADATA_KEYS = (
 
 
 def _native_exec_fingerprint_kwargs(task: dict) -> dict[str, str]:
+    if isinstance(task.get("_execution_binding"), dict):
+        return {"execution_binding_sha256": execution_digest(task["_execution_binding"])}
     """Return native fingerprint binding only for a complete normalized tuple."""
     if all(key in task for key in _NATIVE_EXEC_METADATA_KEYS):
         return {
@@ -130,6 +141,9 @@ def _native_exec_fingerprint_kwargs(task: dict) -> dict[str, str]:
 
 
 def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
+    if source.get("execution") is not None:
+        destination["execution"] = source["execution"]
+        destination["_execution_binding"] = source["_execution_binding"]
     """Persist the schema-issued native metadata without partial tuples."""
     if all(key in source for key in _NATIVE_EXEC_METADATA_KEYS):
         destination.update(
@@ -467,7 +481,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     diagnostic_stream = (
         sys.stderr
-        if getattr(args, "dry_run", False) and getattr(args, "json", False)
+        if getattr(args, "json", False)
         else sys.stdout
     )
     _warn_colocate_disabled(norm, cfg, stream=diagnostic_stream)
@@ -487,7 +501,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     # B15: 未声明运行环境的任务 -> 一次性警告
     _unwarn = [t["id"] for t in norm.get("tasks", [])
-               if not t.get("runtime") and not any(
+               if not t.get("execution") and not t.get("runtime") and not any(
                    "{VENV:" in str(c) for c in (t.get("cmd") or []))
                and not any("{VENV:" in str(c) for st in (t.get("stages") or [])
                            for c in (st.get("cmd") or []))]
@@ -578,20 +592,26 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        print(
-            f"已投递: {bid} ({len(norm['tasks'])} 任务) "
-            f"-> {cfg.get('node')} (inbox)"
-        )
+        if getattr(args, "json", False):
+            print(json.dumps({"schema_version": 1, "batch_id": bid,
+                              "delivery": "inbox", "persisted": False,
+                              "tasks": len(norm["tasks"]), "project": norm.get("project")},
+                             ensure_ascii=False))
+        else:
+            print(
+                f"已投递: {bid} ({len(norm['tasks'])} 任务) "
+                f"-> {cfg.get('node')} (inbox)"
+            )
         health = _daemon_health()
         heartbeat_age = health.get("heartbeat_age_s")
         tick_age = health.get("tick_ok_age_s")
         if heartbeat_age is None or heartbeat_age > 60:
-            print("⚠️ daemon 未运行或心跳已过期；payload 已落 inbox，恢复 daemon 后才会消费")
-            print("请先恢复 daemon，再用 sched verify 确认批次入队")
+            print("⚠️ daemon 未运行或心跳已过期；payload 已落 inbox，恢复 daemon 后才会消费", file=diagnostic_stream)
+            print("请先恢复 daemon，再用 sched verify 确认批次入队", file=diagnostic_stream)
         elif tick_age is None or health.get("frozen"):
-            print("⚠️ daemon 心跳存在但调度 tick 未确认完成；请检查 daemon.log 后再用 sched verify")
+            print("⚠️ daemon 心跳存在但调度 tick 未确认完成；请检查 daemon.log 后再用 sched verify", file=diagnostic_stream)
         else:
-            print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果")
+            print("由 daemon 扫描消费入队 (下一 tick); sched verify 确认结果", file=diagnostic_stream)
         return 0
 
     # Foreign-host or first-run dry-run cannot create/migrate/write state.db.
@@ -761,9 +781,22 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # 在 with 事务块**内部** —— commit 发生在块退出时, 若 ensure_running 抛
     # 异常 (如 NFS 读配置瞬断 -> ConfigError), 整个事务回滚但 "已入队" 已
     # 打印, 用户以为成功实际批次消失。打印必须在提交之后。
-    print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
+    if getattr(args, "json", False):
+        print(json.dumps({"schema_version": 1, "batch_id": bid,
+                          "delivery": "database", "persisted": True,
+                          "tasks": len(norm["tasks"]), "project": norm.get("project")},
+                         ensure_ascii=False))
+    else:
+        print(f"已入队: {bid} ({len(norm['tasks'])} 任务, mode={norm['mode']})")
     if not wake_deferred:
-        print(_ensure_running_locked())
+        if getattr(args, "json", False):
+            try:
+                print(_ensure_running_locked(), file=sys.stderr)
+            except Exception as error:
+                # Submission already committed; daemon startup is independent.
+                print(f"批次已持久化，但 daemon 唤醒失败: {error}", file=sys.stderr)
+        else:
+            print(_ensure_running_locked())
     return 0
 
 
@@ -1503,6 +1536,36 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_execution(args: argparse.Namespace) -> int:
+    from . import execution_state
+    batch, task = _resolve_task_ref(args.task)
+    if args.version is not None and args.version < 1:
+        print("错误: version 必须为正整数", file=sys.stderr)
+        return 1
+    with state.connect() as conn:
+        conn.execute("BEGIN")
+        batch_row = state.get_batch(conn, batch)
+        if batch_row is None:
+            print("错误: 批次不存在", file=sys.stderr)
+            return 1
+        batch_revision = batch_row["revision"]
+        jobs = conn.execute("SELECT id FROM jobs WHERE batch_id=? AND task_id=?" +
+                            (" AND version=?" if args.version is not None else "") + " ORDER BY version",
+                            (batch, task, args.version) if args.version is not None else (batch, task)).fetchall()
+        if not jobs:
+            print("错误: 任务或版本不存在", file=sys.stderr)
+            return 1
+        attempts = []
+        for job in jobs:
+            row = execution_state.get(conn, job["id"])
+            if row is not None:
+                attempts.append(execution_state.public(row))
+    output = {"schema_version": 1, "batch_id": batch, "batch_revision": batch_revision,
+              "task_id": task, "attempts": attempts}
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     """Return one task's version timeline in human or stable JSON form."""
     batch, task = _resolve_task_ref(args.task)
@@ -2100,11 +2163,18 @@ def cmd_retry(args: argparse.Namespace) -> int:
             except (json.JSONDecodeError, TypeError):
                 task_spec = None
             if isinstance(task_spec, dict) and any(
-                key in task_spec for key in _NATIVE_EXEC_METADATA_KEYS
+                key in task_spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS
             ):
                 print(
                     "错误: 含原生执行绑定的任务不允许 retry;"
                     " 请重新审批并提交新批次",
+                    file=sys.stderr,
+                )
+                return 1
+            if execution_state.get(conn, job["id"]) is not None:
+                print(
+                    "错误: execution attempt 已消费，不允许 retry 重放；"
+                    "确认旧任务终态后使用 resubmit 创建新版本",
                     file=sys.stderr,
                 )
                 return 1
@@ -2359,13 +2429,19 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            if any(key in spec for key in _NATIVE_EXEC_METADATA_KEYS):
+            if any(key in spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS):
                 print(
                     "错误: 含原生执行绑定的任务不允许 resubmit;"
                     " 请重新审批并提交新批次",
                     file=sys.stderr,
                 )
                 return 1
+            if "execution" in spec:
+                try:
+                    revalidate_binding(spec, cfg, project, json.loads(batch_row["env"] or "{}"))
+                except ExecutionPolicyError as error:
+                    print(f"resubmit 拒绝: {error}", file=sys.stderr)
+                    return 1
             spec.pop("retry_transform", None)
             for stage in spec.get("stages") or []:
                 if isinstance(stage, dict):
@@ -2405,6 +2481,7 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             runtime_prefix=spec.get("runtime_prefix"),
             execution_env=task_environment(cfg, json.loads(batch_row["env"] or "{}"), spec.get("env")),
             artifacts=spec.get("artifacts"),
+            **_native_exec_fingerprint_kwargs(spec),
         )
         prepared["fingerprint"] = fingerprint
         prepared["stage_fingerprints"] = stage_fingerprints
@@ -2597,6 +2674,14 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            legacy_specs = conn.execute(
+                "SELECT t.spec FROM tasks t WHERE t.batch_id=?", (b,)
+            ).fetchall()
+            for row in legacy_specs:
+                spec = json.loads(row["spec"] or "{}")
+                if isinstance(spec, dict) and any(key in spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS):
+                    print("错误: 历史 native 绑定不能 clean 或重新排队", file=sys.stderr)
+                    return 1
             if batch_row["status"] not in ("done", "blocked"):
                 print(
                     "错误: clean 仅允许 done/blocked 终态批次；"
@@ -2654,7 +2739,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 return 1
 
             trows = conn.execute(
-                "SELECT t.id, t.version, t.spec FROM jobs j"
+                "SELECT t.id, t.version, t.spec, j.id AS job_id FROM jobs j"
                 " JOIN (SELECT task_id, MAX(version) AS mv FROM jobs"
                 "       WHERE batch_id=? GROUP BY task_id) latest"
                 "   ON j.task_id=latest.task_id AND j.version=latest.mv"
@@ -2665,6 +2750,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
             ).fetchall()
             for tr in trows:
                 task_label = f"{tr['id']}v{tr['version']}"
+                if execution_state.get(conn, tr["job_id"]) is not None:
+                    print("错误: 已消费 execution attempt 的任务不能 clean 后重排", file=sys.stderr)
+                    return 1
                 try:
                     spec = json.loads(tr["spec"] or "{}")
                 except (json.JSONDecodeError, TypeError) as error:
@@ -2956,7 +3044,7 @@ def _config_set_serialized(args: argparse.Namespace) -> int:
     _deep_merge(new_cfg, patch)
 
     # 冷键拒绝 (与 dispatcher CONFIG_COLD_KEYS 同口径)
-    cold = [k for k in ("node", "state_dir", "user", "schema_version", "native_exec_profiles")
+    cold = [k for k in ("node", "state_dir", "user", "schema_version", "native_exec_profiles", "execution_backends")
             if old.get(k) != new_cfg.get(k)]
     try:
         og, ng = parse_gpus(old), parse_gpus(new_cfg)
@@ -4171,7 +4259,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("batch", help="batch.json 路径")
     p.add_argument("--dry-run", action="store_true",
                    help="只预览不入队 (skip 预测 + 依赖就绪 + 展开命令, §G4)")
-    p.add_argument("--json", action="store_true", help="dry-run 输出 JSON (供脚本解析)")
+    p.add_argument("--json", action="store_true", help="提交结果或 dry-run 预览输出 JSON")
     p.set_defaults(fn=cmd_submit)
 
     p = sub.add_parser("run", help="一行提交单任务 (B14 L1)")
@@ -4219,6 +4307,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--project", default=None,
                    help="按项目过滤 (B11c)")
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("execution", help="通用执行尝试与原始退出事实")
+    p.add_argument("task", help="<batch>:<task>")
+    p.add_argument("--version", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_execution)
 
     p = sub.add_parser("task", help="单任务详情")
     p.add_argument("task", help="<batch>:<task>")
@@ -4459,6 +4553,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify",
         "status",
         "task",
+        "execution",
         "history",
         "markers",
         "incidents",

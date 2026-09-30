@@ -605,6 +605,14 @@ def check(fake: bool = False) -> list[dict[str, str]]:
     def add(item: str, detail: str, level: str = "ok") -> None:
         issues.append({"item": item, "detail": detail, "level": level})
 
+    if cfg.get("execution_backends"):
+        from .execution import BackendUnavailable, LinuxFdBackend
+        try:
+            backend = LinuxFdBackend()
+            add("execution backend", ", ".join(sorted(backend.capabilities)))
+        except BackendUnavailable as error:
+            add("execution backend", str(error), "fail")
+
     # 用户身份 (H2)
     import getpass
 

@@ -39,7 +39,7 @@
 |---|---|---|---|
 | `name` | str | ✅ | 批次名（1..128 位安全 ASCII 标识符；id 自动追加时间戳）|
 | `project` | str | ✅ | 项目名，必须在 config.projects 注册 |
-| `mode` | str | ✗ | `mix`（缺省）或管理员冷 profile 精确授权的 `strict` |
+| `mode` | str | ✗ | `mix`（缺省）；旧 `strict` 只识别历史持久态，不接受新提交 |
 | `priority` | int | ✗ | 项目内批次优先级，默认 0；整数越大越先考虑 |
 | `cwd` | str | ✗ | 缺省为该批次的 project root；支持 `{ROOT}`/`{PROJECT:name}`/`{VENV:key}` 模板 |
 | `env` | obj | ✗ | 字符串环境变量映射（最终覆盖，优先级高于自动注入）；变量名/值必须安全，shell bootstrap 与动态加载注入变量会被拒绝 |
@@ -68,6 +68,7 @@
 | `runtime` | obj | ✗ | `{conda_env:"名"}` ∥ `{venv_alias:"名"}` ∥ `{prefix:"路径"}` 必须且只能选一个；别名须注册、conda env/prefix 目录须在提交时存在；参与指纹 |
 | `progress_regex` | str | ✗ | 从日志尾部提取进度，status 展示 |
 | `artifacts` | obj | ✗ | `{key:{path,...}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`regex:"模式"`；内容校验有读取/执行上限，symlink 与特殊文件拒绝；命中→SKIP |
+| `execution` | obj | ✗ | 通用冷 backend 与输入 FD 绑定；见 [execution-api.md](execution-api.md) |
 | `probes` | obj | ✗ | 仅任务级 `{fail_on_log,ready_on_log}` 日志门控 |
 | `_force_rerun` | 内部 | — | `force_rerun` 的落库字段，输入中不要提供 |
 
@@ -75,90 +76,17 @@
 
 标识符必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`，且不能是 `.`/`..`。已移除或未实现的输入会拒绝：批次级 `gpus`、任务/阶段级 `retry_transform`、阶段级 `probes`；GPU 需求写 `resources.gpu`，probe 只写在任务级。
 
-M2B 的可用范围、外部 bridge 依赖和测试入口见 [native-integration.md](native-integration.md)。
+通用执行层的配置、输入与生命周期见 [execution-api.md](execution-api.md)。
+普通任务缺省仍使用 subprocess；显式 `execution` 任务只使用管理员允许的 backend，
+不可用时明确拒绝，不回退执行原命令。daemon 不解释客户的协议或科学字段。
 
-下述 `strict` 行为仅指 legacy V1，不是普通用户可自由选择的模式。它只允许一个单 `cmd` 任务，并要求：管理员冷配置
-`native_exec_profiles` 与 `(strict, project, batch name, task id, submitted argv)` 唯一精确匹配；
-`cmd[0]` 为规范化绝对路径；effective cwd 为当前项目根；不含 `stages`、`sweep`、`runtime`
-或 scheduler artifact skip/cleanup 规则、日志 probe；batch/task env 为空；resources 精确为
-`gpu=0, cpus=1, gpu_share=false`；显式 `git=false` 与 `max_retry=0`。`git=false` 阻止 reviewed
-native verifier 之前启动 PATH-resolved Git 子进程，code-byte 绑定由 external verifier 负责。四项 scheduler-owned metadata
-（profile id/digest、project-root identity digest、submitted argv）会落库，两个 digest 共同参与
-指纹。profile 对全部 mix 入口（包括 `sched run`）保留 batch name，第一次 strict 耐久入库后该名称永久消费；任何终态后的 fresh submit、
-retry/resubmit、失败重试或节点重启重放均拒绝。同 batch id 的 inbox 重投仅在耐久
-batch/task/job 不可变绑定精确一致时幂等，同名预占或持久态漂移会 fail-closed。
-
-dispatcher 在 running claim 前复核 cold profile、当前/持久 project-root canonical path 与
-device/inode identity、空 env、CPU-only resources。通过后从空继承环境构造 scheduler-owned
-control/identity 字段并 exact argv 直接 Popen，不走 Bash/RC supervisor。只有当前 daemon 持有的
-Popen rc 可成功结算；权威丢失时 fail-closed blocked，RC sidecar 对 native 无成功权威。
-
-边界：该实现仍按路径打开 executable/cwd，reattest→Popen 存在 TOCTOU；它不是 byte/FD-exact
-执行证明。external retained-FD verifier/monitor、七字段 attestation 与专用 poison-overwrite probe
-尚未实现，正式任务不得据此运行。
-
-显式版本 `schema: "sched_native_exec_profile_v2"` 当前仅提供冻结批次兼容校验：精确绑定
-root/task 公共 keyset，以及 raw `{PROJECT:...}` cwd、空依赖、`_protocol`、非空 batch env、
-空 task env、prefix runtime、整数 duration、`max_retry=0`、raw CPU resources、空 artifacts、
-公共 task `git` 缺席和未改写 logical argv。local submit 与 daemon inbox 均在依赖/指纹、
-批次或名称耐久写入、running claim、进程创建之前 fail-closed。V2 当前不落库，也不授权
-Popen。内部 task spec 构造器现可保留 schema 生成的冻结合同；启动前复核函数可对照
-持久化 batch/task 字段与管理员冷 profile，但正常提交路径不会触发该函数。正式
-retained/bootstrap launcher 与完整生命周期接入后，才能考虑解除提交闸门。
-
-后续接口目前也仅是 fail-closed plan foundation：scheduler 私有的一次性
-`NativeLaunchPlan` 持有并复核 retained launcher FD、全封印 request memfd、已连接
-AF_UNIX stream control FD、retained project-root dirfd 与 append-only log FD。request
-副本具有独立的零 offset；root 必须是非 `O_PATH` 的 `O_RDONLY` FD；单链接 log FD 必须
-匹配 retained root 下 `logs/` 内由逐级 `O_NOFOLLOW` 解析的相对路径。actual argv 固定为
-`m2b-exec-monitor[native-entry-v1] --native-entry-v1`，actual env 固定为空，child
-request/control/root FD 固定为 3/4/5；logical submitted argv 只作证据，不会拼入 actual
-argv。request body 仍 opaque 且无权威。私有 generated/no-data
-`NativeStep5DNoDataLaunchOwner` adapter 现在自行创建 AF_UNIX socketpair，只将 native 端交给
-plan factory 并立即关闭该源端；peer 端由创建进程私有保留，且不提供 raw-FD 或 transfer API。
-这只固定预期的 endpoint 构造形状，不认证 scheduler role，也不声称 native 可推断 peer endpoint
-独占。plan 只用 `request_frame_sha256` 命名完整 sealed frame 的 SHA-256，并另用
-`request_body_sha256` 命名 opaque body 的 SHA-256；不存在歧义的 `request_sha256` alias。
-`Executor.launch_native(plan)` 在 Linux FD-exec backend 接入前会关闭 plan 并在创建
-进程前拒绝，V2 提交闸门因此仍未解除。adapter 不含 launch、control protocol、nonce、publication
-或 daemon route；接入前仍必须完成原子的 final validate/map/FD-exec 与经过审查的真实
-direct-parent lifecycle。
-隔离式 `NativeStep5DRequestOwner.prepare()` 省略 `log_fd` 时，会在已复核的项目 root 下
-以 `O_EXCL` 创建 `logs/` 内的私有 `0600` 日志；plan 保留独立 FD，调用方的 root FD
-仍归调用方所有。后续失败保留已创建的日志。内部 `native_sessions` 预留目前只服务
-`isolated_integration`，owner 固定为 `unbound`，不代表 M 所有权或正式执行授权。
-`claim_native_session_candidate()` 在同一 SQLite writer 事务中对 active/latest/pending 的
-V2 job 执行 `running` CAS 并插入唯一 session；调用方必须先完成冻结合同复核，并在
-任何 FD 或子进程创建前提交该事务。随后 `_create_bound_native_session_log()` 先以独立
-writer 事务 CAS 写入并提交唯一 `log_attempted_at`；只有确认提交后才经 retained root FD
-对 `logs/sched-native-<session-id>.log` 尝试 `O_EXCL` 创建，并将实际 `st_dev/st_ino`
-写为 `log_bound`、提交后返回 FD。绑定要求此前已记录 attempt 意图；两个 CAS 都拒绝
-同一 job 已入库的 cancel 请求。`reserved` 且
-`log_attempted_at` 非空表示文件尝试已消费但绑定未决；目录缺失、路径占用、创建或回写
-失败后同一 session 不能再打开日志，即使之后修复目录或移走占用文件。v2→v3 迁移将
-所有旧 session 保守标为已尝试，因为旧 `reserved` 无法区分是否发生过失败的文件打开；
-迁移填入的时间只表示已消费，不应解读为真实打开时间。
-隔离域 T2a 的 `_commit_native_monitor_launch_intent()` 要求独立提交后的 `log_bound`
-session，重新核对 retained root 与日志 FD 的模式、访问方式、append/CLOEXEC、唯一
-项目路径及数据库 inode，再以单行 CAS 提交 `monitor_launch_attempted_at`。CAS
-同时要求 active/latest/running、无 pgid/kill_reason 且该 job 没有任何已入库的 cancel
-请求；该字段写入后不可清除。v1/v2/v3 的旧 session 迁移时一律标为已消费，因为无法
-证明此前未尝试启动 M。commit 失败或结果不明时不返回已消费意图；提交成功只证明
-该隔离域意图已消费，不创建 M owner 或启动 M。提交后至未来实际 M 启动间仍可能有
-新的 cancel/timeout，后续调用方必须现场重验；该意图不构成正式执行授权。
-`reserved` 与 `log_bound` 都不能自动换 session、回到 pending、重放或推断成功；已创建
-的日志在后续失败时保留。正式 dispatcher 不调用这些 helper；其 attempt 日志查询路径、
-native cancel/timeout/崩溃接管、真实 M 启动与可信终态证据仍未接入。
-CLI `task/log/diag` 仍按既有 state 目录版本路径查询，不能用其读取 native session 日志。
-内部 DB `user_version=4` 与公开 CLI JSON 的 `schema_version:1` 是不同版本号。
-
-`gsched.native_step5d_alignment.foundation_alignment_projection()` 提供只读、可 JSON 序列化的
-`digest_and_direct_parent_endpoint_foundation_only` 声明；其值从生产 launch 常量、
-plan/owner slots、私有 factory 签名与 authority flags 派生。声明明确把 canonical request、
-owner-lifetime nonce、control protocol 和 isolated runtime 标为 `unimplemented`，并固定
-`step5d_complete=false`。它不导入项目侧协议、不创建 endpoint，也不新增
-launch/send/daemon API；主仓验证器会独立重建并追踪生产 foundation 后才接受相等。
-因此它只能用于基础对齐，不能作为 Step 5D 完成证据。
+旧 `mode: "strict"`、`native_exec_profiles` 与 `_native_exec_*` 仅供持久态迁移识别，
+新提交不能借其恢复旧执行路径。旧 session 的名称和一次性尝试记录保留；失去原始
+owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删除其运行记录。
+旧合同迁移限制见 [native-integration.md](native-integration.md)。
+内部数据库 schema 与公开 CLI JSON 的 `schema_version:1` 分别演进。
+`sched execution <batch>:<task> --json` 单独返回通用尝试、identity 与原始 observation，
+不改变既有 `status/task/history` 的字段契约；JSON 详见 execution API。
 
 ### config.json 相关（代理只读，调参报告用户）
 
@@ -182,8 +110,9 @@ launch/send/daemon API；主仓验证器会独立重建并追踪生产 foundatio
 | `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
 | `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
-| `task_default_env` | 部署级普通任务环境缺省值 `{k:v}`；batch/task env 可覆盖。legacy V1 strict/native 忽略该键并从空继承环境启动；V2 当前不启动。典型普通任务用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
-| `native_exec_profiles` | 管理员持有的 strict exact-profile 映射；legacy V1 exact keys 为 `mode/project/batch_name/task_id/submitted_argv`；V2 用显式 schema 并增加冻结 batch/task 声明。batch_name 在 registry 内唯一且保留。profile registry 与引用项目的 root 均为冷配置；热更新拒绝，必须重启 daemon |
+| `task_default_env` | 部署级普通任务环境缺省值 `{k:v}`；batch/task env 可覆盖。固定 execution backend 使用其注册的显式环境。典型普通任务用途：`{"PYTHONNOUSERSITE":"1"}` 隔离 ~/.local 用户站点污染 |
+| `execution_backends` | 管理员冷配置的通用可执行文件、argv、env、项目许可与 input slots；见 [execution-api.md](execution-api.md) |
+| `native_exec_profiles` | 旧持久态识别用的冷配置记录；不能授予新 strict/native 执行权限 |
 
 `gpu_quota` 的计数单位是 job，不是不同物理卡或显存：正整数 `N` 表示该项目最多
 同时运行 `N` 个已经分配 GPU 的 job；独占和共享任务均每个 job 计 1，共享时多个

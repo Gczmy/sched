@@ -8,13 +8,22 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[test]'
 python -m pytest -q -rs tests
-python tests/run_native_integration_accept.py
+python tests/run_execution_accept.py
 ```
 
-公共 CI 在 Python 3.10 和 3.14 上运行回归，并在 3.10 上运行 CPU native、
-mode、项目 GPU 开关和文档引用验收。没有 `M2B_STEP5E_CONTRACT_ROOT` 时，
-依赖私有冻结合同的测试按现有规则跳过；公开向量和进程握手测试继续执行。
-这不替代私有合同兼容性验证或集群部署验收。
+公共 CI 在 Python 3.10 和 3.14 上运行完整公共回归，并在 3.10 上运行 execution、
+mode、项目 GPU 开关和文档引用验收。另有独立 Linux native job，显式设置
+`SCHED_BUILD_NATIVE=1` 从本仓库源码构建并运行 native 与调度器回归。
+默认安装不需要编译器，固定 FD backend 不可用时必须明确拒绝。
+两条路径均不读取客户合同路径，不要求另一个仓库存在。
+客户 adapter、研究协议、科学加载和研究 gate 由客户自己的 CI 验证，
+不能因其未通过把 sched 的通用公共验收跳过。
+
+```bash
+SCHED_BUILD_NATIVE=1 python -m pip install -e '.[test]'
+python -m pytest -q -rs tests
+python tests/run_execution_accept.py
+```
 
 ## 提交前检查
 
@@ -22,6 +31,7 @@ mode、项目 GPU 开关和文档引用验收。没有 `M2B_STEP5E_CONTRACT_ROOT
 
 ```bash
 python3 scripts/check_repository.py --all
+python3 scripts/check_execution_boundary.py
 git add <files>
 python3 scripts/check_repository.py --staged
 ```
@@ -62,8 +72,16 @@ git config core.hooksPath .githooks
 
 ```bash
 python3 -m unittest discover -s scripts -p test_repository_check.py -v
+python3 -m unittest discover -s scripts -p test_execution_boundary.py -v
 ```
 
 检查器、测试和 `.githooks/pre-commit` 在 `sched` 与 `dsh-node-sched` 中保持逐字节
 一致；修改时同步两份，并在各自独立 checkout 验证。两个仓库的公共 CI 不要求
 另一仓库或私有研究仓库存在。GitHub Actions 固定到已核对的提交，只有读取权限。
+
+`check_execution_boundary.py` 是 sched 独立的源码边界检查，不属于上述两仓共享的
+隐私扫描器。它使用 AST 检查 runtime import、协议常量和阶段枚举，检查必要测试
+的外部合同与搜索路径，以及向 `gsched` namespace 写入模块/路径的行为。
+同时检查 native 源码、构建定义与 CI。历史文档和源码注释不定义 runtime 依赖；
+旧持久态字段在兼容守卫中允许，但不能借历史键重新加入客户协议执行代码。
+边界检查读取已跟踪和未忽略的新源码，删除的源文件不会继续视作当前实现。

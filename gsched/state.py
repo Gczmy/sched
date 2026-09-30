@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 5
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -182,6 +182,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "tasks",
         "jobs",
         "native_sessions",
+        "execution_attempts",
         "gpus",
         "gpu_jobs",
         "profile_cache",
@@ -204,12 +205,15 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "revision_gpu_job_delete",
         "revision_gpu_job_update",
         "native_session_monitor_launch_immutable",
+        "execution_attempt_identity_immutable",
+        "execution_attempt_terminal_immutable",
     },
 }
 
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "execution_attempts": {"attempt_id", "job_id", "job_version", "backend_id", "backend_config_sha256", "phase", "identity", "observation", "cancel_reason", "created_at", "launch_intent_at", "finished_at"},
     "batches": {"notify", "project", "priority", "revision"},
     "tasks": {"project"},
     "jobs": {"project", "progress"},
@@ -438,6 +442,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 5:
+        required_objects["table"].remove("execution_attempts")
+        required_objects["trigger"].remove("execution_attempt_identity_immutable")
+        required_objects["trigger"].remove("execution_attempt_terminal_immutable")
+        del required_columns["execution_attempts"]
     if version == 1:
         required_objects["table"].remove("native_sessions")
         required_objects["trigger"].remove("native_session_monitor_launch_immutable")
@@ -863,7 +872,7 @@ def _database_schema_is_current(database: str) -> bool:
 
 
 def _database_schema_is_query_compatible(database: str) -> bool:
-    """Accept complete private WAL schemas v1-v4 for local queries only."""
+    """Accept complete private WAL schemas v1-v5 for local queries only."""
     return _database_schema_is_usable(database, allow_legacy=True)
 
 
@@ -910,8 +919,9 @@ def _require_wal_snapshot(database: str) -> None:
 def _initialize_database() -> None:
     """Run one atomic schema initialization/migration attempt."""
     ensure_private_directory(os.path.dirname(db_path()))
+    from .execution_state import SCHEMA as EXECUTION_SCHEMA
     with connect() as conn:
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
@@ -927,7 +937,7 @@ def _initialize_database() -> None:
 def ensure_db_initialized() -> str:
     """Initialize only when the read-only schema probe finds work to do.
 
-    Query commands accept complete private WAL schemas v1-v4 without entering
+    Query commands accept complete private WAL schemas v1-v5 without entering
     init_db() or requesting ``BEGIN IMMEDIATE``.  A fresh, stale, partially
     copied, non-WAL, or permission-drifted state still takes the existing full
     atomic initialization path.
@@ -1608,115 +1618,7 @@ def claim_native_session_candidate(
     calls this candidate-only API while V2 lifecycle handling is unavailable.
     A failed claim or insert rolls back both changes to this savepoint.
     """
-    if type(job_id) is not str or not job_id:
-        raise StateError("native session job id is invalid")
-    if type(job_version) is not int or job_version < 1:
-        raise StateError("native session job version is invalid")
-    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
-        raise StateError("native session id must be 32 lowercase hexadecimal characters")
-    if type(profile_id) is not str or _NATIVE_PROFILE_ID_RE.fullmatch(profile_id) is None:
-        raise StateError("native session profile id is invalid")
-    if (
-        type(profile_sha256) is not str
-        or _NATIVE_SESSION_DIGEST_RE.fullmatch(profile_sha256) is None
-        or type(project_root_identity_sha256) is not str
-        or _NATIVE_SESSION_DIGEST_RE.fullmatch(project_root_identity_sha256) is None
-    ):
-        raise StateError("native session digest is invalid")
-    if (
-        type(project_root_path) is not str
-        or project_root_path == os.path.sep
-        or not os.path.isabs(project_root_path)
-        or os.path.normpath(project_root_path) != project_root_path
-    ):
-        raise StateError("native session project root path is invalid")
-
-    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
-        raise StateError("native session claim requires a caller-owned writer transaction")
-    binding = conn.execute(
-        "SELECT j.version, t.spec FROM jobs j"
-        " JOIN batches b ON b.id=j.batch_id"
-        " JOIN tasks t ON t.batch_id=j.batch_id"
-        "  AND t.id=j.task_id AND t.version=j.version"
-        " WHERE j.id=? AND j.version=? AND b.mode='strict'",
-        (job_id, job_version),
-    ).fetchone()
-    if binding is None:
-        raise StateError("native session requires an existing strict job version")
-    try:
-        spec = json.loads(binding["spec"])
-    except (TypeError, ValueError) as error:
-        raise StateError("native session task spec is invalid") from error
-    if (
-        type(spec) is not dict
-        or type(spec.get("_native_exec_contract_v2")) is not dict
-        or spec.get("_native_exec_profile_id") != profile_id
-        or spec.get("_native_exec_profile_sha256") != profile_sha256
-        or spec.get("_native_exec_project_root_identity_sha256")
-        != project_root_identity_sha256
-        or spec.get("cwd_abs") != project_root_path
-    ):
-        raise StateError("native session differs from the persisted V2 binding")
-
-    conn.execute("SAVEPOINT native_session_claim")
-    try:
-        claimed = conn.execute(
-            "UPDATE jobs SET status='running', started_at=?, gpu=NULL,"
-            " pgid=NULL, kill_reason=NULL"
-            " WHERE id=? AND version=? AND status='pending'"
-            " AND gpu IS NULL AND pgid IS NULL AND kill_reason IS NULL"
-            " AND retries=0 AND rc IS NULL AND started_at IS NULL"
-            " AND EXISTS (SELECT 1 FROM batches b WHERE b.id=jobs.batch_id"
-            "   AND b.status='active' AND b.mode='strict')"
-            " AND version=(SELECT MAX(j2.version) FROM jobs j2"
-            "   WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)"
-            " AND NOT EXISTS (SELECT 1 FROM native_sessions n WHERE n.job_id=jobs.id)",
-            (now(), job_id, job_version),
-        )
-        if claimed.rowcount != 1:
-            raise StateError("native session claim lost active/latest/pending CAS")
-        # The CAS holds the main database writer even when the caller started
-        # a DEFERRED transaction.  Check the external stop marker only now;
-        # the savepoint rolls back this claim if shutdown was published first.
-        # A failed marker inspection must also deny this one-shot claim.
-        try:
-            os.lstat(submission_shutdown_marker())
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise StateError("native session claim cannot inspect shutdown marker") from error
-        else:
-            raise StateError("native session claim rejected during daemon shutdown")
-        try:
-            os.lstat(launch_marker_path(job_id))
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise StateError("native session claim cannot inspect legacy launch marker") from error
-        else:
-            raise StateError("native session claim rejected by legacy launch marker")
-        conn.execute(
-            "INSERT INTO native_sessions ("
-            "session_id,job_id,job_version,evaluation_domain,owner_kind,"
-            "profile_id,profile_sha256,project_root_path,"
-            "project_root_identity_sha256,log_relative_path,phase,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                session_id, job_id, job_version, "isolated_integration", "unbound",
-                profile_id, profile_sha256, project_root_path,
-                project_root_identity_sha256,
-                f"logs/sched-native-{session_id}.log", "reserved", now(),
-            ),
-        )
-    except BaseException:
-        conn.execute("ROLLBACK TO SAVEPOINT native_session_claim")
-        conn.execute("RELEASE SAVEPOINT native_session_claim")
-        raise
-    conn.execute("RELEASE SAVEPOINT native_session_claim")
-    session = get_native_session(conn, session_id)
-    if session is None:
-        raise StateError("native session reservation disappeared")
-    return session
+    raise StateError("legacy native session creation and launch are retired")
 
 
 def mark_native_session_log_attempted(
@@ -1727,72 +1629,14 @@ def mark_native_session_log_attempted(
     The caller must commit this CAS before opening any log path.  A failed or
     uncertain commit must never be followed by a filesystem open.
     """
-    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
-        raise StateError("native session id is invalid")
-    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
-        raise StateError("native log attempt requires a caller-owned writer transaction")
-    # A DEFERRED caller transaction may not own the writer yet.  Acquire it
-    # before checking the stop marker, then leave the one-shot CAS untouched
-    # when the marker exists or its state cannot be inspected.
-    conn.execute("UPDATE jobs SET status=status WHERE 0")
-    _check_native_session_shutdown_marker("log attempt")
-    changed = conn.execute(
-        "UPDATE native_sessions SET log_attempted_at=?"
-        " WHERE session_id=? AND phase='reserved' AND log_attempted_at IS NULL"
-        " AND evaluation_domain='isolated_integration' AND owner_kind='unbound'"
-        " AND NOT EXISTS (SELECT 1 FROM control_requests c"
-        "   WHERE c.job_id=native_sessions.job_id AND c.op='cancel')"
-        " AND EXISTS (SELECT 1 FROM jobs j JOIN batches b ON b.id=j.batch_id"
-        "   WHERE j.id=native_sessions.job_id"
-        "   AND j.version=native_sessions.job_version"
-        "   AND j.status='running' AND j.pgid IS NULL"
-        "   AND j.kill_reason IS NULL AND b.status='active'"
-        "   AND b.mode='strict'"
-        "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
-        "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))",
-        (now(), session_id),
-    )
-    if changed.rowcount != 1:
-        raise StateError("native log attempt is no longer an active reservation")
-    session = get_native_session(conn, session_id)
-    if session is None:
-        raise StateError("native log attempt disappeared")
-    return session
+    raise StateError("legacy native session creation and launch are retired")
 
 
 def bind_native_session_log(
     conn: sqlite3.Connection, session_id: str, log_dev: int, log_ino: int,
 ) -> sqlite3.Row:
     """Bind one validated O_EXCL log inode; never open or reuse an old path."""
-    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
-        raise StateError("native session id is invalid")
-    if type(log_dev) is not int or log_dev < 0 or type(log_ino) is not int or log_ino <= 0:
-        raise StateError("native log inode identity is invalid")
-    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
-        raise StateError("native log bind requires a caller-owned writer transaction")
-    changed = conn.execute(
-        "UPDATE native_sessions SET phase='log_bound', log_dev=?, log_ino=?,"
-        " log_bound_at=? WHERE session_id=? AND phase='reserved'"
-        " AND log_attempted_at IS NOT NULL"
-        " AND evaluation_domain='isolated_integration' AND owner_kind='unbound'"
-        " AND NOT EXISTS (SELECT 1 FROM control_requests c"
-        "   WHERE c.job_id=native_sessions.job_id AND c.op='cancel')"
-        " AND EXISTS (SELECT 1 FROM jobs j JOIN batches b ON b.id=j.batch_id"
-        "   WHERE j.id=native_sessions.job_id"
-        "   AND j.version=native_sessions.job_version"
-        "   AND j.status='running' AND j.pgid IS NULL"
-        "   AND j.kill_reason IS NULL AND b.status='active'"
-        "   AND b.mode='strict'"
-        "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
-        "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))",
-        (str(log_dev), str(log_ino), now(), session_id),
-    )
-    if changed.rowcount != 1:
-        raise StateError("native log binding is no longer an active reservation")
-    session = get_native_session(conn, session_id)
-    if session is None:
-        raise StateError("native log binding disappeared")
-    return session
+    raise StateError("legacy native session creation and launch are retired")
 
 
 def mark_native_monitor_launch_attempted(
@@ -1806,39 +1650,7 @@ def mark_native_monitor_launch_attempted(
     The caller must confirm a separate commit before starting any native owner.
     This reservation does not create or bind an owner, nor grant phase execution.
     """
-    if type(session_id) is not str or _NATIVE_SESSION_ID_RE.fullmatch(session_id) is None:
-        raise StateError("native session id is invalid")
-    if type(log_dev) is not int or log_dev < 0 or type(log_ino) is not int or log_ino <= 0:
-        raise StateError("native monitor launch log inode identity is invalid")
-    if conn.row_factory is not sqlite3.Row or not conn.in_transaction:
-        raise StateError("native monitor launch intent requires a caller-owned writer transaction")
-    conn.execute("UPDATE jobs SET status=status WHERE 0")
-    _check_native_session_shutdown_marker("monitor launch intent")
-    changed = conn.execute(
-        "UPDATE native_sessions SET monitor_launch_attempted_at=?"
-        " WHERE session_id=? AND phase='log_bound'"
-        " AND log_attempted_at IS NOT NULL"
-        " AND monitor_launch_attempted_at IS NULL"
-        " AND log_dev=? AND log_ino=?"
-        " AND evaluation_domain='isolated_integration' AND owner_kind='unbound'"
-        " AND NOT EXISTS (SELECT 1 FROM control_requests c"
-        "   WHERE c.job_id=native_sessions.job_id AND c.op='cancel')"
-        " AND EXISTS (SELECT 1 FROM jobs j JOIN batches b ON b.id=j.batch_id"
-        "   WHERE j.id=native_sessions.job_id"
-        "   AND j.version=native_sessions.job_version"
-        "   AND j.status='running' AND j.pgid IS NULL"
-        "   AND j.kill_reason IS NULL AND b.status='active'"
-        "   AND b.mode='strict'"
-        "   AND j.version=(SELECT MAX(j2.version) FROM jobs j2"
-        "     WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id))",
-        (now(), session_id, str(log_dev), str(log_ino)),
-    )
-    if changed.rowcount != 1:
-        raise StateError("native monitor launch intent is no longer an active reservation")
-    session = get_native_session(conn, session_id)
-    if session is None:
-        raise StateError("native monitor launch intent disappeared")
-    return session
+    raise StateError("legacy native session creation and launch are retired")
 
 
 def mark_native_session_timed_out(

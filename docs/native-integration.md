@@ -1,92 +1,34 @@
-# M2B 分支整合与实现边界
+# 旧 native 接口兼容记录
 
-2026-09-27 将 `codex/m2b-step5e-external-anchor` 的 `3cd3987` 整合到
-主线 `b097fbc`。前两条 M2B 分支均为此分支的祖先，不需要分别合并。
-三个原始分支头通过以下 annotated tags 保留，可恢复对应历史：
+本文记录从历史 M2B 实验集成到通用 execution API 的边界变化，不能作为新任务提交
+或研究执行授权。当前接口见 [execution-api.md](execution-api.md)，责任划分见
+[execution-boundary.md](execution-boundary.md)。
 
-- `archive/m2b-native-exec-profile-20260927` → `0d5d8e3`
-- `archive/m2b-step5d-control-runtime-20260927` → `eaea20e`
-- `archive/m2b-step5e-external-anchor-20260927` → `3cd3987`
+历史 `main@ccbf600` 包含 MPC_OTSF 的 Step5D/E/F 协议、部署绑定和 native bridge
+调用。专用源码、冻结向量、测试及原始快照已迁至研究仓库的独立命名空间；
+研究仓库不能再提供或注入 `gsched._m2b_scheduler_native`。
+原分支历史仍可由 Git 查看，历史测试计数和运行记录只对应当时版本。
 
-## 当前可用范围
+## 旧持久态
 
-普通 `mix` 提交仍使用主线的 schema 2 指纹、提交事务、取消优先级、项目
-GPU 开关、主机内存预留、drain 和 daemon 健康检查。没有配置
-`native_exec_profiles` 时，不会启用 strict 通道或导入 native C bridge。
-运行时仍无第三方 Python 依赖。
+旧 `native_exec_profiles`、`mode: "strict"` 和内部 `_native_exec_*` 字段仅供
+迁移识别。新提交拒绝旧 strict/native 输入，不能借这些键启用旧研究执行路径。
+`retry`、`resubmit` 和 `clean` 也识别旧内部字段，包括只有 V2 metadata 的部分记录，
+拒绝将其重新入队；清理不能先删产物再发现旧执行无法安全重放。
+已有 native session 表、尝试字段、名称消费记录和指纹绑定保留，避免把未知结果
+解释为未启动或重新授予一次启动机会。旧 session 的恢复、取消和停止守卫继续
+保留其未解决状态；没有原 owner/wait 证据时，不推断成功、不自动回队或重放。
 
-V1 `strict` 只接受管理员冷 profile 精确绑定的单个 CPU 任务；已消费的
-批次名称不能再次提交、retry 或 resubmit。运行中任务需要当前 daemon 的
-原始 `Popen` 权威才能成功结算。它受 drain 控制，项目禁用 GPU 不阻止
-此 CPU 通道；任务不继承 daemon 或 `task_default_env` 环境。
-`SCHED_BATCH_ID` 沿用既有环境契约，值是批次名称；CLI JSON 的 `batch_id`
-才是持久化批次 ID。完整限制见 [reference.md](reference.md)。
+数据库 schema 与公开 CLI JSON 的 `schema_version` 分别演进。
+迁移代码不删除旧 session，也不直接清理运行目录。部署前需先读取本机持久态，
+按 CLI 契约处理未解决尝试；此文档不授权操作正在使用的远程实例。
 
-V2 profile 的提交入口仍在持久化和启动前拒绝。内部已具备冻结合同随 task spec
-保存和启动前逐项复核的基础，但正常提交流程不会写入 V2；它不构成正式执行链。
-`Executor.launch_native(plan)` 仍抛出 `NativeLaunchUnavailable`，不会回退到
-路径执行。Step 5D/5E/5F 的协议、传输和生命周期组件作为实验基础保留，
-不构成正式 MPC_OTSF 执行链，也没有接入常规 dispatcher 的 V2 调度路径。
-内部另有 isolated-only 的 native session 抢占/预留、日志打开前独立提交的一次性
-`log_attempted_at` CAS、项目日志 inode 绑定，以及 T2a 的一次性
-`monitor_launch_attempted_at` 启动前 CAS。文件打开失败永久消费本 session 的日志
-尝试；启动意图提交结果不明也不得重试。隔离域 session 超过 `duration_min`
-时，dispatcher 只持久写入 `timed_out` 意图，阻止后续启动前 CAS，不发信号或
-结算任务；已提交 T2a 意图的会话在 M 启动前仍须再次检查。上述 helper 未接入正式
-V2 派发，owner 仍未绑定，
-不创建或启动 M，不能作为生产授权、启动或完成证据。
+## 研究迁移
 
-## 外部依赖
+新的通用 `linux_fd` 接口只绑定 executable、argv、env 与输入 FD，
+不解析旧 M2B wire、Step5 合同或科学阶段。项目 adapter 在独立子进程中运行，
+因此旧合同的 direct-parent、peer identity、进程角色和 wait 权威需要新版审查。
+普通 wrapper 的成功退出不能直接替代完整研究链证据。
 
-部署专用的解释器路径和任务身份绑定已移到显式、不可变的管理员私有配置，
-格式为 `sched_native_deployment/v1`。加载时校验独立固定的文件摘要；协议和
-owner 必须显式接收配置，不从请求获取预期值。迁移方式和调用变更见
-[native-deployment.md](native-deployment.md)。冻结 wire 格式与摘要保持不变，
-使用原绑定时仍逐字节兼容；Git 历史和外部私有合同中的旧信息没有清除。
-
-`Executor.reserve_native_monitor()` 等显式 native monitor 方法需要
-`gsched._m2b_scheduler_native` 扩展。其 C 源码和专用构建/验收脚本位于
-配套研究仓库 `MPC_OTSF`，不随 `sched` 包构建或安装；普通 daemon 不依赖它。
-整合不修改该仓库的冻结合同，也不把历史 native 运行记录当作当前验证。
-`Executor.start_native_monitor()` 在原线程原子消费一次性启动令牌；重复或跨线程
-调用在 Python 边界拒绝，不会因底层拒绝而误取消原 M。从 native pin 恢复的 owner
-一律视为启动尝试已消费，不能用恢复动作重放启动。同一进程内的 session
-由仍存活的原 `Executor` 独占认领，其他实例不能同时接管同一 C pin；原实例
-失去所有引用后，可由原线程的新实例恢复。成功退役或丢弃空 owner 后释放
-认领；创建结果不明时，原实例继续存活则保留认领直到 pin 状态确认。
-
-Step 5E 的跨仓协议测试从 `M2B_STEP5E_CONTRACT_ROOT` 读取冻结向量、合同和
-勘误，校验其 SHA-256。未设置此变量时仅跳过外部向量测试；一旦设置，
-路径错误、文件缺失或摘要不符均导致失败。Step5D／5E／5F 的身份与 argv 仍按
-管理员绑定精确匹配，没有开放请求可指定的任意项目 API。外部隔离启动器已在
-`MPC_OTSF` 的 `d8164bf` 同步显式配置参数和固定源码清单；本地 Step5E
-root/C 回归 42 项通过，这不代替 HPDC 正式任务验收。
-
-## 本地验证与复现
-
-在 Linux/POSIX 开发环境使用独立虚拟环境；以下命令不访问 HPDC。
-安装可选测试依赖不会增加调度器的运行时依赖：
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install -e '.[test]'
-M2B_STEP5E_CONTRACT_ROOT=/path/to/MPC_OTSF python3 -m pytest -q tests
-python3 tests/run_native_integration_accept.py
-bash tests/run_mode_consistency_accept.sh
-bash tests/run_submit_inbox_accept.sh
-bash tests/run_project_gpu_enabled_accept.sh
-python3 tests/run_host_resources_accept.py
-bash tests/run_daemon_heartbeat_accept.sh
-bash tests/run_docs_refs_accept.sh
-```
-
-跨仓向量验证使用的本地 `MPC_OTSF` 提交为
-`8405c879f5b30982510d4e82c64770530e2820db`。后续调用方迁移提交为
-`d8164bfe35f0556d582dc0051fcec8417fdbda75`；旧冻结测试数据原字节保留。
-调度器 native 验收使用临时目录和真实 CPU 子进程，检查 drain、GPU 禁用时的
-CPU 执行、环境隔离、完成与禁止重放。
-
-研究仓库已在本地 GCC 11 环境构建并运行外部 C bridge 的十项 S/M 生命周期
-用例。正式 FD-exec 后端和研究项目全链路验收仍未完成；没有连接、部署或重启
-远程 HPDC。
+旧冻结协议的兼容测试和研究 G1–G6 属于 MPC_OTSF 的独立工作目标。
+`sched` 公共 CI 和发布不等待这些 gate，也不读取研究合同路径。
