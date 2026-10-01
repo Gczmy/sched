@@ -35,6 +35,8 @@ jobs:
         run: python -m unittest discover -s scripts -p test_execution_boundary.py -v
       - name: Check candidate integrity and CI admission
         run: python -m unittest discover -s scripts -p test_release_candidate.py -v
+      - name: Check release preparation and interrupted draft uploads
+        run: python -m unittest discover -s scripts -p test_prepare_release.py -v
       - name: Check runtime and required-test independence
         run: python scripts/check_execution_boundary.py
       - name: Check privacy, Markdown references and commit whitespace
