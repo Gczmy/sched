@@ -51,6 +51,9 @@ def ci_evidence(commit, env, head):
         "run_attempt": env.get("GITHUB_RUN_ATTEMPT", ""),
         "validation_jobs": {j: jobs[j].get("result") for j in sorted(jobs)},
     }
+    if env.get("SCHED_CI_BUILD_TARGET"):
+        require(env["SCHED_CI_BUILD_TARGET"] in {"ubuntu-22.04", "ubuntu-24.04"}, "unsupported CI build target")
+        evidence["build_target"] = env["SCHED_CI_BUILD_TARGET"]
     require(env.get("GITHUB_SERVER_URL") == "https://github.com", "unsupported CI server")
     evidence["run_url"] = f"https://github.com/{evidence['repository']}/actions/runs/{evidence['run_id']}"
     check_ci(evidence, commit)
