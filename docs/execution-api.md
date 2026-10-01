@@ -1,6 +1,6 @@
 # 通用 execution API
 
-> 本文对应 0.2.1，写库 schema 7；发布提交和产物以 GitHub Release 为准。
+> 本文对应 0.2.2 开发候选，写库 schema 7；已发布 0.2.1 的提交和产物以 GitHub Release 为准。
 
 普通任务继续使用默认 subprocess 执行。需要固定可执行文件和输入 FD 的任务，
 通过管理员冷配置的 `linux_fd` backend 使用通用执行层。backend 注册值和其引用的
@@ -225,6 +225,23 @@ id 为 `configuration/execution_backend/user_identity/state_writable/node_state_
 venv 或 project。fake 模式跳过的检查不能作为实际验收证据。
 有 fail 时返回 1，其余返回 0；主机守卫拒绝仍为 2。文本输出保持现有格式。
 该命令包含原有的目录写入与资源检查，不属于纯只读查询；网关不得执行。
+
+0.2.2 开发候选另按 backend ID 检查管理员配置的 executable 和每个允许项目的 root。
+新增检查 ID 为 `execution_executable` 与 `execution_project_root`；`subject` 为 backend ID，
+`project` 为项目名或 null，`reason` 为稳定错误码或 null。这些新增项保留既有
+item/detail/level/performed 字段；其他检查的字段与 subject 含义保持原契约。
+检查以有界流式读取验证普通文件、SHA-256、读取中变化和 ELF 标识，
+按实际启动策略解析 root 并检查目录打开和搜索权限。文件执行位不作为原始文件的
+必要条件，因为启动使用独立封印副本；检查不读取任务输入、不保留执行 FD、
+不连接 owner、不打开数据库、不创建 attempt 或 child。fake 仅跳过原有资源探测，
+不会跳过这些管理员文件检查。
+
+reason 为 `executable_missing/symlink/not_directory/unreadable/io_error/not_regular/`
+`too_large/changed/digest_mismatch/not_elf/probe_failed`（各项完整值均以
+`executable_` 开头）；root 为 `project_root_missing/symlink/not_directory/unreadable/`
+`io_error/unsearchable/probe_failed`；非 Linux 为 `non_linux`，performed 为 false。
+错误不输出路径或异常原文。通过只证明本次读取时的部署条件，不验证 ELF 动态加载、
+任务输入或未来启动；实际 prepare/start 继续执行原来的完整校验。
 
 `request` 保留原写命令的 stdout、stderr 和返回码。`cancel` 及其 request 包装
 没有 `--json` 选项；客户端保留原始输出，不能将展示文字作为稳定结果字段。

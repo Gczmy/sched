@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 (unreleased)
+
+- Check each administrator execution backend's executable and project roots before
+  deployment, with bounded streaming SHA-256, ELF checks and stable failure codes.
+  Checks never reserve attempts, launch children or replace startup validation.
+
 ## 0.2.1
 
 - Add passive cross-task execution browsing with project/batch/backend/phase/owner

@@ -112,7 +112,7 @@
 | `sched task <batch>:<task> --json` | 单任务与各版本详情 |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
-| `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；只使用 verified 能力，不解析展示文本 |
+| `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；check 另按 backend ID 检查文件摘要与项目 root，通过不替代启动校验 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |

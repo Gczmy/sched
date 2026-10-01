@@ -616,6 +616,8 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
             add("execution backend", ", ".join(result["verified"]) if result["status"] == "available"
                 else result["reason"], "ok" if result["status"] == "available" else "fail",
                 check_id="execution_backend", subject=kind)
+        from .execution.preflight import deployment_checks
+        issues.extend(deployment_checks(cfg))
 
     # 用户身份 (H2)
     import getpass

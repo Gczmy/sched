@@ -1,5 +1,6 @@
 """Capability evidence and structured checks never invent execution authority."""
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -8,6 +9,7 @@ from unittest import mock
 from gsched import cli, daemon, state
 from gsched.execution import BackendUnavailable
 from gsched.execution import capabilities
+from pathlib import Path
 from test_review_cli_state import TempStateCase
 
 
@@ -92,9 +94,34 @@ class CapabilityTests(TempStateCase):
                   "linux_fd_owner": {"status": "unavailable", "reason": "owner_primitives_unavailable", "verified": []}}
         with mock.patch.object(daemon, "load_config", return_value=self.cfg), mock.patch.object(
             capabilities, "snapshot", return_value={"backends": probes}
-        ):
+        ), mock.patch("gsched.execution.preflight.deployment_checks", return_value=[]):
             checks = daemon.check(fake=True)
         execution = [c for c in checks if c["id"] == "execution_backend"]
         self.assertEqual(1, len(execution))
         self.assertEqual("linux_fd_owner", execution[0]["subject"])
         self.assertEqual("fail", execution[0]["level"])
+
+    def test_daemon_json_includes_each_registered_executable_and_root(self):
+        executable = os.path.join(self.tmp.name, "worker")
+        Path(executable).write_bytes(b"\x7fELFpreflight fixture")
+        self.cfg["execution_backends"] = {"worker": {
+            "kind": "linux_fd", "executable": executable,
+            "sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest(),
+            "argv": ["worker"], "env": {}, "projects": ["p"], "input_slots": {},
+        }}
+        probes = {"linux_fd": {"status": "available", "reason": None, "verified": ["fd_exec_v1"]}}
+        with mock.patch.object(daemon, "load_config", return_value=self.cfg), mock.patch.object(
+            capabilities, "snapshot", return_value={"backends": probes}
+        ), mock.patch("getpass.getuser", return_value="test"):
+            code, output, _ = self.capture(cli.cmd_daemon, argparse.Namespace(action="check", json=True, fake=True))
+            value = json.loads(output)
+            deployment = [c for c in value["checks"] if c["id"] in {"execution_executable", "execution_project_root"}]
+            self.assertEqual(0, code)
+            self.assertTrue(all(c["reason"] is None and c["performed"] for c in deployment))
+            self.assertEqual(2, len(deployment))
+            Path(executable).write_bytes(b"\x7fELFdrift")
+            code, output, _ = self.capture(cli.cmd_daemon, argparse.Namespace(action="check", json=True, fake=True))
+        self.assertEqual(1, code)
+        failed = next(c for c in json.loads(output)["checks"] if c["id"] == "execution_executable")
+        self.assertEqual("worker", failed["subject"])
+        self.assertEqual("executable_digest_mismatch", failed["reason"])
