@@ -29,7 +29,7 @@ Release 与 tag 记录，发布时保留已经验收的包与 manifest 原始字
 0.2.2 开发候选按 Python 3.10/3.14 与 Ubuntu 22.04/24.04 保存四份产物，
 名称含完整提交、Python 版本、runner target 和运行 attempt，
 保留 30 天，不覆盖已有 artifact。每份包含默认 wheel 与对应 ABI 的 native wheel；
-两份中的默认 wheel 不要求逐字节一致，分别以各自 manifest 的哈希为准。
+各份中的默认 wheel 不要求逐字节一致，分别以各自 manifest 的哈希为准。
 
 manifest 的 `ci` 只保存公开的仓库、事件、源码/工作流提交、run 链接和前置 job 结果，
 不会把构建中的整次 workflow 标为成功。整次 run 完成后，另查最终结果；上传成功的
@@ -45,6 +45,11 @@ python scripts/verify_release_candidate.py <candidate-directory> --commit <revie
 schema、wheel 元数据/ABI 与安装证据。它不替代对 GitHub run 最终结果的核对。
 PR 产物对应该分支提交；合并后须使用新 `main` 提交的 CI 产物准备正式发布。
 CI 产物会过期，正式发布前须取得独立授权并保存已验收包、摘要与对应 CI 记录。
+
+0.2.2 增加同仓发布准备脚本和手动 workflow，验证来源完整成功矩阵，保留原始 ZIP，
+生成总校验和与 evidence，可选择上传来源一致的草稿。中断后只复用经过哈希核对的
+匹配资产；不覆盖已发布版本，不自动发布。入口与离线元数据契约见
+[release-preparation.md](release-preparation.md)。
 
 ## 本地候选
 

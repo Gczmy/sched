@@ -38,10 +38,10 @@ owner 确实消失时进入既有 authority_lost 守卫；只有进程组确已�
 
 终局观察和任务状态提交后，daemon 才确认并关闭 owner。终局等待确认有有限
 保留期；超过保留期而没有持久终局的记录仍属于未知结果，不补造成功。
-0.2.0 使用写 schema 6，0.2.1 候选使用 schema 7；只读查询兼容 schema 1–7
+0.2.0 使用写 schema 6，0.2.1使用 schema 7；只读查询兼容 schema 1–7
 且不升级，旧尝试没有 owner binding 时仍按原守卫处理。
 
-## 保留配置与运维观察（0.2.1 候选）
+## 保留配置与运维观察（0.2.1）
 
 `execution_backends[ID].owner` 仅适用于 `linux_fd_owner`，属于冷配置：
 

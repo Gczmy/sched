@@ -41,7 +41,7 @@ backend 缺失、文件漂移、输入不匹配或 native 能力缺失时明确�
 owner 身份；客户端必须明确支持此封装。绑定与崩溃窗口见
 [persistent-execution-owner.md](persistent-execution-owner.md)。
 
-0.2.1 候选允许该 backend 的可选冷配置 `owner.prepare_timeout_sec`（1–300 秒，默认 30）
+0.2.1允许该 backend 的可选冷配置 `owner.prepare_timeout_sec`（1–300 秒，默认 30）
 与 `owner.terminal_retention_sec`（60–604800 秒，默认 3600）。省略字段使用默认值；
 其他 backend 不接受 `owner`，未知字段、布尔值和非有限数值拒绝。热更新不改变既有绑定。
 
@@ -131,7 +131,7 @@ child 的 `exited` 仅是进程事实；仍有同组后代时状态为 `cleanup_
 cancel reason 和时间；没有发生通用尝试的任务返回空数组。
 持久尝试另有 `owner`，仅含 schema、owner ID、PID/start ticks、boot ID 和 attempt ID；
 私有 endpoint 和认证 token 不输出。
-0.2.1 候选还返回 `owner_health`：`source:recorded`、`connection_status`、
+0.2.1还返回 `owner_health`：`source:recorded`、`connection_status`、
 `last_observed_at`、`cleanup_state`、`cleanup_attempts`、`retry_after`、
 `last_cleanup_at`、`cleanup_error`、`acknowledged_at` 和 `acknowledgement`。
 连接值为 `unknown/responsive/unreachable/lost`；确认状态为 `active/pending/acknowledged`，
@@ -252,7 +252,7 @@ reason 为 `executable_missing/symlink/not_directory/unreadable/io_error/not_reg
 节点重启重排均禁用。daemon 原 owner 丢失时保留未解决尝试和资源；确认进程组
 消失后记 `interrupted`，不推断真实退出码或成功。意图提交前的崩溃记 `not_started`。
 `linux_fd_owner` 在原服务存活时可以恢复真实 wait；恢复发现 prepared 时废弃该准备，
-不补发 start。0.2.1 候选只读查询兼容写 schema 1–7，不迁移旧库或探测服务。
+不补发 start。0.2.1只读查询兼容写 schema 1–7，不迁移旧库或探测服务。
 
 ## 可选 Linux native 构建
 

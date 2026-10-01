@@ -1,58 +1,44 @@
 # sched 开发范围与后续工作
 
-本文只记录通用调度器工作。当前配置和 CLI 以 [reference.md](reference.md) 为准，
-execution API 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
-尚未通过验收的计划不视为可用 API。
+本文只记录通用调度器工作。配置和 CLI 以 [reference.md](reference.md) 为准，
+execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
+候选代码、验证、正式发布和生产部署分别记录，不能互相替代。
 
-## 当前交付范围
+## 已发布 0.2.1
 
-执行隔离分支把客户专用协议移出调度器，为固定 executable/argv/env、输入 FD、
-一次性启动与直接子进程 owner 提供自包含的通用执行层。
-默认安装继续使用 subprocess，可选 Linux native 由本仓源码构建。
-旧 strict/native 持久态保留兼容守卫，新任务使用通用公开接口。
-责任与证据边界见 [execution-boundary.md](execution-boundary.md)。
+[GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 保存正式来源、
+源码、默认/native wheel、安装说明、哈希与 CI 证据。运行时无第三方依赖；
+默认安装要求 Python >= 3.10，原 native 包覆盖 CPython 3.10/3.14、
+Linux x86_64、glibc 2.39。
 
-## 本次新增交付
+该版本包含通用 FD 执行与原始 wait、持久 owner、认证重连、有限确认队列、
+冷配置保留期、execution 详情/列表、本机 capabilities 和结构化 daemon 检查。
+写库 schema 7，只读 schema 1–7；未知尝试和旧 session 不重放。
+职责见 [execution-boundary.md](execution-boundary.md)。生产现状未查询，
+不能把发布记录当作生产已升级的证据。
 
-`sched execution` 已补充逐版本只读诊断和旧 session 摘要，区分原始 wait、
-进程组清理与未知结果。查询不升级数据库，不重建 owner，不改变 replay 守卫。
-字段和旧 schema 兼容限制见 [execution-api.md](execution-api.md)。
+## 0.2.2 开发候选
 
-0.2.0 候选增加显式 `linux_fd_owner`：独立服务持有原始 child、wait 和清理，
-daemon 通过认证绑定恢复查询；准备恢复不重放，取消与 duration 由服务独立升级。
-设计与故障验收见 [persistent-execution-owner.md](persistent-execution-owner.md)。
-该实现已合并，合并提交 CI 已通过；发布与生产切换另按
-[execution-rollout.md](execution-rollout.md) 执行。
+- 按 backend ID 预检 executable 和项目 root：有界 SHA-256、ELF 标识、
+  读取漂移、文件类型与目录权限。错误码不输出私有路径，不授予后续执行权。
+- 默认安装和回归覆盖 Python 3.10–3.14；native/真实执行与候选构建覆盖
+  CPython 3.10/3.14、Ubuntu 22.04/24.04 / Linux x86_64。
+  真实 syscall 拒绝用例验证不可用能力不会标为 verified，不弱化执行方式。
+- 同仓脚本和手动 workflow 从最终 main 的成功 CI 校验四份原始 ZIP，
+  生成总校验和、说明与 evidence，可续传匹配的草稿资产，不自动发布。
 
-0.2.1 运维候选增加有限的冷配置保留期、只读的已记录连接/确认状态，以及
-持久确认队列。历史确认每轮最多 8 条，失败退避，不扫描已确认历史或删除 binding；
-覆盖一万条记录与确认提交故障。该实现已通过审查并合并到 `main`（`9056253`），
-[合并提交 CI](https://github.com/Gczmy/sched/actions/runs/36760744711) 已通过。
-0.2.1 写库 schema 7；正式发布提交和产物以
-[GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 为准。
-生产切换独立安排。
-
-候选构建纳入公共 CI：Repository、Python 和 native 检查全部成功后，
-Python 3.10、3.14 分别从同一完整提交构建默认/native wheel，保存源码、安装说明、
-Release 草稿与带哈希和独立安装证据的 manifest。产物保留 30 天，不自动发布。
-下载验证和发布流程见 [execution-rollout.md](execution-rollout.md)。
-
-跨任务 `execution list` 与本机 `capabilities`、`daemon check --json` 已实现，
-新增版本化结果不修改 status/task/history 或现有逐任务 execution 契约。
-分页完整性、已记录状态与能力验证的语义见 [execution-api.md](execution-api.md)。
+见 [0.2.2 开发候选](releases/0.2.2.md) 与
+[发布准备](release-preparation.md)。验收以独立选定的完整提交、最终 CI run
+和实际产物为准；只有通过的矩阵才构成支持证据。尚未正式发布或部署。
+写库仍为 schema 7，状态、FD4 identity、原始 wait 和未知结果守卫保持不变。
 
 ## 后续候选
 
-- 更多平台能力：需明确 capabilities 和不支持时的拒绝语义，不回退到权限或
-  文件绑定较弱的执行方式。
-- 配套客户端展示通用诊断：需单独增加 execution 查询与 UI，不改写 scheduler 语义。
+- 更多 Linux ABI/架构须先有对应构建、探测、独立安装和实际执行验收，
+  再扩大兼容范围；不把当前 x86_64 证据用于未验收环境。
+- 配套客户端的 execution 展示归其仓库独立安排，继续消费公共 CLI，
+  不重写 scheduler 语义或将实时多页浏览当作完整当前态。
 
-这些候选没有自动授权部署，也不因某个研究项目需要而成为 sched 发布阻塞项。
-MPC_OTSF 的科学加载、G1–G6 矩阵、冻结合同重审、正式实验和研究部署包，
-全部属于该项目自己的 roadmap 与 goal。
-
-## 已有调度能力
-
-项目 GPU 开关、配额与亲和、主机资源准入、drain/resume、daemon 健康查询和
-幂等维护请求由 sched 独立维护。配套插件只消费 CLI 契约，不重新实现调度。
-隐私、文档引用、仓库边界及 Linux 回归在公共 CI 执行；它们不要求其他仓库存在。
+维护与回退见 [execution-rollout.md](execution-rollout.md)。客户协议、
+科学验收和研究部署由客户仓库独立维护，不作为 sched 发布前置条件。
+已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。

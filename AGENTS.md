@@ -45,6 +45,7 @@
 | `docs/execution-api.md` | 公开 execution backend 注册、输入 FD 与可选 native 构建 |
 | `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连、冷配置保留期与已记录健康 |
 | `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
+| `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
 | `docs/native-integration.md` | 旧实验接口的持久态保护与迁移限制 |
 | `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |

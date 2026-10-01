@@ -11,16 +11,19 @@ python -m pytest -q -rs tests
 python tests/run_execution_accept.py
 ```
 
-公共 CI 在 Python 3.10 和 3.14 上运行完整公共回归，并在 3.10 上运行 execution、
-mode、项目 GPU 开关和文档引用验收。另有独立 Linux native job，显式设置
-`SCHED_BUILD_NATIVE=1` 从本仓库源码构建并运行 native 与调度器回归。
+公共 CI 在 Python 3.10–3.14 上运行完整公共回归和默认 wheel 独立安装，
+并在 3.10 上运行 execution、mode、项目 GPU 开关和文档引用验收。
+native 矩阵覆盖 CPython 3.10/3.14 与 Ubuntu 22.04/24.04，显式设置
+`SCHED_BUILD_NATIVE=1` 从本仓源码构建，运行 native/调度器回归和真实 syscall 拒绝验收。
 默认安装不需要编译器，固定 FD backend 不可用时必须明确拒绝。
 
-全部检查成功后，Candidate job 在 Python 3.10、3.14 上从同一固定提交分别构建
+全部检查成功后，Candidate job 在两种 Python ABI 和两种 Linux runner 上构建四份
 默认/native wheel 并独立安装，保存 30 天的候选 artifact。产物包含源码、manifest、
 安装证据和 Release 草稿；不自动创建标签或发布。下载校验与 ABI 限制见
 [execution-rollout.md](docs/execution-rollout.md)。开发构建工具固定版本在 workflow 中，
 不影响运行时零第三方依赖。
+Release 草稿准备流程和中断恢复验收见 [release-preparation.md](docs/release-preparation.md)；
+常规 CI 不发布 Release 或部署生产。
 两条路径均不读取客户合同路径，不要求另一个仓库存在。
 客户 adapter、研究协议、科学加载和研究 gate 由客户自己的 CI 验证，
 不能因其未通过把 sched 的通用公共验收跳过。
