@@ -57,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.14"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
     steps:
@@ -72,7 +72,6 @@ jobs:
       - name: Public Linux regression suite
         run: python -m pytest -q -rs tests
       - name: Independent default wheel installation without a compiler
-        if: matrix.python == '3.10'
         run: |
           python -m pip install 'setuptools>=61' wheel
           python tests/run_install_accept.py
@@ -86,9 +85,14 @@ jobs:
           bash tests/run_docs_refs_accept.sh
 
   native:
-    name: Optional Linux native
-    runs-on: ubuntu-24.04
+    name: Native Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+        os: [ubuntu-22.04, ubuntu-24.04]
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
       SCHED_BUILD_NATIVE: "1"
@@ -100,7 +104,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python }}
       - name: Build native from this repository
         run: python -m pip install -e '.[test]'
       - name: Require native backend availability
@@ -111,18 +115,21 @@ jobs:
           python tests/run_install_accept.py --native
       - name: Independent native and scheduler regression suite
         run: python -m pytest -q -rs tests
+      - name: Real syscall denial capability checks
+        run: python tests/run_capability_denial_accept.py
       - name: Public execution CLI lifecycle
         run: python tests/run_execution_accept.py
 
   candidate:
-    name: Candidate Python ${{ matrix.python }}
+    name: Candidate Python ${{ matrix.python }} / ${{ matrix.os }}
     needs: [repository, python, native]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         python: ["3.10", "3.14"]
+        os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -138,6 +145,7 @@ jobs:
         env:
           SCHED_CI_VALIDATED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           SCHED_CI_RESULTS: ${{ toJSON(needs) }}
+          SCHED_CI_BUILD_TARGET: ${{ matrix.os }}
         run: |
           python scripts/build_release_candidate.py --commit "$SCHED_CI_VALIDATED_SHA" --native
           python scripts/verify_release_candidate.py "dist/candidate-${SCHED_CI_VALIDATED_SHA:0:7}" --commit "$SCHED_CI_VALIDATED_SHA" --require-ci
@@ -154,7 +162,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sched-candidate-${{ steps.build.outputs.commit }}-python-${{ matrix.python }}-attempt-${{ github.run_attempt }}
+          name: sched-candidate-${{ steps.build.outputs.commit }}-python-${{ matrix.python }}-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: ${{ steps.build.outputs.directory }}/
           if-no-files-found: error
           retention-days: 30

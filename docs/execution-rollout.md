@@ -9,7 +9,7 @@
 
 ## 发布验收
 
-- 确认最终提交的 Repository、Python 3.10、Python 3.14、Optional Linux native 和两个 Candidate 检查全部通过。
+- 确认最终提交的 Repository、所有 Python/native 矩阵及 Candidate 检查全部通过。
 - 默认 wheel 不含 native extension，也没有第三方运行时依赖；native wheel 从本仓源码独立构建。
 - 记录合并提交、wheel SHA-256、Python ABI 和构建方式。配套客户端仍通过公开 CLI 使用调度器。
 
@@ -26,7 +26,8 @@ Release 与 tag 记录，发布时保留已经验收的包与 manifest 原始字
 
 所有 job 使用同一源码提交：PR 使用 head SHA，push 和手动运行使用事件 SHA。
 只有 Repository、Python 和 native 三组检查全部成功后，Candidate job 才开始。
-Python 3.10、3.14 各保存一份产物，名称含完整提交、Python 版本和运行 attempt，
+0.2.2 开发候选按 Python 3.10/3.14 与 Ubuntu 22.04/24.04 保存四份产物，
+名称含完整提交、Python 版本、runner target 和运行 attempt，
 保留 30 天，不覆盖已有 artifact。每份包含默认 wheel 与对应 ABI 的 native wheel；
 两份中的默认 wheel 不要求逐字节一致，分别以各自 manifest 的哈希为准。
 
@@ -59,9 +60,13 @@ python scripts/verify_release_candidate.py dist/candidate-<commit-prefix> --comm
 本地构建不冒充 CI 产物，正式发布仍须核对该提交对应的完整 CI 并取得明确授权。
 开发构建工具版本见 workflow；它们不成为运行时依赖。
 默认 wheel 要求 Python >= 3.10，调度执行仍要求 Linux/POSIX。
-CI native 候选分别为 CPython 3.10、3.14/Linux x86_64，runner 为 Ubuntu 24.04；
+0.2.2 CI 默认安装/回归覆盖 Python 3.10–3.14；native 候选为 CPython 3.10/3.14 /
+Linux x86_64，runner 为 Ubuntu 22.04/24.04；真实 seccomp 故障验收覆盖 execveat 缺失、
+close_range、memfd 和 UNIX socket 权限拒绝。尚未通过的矩阵不扩大已发布支持范围。
 实际 libc 和 SOABI 写入各自 manifest，不声明 manylinux 通用兼容。
 其他 ABI 或 Linux 基础环境须单独构建、安装验收并记录；不能复用不匹配的 wheel。
+已发布 0.2.1 的 native 产物仍只覆盖原来的 CPython 3.10/3.14 与 glibc 2.39，
+开发矩阵不改变旧 Release 的产物或兼容性声明。
 
 安装后从无关目录验证 `sched --version`、`sched --help` 和 native 能力。默认安装不需要
 编译器；native 安装须选择匹配解释器 ABI 的 wheel。两种安装都不需要客户仓库。

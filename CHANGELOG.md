@@ -5,6 +5,9 @@
 - Check each administrator execution backend's executable and project roots before
   deployment, with bounded streaming SHA-256, ELF checks and stable failure codes.
   Checks never reserve attempts, launch children or replace startup validation.
+- Validate default wheels on Python 3.10–3.14, native wheels on Python 3.10/3.14
+  and Ubuntu 22.04/24.04, and actual isolated syscall denials before admitting
+  all four immutable CI candidate packets.
 
 ## 0.2.1
 
