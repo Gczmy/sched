@@ -109,3 +109,10 @@ close_range、memfd 和 UNIX socket 权限拒绝。尚未通过的矩阵不扩�
 默认配置不会自动启用持久 backend；启用前先验证客户程序的 FD4 owner identity 支持。
 
 客户协议和科学验收由客户仓库独立发布；进程退出 0 不代表科学验证通过。
+
+## 恢复 FIFO 候选迁移
+
+候选 [恢复策略](recovery-policy.md) 增加不可变恢复结算和队列 lineage，写 schema 8、
+只读完整 schema 1–8。初始化在单事务中建表并最后写 schema marker，不回填历史任务
+的执行权。0.2.2/更旧二进制拒绝 schema 8；不要对新写库直接回退旧程序或删除恢复记录。
+发布、安装、部署与状态迁移仍独立安排，不能把候选 PR 当作生产已升级。

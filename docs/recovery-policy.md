@@ -1,8 +1,8 @@
 # 断点恢复与 smoke 门禁
 
 本页描述候选版本中显式启用的通用恢复接口；0.2.2 不提供这些字段。
-当前包含 checkpoint 和 smoke 门禁。持久 OOM 轮转、剩余显存阈值与 supervisor
-仍是后续开发项，不能将下文协议视为已支持自动补跑。
+当前包含 checkpoint、smoke 门禁和显式新版本恢复 FIFO。剩余显存阈值、分级与
+supervisor 仍是后续开发项，不能将协议视为已支持与外部任务共卡。
 
 ## 任务声明
 
@@ -75,7 +75,7 @@ checkpoint 位于 scheduler 管理的独立 recovery 目录，每 task 保留最
 它们不是最终成功产物，不参与 artifact SKIP，也不被 `clean` 或启动前产物清理删除。
 本阶段默认保留，不自动过期；没有 CLI 删除接口时不要直接删除 state 目录。
 恢复任务禁止同版本 retry 和 clean 后 skip 重排，显式 resubmit 创建新版本。
-本阶段 daemon 重启不会将 interrupted recovery job 原地改回 pending。
+daemon 重启不会将 interrupted recovery job 原地改回 pending；显式 retry policy 可以授权新版本。
 
 应用 OOM 报告不能提供 wait 或进程组清理权威，也不能修改 scheduler 状态。
 被 SIGKILL 或无法捕获 OOM 的程序只能恢复最近一次已落盘断点；应用应周期保存。
@@ -83,7 +83,8 @@ checkpoint 位于 scheduler 管理的独立 recovery 目录，每 task 保留最
 ## 查询与验收
 
 `sched recovery <batch-id-or-name>:<task-id> --json` 是独立的只读 schema 1 接口，
-查询最新版本。输出包含 enabled、mode、binding_sha256、smoke_job_id、smoke_ready、
+默认查询最新版本，`--version N` 查看历史结算和队列 lineage；checkpoint 始终表示 group
+当前现存的最新断点，不能把它当作指定历史版本的快照。输出包含 enabled、mode、binding_sha256、smoke_job_id、smoke_ready、
 checkpoint 的 absent/verified/invalid 状态与 payload_sha256，以及当前 job 的 report。
 不输出应用 payload 或私有 checkpoint 路径；smoke_ready 只表示门禁记录成立，
 不表示资源、配额或派发许可已满足。已有 status/task/history 的 JSON schema 不变。
@@ -97,3 +98,51 @@ python -m pytest -q tests/test_recovery_protocol.py tests/test_execution_policy.
 测试运行真实的通用 CPU 子进程，覆盖 smoke、OOM 后进度保存和新版本继续完成，
 并注入原子替换失败、文件摘要变化、符号链接、断点损坏、假成功和环境伪造。
 不需要 CUDA、客户仓库或生产节点。
+
+## 显式自动恢复 FIFO
+
+在 smoke 和正式任务的 recovery 声明中同时增加相同的 retry policy：
+
+```json
+{"retry": {"oom": true, "interrupted": true, "cooldown_sec": 30, "max_attempts": 0}}
+```
+
+省略 retry 时完全禁用自动恢复。显式空对象使用上述默认；两类开关必须为布尔，
+至少启用一个。cooldown_sec 允许 0–86400 秒，max_attempts 为 0–100000 的整数，
+0 表示不限次数，正数包含首个原始版本。策略参与 smoke binding，不能在运行后改变。
+普通 max_retry 仍必须为 0，不承载此策略。
+
+OOM 只有在原退出记录为非零、旧进程组清理完成且断点有效时才授权新尝试。
+应用可提交结构化 oom report；没有 report 时可以使用真实失败退出后的 OOM 分类和
+已验证的周期断点，但日志或 checkpoint 不能提供退出/清理权威。真实信号退出、
+节点重启或确认 owner 丢失且原进程组消失，可按 interrupted 开关创建新版本；
+未知连接或旧进程组仍存活时保留原任务与资源，不创建新版本，不推断 rc/rusage。
+已认证的 not_started 准备可授权新版本，但不会补发原 start。首次落盘前的干净中断允许从初始状态开始；已经记录的断点丢失或损坏则拒绝，
+不能将遗失进度当作从未保存。没有有效 checkpoint 的 OOM 不自动补跑。
+
+结算、决策、新 task/job version 和队尾记录在同一事务内提交，并用唯一 predecessor
+保证幂等；发布失败回滚全部新版本写入。旧 job 状态、失败和原始退出记录保留，
+旧 execution attempt 永不重新 start。新版本排队时尚无 attempt，真正启动才创建新 ID。
+queue lineage 与结算证据有保留/不可改写守卫。取消意图、状态/版本变化和批次退役
+优先于创建 successor。自动排队不授予立即派发权；项目 GPU 禁用、配额、drain、
+节点守卫与未决 launch marker 仍优先。
+
+该批次全部普通 group 首轮结束后，按持久 seq 派发延后 FIFO；队首处于 cooldown
+时后面的延后 group 不能越过。运行中的队首已完成 admission，可以在其他资源上派发
+后续 group。再次 OOM 追加新版本到队尾，而不是重置旧 job 或保留最初 rowid 优先级。
+等待顺序、轮次、首次排队时间和 checkpoint 摘要跨 daemon 重启保留。
+
+达到次数上限、策略不允许或 checkpoint 无效时不创建 successor，batch 按既有失败
+规则收敛；sched recovery 的 settlement 返回具体 denied reason。该命令还返回
+queue 的 seq、predecessor_job_id、root_job_id、round、queued_at、not_before 和摘要，
+不暴露私有路径或应用 payload。既有 status/task/history schema 和 wait_reason 枚举不变。
+
+候选写库 schema 8，读取完整 schema 1–8；旧 schema 的 recovery 队列/结算返回 null，
+只读查询不迁移。0.2.2 不识别 schema 8，不能将旧二进制接回新写库。
+
+验收见 [test_recovery_queue.py](../tests/test_recovery_queue.py)：真实普通 subprocess、
+linux_fd 和 linux_fd_owner 均验证 A OOM → B/C 完成 → A 新版本恢复；持久 owner
+在 dispatcher 重建后仍返回原始 wait。另覆盖重复 OOM 队尾、事务注入失败、取消、
+冷却、次数上限、首次落盘前中断、损坏/丢失断点、未知/未清理原尝试和 schema 迁移。
+
+Smoke binding also covers normalized task resources, duration, probes and parallelism. A CPU smoke cannot authorize a differently configured GPU run. Candidate bindings created before this schema-8 change must be recreated with a new smoke; ordinary jobs are unaffected.
