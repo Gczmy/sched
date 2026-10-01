@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from . import recovery
 from . import state, execution_state, __version__
 from . import artifacts
 from .executor import PROGRESS_RE
@@ -682,6 +683,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
             artifacts=t.get("artifacts"),
             **_native_exec_fingerprint_kwargs(t),
         )
+        try:
+            recovery.freeze(t, fp)
+        except recovery.RecoveryError as error:
+            print(f"校验失败: {error}", file=sys.stderr)
+            return 1
         prepared_tasks.append((i, t, cmd_e, stages_e, fp, stage_fps))
     if stateless_dry_run:
         prev = _dry_run_preview(norm, cfg, use_state=False)
@@ -1603,6 +1609,48 @@ def cmd_execution(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_recovery(args: argparse.Namespace) -> int:
+    try:
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch, task_id = _resolve_task_ref(args.task, conn)
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1", (batch, task_id)).fetchone()
+            if job is None:
+                raise ValueError("任务不存在")
+            row = conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?", (batch, task_id, job["version"])).fetchone()
+            spec = json.loads(row["spec"])
+            declaration = spec.get("recovery")
+            output = {"schema_version": 1, "batch_id": batch, "task_id": task_id,
+                      "job_id": job["id"], "version": job["version"], "enabled": declaration is not None}
+            if declaration is not None:
+                value = json.loads(recovery.context(state.host_dir(), job, spec, create=False))
+                try:
+                    checkpoint = recovery.CheckpointStore(value).load()
+                    checkpoint_state = "absent" if checkpoint is None else "verified"
+                    receipt = recovery.report(state.host_dir(), job, spec)
+                    allowed = recovery.smoke_gate(conn, state.host_dir(), job, spec)
+                except FileNotFoundError:
+                    checkpoint_state, checkpoint, receipt = "absent", None, None
+                    allowed = recovery.smoke_gate(conn, state.host_dir(), job, spec)
+                except (ValueError, OSError):
+                    checkpoint_state, checkpoint, receipt, allowed = "invalid", None, None, False
+                output.update({"protocol": recovery.PROTOCOL, "mode": declaration["mode"],
+                    "binding_sha256": spec["_recovery_binding"], "smoke_job_id": declaration.get("smoke_job_id"),
+                    "smoke_ready": allowed, "checkpoint": {"state": checkpoint_state,
+                    "payload_sha256": recovery.digest(checkpoint) if checkpoint_state == "verified" else None},
+                    "report": receipt})
+    except (ValueError, state.StateError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        print(f"{output['job_id']}: recovery={'enabled' if output['enabled'] else 'disabled'}")
+        if output["enabled"]:
+            print(f"mode={output['mode']} smoke_ready={output['smoke_ready']} checkpoint={output['checkpoint']['state']}")
+    return 0
+
+
 def cmd_capabilities(args: argparse.Namespace) -> int:
     from .execution.capabilities import snapshot
     result = snapshot()
@@ -2219,6 +2267,9 @@ def cmd_retry(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if isinstance(task_spec, dict) and task_spec.get("recovery") is not None:
+                print("错误: recovery 任务不能 retry 重放；使用 resubmit 创建新版本", file=sys.stderr)
+                return 1
             if execution_state.get(conn, job["id"]) is not None:
                 print(
                     "错误: execution attempt 已消费，不允许 retry 重放；"
@@ -2531,6 +2582,11 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
             artifacts=spec.get("artifacts"),
             **_native_exec_fingerprint_kwargs(spec),
         )
+        try:
+            recovery.verify_binding(spec, fingerprint)
+        except recovery.RecoveryError as error:
+            print(f"resubmit 拒绝: {error}", file=sys.stderr)
+            return 1
         prepared["fingerprint"] = fingerprint
         prepared["stage_fingerprints"] = stage_fingerprints
 
@@ -2811,6 +2867,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     raise state.StateError(
                         f"clean 拒绝无效任务规格 {task_label}: spec 必须是对象"
                     )
+                if spec.get("recovery") is not None:
+                    print("错误: clean 不能将 recovery skip 版本重新排队；使用 resubmit", file=sys.stderr)
+                    return 1
                 cwd = spec.get("cwd_abs") or "."
                 if not isinstance(cwd, str):
                     raise state.StateError(
@@ -4377,6 +4436,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cursor")
     p.set_defaults(fn=cmd_execution)
 
+    p = sub.add_parser("recovery", help="断点与精确 smoke 门禁的只读查询")
+    p.add_argument("task", help="<batch-id-or-name>:<task-id>")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_recovery)
+
     p = sub.add_parser("capabilities", help="本机 execution 能力检查，不读取配置或状态库")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_capabilities)
@@ -4623,6 +4687,7 @@ def main(argv: list[str] | None = None) -> int:
         "status",
         "task",
         "execution",
+        "recovery",
         "history",
         "markers",
         "incidents",

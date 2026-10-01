@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from . import notify, state, execution_state
+from . import notify, state, execution_state, recovery
 from dataclasses import asdict
 from .artifacts import (
     bounded_regex_last_match,
@@ -223,6 +223,7 @@ def _native_exec_fingerprint_kwargs(spec: dict) -> dict[str, str]:
 
 
 def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
+    recovery.copy_fields(source, destination)
     if source.get("execution") is not None:
         destination["execution"] = source["execution"]
         destination["_execution_binding"] = source["_execution_binding"]
@@ -2594,6 +2595,7 @@ class Dispatcher:
                                 artifacts=t.get("artifacts"),
                                 **_native_exec_fingerprint_kwargs(t),
                             )
+                            recovery.freeze(t, fp)
                             prepared_tasks.append((i2, t, cmd_e, stages_e, fp, stage_fps))
 
                         duplicate = False
@@ -3856,12 +3858,14 @@ class Dispatcher:
             # Only the execution reaper may establish cleanup and settlement.
             # A consumed attempt cannot enter legacy automatic restart logic.
             return
+        recovery_task = False
         native_exec = batch is not None and batch["mode"] == "strict"
         if not native_exec:
             try:
                 persisted_spec = self._load_task_spec(conn, j)
             except ValueError:
                 persisted_spec = {}
+            recovery_task = persisted_spec.get("recovery") is not None
             native_exec = any(
                 key in persisted_spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS
             )
@@ -3874,6 +3878,11 @@ class Dispatcher:
             return
         if j["gpu"] is not None:
             self._release_in_tx(conn, j["id"])
+        if recovery_task:
+            state.update_job(conn, j["id"], status="interrupted",
+                             failure="recovery_new_attempt_required", finished_at=state.now(),
+                             pgid=None, rc=None, kill_reason=None, gpu=None)
+            return
         if native_exec:
             state.update_job(
                 conn,
@@ -4180,6 +4189,7 @@ class Dispatcher:
             # the exact same snapshot feeds skip, cleanup, and launch.
             self._ready_task_specs: dict[str, dict] = {}
             self._ready_fingerprint_snapshots: dict[str, tuple] = {}
+            smoke_waits = set()
             for job in ready:
                 try:
                     task_spec = self._load_task_spec(conn, job)
@@ -4192,6 +4202,12 @@ class Dispatcher:
                 self._ready_fingerprint_snapshots[job["id"]] = (
                     self._snapshot_fingerprint(task_spec, task_cwd, job["id"], json.loads(job["batch_env"] or "{}"))
                 )
+                if task_spec.get("recovery") is not None:
+                    try:
+                        if not recovery.smoke_gate(conn, self.host_dir, job, task_spec):
+                            smoke_waits.add(job["id"])
+                    except (ValueError, OSError):
+                        smoke_waits.add(job["id"])
             # B11c: waiting_quota 只是"配额不足被跳过"的可见标记, 不是终态;
             # 重新入候选前归一化回 pending, 否则 _launch_job 的 pending 条件
             # 更新 (M1 竞态防护) 会永远拒绝启动
@@ -4255,6 +4271,8 @@ class Dispatcher:
                     spec = self._ready_task_specs.get(j["id"])
                     if spec is None:
                         spec = self._load_task_spec(conn, j)
+                    if j["id"] in smoke_waits:
+                        continue
                     resources = spec.get("resources") or {}
                     if not isinstance(resources, dict):
                         raise ValueError("resources 必须是对象")
@@ -4747,6 +4765,15 @@ class Dispatcher:
                 spec, cwd, j["id"], json.loads(batch["env"] or "{}") if batch else {},
             )
         current_fp, stage_fingerprints, git_rev = fingerprint_snapshot
+        if spec.get("recovery") is not None:
+            if conn.in_transaction:
+                conn.commit()
+            recovery.verify_binding(spec, current_fp)
+            if not recovery.smoke_gate(conn, self.host_dir, j, spec):
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                self.log_line(f"job {j['id']} waits for its exact smoke receipt")
+                return False
 
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
         # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验
@@ -4827,6 +4854,10 @@ class Dispatcher:
             task_env = {}
         else:
             task_env = task_environment(self.cfg, batch_env, spec.get("env"))
+        task_env.pop(recovery.ENVIRONMENT, None)
+        recovery_context = recovery.context(self.host_dir, j, spec)
+        if recovery_context is not None:
+            task_env[recovery.ENVIRONMENT] = recovery_context
         task_env["SCHED_PROFILE_OUT"] = self._profile_path(j)
         # Dispatcher-owned live identity: these values are derived from the
         # persisted batch/job records and must override batch/task/default env.
@@ -4933,7 +4964,9 @@ class Dispatcher:
         conn.commit()
         prepared = None
         try:
-            prepared = self.executor.prepare_configured_execution(job["id"], spec, profile, identity, gpu, log_path)
+            launch_spec = dict(spec)
+            launch_spec["_recovery_context"] = recovery.context(self.host_dir, job, spec)
+            prepared = self.executor.prepare_configured_execution(job["id"], launch_spec, profile, identity, gpu, log_path)
             conn.execute("BEGIN IMMEDIATE")
             if hasattr(prepared.owner, "binding"):
                 execution_state.bind_owner(conn, job["id"], prepared.owner.binding)

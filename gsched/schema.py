@@ -18,6 +18,7 @@ from ._legacy_execution import (
     native_exec_reserved_batch_names,
 )
 from .execution_policy import ExecutionPolicyError, INTERNAL_FIELD, normalize_execution
+from . import recovery
 
 
 SUDO_TOKENS = {"sudo", "su", "runuser"}
@@ -77,6 +78,7 @@ def _validate_env(value: Any, where: str) -> dict[str, str]:
         if (
             not isinstance(key, str)
             or SAFE_ENV_NAME_RE.fullmatch(key) is None
+            or key == recovery.ENVIRONMENT
             or key in DANGEROUS_ENV_NAMES
             or key.startswith(("LD_", "DYLD_"))
         ):
@@ -720,6 +722,13 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
                 nt[INTERNAL_FIELD] = normalize_execution(nt, cfg, project, env)
             except ExecutionPolicyError as error:
                 raise SchemaError(f"tasks[{i}].execution: {error}") from error
+        try:
+            declaration = recovery.normalize({**nt, **{key: t[key] for key in ("recovery", *recovery.INTERNAL_FIELDS, "_recovery_context") if key in t}})
+            if declaration is not None:
+                nt["recovery"] = declaration
+                recovery.verify_inputs(nt)
+        except recovery.RecoveryError as error:
+            raise SchemaError(f"tasks[{i}].recovery: {error}") from error
         norm_tasks.append(nt)
 
     if check_gpu_access:

@@ -48,3 +48,9 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 维护与回退见 [execution-rollout.md](execution-rollout.md)。客户协议、
 科学验收和研究部署由客户仓库独立维护，不作为 sched 发布前置条件。
 已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。
+
+## 恢复工作流候选
+
+当前候选协议见 [recovery-policy.md](recovery-policy.md)。后续按顺序实现独立新尝试授权与持久
+OOM 队列、固定 12 GiB 默认剩余显存准入与分级、前台 daemon/supervisor 和完整故障验收。
+这些后续配置暂不可用，不属于已发布 0.2.2 的能力。
