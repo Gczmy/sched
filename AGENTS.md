@@ -46,6 +46,7 @@
 | `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连、冷配置保留期与已记录健康 |
 | `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
 | `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
+| `docs/releases/0.2.2.md` | 已发布 0.2.2 的固定来源、验收证据、ABI/libc 范围与安装约束 |
 | `docs/native-integration.md` | 旧实验接口的持久态保护与迁移限制 |
 | `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |

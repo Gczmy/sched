@@ -1,6 +1,6 @@
 # 通用 execution API
 
-> 本文对应 0.2.2 开发候选，写库 schema 7；已发布 0.2.1 的提交和产物以 GitHub Release 为准。
+> 本文对应 0.2.2，写库 schema 7；正式提交和产物以 [v0.2.2 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2) 为准，生产部署独立安排。
 
 普通任务继续使用默认 subprocess 执行。需要固定可执行文件和输入 FD 的任务，
 通过管理员冷配置的 `linux_fd` backend 使用通用执行层。backend 注册值和其引用的
@@ -226,7 +226,7 @@ venv 或 project。fake 模式跳过的检查不能作为实际验收证据。
 有 fail 时返回 1，其余返回 0；主机守卫拒绝仍为 2。文本输出保持现有格式。
 该命令包含原有的目录写入与资源检查，不属于纯只读查询；网关不得执行。
 
-0.2.2 开发候选另按 backend ID 检查管理员配置的 executable 和每个允许项目的 root。
+0.2.2 另按 backend ID 检查管理员配置的 executable 和每个允许项目的 root。
 新增检查 ID 为 `execution_executable` 与 `execution_project_root`；`subject` 为 backend ID，
 `project` 为项目名或 null，`reason` 为稳定错误码或 null。这些新增项保留既有
 item/detail/level/performed 字段；其他检查的字段与 subject 含义保持原契约。

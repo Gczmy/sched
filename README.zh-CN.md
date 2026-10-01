@@ -22,6 +22,11 @@
 
 ## 安装
 
+已发布的源码和 wheel 包见
+[v0.2.2 GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2)。
+解包前先验证 `SHA256SUMS`，native wheel 按 Python ABI 和包内 libc 选择。
+已验收矩阵见 [Release 说明](docs/releases/0.2.2.md)；正式发布不代表生产已部署。
+
 ```bash
 # 方式 A: pip 安装 (console script)
 pip install .

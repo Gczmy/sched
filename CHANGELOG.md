@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.2.2 (unreleased)
+## 0.2.2 (2026-10-01)
+
+Published as [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2) from
+`8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`; the complete 14-job CI and seven
+original release assets are recorded in the Release evidence. Production deployment
+is separate from publication.
 
 - Check each administrator execution backend's executable and project roots before
   deployment, with bounded streaming SHA-256, ELF checks and stable failure codes.
