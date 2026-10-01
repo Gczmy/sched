@@ -1,11 +1,11 @@
-# sched execution 候选发布与部署清单
+# sched execution 发布与部署清单
 
 本清单用于交付准备。当前生产版本、配置和运行状态尚未查询；执行本清单前须取得对应部署授权。
 
-0.2.1 运维实现已合并到 `main`（`9056253`），
-[合并提交 CI](https://github.com/Gczmy/sched/actions/runs/36760744711) 已通过。
-0.2.1 正式发布提交和产物以
-[GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 为准；生产切换独立安排。
+当前正式版本为 [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2)，
+发布来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`；
+[最终来源 CI](https://github.com/Gczmy/sched/actions/runs/36881160410) 的 14 项检查全部通过。
+七个原始资产已从公开 Release 下载核对，生产切换独立安排。
 
 ## 发布验收
 
@@ -14,7 +14,7 @@
 - 记录合并提交、wheel SHA-256、Python ABI 和构建方式。配套客户端仍通过公开 CLI 使用调度器。
 
 候选产物必须从固定提交的独立源码副本构建，忽略本地 `.so`、测试状态与运行配置。
-当前默认产物为 `sched-0.2.1-py3-none-any.whl`；native wheel 的 ABI/平台以实际构建结果为准。
+当前默认产物为 `sched-0.2.2-py3-none-any.whl`；native wheel 的 ABI/平台以实际构建结果为准。
 候选目录保存 `manifest.json`、源码归档、两种 wheel、安装说明和 `RELEASE_NOTES.md`；
 manifest 记录完整 commit、构建 Python/平台、各文件 SHA-256 与独立安装证据。
 发布标签应指向最终验收提交，不能只凭包版本
@@ -26,7 +26,7 @@ Release 与 tag 记录，发布时保留已经验收的包与 manifest 原始字
 
 所有 job 使用同一源码提交：PR 使用 head SHA，push 和手动运行使用事件 SHA。
 只有 Repository、Python 和 native 三组检查全部成功后，Candidate job 才开始。
-0.2.2 开发候选按 Python 3.10/3.14 与 Ubuntu 22.04/24.04 保存四份产物，
+0.2.2 按 Python 3.10/3.14 与 Ubuntu 22.04/24.04 保存四份 CI 产物，
 名称含完整提交、Python 版本、runner target 和运行 attempt，
 保留 30 天，不覆盖已有 artifact。每份包含默认 wheel 与对应 ABI 的 native wheel；
 各份中的默认 wheel 不要求逐字节一致，分别以各自 manifest 的哈希为准。
@@ -71,7 +71,8 @@ close_range、memfd 和 UNIX socket 权限拒绝。尚未通过的矩阵不扩�
 实际 libc 和 SOABI 写入各自 manifest，不声明 manylinux 通用兼容。
 其他 ABI 或 Linux 基础环境须单独构建、安装验收并记录；不能复用不匹配的 wheel。
 已发布 0.2.1 的 native 产物仍只覆盖原来的 CPython 3.10/3.14 与 glibc 2.39，
-开发矩阵不改变旧 Release 的产物或兼容性声明。
+0.2.2 正式资产覆盖 CPython 3.10/3.14 与 glibc 2.35/2.39，
+不改变旧 Release 的产物或兼容性声明。
 
 安装后从无关目录验证 `sched --version`、`sched --help` 和 native 能力。默认安装不需要
 编译器；native 安装须选择匹配解释器 ABI 的 wheel。两种安装都不需要客户仓库。
@@ -99,8 +100,8 @@ close_range、memfd 和 UNIX socket 权限拒绝。尚未通过的矩阵不扩�
 ## 回退边界
 
 切换前保留旧安装、原配置和经正式备份流程取得的恢复点。
-0.2.0 将写库 schema 升至 6，新增不可变 owner binding；当前 0.2.1 升至 7，
-新增确认队列与已记录健康。对应只读范围分别为 1–6 和 1–7。
+0.2.0 将写库 schema 升至 6，新增不可变 owner binding；0.2.1 升至 7，
+新增确认队列与已记录健康，0.2.2 保持 schema 7。对应只读范围分别为 1–6 和 1–7。
 旧版本不能被假定为兼容新写库。回退须在 daemon 排空后，
 依据实际 schema 兼容性与已审查恢复方案执行，不能直接将旧代码覆盖到新库上。
 任何已消费或结果未知的 execution attempt 都必须继续保留，不能因回退再次启动。

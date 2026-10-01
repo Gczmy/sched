@@ -4,7 +4,7 @@
 execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
 候选代码、验证、正式发布和生产部署分别记录，不能互相替代。
 
-## 已发布 0.2.1
+## 历史版本 0.2.1
 
 [GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 保存正式来源、
 源码、默认/native wheel、安装说明、哈希与 CI 证据。运行时无第三方依赖；
@@ -17,7 +17,13 @@ Linux x86_64、glibc 2.39。
 职责见 [execution-boundary.md](execution-boundary.md)。生产现状未查询，
 不能把发布记录当作生产已升级的证据。
 
-## 0.2.2 开发候选
+## 当前已发布 0.2.2
+
+[v0.2.2 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2) 于 2026-10-01 发布，
+来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`。
+[最终来源 CI](https://github.com/Gczmy/sched/actions/runs/36881160410) 的 14 项检查通过；
+四份原始 ZIP 和三个说明/证据/校验和文件已从公开 Release 下载核对。
+native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 
 - 按 backend ID 预检 executable 和项目 root：有界 SHA-256、ELF 标识、
   读取漂移、文件类型与目录权限。错误码不输出私有路径，不授予后续执行权。
@@ -27,9 +33,9 @@ Linux x86_64、glibc 2.39。
 - 同仓脚本和手动 workflow 从最终 main 的成功 CI 校验四份原始 ZIP，
   生成总校验和、说明与 evidence，可续传匹配的草稿资产，不自动发布。
 
-见 [0.2.2 开发候选](releases/0.2.2.md) 与
+见 [0.2.2 Release 说明](releases/0.2.2.md) 与
 [发布准备](release-preparation.md)。验收以独立选定的完整提交、最终 CI run
-和实际产物为准；只有通过的矩阵才构成支持证据。尚未正式发布或部署。
+和实际产物为准；只有通过的矩阵才构成支持证据。正式发布不代表生产已切换。
 写库仍为 schema 7，状态、FD4 identity、原始 wait 和未知结果守卫保持不变。
 
 ## 后续候选

@@ -22,6 +22,12 @@ Zero third-party dependencies: pure Python standard library (`>= 3.10`).
 
 ## Installation
 
+Published source and wheel packets are available in the
+[v0.2.2 GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2).
+Verify `SHA256SUMS` before extraction, then select the native wheel by Python ABI and
+recorded libc. See the [release notes](docs/releases/0.2.2.md) for the validated matrix;
+publication does not imply a production deployment.
+
 ```bash
 # Option A: pip install (console script)
 pip install .

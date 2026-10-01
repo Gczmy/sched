@@ -2,7 +2,9 @@
 
 `scripts/prepare_release.py` 仅依赖 Python 标准库。它准备原始 CI 包、总校验和和
 来源证据，可选择上传 Release 草稿；不发布 Release，不部署生产。
-已发布版本的事实以 [0.2.1 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 为准。
+当前已发布版本的事实以 [0.2.2 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2) 为准。
+该版本来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`，七个原始资产已经公开下载核对。
+发布后的文档提交不改变该标签或资产；本脚本拒绝修改已发布版本。
 
 ## 在线准备
 
