@@ -415,3 +415,7 @@ config/API 使用。项目级 GPU 开关 ND-01 已实现，行为与验收依据
 `sched recovery <batch>:<task> [--version N] --json`
 见 [recovery-policy.md](recovery-policy.md)。0.2.2 不支持该候选接口；现有 task/status/history
 JSON 与 execution FD4 identity 不变，恢复任务仍使用 max_retry:0，禁止旧版本重放。
+
+候选 `projects[P].gpu_admission` 显式开启固定默认 12 GiB 准入，外部占卡共用需另设
+allow_external_occupancy:true。恢复分级和持久无进展策略见 [recovery-policy.md](recovery-policy.md)；
+默认不限等待，schema 9 写库不能由 0.2.2 回接。

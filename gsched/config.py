@@ -169,6 +169,12 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
             raise ConfigError(f"{p}: projects.{proj_name}.root 必须是非空字符串")
         if not isinstance(proj_cfg.get("gpu_enabled", True), bool):
             raise ConfigError(f"{p}: projects.{proj_name}.gpu_enabled 必须是布尔 (缺省=true)")
+        if "gpu_admission" in proj_cfg:
+            from .gpu_admission import normalize
+            try:
+                normalize(proj_cfg["gpu_admission"])
+            except ValueError as error:
+                raise ConfigError(f"{p}: projects.{proj_name}: {error}") from error
         gq = proj_cfg.get("gpu_quota")
         if gq is not None:
             if not isinstance(gq, int) or isinstance(gq, bool) or gq < 0:
@@ -263,10 +269,10 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         on = nf.get("on")
         if on is not None and (
             not isinstance(on, list)
-            or not all(e in ("batch_done", "batch_blocked") for e in on)
+            or not all(e in ("batch_done", "batch_blocked", "recovery_no_progress") for e in on)
         ):
             raise ConfigError(
-                f"{p}: notify.on 必须是 batch_done/batch_blocked 子集数组"
+                f"{p}: notify.on 必须是 batch_done/batch_blocked/recovery_no_progress 子集数组"
             )
         em = nf.get("email")
         if em is not None:

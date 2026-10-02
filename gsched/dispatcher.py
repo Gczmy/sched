@@ -1190,6 +1190,7 @@ class Dispatcher:
         for g in restored:
             self._clear_gpu_ignore(g)  # 恢复 free 自动复位 ignore 标记 (下次占用重新告警)
             self.log_line(f"unmanaged 自动恢复: GPU{g} 真实空闲 -> free")
+        self._check_recovery_progress()
         self._unlock_dependent_batches()
         self._settle_batch_status()  # P1: 批次终态收敛
         self._dispatch_ready_jobs()
@@ -1197,6 +1198,17 @@ class Dispatcher:
             notify.cleanup_acked()  # 顺带清理 7 天前已确认通知 (设计 §6)
         except Exception as e:
             self.log_line(f"notify 清理异常: {e}")
+
+    def _check_recovery_progress(self):
+        from . import recovery_watch
+        with state.connect() as conn:
+            jobs = list(conn.execute("SELECT j.* FROM recovery_queue q JOIN jobs j ON j.id=q.job_id JOIN batches b ON b.id=j.batch_id WHERE b.status='active' AND j.status IN ('pending','waiting_quota') AND j.version=(SELECT MAX(version) FROM jobs WHERE batch_id=j.batch_id AND task_id=j.task_id)"))
+            for job in jobs:
+                recovery_watch.inspect(conn, self.host_dir, job, self._load_task_spec(conn, job), self.cfg)
+        if not any(t.name == "recovery-notify" and t.is_alive() for t in self._notify_threads):
+            thread = threading.Thread(target=recovery_watch.deliver, args=(self.cfg, self.log_line), name="recovery-notify", daemon=True)
+            thread.start()
+            self._notify_threads.append(thread)
 
     def _gpu_ignored(self, idx: int) -> bool:
         """gpu-ignore 人工确认标记 (C2 修复): ignore_until 非 NULL = 静默告警.
@@ -4185,6 +4197,8 @@ class Dispatcher:
             for key, default in (("host_mem_total_gib", 0), ("host_mem_reserve_gib", 16),
                                  ("host_mem_default_gib", 8)):
                 admission_cfg[key] = gpu_policy.get(key, default)
+        from . import gpu_admission
+        self._gpu_admission_samples = gpu_admission.sample(self.allocator) if any("gpu_admission" in item for item in self.cfg.get("projects", {}).values()) else {}
         with self._dispatch_connection() as conn:
             # 只派发 active 批次中每个 task 的最新版本 pending job。
             # queued 批次 (依赖未解锁) 与终态批次一律不派发；done/blocked
@@ -4500,6 +4514,10 @@ class Dispatcher:
         # instead of fabricating a truthy ``is_dispatch_suppressed`` method.
         return Allocator.is_dispatch_suppressed(self.allocator, idx)
 
+    @staticmethod
+    def _admission_now():
+        return state.now()
+
     def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None, project: str | None = None) -> int | None:
         """事务内 assign (定案 39 L2 共享装箱).
 
@@ -4514,6 +4532,9 @@ class Dispatcher:
         由调用方按无卡处理).
         """
         spec = spec or {}
+        from . import gpu_admission
+        if gpu_admission.policy(self.cfg, project) is not None:
+            return gpu_admission.assign(conn, self, job_id, spec, project, getattr(self, "_gpu_admission_samples", {}))
         resources = spec.get("resources") or {}
         gpu_share = bool(resources.get("gpu_share"))
         co_locate = bool(self.cfg.get("co_locate", False))
@@ -4821,6 +4842,17 @@ class Dispatcher:
                     self._release_in_tx(conn, j["id"])
                 self.log_line(f"job {j['id']} waits for its exact smoke receipt")
                 return False
+
+        if gpu is not None:
+            from . import gpu_admission
+            if gpu_admission.policy(self.cfg, str(b["project"])) is not None:
+                conn.commit()
+                fresh = gpu_admission.sample(self.allocator)
+                current_cfg = self._read_gpu_policy()
+                if gpu_admission.policy(current_cfg, str(b["project"])) is None or not project_gpu_enabled(current_cfg, str(b["project"])) or not gpu_admission.permits(conn, current_cfg, gpu, j["id"], spec, str(b["project"]), fresh):
+                    self._release_in_tx(conn, j["id"])
+                    self.log_line(f"job {j['id']} waits for fresh VRAM admission")
+                    return False
 
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
         # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验

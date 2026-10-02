@@ -49,7 +49,7 @@ CREATE TRIGGER IF NOT EXISTS recovery_queue_retained
  BEGIN SELECT RAISE(ABORT,'recovery queue history is retained'); END;
 """
 
-DEFAULTS = {"oom": True, "interrupted": True, "cooldown_sec": 30, "max_attempts": 0}
+DEFAULTS = {"oom": True, "interrupted": True, "cooldown_sec": 30, "max_attempts": 0, "min_free_gib_by_round": [12], "no_progress_sec": 1800, "max_no_progress_sec": 0}
 
 
 def normalize_policy(raw):
@@ -66,6 +66,13 @@ def normalize_policy(raw):
         raise recovery.RecoveryError("recovery.retry.cooldown_sec must be finite and within 0..86400")
     if type(policy["max_attempts"]) is not int or not 0 <= policy["max_attempts"] <= 100000:
         raise recovery.RecoveryError("recovery.retry.max_attempts must be 0..100000; 0 is unlimited")
+    tiers = policy["min_free_gib_by_round"]
+    if type(tiers) is not list or not 1 <= len(tiers) <= 16 or any(type(v) not in (int, float) or not 12 <= v <= 4096 or not math.isfinite(v) for v in tiers) or any(b < a for a, b in zip(tiers, tiers[1:])):
+        raise recovery.RecoveryError("recovery.retry.min_free_gib_by_round requires 1..16 nondecreasing finite values >=12")
+    for key in ("no_progress_sec", "max_no_progress_sec"):
+        value = policy[key]
+        if type(value) not in (int, float) or not 0 <= value <= 31536000 or not math.isfinite(value):
+            raise recovery.RecoveryError(f"recovery.retry.{key} must be finite and within 0..31536000")
     return policy
 
 
@@ -158,6 +165,8 @@ def create_next(conn, host_dir, job, spec):
                      (next_id, job["id"], previous["root_job_id"] if previous else job["id"], round_number,
                       previous["first_queued_at"] if previous else timestamp, timestamp,
                       timestamp + policy["cooldown_sec"], checkpoint_sha, spec["_recovery_binding"]))
+        from . import recovery_watch
+        recovery_watch.progress(conn, previous["root_job_id"] if previous else job["id"], checkpoint_sha, timestamp)
         _decision(conn, job["id"], "queued", settlement["outcome"], next_id)
     except BaseException:
         conn.execute("ROLLBACK TO recovery_publish")
@@ -189,4 +198,7 @@ def public(conn, job_id):
         return {"queue": None, "settlement": None}
     queue = conn.execute("SELECT * FROM recovery_queue WHERE job_id=?", (job_id,)).fetchone()
     settlement = conn.execute("SELECT * FROM recovery_settlements WHERE job_id=?", (job_id,)).fetchone()
-    return {"queue": dict(queue) if queue else None, "settlement": dict(settlement) if settlement else None}
+    result = {"queue": dict(queue) if queue else None, "settlement": dict(settlement) if settlement else None}
+    from . import recovery_watch
+    result.update(recovery_watch.public(conn, job_id, queue))
+    return result
