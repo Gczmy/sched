@@ -1,6 +1,6 @@
 # 恢复候选验收
 
-本分支组合四组候选 PR：协议/smoke、新尝试/OOM FIFO、显存准入/分级、前台守护。
+本页验收已合并的协议/smoke、新尝试/OOM FIFO、显存准入/分级和前台守护。
 不包含客户科学算法或特定客户仓库操作；不访问远程生产节点。
 
 ## 本地 Linux 与 CI
@@ -72,6 +72,15 @@ python tests/run_real_gpu_accept.py --gpu <index> --work-dir <new-private-direct
 只通过 CLI 操作调度器；结束后保留私有 state 和 evidence.json，不删除运行记录。
 覆盖外部占用许可、12 GiB 门槛、20 GiB 恢复门槛、普通组优先/FIFO、预留、真实
 worker/daemon SIGKILL、GPU 禁用、drain/resume/stop。节点、路径和完整原始输出只保存在私有证据中。
+
+## 2026-10-02 真实 GPU 结果
+
+上述手动入口已在隔离的 RTX A5000 / Python 3.12.3 / Linux x86_64 环境通过全部 8 项。
+实测空闲显存为 11.898/12.148 GiB，分别阻止/允许派发；真实 CUDA 分配 OOM、20 GiB
+恢复门槛、FIFO 无重复、预留、daemon/worker SIGKILL 和控制流程均符合断言。
+测试完成后其独立 daemon 已停止，测试显存占用已释放。所用 runtime/native/验收
+源码逐文件与已提交源码核对一致。私有配置、状态、路径和原始日志不进入公开仓库。
+该源码构建证据不扩大正式 CPython 3.10/3.14 二进制资产矩阵，也不证明任意训练框架的科学正确性。
 
 ## 发布边界
 
