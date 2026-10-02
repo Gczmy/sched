@@ -5,6 +5,14 @@
 
 ---
 
+## 版本查询
+
+`sched --version` 和 `sched version` 输出 `sched <version>`。
+自动化使用 `sched version --json`，返回 `schema_version: 1`、`query: "version"`、
+`sched_version` 和 `database_schema` 的 `write`、`read_min`、`read_max`。
+查询只报告当前加载代码的版本和 schema 兼容范围，不读取配置或状态数据库，
+也不表示运行中的 daemon 已切换到该版本。数据库实际版本不由此查询推断。
+
 ## 1. 心智模型
 
 ```

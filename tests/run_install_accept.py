@@ -62,6 +62,14 @@ def main():
             observed_version = run([str(target / "bin/sched"), "--version"], cwd=unrelated, environment=runtime_env)
             assert observed_version.strip() == "sched " + metadata["Version"]
             run([str(target / "bin/sched"), "--help"], cwd=unrelated, environment=runtime_env)
+            version_env = dict(runtime_env, SCHED_CONFIG=str(unrelated / "invalid-config.json"),
+                               SCHED_STATE=str(unrelated / "untouched-state"))
+            (unrelated / "invalid-config.json").write_text("invalid JSON", encoding="utf-8")
+            version_info = json.loads(run([str(target / "bin/sched"), "version", "--json"],
+                                          cwd=unrelated, environment=version_env))
+            assert version_info["schema_version"] == 1 and version_info["query"] == "version"
+            assert version_info["sched_version"] == metadata["Version"]
+            assert not (unrelated / "untouched-state").exists()
             probe = (
                 "import json,pathlib,gsched; from gsched.execution import LinuxFdBackend,BackendUnavailable; "
                 "print(json.dumps({'file':gsched.__file__})); "
