@@ -197,3 +197,37 @@ schema 和 wait_reason 枚举保持不变。schema 8 查询不迁移且 watch �
 
 验收见 [test_gpu_admission.py](../tests/test_gpu_admission.py)。实际 GPU 验收须在独立的
 非生产计算环境执行；本次 fake GPU + 真实 CPU/native 子进程不能当作真实 CUDA 压力证据。
+
+
+## 候选前台 daemon 与 supervisor
+
+在配置指定的计算节点执行：
+
+```bash
+sched daemon foreground
+sched daemon foreground --supervise --restart-delay-sec 3 --max-restarts 0
+```
+
+foreground 保持命令前台，拥有一个真实 daemon 子进程。`--supervise` 才开启意外退出后
+重启；delay 范围 1–300 秒，max-restarts 为 0–100000，0 不限。正常退出不重启。
+这是整个节点一个 dispatcher 的监督者，不是每块 GPU 再建一个 daemon，也不持有应用 wait。
+
+监督者通过原 Popen 的 poll/wait 确认其子进程退出后才允许启动替代 daemon，不能用过期
+心跳、卡顿或陌生 PID 判死。停止控制读失败或未知时，保留运行中的 child，禁止再重启。重复监督者由私有 mutex 拒绝；仍然运行、归属不明或其他
+physical host 的 daemon lease 均不能被抢占。已验证本机 owner 确已死亡时可立即重新
+核对并接管 exact lease；新鲜 ownerless 锁仍保留原启动宽限，ABA 变化仍拒绝。
+
+`sched daemon stop` 先持久化当前 supervisor 的停止请求，因此 daemon 已死、正处于
+重启 delay 时也不会再拉起。SIGINT/SIGTERM 发给前台命令时，监督者只通知它自己持有
+且未 wait 的子进程优雅停止；不按心跳里的 PID 强杀。超时保留 child/lease/control，
+报告未完成。stop 保持原取消语义；需要运行任务自然结束时使用 drain --stop-when-idle。
+排空标记跨意外重启继续有效，正常排空退出不再启动；resume 仅解除标记，不创建 daemon。
+
+应用由新的 dispatcher 按既有恢复契约处理：持久 owner 可认证重连并保留同一 attempt，
+未知 wait/未清理进程组仍保留任务和资源；只有已有退出/清理结算才授予新的 task version。
+事务发布失败留下的 pending settlement 在下次 tick 重试，不重新 start 原 attempt。
+连续 tick 异常退出现在返回失败给监督者，正常 idle、drain、stop 与 lease 失去仍正常结束。
+foreground 不接受 request 包装，避免长驻监督被当成普通幂等 mutation。
+
+完整故障与兼容验收见 [recovery-acceptance.md](recovery-acceptance.md)。这些候选能力
+尚未正式发布或部署；不能用本地验收推断生产状态。

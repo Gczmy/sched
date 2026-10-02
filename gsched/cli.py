@@ -142,6 +142,7 @@ def _native_exec_fingerprint_kwargs(task: dict) -> dict[str, str]:
 
 
 def _persist_native_exec_metadata(source: dict, destination: dict) -> None:
+    recovery.copy_fields(source, destination)
     if source.get("execution") is not None:
         destination["execution"] = source["execution"]
         destination["_execution_binding"] = source["_execution_binding"]
@@ -3710,6 +3711,11 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             raise ValueError("--json 仅用于 daemon status/check")
         if getattr(args, "stop_when_idle", False) and args.action != "drain":
             raise ValueError("--stop-when-idle 仅用于 daemon drain")
+        if args.action != "foreground" and (getattr(args, "supervise", False) or getattr(args, "restart_delay_sec", None) is not None or getattr(args, "max_restarts", None) is not None):
+            raise ValueError("supervisor options require daemon foreground")
+        if args.action == "foreground":
+            from .supervisor import foreground
+            return foreground(fake=getattr(args, "fake", False), supervise=getattr(args, "supervise", False), restart_delay_sec=3 if args.restart_delay_sec is None else args.restart_delay_sec, max_restarts=0 if args.max_restarts is None else args.max_restarts)
         if args.action in ("drain", "resume"):
             from . import resources as admission
             if args.action == "drain":
@@ -4578,8 +4584,11 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_request)
 
     p = sub.add_parser("daemon", help="daemon 生命周期")
-    p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume"])
+    p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume", "foreground"])
     p.add_argument("--json", action="store_true", help="status/check: 结构化健康状态或前置检查")
+    p.add_argument("--supervise", action="store_true", help="foreground: restart only after unexpected owned-child exit")
+    p.add_argument("--restart-delay-sec", type=float, default=None)
+    p.add_argument("--max-restarts", type=int, default=None, help="foreground: 0 means unlimited restarts")
     p.add_argument("--stop-when-idle", action="store_true", help="drain: running 清空后退出，保留 pending")
     p.add_argument("--fake", action="store_true", help="fake-gpu 模式 (P3)")
     p.set_defaults(fn=cmd_daemon)
@@ -4620,7 +4629,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(wrapped) >= 2 and wrapped[0] == "daemon":
             daemon_write_action = wrapped[1]
     daemon_requires_host = daemon_write_action in {
-        "start", "stop", "check", "drain", "resume",
+        "start", "stop", "check", "drain", "resume", "foreground",
     }
     config_get = (
         command == "config" and getattr(args, "config_cmd", None) == "get"

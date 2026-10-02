@@ -411,6 +411,11 @@ def start(fake: bool = False, force: bool = False) -> str:
 
 
 def stop() -> str:
+    from .supervisor import request_stop
+    try:
+        request_stop()
+    except (OSError, ValueError) as error:
+        return f"daemon supervisor stop control 失败: {error}"
     owner = _read_lease_owner()
     if owner is None:
         if os.path.lexists(_owner_file()):

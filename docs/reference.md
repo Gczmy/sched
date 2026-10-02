@@ -419,3 +419,8 @@ JSON 与 execution FD4 identity 不变，恢复任务仍使用 max_retry:0，禁
 候选 `projects[P].gpu_admission` 显式开启固定默认 12 GiB 准入，外部占卡共用需另设
 allow_external_occupancy:true。恢复分级和持久无进展策略见 [recovery-policy.md](recovery-policy.md)；
 默认不限等待，schema 9 写库不能由 0.2.2 回接。
+
+候选 `sched daemon foreground [--supervise] [--restart-delay-sec N] [--max-restarts N]`
+只在计算节点前台执行，不由 request 包装。人工 stop 包含当前 supervisor 的持久停止请求；
+正常 drain/idle 退出不重启，心跳过期不能证明 child 已死亡。见
+[恢复策略](recovery-policy.md) 与 [故障验收](recovery-acceptance.md)。

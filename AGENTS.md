@@ -42,7 +42,8 @@
 | --- | --- |
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
 | `docs/execution-boundary.md` | 通用执行层、客户程序、旧兼容守卫与各仓库独立发布边界 |
-| `docs/recovery-policy.md` | 候选 checkpoint/smoke 协议与恢复任务禁止旧版本重放 |
+| `docs/recovery-policy.md` | 候选 checkpoint/smoke、新版本 FIFO、显存准入与前台守护 |
+| `docs/recovery-acceptance.md` | 候选恢复故障/兼容矩阵与非生产 GPU 验收 |
 | `docs/execution-api.md` | 公开 execution backend 注册、输入 FD 与可选 native 构建 |
 | `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连、冷配置保留期与已记录健康 |
 | `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
