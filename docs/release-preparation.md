@@ -13,7 +13,7 @@
 
 ```bash
 python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <successful-ci-run-id> \
-  --version 0.2.2 --output dist/release-prepared
+  --version 0.3.0 --output dist/release-prepared
 ```
 
 `GH_TOKEN` 可通过现有环境提供，下载和草稿上传仅在内存使用；脚本不保存 token、

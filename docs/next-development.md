@@ -49,9 +49,10 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 科学验收和研究部署由客户仓库独立维护，不作为 sched 发布前置条件。
 已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。
 
-## 恢复工作流候选
+## 0.3.0 发布准备
 
 当前候选协议见 [recovery-policy.md](recovery-policy.md)。候选已实现独立新尝试授权与持久
 OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策略，以及前台 daemon/supervisor 和完整本地故障验收。
-候选能力待审查、正式发布和独立非生产 GPU 验收，不属于已发布 0.2.2 的能力。
+四组 PR 已审查合入 main，合并提交的 14 项 CI 全部通过。包版本已进入 0.3.0 发布准备，
+正式发布与独立非生产 GPU 验收尚待完成，不属于已发布 0.2.2 的能力。
 验收矩阵见 [recovery-acceptance.md](recovery-acceptance.md)。
