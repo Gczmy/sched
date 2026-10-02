@@ -784,6 +784,8 @@ class Executor:
                 bindings[0] = null
                 env = dict(profile["env"])
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ""
+                if spec.get("_recovery_context") is not None:
+                    env["SCHED_RECOVERY_CONTEXT"] = spec["_recovery_context"]
                 options = {}
                 if profile["kind"] == "linux_fd_owner":
                     from .execution_policy import OWNER_DEFAULTS
@@ -939,6 +941,7 @@ class Executor:
         # daemon/PATH/loader/Python startup state; only dispatcher-owned control
         # values are copied into an otherwise empty execve environment.
         merged_env = {} if native_exec else dict(os.environ)
+        merged_env.pop("SCHED_RECOVERY_CONTEXT", None)
         for k, v in env.items():
             merged_env[k] = str(v)
         # H8 修复: 钉卡/fake 剥离放在任务 env 合并**之后** (§4.1 不可覆盖);

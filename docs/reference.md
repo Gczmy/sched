@@ -408,3 +408,9 @@ submission gate；批次已被 retry/resubmit 重开时不会把 `active` 误报
 尚未实现的能力记录在 [`next-development.md`](next-development.md)，不能作为当前
 config/API 使用。项目级 GPU 开关 ND-01 已实现，行为与验收依据见
 [`project-gpu-access.md`](project-gpu-access.md)。
+
+## 候选断点恢复接口
+
+显式 task.recovery、精确 smoke 门禁和独立只读 `sched recovery <batch>:<task> --json`
+见 [recovery-policy.md](recovery-policy.md)。0.2.2 不支持该候选接口；现有 task/status/history
+JSON 与 execution FD4 identity 不变，恢复任务仍使用 max_retry:0，禁止旧版本重放。
