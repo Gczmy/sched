@@ -7,6 +7,7 @@
 | --- | --- |
 | [开发与提交检查](../CONTRIBUTING.md) | 公共 CI、隐私检查与本地提交钩子 |
 | [reference.md](reference.md) | 配置、CLI、JSON、状态机与写操作契约 |
+| [sqlite-lock-safety.md](sqlite-lock-safety.md) | 未发布的 SQLite 锁修复、事务诊断与旧 schema 回补边界 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [execution-boundary.md](execution-boundary.md) | 通用执行层、项目 adapter 和独立发布边界 |
 | [recovery-policy.md](recovery-policy.md) | 候选恢复协议、smoke、FIFO、显存准入与守护 |
