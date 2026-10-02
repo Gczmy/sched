@@ -66,7 +66,7 @@ class Acceptance:
 
     def health(self): return self.cli('daemon','status','--json')
     def jobs(self,batch): return self.cli('status',batch,'--json')['jobs']
-    def latest(self,batch,task='task'): return next(j for j in self.jobs(batch) if j['task_id']==task)
+    def latest(self,batch,task='task'): return next(j for j in self.jobs(batch) if j['task']==task)
 
     def start(self):
         command="from gsched import dispatcher; dispatcher.POLL_SEC=1; from gsched import cli; raise SystemExit(cli.main(['daemon','foreground','--supervise','--restart-delay-sec','1','--max-restarts','3']))"
@@ -100,7 +100,7 @@ class Acceptance:
         (self.project/'settings.json').write_text(json.dumps(settings))
         smoke=self.submit(name+'-smoke',[self.task(g,share=share) for g in groups])
         self.wait(lambda:all(j['status']=='done' for j in self.jobs(smoke)))
-        ids={j['task_id']:j['id'] for j in self.jobs(smoke)}
+        ids={j['task']:j['id'] for j in self.jobs(smoke)}
         return [self.task(g,ids[g],share=share) for g in groups]
 
     def free(self):
