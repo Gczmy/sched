@@ -60,6 +60,19 @@ Darwin 专用用例及 native 已构建时的缺失安装用例按原契约跳�
 wait/新 version 的区分，再验证 stop、drain 和项目 GPU 禁用。保存外部实验记录即可，
 不把个人节点、任务名称、部署路径或生产记录提交到公开仓库。
 
+手动 CUDA 验收入口（只在已授权、没有其他 compute 用户且至少有 20 GiB 空闲的 GPU 上运行）：
+
+```bash
+SCHED_BUILD_NATIVE=1 python -m pip install -e .
+python tests/run_real_gpu_accept.py --gpu <index> --work-dir <new-private-directory>
+```
+
+该入口使用标准库 ctypes 调用 CUDA driver，执行 PTX kernel，并通过实际分配失败
+产生可捕获 OOM；不依赖训练框架。它使用新的独立配置/state，测试进程均由自身持有，
+只通过 CLI 操作调度器；结束后保留私有 state 和 evidence.json，不删除运行记录。
+覆盖外部占用许可、12 GiB 门槛、20 GiB 恢复门槛、普通组优先/FIFO、预留、真实
+worker/daemon SIGKILL、GPU 禁用、drain/resume/stop。节点、路径和完整原始输出只保存在私有证据中。
+
 ## 发布边界
 
 四组分支按 A → B → C → D 审查/合并。本次 PR 完成不等于已发布新版本或已升级生产。
