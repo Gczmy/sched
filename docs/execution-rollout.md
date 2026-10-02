@@ -116,3 +116,6 @@ close_range、memfd 和 UNIX socket 权限拒绝。尚未通过的矩阵不扩�
 只读完整 schema 1–8。初始化在单事务中建表并最后写 schema marker，不回填历史任务
 的执行权。0.2.2/更旧二进制拒绝 schema 8；不要对新写库直接回退旧程序或删除恢复记录。
 发布、安装、部署与状态迁移仍独立安排，不能把候选 PR 当作生产已升级。
+
+候选显存与恢复观察写库升级到 schema 9（完整 1–9 只读兼容，查询不迁移）。
+schema 8 可读恢复 queue/settlement，但 watch 为 null；0.2.2 无法打开新写库。

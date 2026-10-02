@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 8
+DB_SCHEMA_VERSION = 9
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -188,6 +188,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "execution_owner_operations",
         "recovery_settlements",
         "recovery_queue",
+        "recovery_watch",
+        "recovery_notices",
         "gpus",
         "gpu_jobs",
         "profile_cache",
@@ -222,6 +224,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "recovery_watch": {"root_job_id", "checkpoint_sha256", "last_progress_at", "last_notice_at"},
+    "recovery_notices": {"id", "root_job_id", "event", "delivered_at"},
     "recovery_settlements": {"job_id", "outcome", "authority", "binding_sha256", "observed_at", "decision", "reason", "successor_job_id"},
     "recovery_queue": {"seq", "job_id", "predecessor_job_id", "root_job_id", "round", "first_queued_at", "queued_at", "not_before", "checkpoint_sha256", "binding_sha256"},
     "execution_owner_operations": {"job_id", "connection_status", "last_observed_at", "cleanup_state", "cleanup_attempts",
@@ -456,6 +460,10 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 9:
+        required_objects["table"].difference_update({"recovery_watch", "recovery_notices"})
+        del required_columns["recovery_watch"]
+        del required_columns["recovery_notices"]
     if version < 8:
         required_objects["table"].difference_update({"recovery_queue", "recovery_settlements"})
         required_objects["index"].discard("recovery_queue_predecessor")
@@ -951,10 +959,11 @@ def _initialize_database() -> None:
     ensure_private_directory(os.path.dirname(db_path()))
     from .execution_state import SCHEMA as EXECUTION_SCHEMA, OWNER_SCHEMA, OWNER_OPERATIONS_SCHEMA, migrate_owner_operations
     from .recovery_state import SCHEMA as RECOVERY_SCHEMA
+    from .recovery_watch import SCHEMA as RECOVERY_WATCH_SCHEMA
     with connect() as conn:
         needs_owner_backfill = (conn.execute("PRAGMA user_version").fetchone()[0] < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
@@ -972,7 +981,7 @@ def _initialize_database() -> None:
 def ensure_db_initialized() -> str:
     """Initialize only when the read-only schema probe finds work to do.
 
-    Query commands accept complete private WAL schemas v1-v8 without entering
+    Query commands accept complete private WAL schemas v1-v9 without entering
     init_db() or requesting ``BEGIN IMMEDIATE``.  A fresh, stale, partially
     copied, non-WAL, or permission-drifted state still takes the existing full
     atomic initialization path.

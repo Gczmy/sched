@@ -238,8 +238,8 @@ class RecoveryQueueTests(TempStateCase):
             self.assertEqual({"queue": None, "settlement": None}, recovery_state.public(conn, "missing"))
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(8, conn.execute("PRAGMA user_version").fetchone()[0])
-            self.assertTrue(state._schema_is_complete(conn, 8))
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertTrue(state._schema_is_complete(conn, state.DB_SCHEMA_VERSION))
 
     def dispatch_scenario(self, kind=None, restart=True):
         settings = {"total": 5, "oom_at": [], "oom_log": False, "groups": {"a": {"oom_at": [2]}}}

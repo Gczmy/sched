@@ -137,8 +137,8 @@ queue lineage 与结算证据有保留/不可改写守卫。取消意图、状�
 queue 的 seq、predecessor_job_id、root_job_id、round、queued_at、not_before 和摘要，
 不暴露私有路径或应用 payload。既有 status/task/history schema 和 wait_reason 枚举不变。
 
-候选写库 schema 8，读取完整 schema 1–8；旧 schema 的 recovery 队列/结算返回 null，
-只读查询不迁移。0.2.2 不识别 schema 8，不能将旧二进制接回新写库。
+候选写库 schema 9，读取完整 schema 1–9；旧 schema 的 recovery 队列/结算返回 null，
+只读查询不迁移。0.2.2 不识别 schema 9，不能将旧二进制接回新写库。
 
 验收见 [test_recovery_queue.py](../tests/test_recovery_queue.py)：真实普通 subprocess、
 linux_fd 和 linux_fd_owner 均验证 A OOM → B/C 完成 → A 新版本恢复；持久 owner
@@ -146,3 +146,54 @@ linux_fd 和 linux_fd_owner 均验证 A OOM → B/C 完成 → A 新版本恢复
 冷却、次数上限、首次落盘前中断、损坏/丢失断点、未知/未清理原尝试和 schema 迁移。
 
 Smoke binding also covers normalized task resources, duration, probes and parallelism. A CPU smoke cannot authorize a differently configured GPU run. Candidate bindings created before this schema-8 change must be recreated with a new smoke; ordinary jobs are unaffected.
+
+
+## 候选显存准入与无进展策略
+
+项目配置 `projects[P].gpu_admission` 显式开启新准入，省略时保留原分配语义：
+
+```json
+{"gpu_admission": {"min_free_gib": 12, "allow_external_occupancy": false}}
+```
+
+空对象也是开启，默认门槛固定为 **12 GiB**，不随 GPU 总容量变化。30 GiB 只是可显式
+覆盖的示例；`min_free_gib` 必须是 0–4096 范围内的有限正数。`allow_external_occupancy`
+默认 false；设置 true 才允许在可完整归属的外部 compute 进程占卡时共用。
+这不是独占保证，也不停止外部程序。显存门槛不是应用峰值估计；声明的 `vram_gib`
+和缓存峰值较大时，仍需预留更大的预算。
+
+nvidia-smi 的 topology、compute、memory.free 与 utilization 必须完整、可归属并保持
+拓扑一致。未知进程组、无 compute 归属的利用率、不可读或过期采样均拒绝。
+本项目未清理残留、未决 owner、releasing、quarantined 和人工 ignore 均不能被共用
+策略绕过。unmanaged 只有重新确认实际存在可归属的外部进程时才有此显式准入；
+空样本不会自动撤销 registry 的未决状态。
+
+派发前采样，创建子进程前再采样并读取热配置；慢探测不持有 SQLite writer。
+样本最多使用 5 秒。事务中的 gpu_jobs 预留覆盖同 tick 和既有启动，每个共享绑定
+保留完整预算，即使 memory.free 已反映部分占用也再次保留，宁可延后而不透支。
+独占 sentinel、共享总容量/任务数上限、项目配额、硬亲和、GPU 开关和 drain 仍有效。
+外部程序可在采样后继续分配，因此准入不保证应用不会 OOM，恢复仍靠有效断点。
+
+`recovery.retry` 增加三个参与 smoke binding 的字段：
+
+```json
+{"min_free_gib_by_round": [12, 24, 30], "no_progress_sec": 1800, "max_no_progress_sec": 0}
+```
+
+`min_free_gib_by_round` 默认 `[12]`；允许 1–16 个非递减、有限、12–4096 GiB 的值。
+首轮取第 0 项，延后 queue round=1 取第 1 项，超出长度保持最后一项，不降低项目门槛。
+可用显存未达该轮要求时继续等待资源改善；不修改应用精度、科学参数或输入。
+
+`no_progress_sec` 默认 1800 秒，0 关闭通知周期；`max_no_progress_sec` 默认 0 表示不限
+等待时间，正值仅停止等待中的新版本，不强杀运行中的尝试。两者为有限非负秒数，上限一年。
+应用 checkpoint payload 摘要改变才算进展；相同 OOM 断点、daemon 重启、坏/丢失断点
+都不能重置持久计时。到达停止条件，新版本 blocked/recovery_no_progress，旧退出事实保留。
+
+通知需显式加入 `notify.on: ["recovery_no_progress"]`。新事件含 job/root ID、round、
+last_progress_at、observed_at 与 stopped，使用持久 outbox，渠道失败后重试；command/email
+可能至少一次投递，接收端用 event_id 去重。file 同一 event_id 使用固定文件名，已确认事件
+不重新变成未读。`sched recovery --json` 的独立接口增加 watch；已有 status/task/history
+schema 和 wait_reason 枚举保持不变。schema 8 查询不迁移且 watch 为 null，写入原子升级到 9。
+
+验收见 [test_gpu_admission.py](../tests/test_gpu_admission.py)。实际 GPU 验收须在独立的
+非生产计算环境执行；本次 fake GPU + 真实 CPU/native 子进程不能当作真实 CUDA 压力证据。
