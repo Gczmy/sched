@@ -15,6 +15,8 @@ if os.environ.get("CHECK_IDENTITY_FD") == "1":
     assert identity["schema"] == "sched_execution_identity/v1"
     assert identity["job_id"] == store.value["job_id"]
 settings = json.loads(Path("settings.json").read_text())
+if len(sys.argv) > 1:
+    settings.update(settings.get("groups", {}).get(sys.argv[1], {}))
 if store.value["mode"] == "smoke":
     store.save({"next": 1, "results": [0]})
     assert store.load() == {"next": 1, "results": [0]}
@@ -32,6 +34,7 @@ for step in range(progress["next"], settings["total"]):
     store.save(progress)
     if progress["next"] in settings.get("oom_at", []):
         store.report("oom")
-        print("CUDA out of memory", flush=True)
+        if settings.get("oom_log", True):
+            print("CUDA out of memory", flush=True)
         sys.exit(42)
 Path("result.json").write_text(json.dumps(progress))

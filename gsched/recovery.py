@@ -44,7 +44,7 @@ def normalize(task):
         return None
     raw = task["recovery"]
     required = {"protocol", "mode", "code", "config", "inputs"}
-    if type(raw) is not dict or not required <= raw.keys() or raw.keys() - required - {"smoke_job_id"}:
+    if type(raw) is not dict or not required <= raw.keys() or raw.keys() - required - {"smoke_job_id", "retry"}:
         raise RecoveryError("recovery requires protocol, mode, code, config and inputs")
     if raw["protocol"] != PROTOCOL or raw["mode"] not in ("smoke", "run"):
         raise RecoveryError("unsupported recovery protocol or mode")
@@ -69,6 +69,9 @@ def normalize(task):
         count += len(entries)
     if count > 64:
         raise RecoveryError("recovery permits at most 64 declared files")
+    if "retry" in raw:
+        from .recovery_state import normalize_policy
+        result["retry"] = normalize_policy(raw["retry"])
     smoke = raw.get("smoke_job_id")
     if raw["mode"] == "run":
         if not isinstance(smoke, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", smoke):
@@ -133,6 +136,9 @@ def freeze(spec, fingerprint):
     _sha(fingerprint)
     payload = {"protocol": PROTOCOL, "task_id": spec["id"], "fingerprint": fingerprint,
                **{kind: spec["recovery"][kind] for kind in ("code", "config", "inputs")}}
+    payload["task_configuration"] = {key: spec.get(key) for key in ("resources", "duration_min", "probes", "max_parallel")}
+    if "retry" in spec["recovery"]:
+        payload["retry"] = spec["recovery"]["retry"]
     spec["_recovery_binding"] = digest(payload)
     spec["_recovery_fingerprint"] = fingerprint
 
@@ -253,6 +259,8 @@ class CheckpointStore:
             raise RecoveryError("checkpoint binding mismatch")
         if not isinstance(value["producer_job_id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", value["producer_job_id"]):
             raise RecoveryError("checkpoint producer identity is invalid")
+        if value["payload"] is None:
+            raise RecoveryError("checkpoint payload must be non-null progress")
         if digest(value["payload"]) != value["payload_sha256"]:
             raise RecoveryError("checkpoint payload checksum mismatch")
         return value["payload"]
@@ -304,7 +312,7 @@ def smoke_gate(conn, host_dir, job, spec):
         return False
     if type(candidate) is not dict:
         return False
-    if candidate.get("recovery", {}).get("mode") != "smoke" or candidate.get("_recovery_binding") != spec.get("_recovery_binding"):
+    if not isinstance(candidate.get("recovery"), dict) or candidate["recovery"].get("mode") != "smoke" or candidate.get("_recovery_binding") != spec.get("_recovery_binding"):
         return False
     try:
         receipt = report(host_dir, smoke, candidate)

@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from . import notify, state, execution_state, recovery
+from . import notify, state, execution_state, recovery, recovery_state
 from dataclasses import asdict
 from .artifacts import (
     bounded_regex_last_match,
@@ -3268,6 +3268,7 @@ class Dispatcher:
                                      failure="execution_not_started", finished_at=state.now())
                     self._release_gpu_for_job(conn, job)
                     cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
+                    self._recover_clean_interruption(conn, job, authority="not_started")
                     continue
                 if previous.get("status") in ("exited", "not_started") and previous.get("group_clean") is True:
                     observation = previous
@@ -3290,6 +3291,7 @@ class Dispatcher:
                         state.update_job(conn, job["id"], status="interrupted", failure="execution_authority_lost", finished_at=state.now())
                         self._release_gpu_for_job(conn, job)
                         cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
+                        self._recover_clean_interruption(conn, job)
                     continue
             else:
                 observation = previous if attempt["phase"] in ("exited", "not_started") else observation
@@ -3314,6 +3316,7 @@ class Dispatcher:
                                  failure="execution_not_started", finished_at=state.now())
                 self._release_gpu_for_job(conn, job)
                 cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
+                self._recover_clean_interruption(conn, job, authority="not_started")
                 conn.commit()
                 if owner is not None:
                     self._ack_configured_owner(conn, job["id"])
@@ -3472,6 +3475,7 @@ class Dispatcher:
                 finished_at=state.now(),
             )
             self.log_line(f"job {j['id']} failed (rc 缺失, {failure})")
+            self._record_recovery_settlement(conn, j, "interrupted", "group_gone")
             if failure in ("oom", "gpu_fault"):
                 self._capture_incident(conn, j, failure, log_path)
             self._release_gpu_for_job(conn, j)
@@ -3500,14 +3504,46 @@ class Dispatcher:
         else:
             log_path = self._job_log_path(j)
             failure, _ = self.executor.failed_classify(log_path)
+            # A current, binding-checked application report classifies failure
+            # only after the real nonzero exit and group cleanup above.
+            try:
+                recovery_spec = self._load_task_spec(conn, j)
+                if recovery_spec.get("recovery") is not None:
+                    receipt = recovery.report(self.host_dir, j, recovery_spec)
+                    if receipt is not None and receipt["outcome"] == "oom":
+                        failure = "oom"
+            except (ValueError, OSError):
+                pass
             state.update_job(conn, j["id"], status="failed", rc=rc, failure=failure,
                              finished_at=state.now())
             self.log_line(f"job {j['id']} failed rc={rc} ({failure})")
+            if failure == "oom" or rc < 0:
+                self._record_recovery_settlement(conn, j, "oom" if failure == "oom" else "interrupted", "wait")
             if failure in ("oom", "gpu_fault"):
                 self._capture_incident(conn, j, failure, log_path)
         self._release_gpu_for_job(conn, j)
         self._maybe_retry(conn, j)
         return cleanup_paths
+
+    def _record_recovery_settlement(self, conn, job, outcome, authority):
+        try:
+            spec = self._load_task_spec(conn, job)
+        except ValueError:
+            return False
+        return recovery_state.record_clean(conn, state.get_job(conn, job["id"]), spec, outcome, authority)
+
+    def _recover_clean_interruption(self, conn, job, *, authority="group_gone"):
+        if self._consume_pending_cancel_before_requeue(conn, job, context="clean recovery interruption"):
+            return True
+        if not self._record_recovery_settlement(conn, job, "interrupted", authority):
+            return False
+        spec = self._load_task_spec(conn, job)
+        if recovery_state.create_next(conn, self.host_dir, state.get_job(conn, job["id"]), spec):
+            self.log_line(f"job {job['id']} clean interruption appended a new recovery version")
+        else:
+            # A denied attempt cannot keep the batch active indefinitely.
+            state.update_job(conn, job["id"], status="blocked")
+        return True
 
     def _release_gpu_for_job(self, conn, j) -> None:
         """assigned -> releasing (立即, B5). 多归属计数释放 (§3.2e B)."""
@@ -3819,6 +3855,10 @@ class Dispatcher:
         try:
             spec = self._load_task_spec(conn, j)
             batch = state.get_batch(conn, j["batch_id"])
+            if isinstance(spec.get("recovery"), dict) and spec["recovery"].get("retry") is not None:
+                if recovery_state.create_next(conn, self.host_dir, j, spec):
+                    self.log_line(f"job {j['id']} recovery appended a new version to deferred FIFO")
+                    return
             if (
                 (batch is not None and batch["mode"] == "strict")
                 or any(key in spec for key in NATIVE_EXEC_ALL_INTERNAL_FIELDS)
@@ -3882,6 +3922,7 @@ class Dispatcher:
             state.update_job(conn, j["id"], status="interrupted",
                              failure="recovery_new_attempt_required", finished_at=state.now(),
                              pgid=None, rc=None, kill_reason=None, gpu=None)
+            self._recover_clean_interruption(conn, j)
             return
         if native_exec:
             state.update_job(
@@ -4272,6 +4313,8 @@ class Dispatcher:
                     if spec is None:
                         spec = self._load_task_spec(conn, j)
                     if j["id"] in smoke_waits:
+                        continue
+                    if spec.get("recovery") is not None and not recovery_state.eligible(conn, j):
                         continue
                     resources = spec.get("resources") or {}
                     if not isinstance(resources, dict):
@@ -4769,6 +4812,10 @@ class Dispatcher:
             if conn.in_transaction:
                 conn.commit()
             recovery.verify_binding(spec, current_fp)
+            if not recovery_state.eligible(conn, j):
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                return False
             if not recovery.smoke_gate(conn, self.host_dir, j, spec):
                 if gpu is not None:
                     self._release_in_tx(conn, j["id"])

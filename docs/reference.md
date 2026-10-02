@@ -411,6 +411,7 @@ config/API 使用。项目级 GPU 开关 ND-01 已实现，行为与验收依据
 
 ## 候选断点恢复接口
 
-显式 task.recovery、精确 smoke 门禁和独立只读 `sched recovery <batch>:<task> --json`
+显式 task.recovery、精确 smoke 门禁、新版本 OOM FIFO 和独立只读
+`sched recovery <batch>:<task> [--version N] --json`
 见 [recovery-policy.md](recovery-policy.md)。0.2.2 不支持该候选接口；现有 task/status/history
 JSON 与 execution FD4 identity 不变，恢复任务仍使用 max_retry:0，禁止旧版本重放。

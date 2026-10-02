@@ -280,3 +280,9 @@ python tests/run_install_accept.py --native
 故障、取消、timeout、重启和未知启动结果的约束见
 [execution-boundary.md](execution-boundary.md)。普通 daemon 不把外部程序返回的
 业务 receipt 当成子进程 wait，也不把 backend 不可用当成重试普通命令的理由。
+
+## 候选显式恢复策略
+
+候选版本通过 [recovery-policy.md](recovery-policy.md) 的显式 smoke-bound retry policy
+在旧尝试结算/进程组清理后创建新的 job/version/attempt；普通 max_retry 仍为 0，
+原 attempt 不重放，未知结果继续保留。该 opt-in 接口与 schema 8 不属于已发布 0.2.2。

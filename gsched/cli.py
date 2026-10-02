@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from . import recovery
+from . import recovery, recovery_state
 from . import state, execution_state, __version__
 from . import artifacts
 from .executor import PROGRESS_RE
@@ -1614,14 +1614,21 @@ def cmd_recovery(args: argparse.Namespace) -> int:
         with state.connect() as conn:
             conn.execute("BEGIN")
             batch, task_id = _resolve_task_ref(args.task, conn)
-            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1", (batch, task_id)).fetchone()
+            version = getattr(args, "version", None)
+            if version is not None and version < 1:
+                raise ValueError("version 必须为正整数")
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=?" +
+                (" AND version=?" if version is not None else "") + " ORDER BY version DESC LIMIT 1",
+                (batch, task_id, version) if version is not None else (batch, task_id)).fetchone()
             if job is None:
                 raise ValueError("任务不存在")
             row = conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?", (batch, task_id, job["version"])).fetchone()
             spec = json.loads(row["spec"])
             declaration = spec.get("recovery")
+            durable = recovery_state.public(conn, job["id"])
             output = {"schema_version": 1, "batch_id": batch, "task_id": task_id,
-                      "job_id": job["id"], "version": job["version"], "enabled": declaration is not None}
+                      "job_id": job["id"], "version": job["version"], "enabled": declaration is not None,
+                      **durable}
             if declaration is not None:
                 value = json.loads(recovery.context(state.host_dir(), job, spec, create=False))
                 try:
@@ -4439,6 +4446,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("recovery", help="断点与精确 smoke 门禁的只读查询")
     p.add_argument("task", help="<batch-id-or-name>:<task-id>")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--version", type=int, help="指定历史版本；checkpoint 仍是 group 当前最新断点")
     p.set_defaults(fn=cmd_recovery)
 
     p = sub.add_parser("capabilities", help="本机 execution 能力检查，不读取配置或状态库")
