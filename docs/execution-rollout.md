@@ -2,10 +2,13 @@
 
 本清单用于交付准备。当前生产版本、配置和运行状态尚未查询；执行本清单前须取得对应部署授权。
 
-当前正式版本为 [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2)，
+已发布 0.2.2 的历史记录为 [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2)，
 发布来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`；
 [最终来源 CI](https://github.com/Gczmy/sched/actions/runs/36881160410) 的 14 项检查全部通过。
 七个原始资产已从公开 Release 下载核对，生产切换独立安排。
+
+0.3.0 的正式来源、资产与状态以对应 Release/tag/evidence 为准，
+恢复能力与真实 CUDA 验收见 [0.3.0 说明](releases/0.3.0.md)。
 
 ## 发布验收
 
@@ -14,7 +17,7 @@
 - 记录合并提交、wheel SHA-256、Python ABI 和构建方式。配套客户端仍通过公开 CLI 使用调度器。
 
 候选产物必须从固定提交的独立源码副本构建，忽略本地 `.so`、测试状态与运行配置。
-当前默认产物为 `sched-0.2.2-py3-none-any.whl`；native wheel 的 ABI/平台以实际构建结果为准。
+0.3.0 默认产物为 `sched-0.3.0-py3-none-any.whl`；native wheel 的 ABI/平台以实际构建结果为准。
 候选目录保存 `manifest.json`、源码归档、两种 wheel、安装说明和 `RELEASE_NOTES.md`；
 manifest 记录完整 commit、构建 Python/平台、各文件 SHA-256 与独立安装证据。
 发布标签应指向最终验收提交，不能只凭包版本

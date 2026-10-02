@@ -1,6 +1,6 @@
 # 恢复候选验收
 
-本分支组合四组候选 PR：协议/smoke、新尝试/OOM FIFO、显存准入/分级、前台守护。
+本页验收已合并的协议/smoke、新尝试/OOM FIFO、显存准入/分级和前台守护。
 不包含客户科学算法或特定客户仓库操作；不访问远程生产节点。
 
 ## 本地 Linux 与 CI
@@ -59,6 +59,28 @@ Darwin 专用用例及 native 已构建时的缺失安装用例按原契约跳�
 已完成结果；显式配置较高 tiers 后应等待显存改善。终止该隔离 daemon 并观察原 owner
 wait/新 version 的区分，再验证 stop、drain 和项目 GPU 禁用。保存外部实验记录即可，
 不把个人节点、任务名称、部署路径或生产记录提交到公开仓库。
+
+手动 CUDA 验收入口（只在已授权、没有其他 compute 用户且至少有 20 GiB 空闲的 GPU 上运行）：
+
+```bash
+SCHED_BUILD_NATIVE=1 python -m pip install -e .
+python tests/run_real_gpu_accept.py --gpu <index> --work-dir <new-private-directory>
+```
+
+该入口使用标准库 ctypes 调用 CUDA driver，执行 PTX kernel，并通过实际分配失败
+产生可捕获 OOM；不依赖训练框架。它使用新的独立配置/state，测试进程均由自身持有，
+只通过 CLI 操作调度器；结束后保留私有 state 和 evidence.json，不删除运行记录。
+覆盖外部占用许可、12 GiB 门槛、20 GiB 恢复门槛、普通组优先/FIFO、预留、真实
+worker/daemon SIGKILL、GPU 禁用、drain/resume/stop。节点、路径和完整原始输出只保存在私有证据中。
+
+## 2026-10-02 真实 GPU 结果
+
+上述手动入口已在隔离的 RTX A5000 / Python 3.12.3 / Linux x86_64 环境通过全部 8 项。
+实测空闲显存为 11.898/12.148 GiB，分别阻止/允许派发；真实 CUDA 分配 OOM、20 GiB
+恢复门槛、FIFO 无重复、预留、daemon/worker SIGKILL 和控制流程均符合断言。
+测试完成后其独立 daemon 已停止，测试显存占用已释放。所用 runtime/native/验收
+源码逐文件与已提交源码核对一致。私有配置、状态、路径和原始日志不进入公开仓库。
+该源码构建证据不扩大正式 CPython 3.10/3.14 二进制资产矩阵，也不证明任意训练框架的科学正确性。
 
 ## 发布边界
 

@@ -17,7 +17,7 @@ Linux x86_64、glibc 2.39。
 职责见 [execution-boundary.md](execution-boundary.md)。生产现状未查询，
 不能把发布记录当作生产已升级的证据。
 
-## 当前已发布 0.2.2
+## 已发布 0.2.2 历史记录
 
 [v0.2.2 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2) 于 2026-10-01 发布，
 来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`。
@@ -49,9 +49,12 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 科学验收和研究部署由客户仓库独立维护，不作为 sched 发布前置条件。
 已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。
 
-## 恢复工作流候选
+## 0.3.0 发布准备
 
 当前候选协议见 [recovery-policy.md](recovery-policy.md)。候选已实现独立新尝试授权与持久
 OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策略，以及前台 daemon/supervisor 和完整本地故障验收。
-候选能力待审查、正式发布和独立非生产 GPU 验收，不属于已发布 0.2.2 的能力。
+四组 PR 已审查合入 main，合并提交的 14 项 CI 全部通过。包版本已进入 0.3.0 发布准备，
+隔离真实 CUDA 验收已通过全部 8 项。正式来源、资产与发布状态见
+[v0.3.0 Release](https://github.com/Gczmy/sched/releases/tag/v0.3.0) 及其 evidence；
+Release 尚未公开时本页只作为准备说明。生产升级独立安排。
 验收矩阵见 [recovery-acceptance.md](recovery-acceptance.md)。

@@ -2,8 +2,9 @@
 
 `scripts/prepare_release.py` 仅依赖 Python 标准库。它准备原始 CI 包、总校验和和
 来源证据，可选择上传 Release 草稿；不发布 Release，不部署生产。
-当前已发布版本的事实以 [0.2.2 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2) 为准。
-该版本来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`，七个原始资产已经公开下载核对。
+0.2.2 的历史发布事实以 [0.2.2 Release](https://github.com/Gczmy/sched/releases/tag/v0.2.2) 为准。
+0.3.0 的正式来源、资产和发布事实以其 Release/tag/evidence 为准。
+0.2.2 来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`，七个原始资产已经公开下载核对。
 发布后的文档提交不改变该标签或资产；本脚本拒绝修改已发布版本。
 
 ## 在线准备
@@ -13,7 +14,7 @@
 
 ```bash
 python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <successful-ci-run-id> \
-  --version 0.2.2 --output dist/release-prepared
+  --version 0.3.0 --output dist/release-prepared
 ```
 
 `GH_TOKEN` 可通过现有环境提供，下载和草稿上传仅在内存使用；脚本不保存 token、
