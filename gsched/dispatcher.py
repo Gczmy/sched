@@ -530,9 +530,8 @@ class Dispatcher:
                 lock_age = max(0.0, time.time() - os.path.getmtime(self.lock_dir))
             except OSError:
                 return False
-            if lock_age < LOCK_STARTUP_GRACE_SEC:
-                if observed is None:
-                    self.log_line("检测到新鲜 ownerless dispatcher lock, 视为启动中")
+            if lock_age < LOCK_STARTUP_GRACE_SEC and observed is None:
+                self.log_line("检测到新鲜 ownerless dispatcher lock, 视为启动中")
                 return False
             if observed is not None and self._lock_owner_is_live(observed):
                 return False
@@ -547,7 +546,7 @@ class Dispatcher:
                     lock_age = max(0.0, time.time() - os.path.getmtime(self.lock_dir))
                 except OSError:
                     return False
-                if lock_age < LOCK_STARTUP_GRACE_SEC:
+                if lock_age < LOCK_STARTUP_GRACE_SEC and current is None:
                     return False
                 if current is not None and self._lock_owner_is_live(current):
                     return False
@@ -1011,6 +1010,7 @@ class Dispatcher:
         self._adopt_running()
 
         tick_failures = 0
+        failed = False
         while True:
             if not self._owns_current_lease():
                 self.log_line("dispatcher lease 已丢失，停止旧实例")
@@ -1039,6 +1039,7 @@ class Dispatcher:
                 # 让外部判死并可重新拉起
                 if tick_failures >= 5:
                     self.log_line("tick 连续 5 次异常, 退出 (停心跳让外部判死)")
+                    failed = True
                     break
             if once:
                 break
@@ -1051,6 +1052,8 @@ class Dispatcher:
                 time.sleep(1)
                 self._check_frozen()  # B26: 不占 tick 预算的调度健康看门狗 (1s 粒度)
         self._cleanup_lock()
+        if failed:
+            raise RuntimeError("dispatcher exited after repeated tick failures")
 
     def _submit_inbox_pending(self) -> bool:
         state_dir = default_state_dir()
@@ -1190,6 +1193,7 @@ class Dispatcher:
         for g in restored:
             self._clear_gpu_ignore(g)  # 恢复 free 自动复位 ignore 标记 (下次占用重新告警)
             self.log_line(f"unmanaged 自动恢复: GPU{g} 真实空闲 -> free")
+        self._reconcile_recovery_settlements()
         self._check_recovery_progress()
         self._unlock_dependent_batches()
         self._settle_batch_status()  # P1: 批次终态收敛
@@ -1198,6 +1202,18 @@ class Dispatcher:
             notify.cleanup_acked()  # 顺带清理 7 天前已确认通知 (设计 §6)
         except Exception as e:
             self.log_line(f"notify 清理异常: {e}")
+
+    def _reconcile_recovery_settlements(self):
+        # Retry publication after a crash/transaction failure without asking an
+        # application checkpoint to supply original exit/cleanup authority.
+        with state.connect() as conn:
+            pending = list(conn.execute("SELECT j.* FROM recovery_settlements r JOIN jobs j ON j.id=r.job_id WHERE r.decision='pending'"))
+            for job in pending:
+                spec = self._load_task_spec(conn, job)
+                if not recovery_state.create_next(conn, self.host_dir, job, spec):
+                    current = state.get_job(conn, job["id"])
+                    if current["status"] in ("failed", "interrupted"):
+                        state.update_job(conn, job["id"], status="blocked")
 
     def _check_recovery_progress(self):
         from . import recovery_watch

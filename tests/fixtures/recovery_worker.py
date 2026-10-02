@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from gsched.recovery import CheckpointStore
 
@@ -27,11 +28,19 @@ if store.value["mode"] == "smoke":
     assert store.load()["next"] == 2
     store.report("smoke_ok")
     sys.exit(0)
+with Path("starts.jsonl").open("a") as stream:
+    stream.write(json.dumps({"job_id": store.value["job_id"], "pid": os.getpid()}) + "\n")
 progress = store.load() or {"next": 0, "results": []}
 for step in range(progress["next"], settings["total"]):
     progress["results"].append(step)
     progress["next"] = step + 1
     store.save(progress)
+    if settings.get("hold_step") == progress["next"]:
+        deadline = time.monotonic() + 120
+        while not Path("release").exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+    if settings.get("step_sec"):
+        time.sleep(settings["step_sec"])
     if progress["next"] in settings.get("oom_at", []):
         store.report("oom")
         if settings.get("oom_log", True):

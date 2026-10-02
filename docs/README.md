@@ -9,7 +9,8 @@
 | [reference.md](reference.md) | 配置、CLI、JSON、状态机与写操作契约 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [execution-boundary.md](execution-boundary.md) | 通用执行层、项目 adapter 和独立发布边界 |
-| [recovery-policy.md](recovery-policy.md) | 候选恢复协议、精确 smoke 门禁与断点保留 |
+| [recovery-policy.md](recovery-policy.md) | 候选恢复协议、smoke、FIFO、显存准入与守护 |
+| [recovery-acceptance.md](recovery-acceptance.md) | 候选恢复完整故障/兼容矩阵与非生产 GPU 验收 |
 | [execution-api.md](execution-api.md) | backend 冷注册、输入 FD 和自包含可选 native |
 | [persistent-execution-owner.md](persistent-execution-owner.md) | 持久 owner、认证重连、运维确认与崩溃恢复证据 |
 | [execution-rollout.md](execution-rollout.md) | 独立发布、安装与 schema 回退边界 |

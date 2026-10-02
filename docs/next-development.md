@@ -52,5 +52,6 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 ## 恢复工作流候选
 
 当前候选协议见 [recovery-policy.md](recovery-policy.md)。候选已实现独立新尝试授权与持久
-OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策略；后续实现前台 daemon/supervisor 和完整故障验收。
-尚未实现部分暂不可用，不属于已发布 0.2.2 的能力。
+OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策略，以及前台 daemon/supervisor 和完整本地故障验收。
+候选能力待审查、正式发布和独立非生产 GPU 验收，不属于已发布 0.2.2 的能力。
+验收矩阵见 [recovery-acceptance.md](recovery-acceptance.md)。

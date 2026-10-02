@@ -164,6 +164,19 @@ class GpuAdmissionTests(TempStateCase):
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM gpu_jobs WHERE job_id=?", (job,)).fetchone()[0])
             self.assertEqual("pending", state.get_job(conn, job)["status"])
 
+    def test_capacity_override_and_explicit_ordinary_floor_are_honored(self):
+        job, spec = self.job(peak=30)
+        self.assertTrue(self.permits(job, spec))
+        with state.connect() as conn:
+            conn.execute("UPDATE gpus SET mem_total_gib=24 WHERE idx=0")
+        self.assertFalse(self.permits(job, spec))
+        spec["resources"].pop("vram_gib")
+        self.cfg["projects"]["p"]["gpu_admission"]["min_free_gib"] = 6
+        with mock.patch.dict(os.environ, {"SCHED_FAKE_FREE_GIB": '{"0": 8}'}):
+            self.assertTrue(self.permits(job, spec))
+        spec["resources"].update(gpu_share=True, vram_gib=18)
+        self.assertFalse(self.permits(job, spec))  # 18 > safety 0.7 * override 24
+
     def test_profile_peak_reservation_is_checked_at_selection_and_launch(self):
         job, spec = self.job(share=True, peak=12)
         spec["resources"]["profile_key"] = "peak"
