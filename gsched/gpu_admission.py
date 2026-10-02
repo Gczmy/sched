@@ -73,6 +73,8 @@ def sample(allocator):
 def minimum(conn, job_id, spec, configured):
     minimum_free = configured["min_free_gib"]
     retry = (spec.get("recovery") or {}).get("retry") or {}
+    if not retry:
+        return minimum_free
     tiers = retry.get("min_free_gib_by_round", [12])
     row = conn.execute("SELECT round FROM recovery_queue WHERE job_id=?", (job_id,)).fetchone()
     return max(minimum_free, tiers[min(row[0] if row else 0, len(tiers) - 1)])
@@ -125,7 +127,14 @@ def permits(conn, cfg, idx, job_id, spec, project, snapshot):
     # Deliberately reserve the full peak of every bound launch, including those
     # already reflected in memory.free. Conservative double accounting avoids
     # admitting against memory that a newly started child has not allocated yet.
-    return value["free_gib"] - outstanding >= reservation(spec, required, conn, project)
+    budget = reservation(spec, required, conn, project)
+    configured_capacity = row["mem_total_gib"]
+    capacity = min(value["total_gib"], float(configured_capacity)) if configured_capacity is not None else value["total_gib"]
+    if not math.isfinite(capacity) or capacity <= 0 or outstanding + budget > capacity:
+        return False
+    if share and outstanding + budget > cfg.get("co_locate_safety", 0.7) * capacity:
+        return False
+    return value["free_gib"] - outstanding >= budget
 
 
 def assign(conn, dispatcher, job_id, spec, project, snapshot):
@@ -153,7 +162,7 @@ def assign(conn, dispatcher, job_id, spec, project, snapshot):
         peak = reservation(spec, minimum(conn, job_id, spec, configured), conn, project)
         if share:
             packed = conn.execute("SELECT COALESCE(SUM(vram_gib),0) FROM gpu_jobs WHERE gpu_id=?", (idx,)).fetchone()[0]
-            if packed + peak > dispatcher.cfg.get("co_locate_safety", 0.7) * snapshot[idx]["total_gib"]:
+            if packed + peak > dispatcher.cfg.get("co_locate_safety", 0.7) * min(snapshot[idx]["total_gib"], dispatcher.allocator.mem_total(idx) or snapshot[idx]["total_gib"]):
                 continue
         conn.execute("UPDATE gpus SET status='assigned',job_id=COALESCE(job_id,?),updated_at=? WHERE idx=?", (job_id, dispatcher._admission_now(), idx))
         conn.execute("INSERT INTO gpu_jobs(gpu_id,job_id,vram_gib,updated_at) VALUES(?,?,?,?)", (idx, job_id, peak if share else None, dispatcher._admission_now()))

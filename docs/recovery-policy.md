@@ -160,7 +160,8 @@ Smoke binding also covers normalized task resources, duration, probes and parall
 覆盖的示例；`min_free_gib` 必须是 0–4096 范围内的有限正数。`allow_external_occupancy`
 默认 false；设置 true 才允许在可完整归属的外部 compute 进程占卡时共用。
 这不是独占保证，也不停止外部程序。显存门槛不是应用峰值估计；声明的 `vram_gib`
-和缓存峰值较大时，仍需预留更大的预算。
+和缓存峰值较大时，仍需预留更大的预算。配置/CLI 的显存容量下调仍是上限，
+不能用较大的物理总容量绕过；显式较小门槛可用于普通任务，恢复 tiers 仍独立取较大值。
 
 nvidia-smi 的 topology、compute、memory.free 与 utilization 必须完整、可归属并保持
 拓扑一致。未知进程组、无 compute 归属的利用率、不可读或过期采样均拒绝。
