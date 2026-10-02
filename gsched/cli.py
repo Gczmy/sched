@@ -4361,6 +4361,24 @@ def cmd_request(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_version(args) -> int:
+    """Report installed code compatibility without consulting configured state."""
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "query": "version",
+            "sched_version": __version__,
+            "database_schema": {
+                "write": state.DB_SCHEMA_VERSION,
+                "read_min": 1,
+                "read_max": state.DB_SCHEMA_VERSION,
+            },
+        }))
+    else:
+        print(f"sched {__version__}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     state.set_read_only(False)
     state.set_query_only(False)
@@ -4373,6 +4391,10 @@ def main(argv: list[str] | None = None) -> int:
     # name for the selected subcommand replaces "run" with a list and breaks
     # every set-membership check below before cmd_run can execute.
     sub = ap.add_subparsers(dest="_subcommand")
+
+    p = sub.add_parser("version", help="show installed version without reading state")
+    p.add_argument("--json", action="store_true", help="structured version and schema compatibility")
+    p.set_defaults(fn=cmd_version)
 
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
@@ -4618,7 +4640,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command == "capabilities":
+    if command in {"capabilities", "version"}:
         return args.fn(args)
     daemon_action = getattr(args, "action", None) if command == "daemon" else None
     daemon_write_action = daemon_action

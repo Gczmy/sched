@@ -1965,7 +1965,7 @@ class ReviewLocalQueryOnlyTests(TempStateCase):
 
         writer = threading.Thread(target=churn_writer, daemon=True)
         writer.start()
-        real_copyfile = state.shutil.copyfile
+        real_copyfile = state._copy_sqlite_snapshot
         main_db_copies = 0
 
         def copy_with_controlled_churn(source, destination, *args, **kwargs):
@@ -1989,8 +1989,8 @@ class ReviewLocalQueryOnlyTests(TempStateCase):
                 "init_db",
                 wraps=state.init_db,
             ) as init_db, mock.patch.object(
-                state.shutil,
-                "copyfile",
+                state,
+                "_copy_sqlite_snapshot",
                 side_effect=copy_with_controlled_churn,
             ), mock.patch(
                 "gsched.state.time.sleep",

@@ -83,6 +83,9 @@ def main():
             observed = run([str(installed / "bin/sched"), "--version"], unrelated, runtime).strip()
             require(observed == "sched " + package_version, "installed CLI version mismatch")
             run([str(installed / "bin/sched"), "--help"], unrelated, runtime)
+            version_info = json.loads(run([str(installed / "bin/sched"), "version", "--json"], unrelated, runtime))
+            require(version_info["schema_version"] == 1 and version_info["query"] == "version"
+                    and version_info["sched_version"] == package_version, "installed version query mismatch")
             capability_evidence = None
             if (source / "gsched/execution/capabilities.py").is_file():
                 capabilities = json.loads(run([str(installed / "bin/sched"), "capabilities", "--json"], unrelated, runtime))
@@ -101,6 +104,8 @@ def main():
             if database_schema is not None:
                 require(database_schema == observed["schema"], "installed database schema mismatch")
             database_schema = observed["schema"]
+            require(version_info["database_schema"] == {"write": database_schema, "read_min": 1,
+                    "read_max": database_schema}, "installed schema compatibility mismatch")
             if native:
                 run([sys.executable, "-c", """
 import os,secrets

@@ -15,7 +15,7 @@ on:
         description: Numeric package version matching the reviewed source
         required: true
         type: string
-        default: '0.3.0'
+        default: '0.3.1'
       upload_draft:
         description: Upload a matching draft after verification; never publish
         type: boolean

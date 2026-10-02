@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -15,6 +16,8 @@ import shutil
 import stat
 import tempfile
 import secrets
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -302,6 +305,35 @@ def ensure_private_file(path: str) -> str:
         os.fchmod(fd, 0o600)
     finally:
         os.close(fd)
+    return path
+
+
+
+def ensure_private_sqlite_file(path: str, *, missing_ok: bool = False) -> str:
+    """Repair SQLite metadata without opening/closing a data descriptor.
+
+    Closing *any* ordinary descriptor for a live DB/SHM inode releases this
+    process's POSIX locks, including locks owned by SQLite.  Do not use
+    ensure_private_file(), even before opening a second SQLite connection.
+    SQLite creates missing files itself inside the private parent directory.
+    """
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        if missing_ok:
+            return path
+        raise
+    if not stat.S_ISREG(entry.st_mode):
+        raise StateError(f"SQLite state file is not regular: {path}")
+    if stat.S_IMODE(entry.st_mode) != 0o600:
+        os.chmod(path, 0o600, follow_symlinks=False)
+    current = os.lstat(path)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino)
+        or stat.S_IMODE(current.st_mode) != 0o600
+    ):
+        raise StateError(f"SQLite state file changed during permission repair: {path}")
     return path
 
 
@@ -1366,6 +1398,31 @@ def _snapshot_signature(path: str) -> tuple:
     return tuple(signature)
 
 
+
+def _copy_sqlite_snapshot(path: str, destination: str, include_wal: bool) -> None:
+    """Copy source bytes in another process to preserve local SQLite locks.
+
+    A query can run while this process has a writer (including in another
+    thread).  shutil.copyfile() here would close a source DB descriptor and
+    silently discard that writer's POSIX locks.  The child never opens SQLite.
+    """
+    code = (
+        "import shutil,sys\n"
+        "try:\n"
+        " shutil.copyfile(sys.argv[1],sys.argv[2])\n"
+        " if sys.argv[3]=='1': shutil.copyfile(sys.argv[1]+'-wal',sys.argv[2]+'-wal')\n"
+        "except FileNotFoundError: sys.exit(2)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, path, destination, "1" if include_wal else "0"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode == 2:
+        raise FileNotFoundError(path)
+    if result.returncode:
+        raise StateError("private SQLite snapshot copy failed")
+
+
 @contextmanager
 def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
     """Yield a stable private copy without opening SQLite state on the source."""
@@ -1380,7 +1437,7 @@ def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
             if before[0] is None:
                 raise StateError(f"state database does not exist: {path}")
             try:
-                shutil.copyfile(path, snapshot_db)
+                _copy_sqlite_snapshot(path, snapshot_db, before[1] is not None)
             except FileNotFoundError:
                 continue
             if before[1] is None:
@@ -1388,11 +1445,6 @@ def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
                     os.unlink(snapshot_wal)
                 except FileNotFoundError:
                     pass
-            else:
-                try:
-                    shutil.copyfile(path + "-wal", snapshot_wal)
-                except FileNotFoundError:
-                    continue
             if before == _snapshot_signature(path):
                 yield snapshot_db, before[1] is None
                 return
@@ -1402,6 +1454,36 @@ def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
         )
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+
+
+_COMMIT_RETRY_DELAYS = (0.05, 0.15, 0.3)
+
+
+def _log_sqlite_failure(conn: sqlite3.Connection, phase: str, error: BaseException) -> None:
+    logging.getLogger(__name__).error(
+        "SQLite transaction failure phase=%s pid=%s code=%s name=%s in_transaction=%s",
+        phase, os.getpid(), getattr(error, "sqlite_errorcode", None),
+        getattr(error, "sqlite_errorname", None), conn.in_transaction,
+    )
+
+
+def _commit_transaction(conn: sqlite3.Connection) -> None:
+    """Retry only an active COMMIT returning exact SQLITE_BUSY; never replay work."""
+    for attempt in range(len(_COMMIT_RETRY_DELAYS) + 1):
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as error:
+            # SQLITE_BUSY_SNAPSHOT, protocol/I/O errors and unclassified old
+            # Python errors do not prove that repeating COMMIT is safe.
+            if (
+                getattr(error, "sqlite_errorcode", None) != 5
+                or not conn.in_transaction
+                or attempt == len(_COMMIT_RETRY_DELAYS)
+            ):
+                raise
+            time.sleep(_COMMIT_RETRY_DELAYS[attempt])
 
 
 @contextmanager
@@ -1445,26 +1527,38 @@ def connect() -> Iterator[sqlite3.Connection]:
         return
 
     ensure_private_directory(os.path.dirname(p))
-    ensure_private_file(p)
+    ensure_private_sqlite_file(p, missing_ok=True)
     conn = sqlite3.connect(p, timeout=5.0)
+    phase = "prepare"
     try:
+        ensure_private_sqlite_file(p)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         for sidecar in (p + "-wal", p + "-shm"):
-            if os.path.exists(sidecar):
-                ensure_private_file(sidecar)
+            try:
+                ensure_private_sqlite_file(sidecar)
+            except FileNotFoundError:
+                pass
+        phase = "body"
+        yield conn
+        phase = "commit"
+        _commit_transaction(conn)
+    except Exception as error:
+        if isinstance(error, sqlite3.Error):
+            _log_sqlite_failure(conn, phase, error)
         try:
-            yield conn
-            conn.commit()
-        except Exception:
             conn.rollback()
-            raise
+        except sqlite3.Error as rollback_error:
+            _log_sqlite_failure(conn, "rollback", rollback_error)
+        raise
     finally:
         conn.close()
         for sidecar in (p + "-wal", p + "-shm"):
-            if os.path.exists(sidecar):
-                ensure_private_file(sidecar)
+            try:
+                ensure_private_sqlite_file(sidecar)
+            except FileNotFoundError:
+                pass
 
 
 def now() -> str:

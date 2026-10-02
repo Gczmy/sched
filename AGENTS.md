@@ -50,6 +50,7 @@
 | `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
 | `docs/releases/0.2.2.md` | 已发布 0.2.2 的固定来源、验收证据、ABI/libc 范围与安装约束 |
 | `docs/releases/0.3.0.md` | 恢复能力、真实 CUDA 验收、正式 ABI 范围与 schema 9 回退 |
+| `docs/releases/0.3.1.md` | SQLite 锁修复、版本查询与 schema 9 升级边界 |
 | `docs/native-integration.md` | 旧实验接口的持久态保护与迁移限制 |
 | `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
@@ -110,6 +111,7 @@
 
 | 命令 | 用途与关键参数 |
 | --- | --- |
+| `sched --version`、`sched version [--json]` | 当前代码版本；JSON 包含 schema 兼容范围，不读取配置或 DB |
 | `sched submit <batch.json> --dry-run --json` | 校验、任务展开与 SKIP 预览；正式提交去掉预览参数 |
 | `sched verify <batch-id>` | 确认批次已持久化；投递成功不代表已经入库 |
 | `sched run` | 计算节点提交单任务；GPU 用 `--gpus 1`，CPU 用 `--cpu-only` |
