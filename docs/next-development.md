@@ -38,6 +38,14 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 和实际产物为准；只有通过的矩阵才构成支持证据。正式发布不代表生产已切换。
 写库仍为 schema 7，状态、FD4 identity、原始 wait 和未知结果守卫保持不变。
 
+## 已发布 0.3.1 与 0.4.0 集成候选
+
+0.3.1 的 SQLite 锁修复与版本查询见 [版本说明](releases/0.3.1.md)。
+0.3.0 发布准备章节保留为历史；它不能代表当前生产状态。
+下一版本完整目标、兼容边界及未完成项见 [集成合同](integration-contract.md)：
+实例身份与任务归属、结构化请求查询、网关幂等投递、两侧客户端适配、
+故障与安装验收、固定来源发布和按实际状态分批部署。
+
 ## 后续候选
 
 - 更多 Linux ABI/架构须先有对应构建、探测、独立安装和实际执行验收，
@@ -49,12 +57,12 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 科学验收和研究部署由客户仓库独立维护，不作为 sched 发布前置条件。
 已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。
 
-## 0.3.0 发布准备
+## 0.3.0 历史发布准备
 
-当前候选协议见 [recovery-policy.md](recovery-policy.md)。候选已实现独立新尝试授权与持久
+该版本协议见 [recovery-policy.md](recovery-policy.md)。候选已实现独立新尝试授权与持久
 OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策略，以及前台 daemon/supervisor 和完整本地故障验收。
-四组 PR 已审查合入 main，合并提交的 14 项 CI 全部通过。包版本已进入 0.3.0 发布准备，
+四组 PR 已审查合入 main，合并提交的 14 项 CI 全部通过。当时包版本进入 0.3.0 发布准备，
 隔离真实 CUDA 验收已通过全部 8 项。正式来源、资产与发布状态见
 [v0.3.0 Release](https://github.com/Gczmy/sched/releases/tag/v0.3.0) 及其 evidence；
-Release 尚未公开时本页只作为准备说明。生产升级独立安排。
+该段只保留历史准备过程；生产现状需重新查询。
 验收矩阵见 [recovery-acceptance.md](recovery-acceptance.md)。

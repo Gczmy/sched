@@ -20,6 +20,14 @@ Zero third-party dependencies: pure Python standard library (`>= 3.10`).
 - **Notifications** — batch terminal events to file inbox / email / user scripts; the webhook channel is reserved but not implemented.
 - **Git fingerprints** — fingerprints include HEAD plus tracked staged/unstaged content, while excluding arbitrary untracked outputs; every task records `git_rev`, and retry/resubmit warns on code drift.
 
+## Public integration
+
+Independent clients can negotiate [CLI contracts](docs/integration-contract.md)
+for persistent instance identity, same-snapshot task ownership and durable request
+receipts. `submit --request-id ... --json` preserves one original batch across
+gateway delivery and response loss. A delivered envelope is not database acceptance;
+unknown results retain the original request.
+
 ## Installation
 
 Published source and wheel packets are available in the

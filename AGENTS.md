@@ -40,6 +40,7 @@
 
 | 来源 | 用途 |
 | --- | --- |
+| `docs/integration-contract.md` | 持久实例身份、结构化请求回执与幂等网关投递 |
 | `docs/reference.md` | 当前配置、CLI、JSON、状态机与写操作契约 |
 | `docs/execution-boundary.md` | 通用执行层、客户程序、旧兼容守卫与各仓库独立发布边界 |
 | `docs/recovery-policy.md` | 候选 checkpoint/smoke、新版本 FIFO、显存准入与前台守护 |
@@ -112,6 +113,8 @@
 | 命令 | 用途与关键参数 |
 | --- | --- |
 | `sched --version`、`sched version [--json]` | 当前代码版本；JSON 包含 schema 兼容范围，不读取配置或 DB |
+| `sched identity --json`、`sched request-status <request-id> --json` | 私有只读快照查询实例身份和原始请求事实，不迁移旧库 |
+| `sched submit <batch.json> --request-id <id> --expect-instance <id> --expect-project P --json` | 同绑定复用原 batch ID；网关投递与数据库接受分别报告，未知不重投 |
 | `sched submit <batch.json> --dry-run --json` | 校验、任务展开与 SKIP 预览；正式提交去掉预览参数 |
 | `sched verify <batch-id>` | 确认批次已持久化；投递成功不代表已经入库 |
 | `sched run` | 计算节点提交单任务；GPU 用 `--gpus 1`，CPU 用 `--cpu-only` |

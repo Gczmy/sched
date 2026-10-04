@@ -452,12 +452,33 @@ def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, con
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
+    if getattr(args, "request_id", None) is None:
+        if getattr(args, "expect_instance", None) is not None or getattr(args, "expect_project", None) is not None:
+            print("错误: submit identity expectations require --request-id", file=sys.stderr)
+            return 64
+        return _cmd_submit_impl(args)
+    from .integration import run_submission
+    try:
+        with open(args.batch, "r", encoding="utf-8") as stream:
+            spec = json.load(stream)
+        return run_submission(args, _load_cfg(), spec, _cmd_submit_impl)
+    except OSError as error:
+        print(f"错误: submission receipt unavailable: {error}", file=sys.stderr)
+        return 75
+    except (ValueError, TypeError) as error:
+        print(f"错误: idempotent submission failed: {error}", file=sys.stderr)
+        return 64
+
+
+def _cmd_submit_impl(args: argparse.Namespace) -> int:
     """sched submit batch.json [--dry-run]: 校验 -> 预览(dry) 或 入队."""
     cfg = _load_cfg()
     path = args.batch
     try:
         with open(path, "r", encoding="utf-8") as f:
-            spec = json.load(f)
+            spec = getattr(args, "_submission_spec", None)
+            if spec is None:
+                spec = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         print(f"错误: 读取 {path} 失败: {e}", file=sys.stderr)
         return 1
@@ -525,6 +546,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
     )
     if foreign_write:
         bid = f"{bid}-{uuid.uuid4().hex[:12]}"
+    ticket = getattr(args, "_submission_ticket", None)
+    if ticket is not None:
+        bid = ticket["batch_id"]
     dry_run = bool(getattr(args, "dry_run", False))
     stateless_dry_run = dry_run and (
         foreign_write or not os.path.isfile(state.db_path())
@@ -556,6 +580,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     json.dump(
                         {
                             "spec": spec,
+                            "submission": ticket,
                             "bid": bid,
                             "project": norm.get("project"),
                             "tasks": len(norm["tasks"]),
@@ -699,6 +724,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
     with db_context as conn:
         if not dry_run:
             try:
+                if ticket is not None:
+                    from .integration import check_submission
+                    check_submission(conn, ticket, spec, norm.get("project"))
                 validate_project_gpu_access(_load_cfg(), norm.get("project"), norm["tasks"])
                 # Fingerprint expansion above may take long enough for another
                 # submit to replace a dependency name.  The submission gate is
@@ -783,6 +811,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
                 fp, stage_fps, norm.get("project"),
             )
+        if ticket is not None:
+            from .integration import complete_submission
+            complete_submission(conn, ticket, {"outcome": "accepted", "batch_id": bid,
+                "delivery": "database", "persisted": True, "project": norm.get("project"),
+                "tasks": len(norm["tasks"])})
     wake_deferred = state.defer_after_commit(_ensure_running_locked)
     # BugFix (2026-08-26, sd_repro_v3 消失事故): "已入队"/ensure_running 此前
     # 在 with 事务块**内部** —— commit 发生在块退出时, 若 ensure_running 抛
@@ -1579,6 +1612,9 @@ def cmd_execution(args: argparse.Namespace) -> int:
             print("错误: 批次不存在", file=sys.stderr)
             return 1
         batch_revision = batch_row["revision"]
+        from .integration import instance_id
+        execution_instance = instance_id(conn)
+        execution_project = batch_row["project"]
         jobs = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=?" +
                             (" AND version=?" if args.version is not None else "") + " ORDER BY version",
                             (batch, task, args.version) if args.version is not None else (batch, task)).fetchall()
@@ -1604,6 +1640,7 @@ def cmd_execution(args: argparse.Namespace) -> int:
             diagnostics.append(summarize(job, spec["spec"] if spec else None,
                                          batch_row["mode"], attempt, legacy))
     output = {"schema_version": 1, "batch_id": batch, "batch_revision": batch_revision,
+              "instance_id": execution_instance, "project": execution_project,
               "task_id": task, "attempts": attempts, "diagnostics": diagnostics,
               "legacy_sessions": legacy_sessions}
     print(json.dumps(output, ensure_ascii=False, indent=2))
@@ -1684,12 +1721,15 @@ def cmd_task(args: argparse.Namespace) -> int:
     with state.connect() as conn:
         conn.execute("BEGIN")
         batch_row = conn.execute(
-            "SELECT name, revision FROM batches WHERE id=?",
+            "SELECT name, revision, project FROM batches WHERE id=?",
             (batch,),
         ).fetchone()
         if batch_row is not None:
             output["batch_name"] = batch_row["name"]
             output["batch_revision"] = int(batch_row["revision"])
+            output["project"] = batch_row["project"]
+        from .integration import instance_id
+        output["instance_id"] = instance_id(conn)
         jobs = conn.execute(
             "SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version",
             (batch, task),
@@ -4159,6 +4199,16 @@ def cmd_request(args: argparse.Namespace) -> int:
         "revision": expect_revision,
         "assignments": expect_assignments,
     }
+    for key in ("instance", "project"):
+        value = getattr(args, "expect_" + key, None)
+        if value is not None:
+            if not isinstance(value, str) or not value or value.startswith("-") or any(c.isspace() for c in value):
+                print("错误: invalid identity/project precondition", file=sys.stderr)
+                return 64
+            if key == "project" and expect_kind not in {"batch", "task"}:
+                print("错误: project precondition requires a batch or task", file=sys.stderr)
+                return 64
+            expectation[key] = value
     argv_json = json.dumps(
         {"command": command, "expect": expectation},
         ensure_ascii=True,
@@ -4167,6 +4217,11 @@ def cmd_request(args: argparse.Namespace) -> int:
     )
 
     def existing_result(conn: sqlite3.Connection):
+        if conn.execute("SELECT 1 FROM submission_requests WHERE request_id=?", (request_id,)).fetchone():
+            return {"argv": "different submission", "status": "done", "code": 64}
+        from .integration import load_ticket
+        if load_ticket(request_id) is not None:
+            return {"argv": "different submission", "status": "done", "code": 64}
         return conn.execute(
             "SELECT argv, status, code, stdout, stderr, output_compacted"
             " FROM operation_requests WHERE request_id=?",
@@ -4193,6 +4248,14 @@ def cmd_request(args: argparse.Namespace) -> int:
         return int(existing["code"])
 
     def precondition_conflict(conn: sqlite3.Connection) -> str | None:
+        from .integration import instance_id
+        if "instance" in expectation and instance_id(conn) != expectation["instance"]:
+            return "scheduler instance changed"
+        if "project" in expectation:
+            batch = expect_id.split(":", 1)[0] if expect_kind == "task" else expect_id
+            owner = conn.execute("SELECT project FROM batches WHERE id=?", (batch,)).fetchone()
+            if owner is None or owner[0] != expectation["project"]:
+                return "scheduler project changed"
         if expect_kind == "none":
             return None
         if expect_kind == "batch":
@@ -4280,7 +4343,7 @@ def cmd_request(args: argparse.Namespace) -> int:
 
     unbound = command[0] in {"daemon", "config"}
     if unbound:
-        with state.connect() as conn:
+        with state.submission_lock(), state.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             state.compact_operation_outputs(conn)
             existing = existing_result(conn)
@@ -4343,11 +4406,13 @@ def cmd_request(args: argparse.Namespace) -> int:
                 conn.execute("ROLLBACK TO request_mutation")
                 deferred.clear()
             conn.execute("RELEASE request_mutation")
+        from .integration import mutation_result
+        result_json = mutation_result(conn, command, code, target_kind, target_id)
         conn.execute(
             "UPDATE operation_requests"
-            " SET status='done', code=?, stdout=?, stderr=?, finished_at=?"
+            " SET status='done', code=?, stdout=?, stderr=?, finished_at=?, result_json=?"
             " WHERE request_id=? AND status='started'",
-            (code, stdout, stderr, state.now(), request_id),
+            (code, stdout, stderr, state.now(), result_json, request_id),
         )
 
     while deferred:
@@ -4361,12 +4426,28 @@ def cmd_request(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_integration_query(args) -> int:
+    from . import integration
+    state.set_read_only(True)
+    try:
+        output = integration.identity() if args._subcommand == "identity" else integration.request_status(args.request_id)
+        print(json.dumps(output, ensure_ascii=False))
+        return 0
+    except (state.StateError, ValueError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_version(args) -> int:
     """Report installed code compatibility without consulting configured state."""
+    from .integration import CONTRACTS
     if args.json:
         print(json.dumps({
             "schema_version": 1,
             "query": "version",
+            "contracts": CONTRACTS,
             "sched_version": __version__,
             "database_schema": {
                 "write": state.DB_SCHEMA_VERSION,
@@ -4396,6 +4477,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="structured version and schema compatibility")
     p.set_defaults(fn=cmd_version)
 
+    for query in ("identity", "request-status"):
+        p = sub.add_parser(query, help="read-only integration identity or receipt")
+        if query == "request-status":
+            p.add_argument("request_id")
+        p.add_argument("--json", action="store_true")
+        p.set_defaults(fn=cmd_integration_query)
+
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
     p.set_defaults(fn=cmd_init)
@@ -4406,6 +4494,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("submit", help="提交 batch.json 批次")
     p.add_argument("batch", help="batch.json 路径")
+    p.add_argument("--request-id")
+    p.add_argument("--expect-instance")
+    p.add_argument("--expect-project")
     p.add_argument("--dry-run", action="store_true",
                    help="只预览不入队 (skip 预测 + 依赖就绪 + 展开命令, §G4)")
     p.add_argument("--json", action="store_true", help="提交结果或 dry-run 预览输出 JSON")
@@ -4594,6 +4685,8 @@ def main(argv: list[str] | None = None) -> int:
         default="none",
     )
     p.add_argument("--expect-id")
+    p.add_argument("--expect-instance")
+    p.add_argument("--expect-project")
     p.add_argument("--expect-status")
     p.add_argument("--expect-version", type=int)
     p.add_argument("--expect-quarantined", type=int, choices=[0, 1])
@@ -4640,7 +4733,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version"}:
+    if command in {"capabilities", "version", "identity", "request-status"}:
         return args.fn(args)
     daemon_action = getattr(args, "action", None) if command == "daemon" else None
     daemon_write_action = daemon_action
