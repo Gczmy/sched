@@ -49,6 +49,7 @@
 | `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连、冷配置保留期与已记录健康 |
 | `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
 | `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
+| `docs/releases/0.4.0.md` | 已发布 0.4.0 的固定来源、集成合同、CI 与 schema 10 边界 |
 | `docs/releases/0.2.2.md` | 已发布 0.2.2 的固定来源、验收证据、ABI/libc 范围与安装约束 |
 | `docs/releases/0.3.0.md` | 恢复能力、真实 CUDA 验收、正式 ABI 范围与 schema 9 回退 |
 | `docs/releases/0.3.1.md` | SQLite 锁修复、版本查询与 schema 9 升级边界 |
