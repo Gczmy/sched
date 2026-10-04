@@ -7,6 +7,7 @@
 | --- | --- |
 | [开发与提交检查](../CONTRIBUTING.md) | 公共 CI、隐私检查与本地提交钩子 |
 | [reference.md](reference.md) | 配置、CLI、JSON、状态机与写操作契约 |
+| [integration-contract.md](integration-contract.md) | 实例身份、项目归属、结构化回执与幂等网关提交 |
 | [sqlite-lock-safety.md](sqlite-lock-safety.md) | SQLite 锁修复、事务诊断与旧 schema 回补边界 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [execution-boundary.md](execution-boundary.md) | 通用执行层、项目 adapter 和独立发布边界 |
@@ -19,6 +20,7 @@
 | [0.2.1 Release 说明](releases/0.2.1.md) | 功能、兼容性与安装/回退约束；发布事实以 GitHub Release 为准 |
 | [0.2.2 Release 说明](releases/0.2.2.md) | 逐 backend 预检、Linux 矩阵与发布准备；正式来源和资产以 Release/tag 为准 |
 | [0.3.0 Release 说明](releases/0.3.0.md) | 恢复协议、显存准入、前台守护与 schema 9；发布事实以 Release/tag 为准 |
+| [0.4.0 Release 说明](releases/0.4.0.md) | 集成候选、schema 10 与独立消费端兼容边界 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |

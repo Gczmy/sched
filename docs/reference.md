@@ -9,9 +9,27 @@
 
 `sched --version` 和 `sched version` 输出 `sched <version>`。
 自动化使用 `sched version --json`，返回 `schema_version: 1`、`query: "version"`、
-`sched_version` 和 `database_schema` 的 `write`、`read_min`、`read_max`。
+`sched_version`、`database_schema` 的 `write`、`read_min`、`read_max`，以及命名 `contracts`。
 查询只报告当前加载代码的版本和 schema 兼容范围，不读取配置或状态数据库，
 也不表示运行中的 daemon 已切换到该版本。数据库实际版本不由此查询推断。
+
+## 集成身份、回执与幂等提交
+
+公开 JSON 保持 `schema_version:1`；命名合同见 [integration-contract.md](integration-contract.md)。
+`sched identity --json` 只读查询持久 `instance_id`、配置节点和查询主机。
+没有状态或未迁移旧 schema 时返回 `available:false` 和原因，查询不会初始化数据库。
+`task` 与单任务 `execution` 增加同一快照中的 `project`、`instance_id`；旧 schema 的身份为 null。
+
+`sched request-status <request-id> --json` 返回 `not_found/unknown/delivered/done`，
+原绑定摘要、结果码及可用的结构化结果。旧回执可有 null result；输出压缩不会删除新结构化事实。
+不存在回执不证明未执行；unknown 保留原请求，不推断 wait 或触发重试。
+
+`sched submit <batch.json> --request-id <id> --expect-instance <instance-id> --expect-project <project> --json`
+绑定有限规范 JSON、项目和可选预期身份，相同绑定保留原 batch ID；改变绑定返回 64。
+网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
+结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
+`sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
+没有新增参数的旧 request 绑定保持原样。写 schema 为 10，完整只读范围为 1–10；0.3.1 不兼容新写库。
 
 ## 1. 心智模型
 
@@ -21,7 +39,7 @@
         └── 作业 (job, version 对应的执行记录)
 ```
 
-- **每次 `sched submit` 都生成新的批次实例**（即使同名）。同名旧实例不会被覆盖，
+- **普通 `sched submit` 生成新的批次实例**（即使同名）；带原始 `--request-id` 的幂等提交复用同一批次。同名旧实例不会被覆盖，
   会以 `[blocked]` 等状态留在列表里 —— 用 `sched discard` 退役，忽略即可。
 - **项目归属与选卡**：提交必须带 `"project"`；`gpu_affinity_hard=true` 时，该项目任务只从其亲和卡中选卡。硬亲和不会反向为项目保留 GPU；需要项目间独占隔离时，所有竞争项目必须使用互不重叠的硬亲和集合。
 - **共享装箱三要素**（想单卡多任务必读）：

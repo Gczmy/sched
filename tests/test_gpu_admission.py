@@ -293,7 +293,7 @@ class RecoveryTierWatchTests(TempStateCase):
             self.assertEqual(queue["first_queued_at"], recovery_state.public(conn, job["id"])["watch"]["last_progress_at"])
             self.assertEqual("pending", state.get_job(conn, job["id"])["status"])
 
-    def test_schema8_readonly_query_and_atomic_upgrade_to_schema9(self):
+    def test_schema8_readonly_query_and_atomic_upgrade_to_current_schema(self):
         with state.connect() as conn:
             conn.execute("DROP TABLE recovery_notices")
             conn.execute("DROP TABLE recovery_watch")
@@ -302,5 +302,5 @@ class RecoveryTierWatchTests(TempStateCase):
             self.assertEqual({"watch": None}, recovery_watch.public(conn, "missing", None))
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(9, conn.execute("PRAGMA user_version").fetchone()[0])
-            self.assertTrue(state._schema_is_complete(conn, 9))
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertTrue(state._schema_is_complete(conn, state.DB_SCHEMA_VERSION))

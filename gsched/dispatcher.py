@@ -2543,6 +2543,8 @@ class Dispatcher:
                         if payload_path not in cleanup_payloads:
                             cleanup_payloads.append(payload_path)
                     bid = None
+                    ticket = None
+                    spec = None
                     try:
                         payload_fd = None
                         try:
@@ -2560,6 +2562,7 @@ class Dispatcher:
                         if not isinstance(envelope, dict):
                             raise ValueError("payload 顶层必须是对象")
                         spec = envelope.get("spec") or {}
+                        ticket = envelope.get("submission")
                         if not isinstance(spec, dict) or "name" not in spec:
                             raise ValueError("payload 缺少合法 spec")
                         cfg_now = self.cfg
@@ -2632,6 +2635,11 @@ class Dispatcher:
                             # fence and commits before releasing the global
                             # gate.  Do not replace this with the outer
                             # long-lived control-request connection.
+                            if ticket is not None:
+                                from .integration import check_submission
+                                if ticket["batch_id"] != bid:
+                                    raise ValueError("submission batch identity changed")
+                                check_submission(submit_conn, ticket, spec, norm.get("project"))
                             existing_bid = submit_conn.execute(
                                 "SELECT name, mode FROM batches WHERE id=?", (bid,)
                             ).fetchone()
@@ -2721,6 +2729,11 @@ class Dispatcher:
                                 state.finish_control_request(
                                     submit_conn, r["id"], f"已入队 {bid}"
                                 )
+                            if ticket is not None:
+                                from .integration import complete_submission
+                                complete_submission(submit_conn, ticket, {"outcome": "accepted",
+                                    "batch_id": bid, "delivery": "database", "persisted": True,
+                                    "project": norm.get("project"), "tasks": len(norm["tasks"])})
                         discard_payload()
                         if duplicate:
                             safe_log(
@@ -2733,6 +2746,8 @@ class Dispatcher:
                                 f"({len(norm['tasks'])} 任务)"
                             )
                     except (SchemaError, ConfigError, ValueError, TypeError, KeyError, FileNotFoundError, sqlite3.IntegrityError) as error:
+                        from .integration import rejected_submission
+                        rejected_submission(conn, ticket, spec)
                         prefix = f"submit {json.dumps(bid, ensure_ascii=True)} => " if bid else ""
                         state.finish_control_request(conn, r["id"], f"{prefix}失败: {error}")
                         discard_payload()

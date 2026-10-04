@@ -161,6 +161,39 @@ CREATE TABLE IF NOT EXISTS control_requests (
   result      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS submission_requests (
+  request_id TEXT PRIMARY KEY,
+  binding TEXT NOT NULL,
+  batch_id TEXT NOT NULL UNIQUE,
+  project TEXT,
+  code INTEGER NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS submission_request_immutable
+BEFORE UPDATE ON submission_requests BEGIN
+  SELECT RAISE(ABORT, 'submission receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS submission_request_retained
+BEFORE DELETE ON submission_requests BEGIN
+  SELECT RAISE(ABORT, 'submission receipt must be retained');
+END;
+
+CREATE TABLE IF NOT EXISTS scheduler_identity (
+  singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+  instance_id TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS scheduler_identity_immutable
+BEFORE UPDATE ON scheduler_identity BEGIN
+  SELECT RAISE(ABORT, 'scheduler identity is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS scheduler_identity_retained
+BEFORE DELETE ON scheduler_identity BEGIN
+  SELECT RAISE(ABORT, 'scheduler identity must be retained');
+END;
+
 CREATE TABLE IF NOT EXISTS operation_requests (
   request_id  TEXT PRIMARY KEY,
   argv        TEXT NOT NULL,
@@ -169,6 +202,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
   stdout      TEXT,
   stderr      TEXT,
   output_compacted INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT,
   created_at  TEXT NOT NULL,
   finished_at TEXT
 );
@@ -178,7 +212,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 9
+DB_SCHEMA_VERSION = 10
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -199,9 +233,13 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "incidents",
         "control_requests",
         "operation_requests",
+        "scheduler_identity",
+        "submission_requests",
     },
     "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor"},
     "trigger": {
+        "scheduler_identity_immutable", "scheduler_identity_retained",
+        "submission_request_immutable", "submission_request_retained",
         "revision_batch_status",
         "revision_task_insert",
         "revision_task_delete",
@@ -246,7 +284,9 @@ _REQUIRED_MIGRATED_COLUMNS = {
         "monitor_launch_attempted_at",
     },
     "gpus": {"mem_total_gib", "revision"},
-    "operation_requests": {"output_compacted"},
+    "operation_requests": {"output_compacted", "result_json"},
+    "scheduler_identity": {"singleton", "instance_id", "created_at"},
+    "submission_requests": {"request_id", "binding", "batch_id", "project", "code", "result_json", "created_at", "finished_at"},
 }
 
 _INIT_DB_RETRY_DELAYS = (0.05, 0.15, 0.3)
@@ -486,12 +526,26 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     """Check objects and columns required by one committed schema version."""
     if version < 1 or version > DB_SCHEMA_VERSION:
         return False
+    if version >= 10:
+        try:
+            row = conn.execute("SELECT instance_id FROM scheduler_identity WHERE singleton=1").fetchone()
+        except sqlite3.Error:
+            return False
+        if row is None or not isinstance(row[0], str) or not re.fullmatch(r"[0-9a-f]{32}", row[0]):
+            return False
     required_objects = {
         kind: set(names) for kind, names in _REQUIRED_SCHEMA_OBJECTS.items()
     }
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 10:
+        required_objects["table"].difference_update({"scheduler_identity", "submission_requests"})
+        required_objects["trigger"].difference_update({"scheduler_identity_immutable", "scheduler_identity_retained"})
+        required_objects["trigger"].difference_update({"submission_request_immutable", "submission_request_retained"})
+        del required_columns["submission_requests"]
+        del required_columns["scheduler_identity"]
+        required_columns["operation_requests"].discard("result_json")
     if version < 9:
         required_objects["table"].difference_update({"recovery_watch", "recovery_notices"})
         del required_columns["recovery_watch"]
@@ -993,6 +1047,9 @@ def _initialize_database() -> None:
     from .recovery_state import SCHEMA as RECOVERY_SCHEMA
     from .recovery_watch import SCHEMA as RECOVERY_WATCH_SCHEMA
     with connect() as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
+            from .integration import instance_id
+            instance_id(conn)  # Never mint a replacement identity for damaged state.
         needs_owner_backfill = (conn.execute("PRAGMA user_version").fetchone()[0] < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
         conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA)
@@ -1001,6 +1058,8 @@ def _initialize_database() -> None:
         migrate_incidents(conn)
         migrate_job_progress(conn)
         migrate_operation_requests(conn)
+        conn.execute("INSERT OR IGNORE INTO scheduler_identity VALUES (1, ?, ?)",
+                     (secrets.token_hex(16), now()))
         migrate_native_session_log_attempts(conn)
         migrate_native_monitor_launch_attempts(conn)
         migrate_revisions(conn)
@@ -1124,6 +1183,9 @@ def migrate_operation_requests(conn: sqlite3.Connection) -> None:
             "ALTER TABLE operation_requests"
             " ADD COLUMN output_compacted INTEGER NOT NULL DEFAULT 0"
         )
+
+    if "result_json" not in columns:
+        conn.execute("ALTER TABLE operation_requests ADD COLUMN result_json TEXT")
 
 
 def migrate_native_session_log_attempts(conn: sqlite3.Connection) -> None:
