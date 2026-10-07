@@ -345,6 +345,21 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 节点 `notify_inbox` 内的普通 `.json`／`.json.acked` 文件；损坏事件在查询中标记
 为不可读，不中断其余事件。
 
+### daemon 进程与集群租约
+
+`sched daemon start` 的默认后台启动通过 `Popen(start_new_session=True)` 在独立 POSIX session
+启动 dispatcher：它会脱离当前 screen/TTY，但不调用 systemd、tmux 或 screen
+托管进程，也不调用 Slurm/PBS 申请新资源。`sched daemon foreground` 在前台等待
+dispatcher；加 `--supervise` 可在满足所有权条件时自动重启，不会申请或迁移租约。
+新启动的 daemon、执行 owner 和任务继承其启动进程的 cgroup、cpuset 与设备权限，
+因此必须从目标计算租约内启动。重连既有持久 owner 不会改变它及其任务的资源上下文，
+不能视为迁移到新 daemon 的租约。screen/tmux 只是进入既有租约的操作通道，
+并不是资源边界。`cpus_total` 与 `resources.cpus` 仅用于 sched 内部
+并发记账；当前实现不创建子 cgroup，也不设置 CPU affinity。资源继承只发生在启动时：
+当前版本不持久记录 Slurm job/cgroup 启动来源，也不持续验证外部租约是否仍有效。若旧
+screen/租约被删除但 daemon 仍存活，它不会自动绑定后续新租约；进程退出后也无法可靠
+追溯当时来源。后续开发项见 [`next-development.md`](next-development.md)。
+
 ### 稳定 JSON 与跨主机读取
 
 - `project list --json` 输出 `{"schema_version":1,"projects":[...]}`；每项含 `name`、有效布尔值 `gpu_enabled`、整数 `gpu_quota`（省略或 null 归一为 0）、`gpu_access:"disabled"|"unlimited"|"limited"`、`gpu_used`、`priority`、`colocate`、`max_jobs`、`gpu_affinity`、`root`。禁用不清空原配额，`gpu_used` 仍显示运行中的 GPU job 数。

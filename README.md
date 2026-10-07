@@ -7,6 +7,8 @@
 
 **sched** (package `gsched`) is a node-level GPU/CPU batch scheduler for multi-GPU compute nodes. It replaces the "nohup everything inside a screen" workflow with a re-entrant, resumable, self-diagnosing batch execution layer — powered by a single daemon and driven entirely through a CLI.
 
+The default background daemon runs in an independent POSIX session (`start_new_session=True`); `sched daemon foreground [--supervise]` also supports foreground waiting and optional automatic restarts. sched does not invoke systemd, tmux, or screen to manage it and does not request a new cluster allocation. Newly started daemons, execution owners and tasks inherit their launching process's cgroup, cpuset, and device permissions, so enter the intended compute allocation before starting them. screen/tmux are operator access paths only. If that external allocation ends, a surviving daemon does not rebind itself to a later allocation; reconnecting to an existing persistent owner does not migrate its tasks' resource context either.
+
 Zero third-party dependencies: pure Python standard library (`>= 3.10`).
 
 ## Features

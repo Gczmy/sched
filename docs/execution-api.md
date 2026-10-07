@@ -223,6 +223,8 @@ fake、passed、summary（ok/warn/fail 计数）与 checks。检查项保留 ite
 id 为 `configuration/execution_backend/user_identity/state_writable/node_state_writable/`
 `gpu_probe/venv/project_git/file_limit/disk_free/terminal_tools`；subject 标识 backend kind、
 venv 或 project。fake 模式跳过的检查不能作为实际验收证据。
+`terminal_tools` 保留稳定 ID，仅说明后台 daemon 的启动方式，`performed:false`；
+不探测终端托管工具，也不验证 Slurm 租约或资源约束是否有效。
 有 fail 时返回 1，其余返回 0；主机守卫拒绝仍为 2。文本输出保持现有格式。
 该命令包含原有的目录写入与资源检查，不属于纯只读查询；网关不得执行。
 

@@ -7,6 +7,8 @@
 
 **sched**（包名 `gsched`）是一个面向多卡计算节点的 GPU/CPU 批量任务调度器。它用"单个 daemon + 纯 CLI 驱动"替代"screen 里 nohup 一把梭"的工作流，提供可重入、可断点续跑、失败自动诊断的批量执行层。
 
+默认后台启动通过 `start_new_session=True` 让 daemon 运行在独立 POSIX session 中；也支持 `sched daemon foreground [--supervise]` 前台等待与可选自动重启。sched 不调用 systemd、tmux 或 screen 托管它，也不会申请新的集群租约。新启动的 daemon、执行 owner 和任务继承其启动进程的 cgroup、cpuset 与设备权限，因此必须先进入目标计算租约再启动；screen/tmux 仅是人工进入该租约的通道。若外部租约结束后 daemon 仍存活，它也不会自动绑定后来创建的新租约；重连既有持久 owner 也不会迁移其任务的资源上下文。
+
 零第三方依赖：纯 Python 标准库（`>= 3.10`）。
 
 ## 功能特性

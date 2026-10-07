@@ -67,3 +67,66 @@ OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策�
 [v0.3.0 Release](https://github.com/Gczmy/sched/releases/tag/v0.3.0) 及其 evidence；
 该段只保留历史准备过程；生产现状需重新查询。
 验收矩阵见 [recovery-acceptance.md](recovery-acceptance.md)。
+
+## ND-02：持久化并校验 daemon 的集群租约来源
+
+**状态：待设计、未实现。** 当前 daemon lease 只用于确认进程身份，没有持久记录
+Slurm job、step、cgroup、cpuset 或启动 shell 的资源上下文，`daemon status` 也不展示
+这些信息。
+
+### 匿名化历史场景
+
+daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 被删除、旧租约
+关闭，但脱离 TTY 的 daemon 在该环境下继续运行。后来同节点创建了新租约，
+旧 daemon 不会自动感知或绑定新租约，直至按 idle timeout 自动退出。进程退出后，现有
+sidecar 与日志不足以百分之百还原它当时属于哪个 Slurm job/cgroup。
+
+这说明“启动时继承 allocation/cgroup”与“租约生命周期持续有效”是两个独立条件；
+`start_new_session=True` 本身既不会申请新租约，也不会完成租约迁移或有效性验证。
+
+### 目标行为
+
+1. daemon 发布 lease 时原子持久化最小、白名单化的启动来源：`started_at`、
+   `physical_host`、PID/start token、`SLURM_JOB_ID`、`SLURM_STEP_ID`、Slurm 声明的 CPU
+   数量、`sched_getaffinity(0)`/`Cpus_allowed_list` 结果及 cgroup 标识。禁止保存完整环境，
+   避免把令牌或其他秘密写入 state。
+2. 扩展现有 `sched daemon status --json`，兼容已有身份与健康字段，展示持久化来源、当前可见来源和
+   `allocation_state=valid|invalid|unknown`；daemon 已退出后仍保留最后一次启动与退出
+   上下文供审计，而不是只剩无法归属的历史日志。现有 lease 已记录 `physical_host`、
+   PID/start token 与 lease ID，缺口是 Slurm/资源上下文及退出后的来源保留。
+3. daemon 周期性验证已记录 Slurm job 是否仍为目标节点上的 RUNNING allocation，并
+   检查自身 affinity/cgroup 是否与启动快照一致。`scontrol` 不可用或集群未启用可靠
+   cgroup 时必须报告 `unknown`，不能伪装成 valid。
+4. 已确认租约失效时停止派发新任务、留下可诊断事件并通知；默认不暗中迁移到后来创建
+   的租约，也不直接杀死已经运行的任务。恢复必须在目标新租约内显式 stop/start。
+5. 增加旧租约关闭但 daemon 存活、新租约同节点建立、Slurm 查询失败、PID 复用、daemon
+   正常退出后追溯，以及状态 JSON 兼容性的验收测试。
+
+## ND-03：CPU 容量自动解析与可执行约束
+
+**状态：待设计、未实现。** 当前 `cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
+任务上回退到 `max_cpu_jobs` 并发计数；正整数仅做声明值求和，不会设置 affinity 或
+子 cgroup。
+
+### 已确认的设计方向
+
+1. 显式增加 `cpus_total: "auto"`（最终字段形式实现前定案），保留
+   `cpus_total=0` 当前“不启用总 CPU 配额”的兼容语义；不得把现有零值静默改成 auto。
+2. auto 模式综合 Slurm 声明、`sched_getaffinity(0)` 与可选配置上限解析有效 CPU 容量。
+   多个可信来源不一致时取保守边界并明确告警，无法确认安全容量时 fail-closed 或报告
+   unavailable，不能静默选择更大的值。
+3. 与 ND-02 联动，daemon 持续验证启动时记录的 Slurm job 是否仍是目标节点上的有效
+   RUNNING allocation，并复核自身 affinity/cgroup；启动时解析一次容量不足以覆盖租约
+   后续被删除而 daemon 继续存活的场景。
+4. 旧租约确认失效时停止派发新任务、记录事件并通知，不自动迁移或绑定同节点后来创建
+   的新租约。已经运行的任务默认不被暗中杀死；恢复要求在目标新租约内显式 stop/start。
+5. per-job affinity/cgroup 作为独立的硬隔离能力后续实现。在它完成前，
+   `resources.cpus` 与解析后的 `cpus_total` 仍只是 admission control/调度记账，不能描述
+   成对单个任务的物理 CPU 限制。
+
+### 可观测性与验收
+
+- `status --json` 同时展示配置值、解析后容量、容量来源与租约有效性；固定正整数仍可
+  用于明确部署，但若大于当前 affinity/Slurm 容量必须告警或拒绝派发。
+- 覆盖 auto、固定值、零值兼容、Slurm/affinity 一致与冲突、租约运行中失效、新租约
+  同节点建立但禁止自动迁移，以及未启用硬隔离时的机器可读语义测试。

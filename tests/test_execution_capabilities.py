@@ -87,6 +87,9 @@ class CapabilityTests(TempStateCase):
         gpu = next(c for c in checks if c["id"] == "gpu_probe")
         self.assertFalse(gpu["performed"])
         self.assertFalse(next(c for c in checks if c["id"] == "project_git")["performed"])
+        launch_info = next(c for c in checks if c["id"] == "terminal_tools")
+        self.assertFalse(launch_info["performed"])
+        self.assertEqual("ok", launch_info["level"])
 
     def test_daemon_checks_only_configured_backend_requirements(self):
         self.cfg["execution_backends"] = {"worker": {"kind": "linux_fd_owner"}}

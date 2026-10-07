@@ -1,6 +1,7 @@
-"""daemon 生命周期 (文档 §2.1c / B13 H2 / §7 M0).
+"""daemon 生命周期.
 
-- start: setsid 脱离会话启动 dispatcher (托管分层: systemd user > tmux > screen > setsid 裸后台)
+- start: 后台 Popen(start_new_session=True) 在独立 POSIX session 中启动 dispatcher;
+  不调用 systemd/tmux/screen, 并继承启动进程的 allocation/cgroup
 - stop: 未完成任务 cancelled 收尾 (N11)
 - status: PID 文件 + 心跳双校验
 - check: H2 前置检查清单 (M0)
@@ -707,17 +708,15 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
         except OSError:
             pass
 
-    # 终端复用工具探测 (2.1c)
-    tools = []
-    if shutil.which("systemctl"):
-        r = subprocess.run(
-            ["systemctl", "--user", "is-system-running"], capture_output=True, text=True,
-        )
-        if r.returncode == 0 and "running" in r.stdout:
-            tools.append("systemd-user")
-    for t in ("tmux", "screen", "setsid"):
-        if shutil.which(t):
-            tools.append(t)
-    add("终端工具", " > ".join(tools) + " (托管选层: systemd user > tmux > screen > setsid)", "ok", check_id="terminal_tools")
+    add(
+        "daemon 启动方式",
+        "Popen(start_new_session=True): 独立 POSIX session; "
+        "不调用 systemd/tmux/screen, 不申请集群资源, "
+        "继承启动进程的 allocation/cgroup, 不会自动切换到后续租约; "
+        "仅为启动方式说明, 未验证租约有效性或资源约束",
+        "ok",
+        check_id="terminal_tools",
+        performed=False,
+    )
 
     return issues

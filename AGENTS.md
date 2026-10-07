@@ -100,7 +100,16 @@
 
 网关禁止运行计算任务。正常批次提交使用网关上的 `sched submit <batch.json>`，由文件 inbox 交给计算节点 daemon 收编；返回“已投递”后，用 `sched verify <batch-id>` 确认入库。`sched run` 是计算节点直接写入入口，不走网关 inbox，除 `--dry-run` 外不得在网关执行。
 
-生产 daemon 通过实际部署使用的 screen 会话进入计算节点后管理。节点、会话、租约与有效期属于私有运行信息，不写入仓库；先用 `screen -ls` 确认会话，节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消运行任务。支持 drain 的版本需要无损重启时按顺序执行：
+生产 daemon 通过实际部署使用的 screen 会话进入计算节点后管理。节点、会话、租约与有效期属于私有运行信息，不写入仓库；先用 `screen -ls` 确认会话，节点身份以实际主机和 `config.node` 为准。`sched daemon stop` 会取消运行任务。
+
+daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选会话时先确认目标，
+不自行新建租约。启动前核对 `hostname`、`SLURM_JOB_ID` 和
+`scontrol show job "$SLURM_JOB_ID"`。screen 只用于进入该上下文；后台 daemon
+脱离 TTY 后仍继承该 shell 的 cgroup/cpuset/device 权限，不申请新租约。
+旧租约结束后，即使 daemon 仍存活，也不会自动绑定新租约；需在新租约内显式重启。
+会话数字前缀会变化，不得硬编码旧会话 ID。
+
+支持 drain 的版本需要无损重启时按顺序执行：
 
 1. 执行 `ssh HPDC`。
 2. 执行 `screen -ls`，再执行 `screen -d -r <session-id>`，使用实查会话。
