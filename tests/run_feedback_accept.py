@@ -17,6 +17,13 @@ import tempfile
 import time
 
 
+def worker_program(content, *, pathological_regex=False):
+    content_expression = "'a' * 100_000 + '!'" if pathological_regex else repr(content)
+    return ("from pathlib import Path; "
+            "Path('runs.txt').open('a').write('run\\n'); "
+            + (f"Path('result.json').write_text({content_expression})" if content is not None else "pass"))
+
+
 class Acceptance:
     def __init__(self, root):
         self.root = root
@@ -95,12 +102,7 @@ class Acceptance:
             directory = self.root / name
             directory.mkdir()
             # The worker is bounded and self-contained, not customer code.
-            content_expression = "'a' * 100_000 + '!'" if name == "timeout" else repr(content)
-            program = (
-                "from pathlib import Path; "
-                "Path('runs.txt').open('a').write('run\\n'); "
-                + (f"Path('result.json').write_text({content_expression})" if content is not None else "pass")
-            )
+            program = worker_program(content, pathological_regex=name == "timeout")
             spec = {"name": name, "project": "example", "cwd": name,
                     "tasks": [{"id": "task", "max_retry": 0,
                                "cmd": [sys.executable, "-I", "-c", program],
@@ -120,16 +122,22 @@ class Acceptance:
         snapshot = self.data("status", "--json")
         assert len(snapshot["batches"]) == len(cases)
         assert not any(snapshot["truncated"].values())
-        assert all(row["wait_reason"] == "draining" for row in snapshot["jobs"])
+        batch_states = {row["id"]: row["status"] for row in snapshot["batches"]}
+        # Before the first daemon tick, accepted batches are still queued.
+        # Drain does not bypass dependency/activation state in the query.
+        assert all(row["status"] == "pending" and row["wait_reason"] ==
+                   ("dependency" if batch_states[row["batch_id"]] == "queued" else "draining")
+                   for row in snapshot["jobs"]), snapshot
+        assert all(not (self.root / name / "runs.txt").exists() for name in cases)
         missing_receipt = self.data("request-status", "missing", "--json")
         assert missing_receipt["phase"] == "not_found"
         assert self.data("request-status", "preview", "--json")["phase"] == "not_found"
         batch = submitted["valid"]
         current = next(row for row in snapshot["batches"] if row["id"] == batch)
-        stale = self.data(*self.request("stale", batch, current["revision"] - 1, "active"), expect=65)
+        stale = self.data(*self.request("stale", batch, current["revision"] - 1, current["status"]), expect=65)
         assert stale["result"]["error"]["conflict_reason"] == "revision_changed"
         assert self.task(batch)["jobs"][0]["status"] == "pending"
-        replay = self.data(*self.request("stale", batch, current["revision"] - 1, "active"), expect=65)
+        replay = self.data(*self.request("stale", batch, current["revision"] - 1, current["status"]), expect=65)
         assert replay["replayed"] and stale["result"] == replay["result"]
         print("PASS: same-RID submits create one batch; stale CAS stays rejected on replay", flush=True)
 
