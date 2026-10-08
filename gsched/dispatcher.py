@@ -366,6 +366,7 @@ def _validate_inbox_dependencies(conn, norm: dict) -> None:
         conn,
         norm["name"],
         norm["depends_on"],
+        norm.get("depends_on_exact", []),
     )
 # gpus 卡集/容量另经 parse_gpus 结构比对, 不在本列表.
 CONFIG_COLD_KEYS = (
@@ -2713,6 +2714,7 @@ class Dispatcher:
                                     norm.get("project"),
                                     norm.get("priority", 0),
                                     failure_policy=norm["failure_policy"],
+                                    exact_dependencies=norm.get("depends_on_exact", []),
                                 )
                                 for (
                                     i2,
@@ -4126,11 +4128,13 @@ class Dispatcher:
                 if not conn.in_transaction:
                     conn.execute("BEGIN IMMEDIATE")
                 batches = conn.execute(
-                    "SELECT * FROM batches WHERE status='queued'"
+                    "SELECT * FROM batches WHERE status IN ('queued','active')"
                 ).fetchall()
                 for b in batches:
                     try:
                         deps = json.loads(b["depends_on"] or "[]")
+                        from .dependencies import stored
+                        exact = stored(b)
                         if (
                             not isinstance(deps, list)
                             or any(
@@ -4142,21 +4146,24 @@ class Dispatcher:
                     except (json.JSONDecodeError, TypeError, ValueError) as exc:
                         conn.execute(
                             "UPDATE batches SET status='blocked'"
-                            " WHERE id=? AND status='queued'",
+                            " WHERE id=? AND status IN ('queued','active')",
                             (b["id"],),
                         )
                         self.log_line(
                             f"批次 {b['name']} 存量依赖规则非法, 已隔离: {exc}"
                         )
                         continue
-                    if not deps:
-                        conn.execute(
-                            "UPDATE batches SET status='active'"
-                            " WHERE id=? AND status='queued'",
-                            (b["id"],),
-                        )
+                    if b["status"] == "active":
+                        if exact:
+                            ready = self._exact_dependencies_successful(conn, b)
+                            conn.execute("UPDATE jobs SET status=? WHERE batch_id=?"
+                                         " AND status IN ('pending','waiting_quota','waiting_dep')"
+                                         " AND version=(SELECT MAX(j2.version) FROM jobs j2"
+                                         " WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)"
+                                         " AND ((? AND status='waiting_dep') OR (NOT ? AND status!='waiting_dep'))",
+                                         ("pending" if ready else "waiting_dep", b["id"], ready, ready))
                         continue
-                    if all(self._batch_successful(conn, d) for d in deps):
+                    if all(self._batch_successful(conn, d) for d in deps) and self._exact_dependencies_successful(conn, b):
                         changed = conn.execute(
                             "UPDATE batches SET status='active'"
                             " WHERE id=? AND status='queued'",
@@ -4166,6 +4173,28 @@ class Dispatcher:
                             self.log_line(
                                 f"批次 {b['name']} 依赖解锁 -> active"
                             )
+
+    def _exact_dependencies_successful(self, conn, batch) -> bool:
+        from .dependencies import stored, matched, recorded_clear
+        from .artifact_validation import wait_snapshot
+        try:
+            for source in stored(batch):
+                for task in source["tasks"]:
+                    job = matched(conn, source, task)
+                    if job is None or not recorded_clear(conn, source, task):
+                        return False
+                    if self._job_uses_native_exec(conn, job):
+                        return False
+                    if self._task_has_unresolved_launch_marker(conn, source["batch_id"], task["task_id"]):
+                        return False
+                    attempt = conn.execute("SELECT 1 FROM execution_attempts WHERE job_id=?", (job["id"],)).fetchone()
+                    if attempt and not wait_snapshot(conn, job, job["rc"])["verified"]:
+                        return False
+                    if not self._terminal_job_successful(conn, job):
+                        return False
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return False
+        return True
 
     def _batch_successful(self, conn, batch_name: str) -> bool:
         """§2.4: depends_on 批次全部任务成功终态 (done/skip) 才解锁."""
@@ -4321,7 +4350,12 @@ class Dispatcher:
                 r["rid"],
             ))
             marker_safe_ready = []
+            exact_ready = {}
             for job in ready:
+                if job["batch_id"] not in exact_ready:
+                    exact_ready[job["batch_id"]] = self._exact_dependencies_successful(conn, state.get_batch(conn, job["batch_id"]))
+                if not exact_ready[job["batch_id"]]:
+                    continue  # Recheck after a CLI reopen between unlock and dispatch.
                 if self._task_has_unresolved_launch_marker(
                     conn,
                     job["batch_id"],
@@ -4402,6 +4436,10 @@ class Dispatcher:
             self._update_project_quota_used(conn)
 
             for j in ready:
+                batch = state.get_batch(conn, j["batch_id"])
+                if not self._exact_dependencies_successful(conn, batch):
+                    conn.execute("UPDATE jobs SET status='waiting_dep' WHERE id=? AND status IN ('pending','waiting_quota')", (j["id"],))
+                    continue  # Earlier candidates may have started a source generation this tick.
                 if self._launch_marker_alive(j):
                     # A previous launch survived transaction rollback; keep its
                     # marker and wait for recovery instead of double-starting.
@@ -4891,6 +4929,10 @@ class Dispatcher:
         b = state.get_batch(conn, j["batch_id"])
         if b is None:
             raise ValueError(f"job {j['id']} batch no longer exists")
+        if not self._exact_dependencies_successful(conn, b):
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
 
         persisted_spec, task_project = self._load_task_launch_binding(conn, j)
         spec_cache = getattr(self, "_ready_task_specs", {})

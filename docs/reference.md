@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前仅产物复验源码候选写 schema 13，完整只读范围为 1–13；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证候选写 11/12，都不能回接 schema 13。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前精确依赖源码候选写 schema 14，完整只读范围为 1–14；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验候选写 11/12/13，都不能回接 schema 14。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched artifact-validations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 只读查询首次验证摘要；`--validation-id ID` 读取同任务/版本的一条完整冻结证据，与 cursor
@@ -96,6 +96,7 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 | `cwd` | str | ✗ | 缺省为该批次的 project root；支持 `{ROOT}`/`{PROJECT:name}`/`{VENV:key}` 模板 |
 | `env` | obj | ✗ | 字符串环境变量映射（最终覆盖，优先级高于自动注入）；变量名/值必须安全，shell bootstrap 与动态加载注入变量会被拒绝 |
 | `depends_on` | [str] | ✗ | 上游批次名数组；每项同样须为安全标识符，上游 done 前挂起 |
+| `depends_on_exact` | [obj] | ✗ | 候选：显式 instance/batch/task/version 清单；网关与 daemon 均须支持 `sched-batch-dependencies-v1` |
 | `force_rerun` | bool | ✗ | true = 全部任务绕过任务 SKIP 与 stage checkpoint |
 | `notify` | bool/obj | ✗ | 覆盖通知配置 |
 | `sweep` | obj | ✗ | `{matrix:{参数:[值]},max_parallel:N}` 笛卡尔积展开 |
@@ -119,6 +120,52 @@ sched request policy-01 --json --expect-kind batch --expect-id example-202610080
 的 blocked 批次和 `continue_independent`，不重试失败任务、不生成新 version。done/discarded
 和历史 strict 批次禁止修改；queued 可修改策略但不绕过依赖解锁。策略变化递增 revision（同值不递增），
 同 RID 原绑定重放只返回原回执。失败策略不放宽主机、租约、原执行身份或未知启动守卫。
+
+### 精确批次依赖（源码候选）
+
+示例选择同一实例内一个来源版本；instance ID 必须从实际 `identity --json` 取得，
+batch ID 从原提交回执取得，task/version 从结构化任务查询取得，不自动使用 latest：
+
+```json
+{"depends_on_exact":[{"instance_id":"0123456789abcdef0123456789abcdef","batch_id":"upstream-20261008000000000","tasks":[{"task_id":"task","version":1}]}]}
+```
+
+每个来源必须显式列出非空 tasks；最多 256 个来源、10,000 个不同 task/version，
+冻结 JSON 最多 4 MiB。version 为 1..2^63-1 整数，不接受布尔、latest、名称选择器、
+未知字段和重复项；batch ID 只按精确主键查找。跨实例及历史 strict 来源拒绝提交。
+本地提交和网关 inbox 接受都在 submission gate/事务内重验来源与混合依赖环。
+接受时另冻结 job ID、完整 task spec 摘要和 fingerprint；这些绑定不可原地改写。
+提交前的来源预检和 dry-run 不代替接受时重验，网关无 DB 预览明确 sources_checked=false。
+
+所有 exact 和旧名称条件是 AND。exact 只检查列出的来源 task/version，不把其他
+任务的失败或整批 blocked 当作失败；同名新批次和同批次新版本不会替换所选版本。
+所选版本必须当前为 done/skip，绑定匹配、声明产物仍有效，且该来源 task 所有代际
+无 running/interrupted、未决 attempt/旧 native session/launch marker。public backend
+还必须有一致的已记录原始 wait/cleanup；不从 PID、日志或当前产物补造 wait。
+历史 native 标识不能获得新执行权。已记录普通 done/skip 使用既有调度成功语义，
+不是科学 acceptance 或不可变文件发布；本功能不阻止外部写文件，也不冻结重试尝试。
+显式 retry 可改变所选同一版本的当前态；原始失败记录仍由首次验证接口保留。
+
+解锁、每 tick 的 active pending 复核及实际派发均检查 exact；失效时 pending
+转 waiting_dep（查询为 pending/wait_reason=dependency），恢复后回 pending，无新版本。
+running 不取消、不迁移。另一个候选本轮启动来源的新代际后，后续依赖候选会再次
+检查，不能使用派发前的旧缓存。旧 blocked 批次仍只显式重开。
+
+`batch-dependencies <batch-ref> --json` 使用独立合同 `sched-batch-dependencies-v1`，
+私有只读快照返回 exact 冻结绑定及每项 recorded_status/binding_matches/recorded_clear；
+旧名称标记 kind=legacy_name/dynamic_latest=true，显示此次快照解析到的 batch ID。
+不读当前产物或 launch marker，不探测 owner；这些事实不构成派发许可。
+默认最多 100 项，`--limit` 为 1..1000，`--cursor` 为非负偏移量；同时返回 total、
+truncated/next_cursor、batch_revision/binding_sha256。续页为实时查询，不能合并成
+完整当前态；来源状态可能变化，即使下游绑定摘要未变也不能证明各页属于同一快照。
+旧 schema 查询 source=legacy_only，不迁移、不补绑。
+schema 10 及以上写升级不归一化已有等待态或递增对应 revision；更旧 schema
+仍按既有格式兼容规则处理历史等待别名，不制造原始 wait 或新的执行授权。
+
+原 status/task/history 字段集不变；status.batches.depends_on **仅含旧名称条件**，
+不能据其为空断言无依赖，完整依赖须协商新合同后查询。配套旧插件仍能解析 status，
+但没有 exact 依赖展示，插件功能独立开发。这里仍是批次级门槛，不是任务 DAG；
+受审计的依赖更新与任务失败路径属于后续阶段。
 
 ### 任务级
 
@@ -370,6 +417,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `status [batch-ref] [--project P] [--detail] [--json] [--limit N] [--cursor TOKEN] [--job-cursor TOKEN]` | 最新版本当前态 | 缺省 200，钳制到 1..1000；`--cursor` 翻批次页，`--job-cursor` 独立翻任务页 |
 | `task <batch-ref>:<task> [--json]` | 单任务全部版本详情 | `--json` 输出单一、版本化 JSON 文档 |
 | `batch-policy <batch-ref> [--json]` | 候选失败策略只读查询 | 写操作只能经 batch CAS 的 request；`--failure-policy freeze\|continue_independent --yes`，可显式 `--reopen` |
+| `batch-dependencies <batch-ref> [--json]` | 候选精确绑定/动态名称事实 | 私有只读快照，不检查产物或 marker；--limit 1..1000，实时 --cursor 非负偏移量 |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
 | `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |

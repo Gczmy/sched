@@ -1,6 +1,7 @@
 # 仅产物复验与重新结算（源码候选）
 
-候选合同为 `sched-artifact-revalidations-v1`，写 schema 13，完整只读范围 1–13。
+候选合同为 `sched-artifact-revalidations-v1`，引入时写 schema 13；后续精确依赖候选
+写 14、完整只读范围 1–14，复验合同本身不变。
 包版本仍为 0.4.0，须协商实际部署的合同/schema；源码推送不是新发布或生产部署。
 首次记录见 [artifact-validation](artifact-validation.md)，本接口不替代科学验收。
 

@@ -24,6 +24,7 @@ CONTRACTS = {
     "artifact_check": "sched-artifact-check-v1",
     "artifact_rules": "sched-artifact-rules-v2",
     "batch_policy": "sched-batch-policy-v1",
+    "batch_dependencies": "sched-batch-dependencies-v1",
     "artifact_validations": "sched-artifact-validations-v1",
     "artifact_revalidations": "sched-artifact-revalidations-v1",
 }

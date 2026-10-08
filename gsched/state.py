@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS batches (
   name        TEXT NOT NULL,
   mode        TEXT NOT NULL DEFAULT 'mix',
   depends_on  TEXT NOT NULL DEFAULT '[]',
+  depends_on_exact TEXT NOT NULL DEFAULT '[]',
   gpus        TEXT,
   cwd         TEXT,
   env         TEXT,
@@ -214,7 +215,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 13
+DB_SCHEMA_VERSION = 14
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -246,6 +247,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "submission_request_immutable", "submission_request_retained",
         "revision_batch_status",
         "revision_batch_failure_policy",
+        "batch_exact_dependencies_immutable",
         "artifact_validation_immutable", "artifact_validation_retained",
         "artifact_revalidation_immutable", "artifact_revalidation_retained",
         "revision_task_insert",
@@ -285,7 +287,7 @@ _REQUIRED_MIGRATED_COLUMNS = {
                                    "retry_after", "last_cleanup_at", "cleanup_error", "acknowledged_at", "acknowledgement"},
     "execution_owners": {"job_id", "binding"},
     "execution_attempts": {"attempt_id", "job_id", "job_version", "backend_id", "backend_config_sha256", "phase", "identity", "observation", "cancel_reason", "created_at", "launch_intent_at", "finished_at"},
-    "batches": {"notify", "project", "priority", "revision", "failure_policy"},
+    "batches": {"notify", "project", "priority", "revision", "failure_policy", "depends_on_exact"},
     "tasks": {"project"},
     "jobs": {"project", "progress"},
     "native_sessions": {
@@ -551,6 +553,9 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 14:
+        required_objects["trigger"].discard("batch_exact_dependencies_immutable")
+        required_columns["batches"].discard("depends_on_exact")
     if version < 13:
         required_objects["table"].discard("artifact_revalidations")
         required_objects["index"].discard("artifact_revalidation_job")
@@ -1077,7 +1082,8 @@ def _initialize_database() -> None:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
             from .integration import instance_id
             instance_id(conn)  # Never mint a replacement identity for damaged state.
-        needs_owner_backfill = (conn.execute("PRAGMA user_version").fetchone()[0] < 7 or
+        previous_schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        needs_owner_backfill = (previous_schema_version < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
         conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA)
         migrate_gpu_jobs(conn)
@@ -1091,7 +1097,9 @@ def _initialize_database() -> None:
         migrate_native_monitor_launch_attempts(conn)
         migrate_revisions(conn)
         migrate_batch_failure_policy(conn)
-        migrate_legacy_job_statuses(conn)
+        migrate_exact_dependencies(conn)
+        if previous_schema_version < 10:
+            migrate_legacy_job_statuses(conn)
         if needs_owner_backfill:
             migrate_owner_operations(conn)
         conn.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
@@ -1257,6 +1265,16 @@ def migrate_native_monitor_launch_attempts(conn: sqlite3.Connection) -> None:
         "  AND NEW.monitor_launch_attempted_at IS NOT OLD.monitor_launch_attempted_at"
         " BEGIN SELECT RAISE(ABORT, 'native monitor launch intent is immutable'); END;"
     )
+
+
+def migrate_exact_dependencies(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(batches)")}
+    if "depends_on_exact" not in columns:
+        conn.execute("ALTER TABLE batches ADD COLUMN depends_on_exact TEXT NOT NULL DEFAULT '[]'")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS batch_exact_dependencies_immutable"
+                 " BEFORE UPDATE OF depends_on_exact ON batches"
+                 " WHEN OLD.depends_on_exact IS NOT NEW.depends_on_exact"
+                 " BEGIN SELECT RAISE(ABORT,'exact dependency bindings cannot be rewritten'); END")
 
 
 def migrate_batch_failure_policy(conn: sqlite3.Connection) -> None:
@@ -1738,14 +1756,17 @@ def insert_batch(
     project: str | None = None,
     priority: int = 0,
     failure_policy: str = "freeze",
+    exact_dependencies: list | None = None,
 ) -> None:
     import json
     from .batch_policy import validate_failure_policy
     validate_failure_policy(failure_policy)
+    from .dependencies import bind
+    frozen_exact = bind(conn, exact_dependencies or [])
 
     conn.execute(
-        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project,priority,failure_policy)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project,priority,failure_policy,depends_on_exact)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             bid,
             name,
@@ -1760,6 +1781,7 @@ def insert_batch(
             project,
             priority,
             failure_policy,
+            json.dumps(frozen_exact),
         ),
     )
 

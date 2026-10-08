@@ -641,6 +641,12 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
     for index, dependency in enumerate(depends_on):
         _validate_identifier(dependency, f"depends_on[{index}]")
 
+    from .dependencies import normalize as normalize_exact
+    try:
+        exact_dependencies = normalize_exact(spec.get("depends_on_exact", []))
+    except ValueError as error:
+        raise SchemaError(str(error)) from error
+
     if "gpus" in spec:
         raise SchemaError("gpus: 批次级选卡未实现, 请使用 task.resources")
 
@@ -763,6 +769,7 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
         "mode": mode,
         "failure_policy": failure_policy,
         "depends_on": depends_on,
+        "depends_on_exact": exact_dependencies,
         "cwd": spec.get("cwd", "{ROOT}"),
         "cwd_abs": batch_cwd_abs,
         "env": env,
@@ -1038,6 +1045,7 @@ def validate_persisted_dependencies(
     conn: Any,
     batch_name: str,
     depends_on: list[str],
+    exact_dependencies: list | None = None,
 ) -> None:
     """Validate one proposed latest-name dependency graph on ``conn``.
 
@@ -1128,6 +1136,13 @@ def validate_persisted_dependencies(
             raise SchemaError(f"依赖成环: {cycle} (B3 拒绝提交)")
         if dependency not in visited:
             stack.append((dependency, 0))
+
+    from .dependencies import bind, validate_mixed_cycles
+    try:
+        frozen = bind(conn, exact_dependencies or [])
+        validate_mixed_cycles(conn, batch_name, depends_on, frozen)
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        raise SchemaError(str(error)) from error
 
 
 def parse_shell_cmd(shell_str: str, where: str) -> list[str]:

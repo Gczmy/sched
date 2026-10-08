@@ -68,7 +68,7 @@ next_cursor、evidence_included，以及 `effect:none`、`historical_failure_rec
 
 ## schema 与后续开发
 
-本阶段引入 schema 12；后续复验候选写 13，完整 schema 1–13 支持只读。旧库没有表时返回
+本阶段引入 schema 12；后续精确依赖候选写 14，完整 schema 1–14 支持只读。旧库没有表时返回
 `available:false,reason:migration_required`，不迁移、不从历史状态回填。写初始化原子
 添加空表/索引/不可变触发器，不改已有任务、版本、状态、revision、身份、wait 或未知回执。
 schema 11 候选及已发布 0.4.0 不能直接启动新写库；回退使用升级前已验证的恢复点，

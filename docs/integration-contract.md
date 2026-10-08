@@ -63,12 +63,23 @@ revalidation_id, artifact_rules_passed, settled and reason. Same RID replays wit
 file reads; unknown remains 75. No worker launch, deletion or version creation.
 `artifact-revalidations` is a separate passive, bounded event query. Existing
 status/task/history fields remain unchanged. See [revalidation](artifact-revalidation.md).
+The subsequent exact-dependency candidate writes schema 14 (complete reads 1–14)
+and advertises `sched-batch-dependencies-v1`. `depends_on_exact` requires explicit
+instance/batch/task/version selectors; acceptance freezes job/spec/fingerprint
+bindings in the submission transaction. No name or new version silently replaces
+the selected source. Existing names retain dynamic latest-name semantics and are
+not rebound during migration. `batch-dependencies` is a passive bounded query;
+recorded facts are not artifact/marker checks or dispatch permission. Existing
+status/task/history fields remain unchanged: status.batches.depends_on contains
+legacy names only, not the complete dependency set. Consumers must negotiate the
+new query to see exact bindings. See [reference](reference.md).
 
 ### Candidate batch failure policy
 
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
 introduced schema 11; the later artifact-validation candidate writes 12 (read
 range 1–12); the subsequent revalidation candidate writes 13 (reads 1–13).
+The later exact-dependency candidate writes 14 (reads 1–14).
 Released 0.4.0 cannot open these new writer states.
 Migration adds `batches.failure_policy` with default `freeze` and a monotonic
 revision trigger, without rewriting status, job versions, execution identity,

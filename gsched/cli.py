@@ -403,13 +403,17 @@ def _dry_run_preview(norm: dict, cfg: dict, *, use_state: bool = True) -> dict:
             }
         )
 
-    return {
+    preview = {
         "tasks": preview_tasks,
         "dep_status": dep_status,
         "git_rev": git_rev,
         "n_skip": n_skip,
         "n_run": n_run,
     }
+    if norm.get("depends_on_exact"):
+        preview["exact_dependencies"] = {"selectors": norm["depends_on_exact"],
+                                         "sources_checked": use_state, "dispatch_ready": None}
+    return preview
 
 
 def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, conflict: bool) -> None:
@@ -422,6 +426,8 @@ def _print_dry_run_preview(norm: dict, args: argparse.Namespace, prev: dict, con
             print("  ⚠️ strict 批次名已消费 — 实际提交会被拒绝")
         else:
             print("  ⚠️ 同名批次已有未终态实例 — 实际提交会被定案 6 拒绝")
+    if norm.get("depends_on_exact"):
+        print("  exact 依赖按显式 instance/batch/task/version 冻结；预览不授予派发权")
     if prev["dep_status"]:
         print("--- 依赖就绪 ---")
         for dep, st in prev["dep_status"].items():
@@ -667,6 +673,7 @@ def _cmd_submit_impl(args: argparse.Namespace) -> int:
                     conn,
                     norm["name"],
                     norm["depends_on"],
+                    norm.get("depends_on_exact", []),
                 )
             except SchemaError as e:
                 print(f"校验失败: {e}", file=sys.stderr)
@@ -735,6 +742,7 @@ def _cmd_submit_impl(args: argparse.Namespace) -> int:
                     conn,
                     norm["name"],
                     norm["depends_on"],
+                    norm.get("depends_on_exact", []),
                 )
             except SchemaError as e:
                 print(f"校验失败: {e}", file=sys.stderr)
@@ -776,6 +784,7 @@ def _cmd_submit_impl(args: argparse.Namespace) -> int:
                 None, norm["cwd"], norm["env"], norm.get("notify"),
                 norm.get("project"), norm.get("priority", 0),
                 failure_policy=norm["failure_policy"],
+                exact_dependencies=norm.get("depends_on_exact", []),
             )
         except sqlite3.IntegrityError:
             # M13: 并发 submit 同时通过定案 6 检查 -> 撞主键, 转友好错误
@@ -1639,6 +1648,44 @@ def cmd_batch_policy(args: argparse.Namespace) -> int:
             print(f"{batch_id}: failure_policy={output['failure_policy']} status={output['status']} revision={output['batch_revision']}")
         return 0
     except (ValueError, ConfigError, state.StateError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
+def cmd_batch_dependencies(args: argparse.Namespace) -> int:
+    from . import dependencies
+    from .integration import CONTRACTS, instance_id
+    from .execution_policy import digest
+    state.set_read_only(True)
+    try:
+        load_config()
+        if not 1 <= args.limit <= 1000 or args.cursor < 0:
+            raise ValueError("limit 必须为 1..1000，cursor 必须为非负偏移量")
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch_id = _resolve_batch_ref(args.batch, conn)
+            batch = state.get_batch(conn, batch_id)
+            if batch is None:
+                raise ValueError("批次不存在")
+            facts = dependencies.facts(conn, batch)
+            selected = facts[args.cursor:args.cursor + args.limit]
+            more = args.cursor + len(selected) < len(facts)
+            output = {"schema_version": 1, "query": "batch_dependencies", "contract": CONTRACTS["batch_dependencies"],
+                      "instance_id": instance_id(conn), "batch_id": batch_id, "batch_revision": batch["revision"],
+                      "status": batch["status"], "source": "stored" if "depends_on_exact" in batch.keys() else "legacy_only",
+                      "binding_sha256": digest({"legacy": json.loads(batch["depends_on"] or "[]"), "exact": dependencies.stored(batch)}),
+                      "dependencies": selected, "total": len(facts), "truncated": more,
+                      "next_cursor": args.cursor + len(selected) if more else None,
+                      "effect": "none", "external_artifacts_checked": False, "task_dag_supported": False}
+            output["launch_markers_checked"] = False
+        if args.json:
+            print(json.dumps(output, ensure_ascii=False))
+        else:
+            print(f"{batch_id}: {output['total']} dependency facts; recorded state only")
+        return 0
+    except (ValueError, TypeError, ConfigError, state.StateError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
     finally:
@@ -4837,6 +4884,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_artifact_check)
 
+    p = sub.add_parser("batch-dependencies", help="只读查询显式 exact 绑定与动态名称依赖，不检查当前文件")
+    p.add_argument("batch")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--cursor", type=int, default=0, help="实时偏移量续页，不是完整当前态")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_batch_dependencies)
+
     p = sub.add_parser("artifact-validations", help="只读查询不可变首次产物验证记录，不检查当前文件")
     p.add_argument("task", help="<batch-id-or-name>:<task>")
     p.add_argument("--version", type=int)
@@ -5120,7 +5174,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies"}:
         return args.fn(args)
     if command == "request":
         try:

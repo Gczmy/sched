@@ -133,6 +133,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched status [batch] --json` | 当前态；支持 `--project`、`--limit`、`--cursor`、`--job-cursor` |
 | `sched task <batch>:<task> --json` | 单任务与各版本详情 |
 | `sched batch-policy <batch> --json` | 源码候选失败策略只读查询；写操作必须经完整 batch CAS 的 request 和 --yes，旧 blocked 只在显式 --reopen 时重开 |
+| `sched batch-dependencies <batch> --json` | 候选 exact 绑定/动态名称事实只读查询；不读产物或 marker，不授予派发权；分页见 reference |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
 | `sched artifact-validations <batch>:<task> --json` | 候选首次验证摘要；--validation-id 读取一条完整证据，不检查当前文件或重新结算 |
@@ -156,6 +157,10 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 ### 与 dsh-node-sched 的接口约定
 
 `status`、`task`、`history` 的 JSON 当前使用 `schema_version: 1`。任务关联使用 `batch_id`，不要用显示名称关联。等待态使用 `status: "pending"` 和独立的 `wait_reason`。
+
+候选 `depends_on_exact` 冻结同实例的完整 batch/task/version，以及接受时的 job/spec/fingerprint。
+旧名称保留动态 latest 兼容，不在迁移时补绑。`status.batches.depends_on` 仍只包含旧名称，
+完整依赖须协商 `sched-batch-dependencies-v1` 后使用独立查询；这不是任务 DAG 或科学 acceptance。
 
 项目禁用 GPU 时，排队 GPU 任务的 `wait_reason` 为 `project_gpu_disabled`。使用此功能前需同步更新配套插件；旧插件的严格校验不接受这个新值。
 

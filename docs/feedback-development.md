@@ -8,7 +8,7 @@
 
 第一阶段源码提交 `5c9a170` 加入产物逐项诊断、`json_equals`、只读
 `artifact-check`、请求格式/JSON 拒绝、同 RID 有界等待/多 RID 查询与
-GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4 引入 11/12，阶段 5 后续候选写 13。
+GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4/5 引入 11/12/13，阶段 6 后续候选写 14。
 包版本仍为 0.4.0，不能仅凭版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
 
 该提交的 [CI](https://github.com/Gczmy/sched/actions/runs/37845958558) 失败：
@@ -88,6 +88,17 @@ Python 必须满足项目版本要求。计算角色还要求已核对的 Linux/
 新增手工脚本 SHA256 为
 `d8350023c0b5af686ece5c7fb7c8184bbf0012716aa2547104ebcc9c6c839306`。
 使用私有临时源码和 state，不替换生产安装；具体原始证据不纳入公共仓库。
+该通用脚本提交 `0a760da` 的 [独立 CI](https://github.com/Gczmy/sched/actions/runs/37855828681)
+14 项均通过，不以这个脚本的绿色 CI 冒充两主机验收；两主机证据来自上面的实际运行。
+
+阶段 6 后续候选提供显式 depends_on_exact、事务内来源/混合环校验、冻结 job/spec/fingerprint
+和独立只读 batch-dependencies。schema 14 默认给旧批次加空清单，不重绑名称。
+解锁及派发复核原版本，未决来源暂停 pending 而不取消 running；同名/新版本成功不能
+替换失败原版本。[CPU/CLI 验收](../tests/run_exact_dependencies_accept.py) 已纳入候选 CI；
+本阶段计算节点隔离 CPU/CLI 已通过：失败源的成功子集继续、v2/同名新批次不替换
+失败原 v1、显式选择原批次 v2 后只运行一次、重启保持绑定/等待/执行次数。
+实际测试源码/脚本摘要已核对，私有证据不入仓库；本阶段完整 CI 尚待推送后确认。
+详细行为与旧 status 字段边界见 [reference](reference.md)。
 
 ## 完整阶段与完成依据
 
@@ -97,7 +108,7 @@ Python 必须满足项目版本要求。计算角色还要求已核对的 Linux/
 | 3 | opt-in 独立失败策略 | 候选 CI/计算节点 CPU 通过 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
 | 4 | 不可变 artifact validation | 候选 CI/计算节点普通 CPU 通过 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
 | 5 | 仅复验及重新结算 | 候选 CI/计算节点普通 CPU 通过 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
-| 6 | 精确依赖 | 未实现 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
+| 6 | 精确依赖 | 候选计算节点 CPU 通过，CI 待确认 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
 | 7 | 任务 DAG/阻塞路径 | 未实现 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待 |
 | 8 | bounded 精确事实/成组 pending-only cancel | 未实现 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
 | 9 | admission explain/装箱解释 | 未实现 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
