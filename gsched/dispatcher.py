@@ -3191,11 +3191,14 @@ class Dispatcher:
                     continue
                 native_exec = self._job_uses_native_exec(conn, j)
                 known_proc = self.executor.has_process(j["pgid"])
+                waited_rc = None
+                waited_identity = self._read_launch_identity(j) if known_proc else None
                 if native_exec and known_proc:
                     # Native execution never writes a trusted Bash RC sidecar.
                     # poll_rc is authoritative only while this daemon retains
                     # the exact Popen object and proves the group is empty.
                     rc = self.executor.poll_rc(j["pgid"])
+                    waited_rc = rc
                     if rc is None:
                         continue
                 else:
@@ -3247,6 +3250,7 @@ class Dispatcher:
                             rc = marker_rc if marker_rc is not None else 137
                         else:
                             rc = self.executor.poll_rc(j["pgid"])
+                            waited_rc = rc if known_proc else None
                             if rc is None:
                                 continue
                             final_state = self._job_process_state(j)
@@ -3266,6 +3270,13 @@ class Dispatcher:
                                 rc = 137
                 rc_path = self._job_rc_path(j)
                 state.update_job(conn, j["id"], rc=rc)
+                ordinary_wait = None
+                if waited_rc is not None and known_proc and not native_exec:
+                    ordinary_wait = {"source": "local_supervisor_wait", "returncode": waited_rc,
+                                     "group_clean": True, "pid": j["pgid"],
+                                     "start_token": waited_identity[1] if waited_identity else None,
+                                     "binding_verified": waited_identity is not None,
+                                     "subject": "scheduler_supervisor_command_chain"}
                 cleanup_jobs.extend(
                     self._handle_job_done(
                         conn,
@@ -3274,6 +3285,7 @@ class Dispatcher:
                         process_exit_authoritative=(
                             native_exec and known_proc
                         ),
+                        ordinary_wait=ordinary_wait,
                     )
                 )
                 if rc_path is not None:
@@ -3434,6 +3446,7 @@ class Dispatcher:
         rc: int | None = None,
         *,
         process_exit_authoritative: bool = False,
+        ordinary_wait: dict | None = None,
     ) -> list[tuple[str, dict]]:
         """Settle after exact exit and return cleanup actions for commit."""
         if j["pgid"] and not process_exit_authoritative:
@@ -3484,7 +3497,7 @@ class Dispatcher:
                     self.log_line(
                         f"job {j['id']} ready probe 存量 spec 非法: {exc}"
                     )
-                if spec is not None and self._completion_artifacts_valid(j, spec, "probe_ready"):
+                if spec is not None and self._completion_artifacts_valid(j, spec, "probe_ready", conn=conn, rc=rc, ordinary_wait=ordinary_wait):
                     state.update_job(
                         conn,
                         j["id"],
@@ -3550,7 +3563,7 @@ class Dispatcher:
             except ValueError as exc:
                 spec = None
                 self.log_line(f"job {j['id']} 存量 spec 非法, 产物验证失败: {exc}")
-            if spec is not None and self._completion_artifacts_valid(j, spec, "exit_zero"):
+            if spec is not None and self._completion_artifacts_valid(j, spec, "exit_zero", conn=conn, rc=rc, ordinary_wait=ordinary_wait):
                 state.update_job(conn, j["id"], status="done", rc=rc,
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} done rc=0 产物校验通过")
@@ -3563,6 +3576,16 @@ class Dispatcher:
         else:
             log_path = self._job_log_path(j)
             failure, _ = self.executor.failed_classify(log_path)
+            try:
+                failed_spec = self._load_task_spec(conn, j)
+            except ValueError:
+                failed_spec = None
+            if failed_spec is not None:
+                # These are first dispatcher settlement observations, not a
+                # reconstruction of an inline stage validator's earlier read.
+                # Passing current artifacts never replaces a nonzero wait.
+                self._completion_artifacts_valid(j, failed_spec, "exit_nonzero", conn=conn,
+                                                rc=rc, ordinary_wait=ordinary_wait)
             # A current, binding-checked application report classifies failure
             # only after the real nonzero exit and group cleanup above.
             try:
@@ -3584,12 +3607,19 @@ class Dispatcher:
         self._maybe_retry(conn, j)
         return cleanup_paths
 
-    def _completion_artifacts_valid(self, job, spec, context) -> bool:
-        """Retain original per-rule observations in the existing daemon log.
+    def _completion_artifacts_valid(self, job, spec, context, *, conn=None, rc=None, ordinary_wait=None) -> bool:
+        """Retain original checks and, on settlement paths, immutable evidence.
 
-        These are diagnostic observations, not a durable validation/settlement
-        authority. No artifact content or raw regex match is written.
+        A standalone diagnostic call does not create history. Neither artifact
+        checks nor a legacy rc can manufacture original wait authority.
         """
+        from . import artifact_validation
+        if conn is not None:
+            prior = artifact_validation.prior_completion(conn, job, context)
+            if prior is not None:
+                if prior["spec_sha256"] != artifact_validation.digest(spec) or prior["payload"]["recorded_rc"] != rc:
+                    raise state.StateError("artifact completion binding differs from original")
+                return prior["passed"]
         identity = dict(job)
         details = inspect_declared_artifacts(spec, spec.get("cwd_abs") or ".")
         for detail in details:
@@ -3598,6 +3628,9 @@ class Dispatcher:
                            "task_id": identity.get("task_id"), "version": identity.get("version"),
                            "context": context, "observed_at": state.now(), **detail}
             self.log_line("artifact_check " + json.dumps(observation, ensure_ascii=True, separators=(",", ":")))
+        if conn is not None:
+            return artifact_validation.record_initial(conn, job, spec, context, details,
+                                                      rc=rc, ordinary_wait=ordinary_wait)["passed"]
         return all(detail["passed"] for detail in details)
 
     def _record_recovery_settlement(self, conn, job, outcome, authority):

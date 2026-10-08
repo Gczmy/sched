@@ -1693,6 +1693,42 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def cmd_artifact_validations(args: argparse.Namespace) -> int:
+    """Query frozen completion observations; do not inspect files or migrate."""
+    from .artifact_validation import list_records
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch, task_id = _resolve_task_ref(args.task, conn)
+            params = (batch, task_id, args.version) if args.version is not None else (batch, task_id)
+            job = conn.execute("SELECT id FROM jobs WHERE batch_id=? AND task_id=?" +
+                               (" AND version=?" if args.version is not None else "") + " LIMIT 1", params).fetchone()
+            if job is None:
+                raise ValueError("任务或版本不存在")
+            result = list_records(conn, batch, task_id, version=args.version, limit=args.limit,
+                                  cursor=args.cursor, validation_id=args.validation_id)
+            output = {"schema_version": 1, "query": "artifact_validations",
+                      "contract": CONTRACTS["artifact_validations"], "instance_id": instance_id(conn),
+                      "batch_id": batch, "task_id": task_id, "version_filter": args.version,
+                      "historical_failure_reconstructed": False, "settlement_authority": False,
+                      "evidence_included": args.validation_id is not None, **result}
+        if args.json:
+            print(json.dumps(output, ensure_ascii=False))
+        else:
+            print("首次产物验证记录（只读，不重新结算）" if result["available"] else "旧库未保存此类记录；查询不迁移")
+            for record in result["validations"]:
+                print(f"  {record['validation_id']} v{record['job_version']} passed={record['passed']} wait_verified={record['wait_verified']}")
+        return 0
+    except (ValueError, ConfigError, state.StateError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_execution(args: argparse.Namespace) -> int:
     if args.task == "list":
         from .execution_queries import list_executions
@@ -4751,6 +4787,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_artifact_check)
 
+    p = sub.add_parser("artifact-validations", help="只读查询不可变首次产物验证记录，不检查当前文件")
+    p.add_argument("task", help="<batch-id-or-name>:<task>")
+    p.add_argument("--version", type=int)
+    p.add_argument("--limit", type=int, default=20, help="摘要数量，1..100")
+    p.add_argument("--cursor", help="按 validation_id 的实时续页游标，不是完整快照")
+    p.add_argument("--validation-id", help="读取该任务的一条完整冻结证据，与 cursor 互斥")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_artifact_validations)
+
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
     p.set_defaults(fn=cmd_init)
@@ -5007,7 +5052,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "batch-policy"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "batch-policy"}:
         return args.fn(args)
     if command == "request":
         try:

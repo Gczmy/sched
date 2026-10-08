@@ -1123,6 +1123,7 @@ class ReviewProbeSettlementTests(DispatcherStateCase):
 
         dispatcher.executor.alive.return_value = False
         with state.connect() as conn:
+            state.update_job(conn, "ready", rc=137)
             dispatcher._handle_job_done(conn, state.get_job(conn, "ready"), 137)
             settled = state.get_job(conn, "ready")
         self.assertEqual("done", settled["status"])
@@ -2525,6 +2526,7 @@ class ReviewProfileConsumptionTests(DispatcherStateCase):
             stream.write("[" * depth + "0" + "]" * depth)
 
         with state.connect() as conn:
+            state.update_job(conn, "profile-recursion", rc=0)
             job = dict(state.get_job(conn, "profile-recursion"))
             cleanup = dispatcher._handle_job_done(conn, job, 0)
             settled = state.get_job(conn, "profile-recursion")

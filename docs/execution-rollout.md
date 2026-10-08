@@ -138,3 +138,12 @@ schema 8 可读恢复 queue/settlement，但 watch 为 null；0.2.2 无法打开
 已经验证的恢复点，不把 schema 字段删除或回改 user_version 当成回退方案。
 发布前必须固定最终来源，完成迁移/失败回滚、Linux CLI/default/native CI 和计算节点
 隔离验收，再另行授权生产排空切换。CPU 验收不代替真实 GPU 或租约硬隔离验收。
+
+## 候选不可变产物验证 schema 12
+
+后续源码候选追加空的 artifact_validations 表、索引和不可变触发器，不回填历史
+退出/验证，不改已有身份、任务、revision、wait 或未决回执。完整 1–12 可只读查询，
+旧库查询不迁移。schema 11 候选和正式 0.4.0 不能直接启动新写库；使用升级前已验证
+恢复点回退，不删除记录或降低 user_version。原始 wait 在落盘前丢失仍为 unknown，
+当前产物不能补权威。冻结记录不构成复验/结算授权，具体合同见
+[artifact-validation](artifact-validation.md)。正式发布及生产升级仍按独立验收流程执行。

@@ -57,6 +57,7 @@
 | `docs/native-deployment.md` | 已外移的旧实验部署绑定记录 |
 | `docs/project-gpu-access.md` | 项目 GPU 开关的行为、实现与验收依据 |
 | `docs/next-development.md` | 尚未实现的开发项，不能当成可用配置或 API |
+| `docs/artifact-validation.md` | 候选不可变首次产物验证与只读查询，不授予复验结算权 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -133,6 +134,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched batch-policy <batch> --json` | 源码候选失败策略只读查询；写操作必须经完整 batch CAS 的 request 和 --yes，旧 blocked 只在显式 --reopen 时重开 |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
+| `sched artifact-validations <batch>:<task> --json` | 候选首次验证摘要；--validation-id 读取一条完整证据，不检查当前文件或重新结算 |
 | `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；check 另按 backend ID 检查文件摘要与项目 root，通过不替代启动校验 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |

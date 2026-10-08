@@ -1163,6 +1163,7 @@ class ReviewStageCheckpointTests(unittest.TestCase):
                 self.assertNotEqual(0, rc)
 
     def test_s_h01_final_settlement_validates_declared_stage_artifacts(self) -> None:
+        import json
         dispatcher = Dispatcher.__new__(Dispatcher)
         dispatcher._drop_launch_marker = mock.Mock()
         dispatcher._load_task_spec = mock.Mock(return_value={
@@ -1185,18 +1186,19 @@ class ReviewStageCheckpointTests(unittest.TestCase):
         dispatcher._consume_pending_cancel_before_requeue = mock.Mock(
             return_value=False
         )
-        job = {
-            "id": "job-v1",
-            "kill_reason": None,
-            "rc": 0,
-            "pgid": None,
-            "gpu": None,
-        }
-
-        with mock.patch(
-            "gsched.dispatcher.state.get_job", return_value=job
-        ), mock.patch("gsched.dispatcher.state.update_job") as update_job:
-            dispatcher._handle_job_done(object(), job, 0)
+        # Settlement now persists frozen evidence in the same transaction.
+        # Exercise a private writer fixture instead of an object-shaped DB.
+        from gsched import state
+        from test_review_cli_state import TempStateCase
+        fixture = TempStateCase(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        job_id = fixture.seed_batch(job_status="running")
+        with state.connect() as conn:
+            conn.execute("UPDATE tasks SET spec=?", (json.dumps(dispatcher._load_task_spec.return_value),))
+            job = state.get_job(conn, job_id)
+            with mock.patch("gsched.dispatcher.state.update_job", wraps=state.update_job) as update_job:
+                dispatcher._handle_job_done(conn, job, 0)
 
         update_job.assert_called_once()
         self.assertEqual("failed", update_job.call_args.kwargs["status"])

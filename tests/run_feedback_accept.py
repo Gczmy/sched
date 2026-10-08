@@ -151,6 +151,7 @@ class Acceptance:
         self.cli("daemon", "drain", "--stop-when-idle")
         self.wait(lambda: self.data("daemon", "status", "--json"),
                   lambda value: value["health_state"] == "stopped")
+        validations = {}
         for name, (_, _, reason) in cases.items():
             before = self.task(submitted[name])
             job = before["jobs"][0]
@@ -159,6 +160,18 @@ class Acceptance:
             assert (self.root / name / "runs.txt").read_text() == "run\n"
             path = self.root / name / "result.json"
             digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+            summary = self.data("artifact-validations", f"{submitted[name]}:task", "--version", "1", "--json")
+            assert summary["available"] and not summary["truncated"]
+            assert len(summary["validations"]) == 1 and not summary["evidence_included"]
+            record = summary["validations"][0]
+            assert record["passed"] == (name == "valid") and record["wait_verified"]
+            frozen = self.data("artifact-validations", f"{submitted[name]}:task", "--version", "1",
+                               "--validation-id", record["validation_id"], "--json")
+            payload = frozen["validations"][0]["payload"]
+            assert payload["recorded_rc"] == 0 and payload["wait"]["returncode"] == 0
+            assert payload["wait"]["subject"] == "scheduler_supervisor_command_chain"
+            assert payload["checks"][0]["reason_code"] == reason
+            validations[name] = frozen
             for _ in range(2):
                 detail = self.data("artifact-check", f"{submitted[name]}:task", "--version", "1",
                                    "--json", expect=0 if name == "valid" else 1)
@@ -168,6 +181,8 @@ class Acceptance:
                 assert (self.root / name / "runs.txt").read_text() == "run\n"
                 if digest is not None:
                     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+                assert self.data("artifact-validations", f"{submitted[name]}:task", "--version", "1",
+                                 "--validation-id", record["validation_id"], "--json") == frozen
         print("PASS: actual rc=0, distinct artifact failures, read-only checks preserve history/files/runs", flush=True)
 
         ids = [f"submit-{name}" for name in cases]
@@ -192,8 +207,11 @@ class Acceptance:
         self.wait(lambda: self.data("daemon", "status", "--json"),
                   lambda value: value["health_state"] == "stopped")
         assert len(self.data("status", "--json")["batches"]) == len(cases)
+        for name, frozen in validations.items():
+            assert self.data("artifact-validations", f"{submitted[name]}:task", "--version", "1",
+                             "--validation-id", frozen["validations"][0]["validation_id"], "--json") == frozen
         assert all((self.root / name / "runs.txt").read_text() == "run\n" for name in cases)
-        print("PASS: bounded queries and daemon restart keep original instance/RIDs/batches", flush=True)
+        print("PASS: bounded queries and daemon restart keep original instance/RIDs/batches/validations", flush=True)
 
         patch = self.root / "patch.json"
         patch.write_text(json.dumps({"projects": {"example": {

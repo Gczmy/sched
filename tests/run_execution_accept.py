@@ -230,6 +230,16 @@ class Acceptance:
             assert identity["job_id"] == job["id"] and identity["batch_id"] == batch and identity["version"] == 1, identity
             assert identity["scheduler_pid"] == int((self.projects[project] / "parent.txt").read_text()), identity
             assert (self.projects[project] / "result.txt").read_text() == expected
+            validations = self.data("artifact-validations", f"{batch}:work", "--version", "1", "--json")
+            assert validations["available"] and not validations["truncated"]
+            assert len(validations["validations"]) == 1
+            record = validations["validations"][0]
+            assert record["passed"] and record["wait_verified"]
+            detail = self.data("artifact-validations", f"{batch}:work", "--version", "1",
+                               "--validation-id", record["validation_id"], "--json")["validations"][0]["payload"]
+            assert detail["wait"]["source"] == "execution_attempt"
+            assert detail["wait"]["attempt_id"] == attempt["attempt_id"]
+            assert detail["wait"]["observation"] == observation
         print("PASS: two projects, sealed FD inputs and actual scheduler identity/wait/rusage", flush=True)
 
     def rejection(self):

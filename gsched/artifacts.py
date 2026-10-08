@@ -153,7 +153,7 @@ def inspect_artifact(
 ) -> dict[str, Any]:
     """Validate one regular-file artifact through an already-open descriptor."""
     started = time.monotonic()
-    evidence: dict[str, Any] = {"file_size": None, "sha256": None, "rule_sha256": None,
+    evidence: dict[str, Any] = {"file_size": None, "file_identity": None, "sha256": None, "rule_sha256": None,
                                 "errno": None, "regex": None}
 
     def finish(reason: str, message: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -202,6 +202,9 @@ def inspect_artifact(
         except OSError as exc:
             return io_failure(exc, "读取属性失败")
         evidence["file_size"] = file_stat.st_size
+        # Decimal strings retain nanosecond/uint64 precision for JSON clients.
+        evidence["file_identity"] = {"device": str(file_stat.st_dev), "inode": str(file_stat.st_ino),
+                                     "mtime_ns": str(file_stat.st_mtime_ns), "ctime_ns": str(file_stat.st_ctime_ns)}
         if not stat.S_ISREG(file_stat.st_mode):
             return finish("not_regular_file", "不是普通文件")
 
@@ -226,6 +229,14 @@ def inspect_artifact(
         ):
             return finish("invalid_regex", "无效正则: 必须是非空无 NUL 字符串")
         if not needs_json and rx is None:
+            try:
+                after = os.fstat(fd)
+            except OSError as exc:
+                return io_failure(exc, "复核属性失败")
+            if (file_stat.st_size, file_stat.st_mtime_ns, file_stat.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns
+            ):
+                return finish("file_changed", "检查期间文件发生变化")
             return finish("passed")
 
         max_content_bytes = 1024 * 1024
@@ -247,7 +258,10 @@ def inspect_artifact(
         if len(content) > max_content_bytes:
             return finish("content_too_large", f"内容过大 (> {max_content_bytes} bytes)")
         evidence["sha256"] = hashlib.sha256(content).hexdigest()
-        after = os.fstat(fd)
+        try:
+            after = os.fstat(fd)
+        except OSError as exc:
+            return io_failure(exc, "复核属性失败")
         if (file_stat.st_size, file_stat.st_mtime_ns, file_stat.st_ctime_ns) != (
             after.st_size, after.st_mtime_ns, after.st_ctime_ns
         ):
@@ -355,7 +369,7 @@ def _beneath_parts(cwd: str, path: str) -> tuple[str, list[str]] | None:
 
 def _inspection_error(reason: str, message: str, error_number: int | None = None) -> dict[str, Any]:
     return {"passed": False, "reason_code": reason, "message": message,
-            "elapsed_ms": 0.0, "file_size": None, "sha256": None,
+            "elapsed_ms": 0.0, "file_size": None, "file_identity": None, "sha256": None,
             "rule_sha256": None, "errno": error_number, "regex": None}
 
 

@@ -46,11 +46,21 @@ also advertises `sched-request-status-many-v1`, `sched-request-validation-v1`,
 `sched-artifact-rules-v2`. Negotiate these capabilities on the actual receiving
 CLI/daemon deployment before using new commands/rules. These diagnostic extensions
 alone use schema 10; the subsequent failure-isolation candidate uses schema 11.
+The subsequent immutable artifact-validation candidate writes schema 12 and reads
+complete schemas 1–12. Negotiate `sched-artifact-validations-v1`; see
+[artifact validation](artifact-validation.md). `artifact-validations TASK --json`
+returns bounded frozen summaries, not fresh file checks. `--validation-id ID`
+reads one exact task/version record and verifies full payload/header digests.
+Live ID keyset pages are not a complete snapshot. Queries never migrate old
+schemas or reconstruct original waits; migration appends an empty table only.
+Existing status/task/history field sets stay unchanged. These records grant no
+settlement authority; revalidation/settlement writes are a later stage.
 
 ### Candidate batch failure policy
 
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
-uses schema 11 (read range 1–11); released 0.4.0 cannot open this new writer state.
+introduced schema 11; the later artifact-validation candidate writes 12 (read
+range 1–12). Released 0.4.0 cannot open either new writer state.
 Migration adds `batches.failure_policy` with default `freeze` and a monotonic
 revision trigger, without rewriting status, job versions, execution identity,
 unknown attempts, receipts or instance identity. Migration is atomic.

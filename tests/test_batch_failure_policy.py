@@ -202,7 +202,7 @@ class BatchPolicyCliTests(TempStateCase):
             self.assertNotIn("failure_policy", state.get_batch(conn, self.batch).keys())
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(11, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             batch = state.get_batch(conn, self.batch)
             self.assertEqual(("blocked", "freeze", revision),
                              (batch["status"], batch["failure_policy"], batch["revision"]))

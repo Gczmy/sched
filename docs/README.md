@@ -26,6 +26,7 @@
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |
 | [next-development.md](next-development.md) | 尚未完成的开发项 |
 | [feedback-development.md](feedback-development.md) | 通用反馈完整阶段、交付纪律与验收进度 |
+| [artifact-validation.md](artifact-validation.md) | 候选不可变首次产物验证、只读查询与原始 wait 边界 |
 | [repository-hygiene.md](repository-hygiene.md) | 仓库中的隐私信息和运行记录边界 |
 
 [2026-09-07 联合审查](code_review_sched_dsh_2026-09-07.md) 保留为修复记录，
