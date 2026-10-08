@@ -25,6 +25,7 @@
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |
 | [next-development.md](next-development.md) | 尚未完成的开发项 |
+| [feedback-development.md](feedback-development.md) | 通用反馈完整阶段、交付纪律与验收进度 |
 | [repository-hygiene.md](repository-hygiene.md) | 仓库中的隐私信息和运行记录边界 |
 
 [2026-09-07 联合审查](code_review_sched_dsh_2026-09-07.md) 保留为修复记录，

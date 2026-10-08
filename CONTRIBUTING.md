@@ -13,6 +13,9 @@ python tests/run_execution_accept.py
 
 公共 CI 在 Python 3.10–3.14 上运行完整公共回归和默认 wheel 独立安装，
 并在 3.10 上运行 execution、mode、项目 GPU 开关和文档引用验收。
+反馈修复的真实 CPU/CLI 隔离验收为 `python tests/run_feedback_accept.py`，
+同样纳入 3.10 CI。它使用临时配置/state 和 fake GPU，不读取生产配置，
+不证明真实 GPU 或跨主机网关投递；集群手动运行必须进入既有计算节点租约。
 native 矩阵覆盖 CPython 3.10/3.14 与 Ubuntu 22.04/24.04，显式设置
 `SCHED_BUILD_NATIVE=1` 从本仓源码构建，运行 native/调度器回归和真实 syscall 拒绝验收。
 默认安装不需要编译器，固定 FD backend 不可用时必须明确拒绝。

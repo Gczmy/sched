@@ -82,6 +82,7 @@ jobs:
         run: |
           python tests/run_execution_accept.py
           python tests/run_host_resources_accept.py
+          python tests/run_feedback_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh

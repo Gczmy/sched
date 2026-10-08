@@ -53,7 +53,7 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
   只读 `artifact-check`、完整请求格式校验/可选 JSON 错误、同 RID 有界回执等待与
   多 RID 查询，以及显式 GPU 池/硬亲和交叉校验。使用契约见
   [integration-contract.md](integration-contract.md) 和 [reference.md](reference.md)。
-  这是工作区候选，不代表新版本发布、Linux 全矩阵或生产部署通过。DB schema 仍为 10，
+  这是已提交的源码候选，不代表新版本发布、Linux 全矩阵或生产部署通过。DB schema 仍为 10，
   默认批次失败策略、名称依赖、真实 wait、资源结算及未知请求守卫未改变。
 - 更多 Linux ABI/架构须先有对应构建、探测、独立安装和实际执行验收，
   再扩大兼容范围；不把当前 x86_64 证据用于未验收环境。
@@ -65,6 +65,8 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。
 
 ### ND-04：后续失败隔离、复验结算与精确依赖
+
+完整分阶段清单与验收状态见 [feedback-development.md](feedback-development.md)。
 
 **状态：设计方向已确认，尚未实现。** 按以下顺序独立开发，不把客户科学状态、
 台账投影、logical experiment、cohort 或 acceptance scope 引入 daemon。
