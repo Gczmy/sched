@@ -85,6 +85,25 @@ batch gates are queried separately. Existing status/task/history field sets stay
 unchanged, including raw task status versus displayed status.wait_reason. Consumers
 must negotiate the independent contract before claiming full task DAG visibility.
 
+The subsequent bounded task-facts candidate advertises `sched-task-facts-v1`
+without changing writer schema 15. `task-facts` selects 1–100 distinct task IDs
+and explicit versions under one full batch ID from one private read snapshot.
+It returns immutable-input bindings and all recorded generations, not permission
+to cancel: `cancel_ready:null`, launch markers and external files are unchecked.
+Limits are 64 KiB inline input, 1000 generations per task, 10000 total records and
+4 MiB canonical evidence; exceeding a bound fails, never silently truncates.
+
+`cancel-pending` requires one batch/instance CAS request with the complete frozen
+binding list. Every member must still be latest pending and all generations must
+prove no start; unknown intents, original execution/validation/recovery facts and
+local startup files are checked before any update. One conflict rolls back the
+whole group. The durable request result includes original cancelled_tasks,
+task_binding_sha256, count and false running_tasks_touched/signals_sent/artifacts_deleted.
+Same RID recovers that result; unknown remains 75. No signals, artifact deletion,
+resource release or new versions occur. Ordinary cancel and strict status/task/history
+contracts are unchanged. Client replacement plans/reservations/lineage remain outside
+the daemon; this is not cross-system atomic pending-replace. See [reference](reference.md).
+
 ### Candidate batch failure policy
 
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer

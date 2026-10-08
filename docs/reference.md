@@ -111,6 +111,44 @@ schema 15 仅新增 append-only task_dependency_events、索引、保留触发�
 旧库 query 仍为只读、task_dag_supported=false；有声明但无接受绑定时不授予派发权。
 能力取决于实际 schema/命名合同，不依赖尚未变更的包版本号。
 
+## 候选精确事实与成组 pending-only 取消
+
+`sched task-facts <full-batch-id> --tasks-json '[{"task_id":"a","version":1}]' --json`
+使用独立合同 `sched-task-facts-v1`。只接受完整批次 ID、显式精确版本和 1..100 个
+不同任务，不按名称/latest 解析；内联 JSON 最多 64 KiB。每次从同一私有只读快照
+返回 batch revision/status、instance、job/spec/fingerprint/history 绑定、所有代际的
+已记录启动/退出事实及拒绝原因；不读 marker、日志、产物或进程，也不迁移旧库。
+`recorded_never_started` 只表示记录内未发现启动，不是取消许可；`cancel_ready:null`、
+`launch_markers_checked:false` 明确尚未完成计算节点的文件核验。
+
+每个任务最多 1000 代，整个选择最多 10000 条记录及 4 MiB 规范证据；超限返回非零，
+不返回一个冒充完整历史的截断结果。旧 schema 缺少完整身份合同明确拒绝授予未启动证明。
+历史失败、retry 清空当前 started_at/pgid/rc、未知请求、launch intent、旧 native 元数据、
+恢复记录和不可变 validation 都不能仅凭当前 pending 忽略。公开执行的原始
+not_started 身份/观察全部匹配且 owner 已关闭才可证明未出生；不从 PID 缺失推断。
+
+取消必须把查询中 `tasks[].binding` 的完整数组原样冻结为内联 `--tasks-json`，
+通过一次源批次 CAS：
+
+```sh
+sched request <rid> --json --expect-kind batch --expect-id <full-batch-id> \
+  --expect-status <batch-status> --expect-revision <batch-revision> \
+  --expect-instance <instance-id> -- cancel-pending <full-batch-id> \
+  --tasks-json '<frozen-binding-list>' --yes
+```
+
+计算节点在同一写事务重验最新 pending/waiting_dep/waiting_quota、所有代际历史摘要和
+启动文件；marker/profile/log 或旧 rc 文件存在、不可读或扫描不完整均拒绝，不删除文件。
+原始 not_started 已验证的前置日志可保留，不当作 worker wait。任一成员冲突整组不变；
+未知原 RID 为 75，不换 RID 重放。直接调用/缺 instance 为 64，冲突为 65，未确认是 1。
+不终止 running、不发送信号、不释放其资源、不写控制请求、不删产物、不创建新版本。
+一次 CAS 可因多个 job 更新累计增加 revision，不保证只加一；逐任务重复用旧 revision
+不是成组操作。同 RID 查询/重放恢复原 durable 回执及清单摘要，不重复取消。
+
+普通 `cancel` 仍可取消运行任务，不等同于这个严格接口。新增查询/回执沿用 schema 15，
+没有新增持久表或迁移，status/task/history 严格字段保持。跨实例替代计划、目标 spec/RID、
+reservation 和 lineage 由客户端保存，不承诺跨系统原子替换。
+
 ## 1. 心智模型
 
 ```
@@ -477,6 +515,8 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `batch-dependencies <batch-ref> [--json]` | 候选精确绑定/动态名称事实 | 私有只读快照，不检查产物或 marker；--limit 1..1000，实时 --cursor 非负偏移量 |
 | `task-dependencies <batch>:<task> [--json]` | 候选任务 DAG/已记录阻塞路径 | --version/--event-id；有界路径不替代派发核验，批次门槛另查 |
 | `dependency-update <batch>:<task> --dependencies-json '<list>' --yes` | 候选受审计依赖更新 | 仅计算节点 task/instance CAS request；未启动版本、事务环检查、不可变历史 |
+| `task-facts <full-batch-id> --tasks-json '<task/version-list>' --json` | 候选有界精确代际事实 | 私有只读快照；不读启动文件，不授予取消权；超限报错 |
+| `cancel-pending <full-batch-id> --tasks-json '<binding-list>' --yes` | 候选成组未启动任务取消 | 仅计算节点一次 batch/instance CAS request；任一成员冲突整组拒绝 |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
 | `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |

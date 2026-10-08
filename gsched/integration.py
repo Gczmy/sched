@@ -26,6 +26,7 @@ CONTRACTS = {
     "batch_policy": "sched-batch-policy-v1",
     "batch_dependencies": "sched-batch-dependencies-v1",
     "task_dependencies": "sched-task-dependencies-v1",
+    "task_facts": "sched-task-facts-v1",
     "artifact_validations": "sched-artifact-validations-v1",
     "artifact_revalidations": "sched-artifact-revalidations-v1",
 }
@@ -100,6 +101,13 @@ def mutation_result(conn, command, code, kind, target, request_id=None):
             if command[0] == "batch-policy":
                 result["effect"]["failure_policy"] = conn.execute(
                     "SELECT failure_policy FROM batches WHERE id=?", (target,)).fetchone()[0]
+            if command[0] == "cancel-pending":
+                from .cli import _build_parser
+                from .pending_cancel import normalize
+                from .execution_policy import digest
+                selectors = normalize(_build_parser().parse_args(command).tasks_json, bindings=True)
+                result["effect"].update(cancelled_tasks=selectors, task_binding_sha256=digest(selectors), count=len(selectors),
+                                        running_tasks_touched=False, signals_sent=False, artifacts_deleted=False)
     return canonical(result)
 
 

@@ -1777,6 +1777,53 @@ def cmd_task_dependencies(args):
         state.set_read_only(False)
 
 
+def cmd_task_facts(args):
+    from . import pending_cancel
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        load_config()
+        selectors = pending_cancel.normalize(args.tasks_json)
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch = dict(pending_cancel.exact_batch(conn, args.batch))
+            tasks = pending_cancel.facts(conn, batch, selectors)
+            output = {"schema_version": 1, "contract": CONTRACTS["task_facts"], "query": "task_facts",
+                      "instance_id": instance_id(conn), "batch_id": batch["id"], "batch_revision": batch.get("revision"),
+                      "batch_status": batch["status"], "tasks": tasks, "truncated": False,
+                      "effect": "none", "cancel_ready": None, "launch_markers_checked": False,
+                      "external_artifacts_checked": False, "source": "recorded_private_snapshot"}
+        print(json.dumps(output, ensure_ascii=False) if args.json else f"{batch['id']}: {len(tasks)} exact task facts; local startup files not checked")
+        return 0
+    except (ValueError, TypeError, state.StateError, ConfigError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
+def cmd_cancel_pending(args):
+    from . import pending_cancel
+    if state._bound_connection.get() is None or pending_cancel.request_id.get() is None:
+        print("错误: cancel-pending 必须通过完整 batch/instance CAS 的 request", file=sys.stderr)
+        return 64
+    if not args.yes:
+        print("未确认: cancel-pending 需要 --yes", file=sys.stderr)
+        return 1
+    try:
+        cfg = load_config()
+        if _is_foreign_host(cfg):
+            raise ValueError("cancel-pending 必须在配置的计算节点执行")
+        selectors = pending_cancel.normalize(args.tasks_json, bindings=True)
+        with state.connect() as conn:
+            result = pending_cancel.perform(conn, args.batch, selectors)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except (ValueError, TypeError, state.StateError, ConfigError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 65
+
+
 def cmd_artifact_check(args: argparse.Namespace) -> int:
     """Read current files against one frozen task spec; never settle a job."""
     from .integration import CONTRACTS, instance_id
@@ -4329,9 +4376,10 @@ def _run_captured_mutation(
     captured_stderr = _BoundedTextCapture()
     callbacks: list[Any] = []
     code = 1
-    from . import artifact_revalidation, task_dependencies
+    from . import artifact_revalidation, task_dependencies, pending_cancel
     token = artifact_revalidation.request_id.set(request_id)
     dependency_token = task_dependencies.request_id.set(request_id)
+    pending_token = pending_cancel.request_id.set(request_id)
     try:
         with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(
             captured_stderr
@@ -4349,6 +4397,7 @@ def _run_captured_mutation(
     finally:
         artifact_revalidation.request_id.reset(token)
         task_dependencies.request_id.reset(dependency_token)
+        pending_cancel.request_id.reset(pending_token)
     return code, captured_stdout.getvalue(), captured_stderr.getvalue(), callbacks
 
 
@@ -4438,6 +4487,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
         "batch-policy",
         "artifact-revalidate",
         "dependency-update",
+        "cancel-pending",
     }
     if not command or command[0] not in allowed:
         raise RequestValidationError("request 只允许调度器 mutation 子命令", "unsupported_mutation")
@@ -4482,7 +4532,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
             raise RequestValidationError("mutation 缺少目标", "missing_target")
         target_id = command[1]
         target_kind = "task" if ":" in target_id else "batch"
-    elif command[0] == "batch-policy":
+    elif command[0] in {"batch-policy", "cancel-pending"}:
         if len(command) < 2:
             raise RequestValidationError("batch-policy 缺少目标", "missing_target")
         target_kind, target_id = "batch", command[1]
@@ -4586,6 +4636,14 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
             raise RequestValidationError("dependency-update 需要完整 task/instance CAS", "invalid_precondition")
         try:
             _dependency_selectors(parsed.dependencies_json)
+        except (ValueError, RecursionError) as error:
+            raise RequestValidationError(str(error), "invalid_command") from error
+    if command[0] == "cancel-pending":
+        if target_kind != "batch" or not re.fullmatch("[0-9a-f]{32}", expectation.get("instance", "")):
+            raise RequestValidationError("cancel-pending 需要完整 batch/instance CAS", "invalid_precondition")
+        try:
+            from .pending_cancel import normalize
+            normalize(parsed.tasks_json, bindings=True)
         except (ValueError, RecursionError) as error:
             raise RequestValidationError(str(error), "invalid_command") from error
     return request_id, command, expectation
@@ -5012,6 +5070,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_dependency_update)
 
+    p = sub.add_parser("task-facts", help="有界精确代际事实，只读私有快照，不授予取消权")
+    p.add_argument("batch", help="完整 batch ID，不按名称解析")
+    p.add_argument("--tasks-json", required=True, help="内联 task_id/version 数组，1..100 项")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_task_facts)
+
+    p = sub.add_parser("cancel-pending", help="经一次 batch/instance CAS 原子取消明确且从未启动的任务组")
+    p.add_argument("batch")
+    p.add_argument("--tasks-json", required=True, help="task-facts 的精确 binding 数组，内联冻结")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_cancel_pending)
+
     p = sub.add_parser("artifact-validations", help="只读查询不可变首次产物验证记录，不检查当前文件")
     p.add_argument("task", help="<batch-id-or-name>:<task>")
     p.add_argument("--version", type=int)
@@ -5295,7 +5365,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending"}:
         return args.fn(args)
     if command == "request":
         try:

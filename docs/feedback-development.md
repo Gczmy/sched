@@ -112,7 +112,21 @@ C v1 只执行一次；后续改变来源后 C v2 不会 SKIP 旧绑定的产物
 `2193aee454c6d8f58a0505eb7b621716cec1324382465ee4b1caa364b028e488`，
 源码/测试摘要已实查一致；16 条 Linux 私有 fixture 和 143 条相关回归通过。
 现有看板严格字段/等待原因已只读核对，无配套仓库改动。
-不占真实 GPU、不重启生产 daemon、不更改生产配置；完整候选 CI 待推送后确认。
+不占真实 GPU、不重启生产 daemon、不更改生产配置；固定提交
+`e2d7fef08b13092192da1e8bebbc63df0f654ba0` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37860518170) 14 项全部通过。
+
+阶段 8 候选加入独立 task-facts 和一次 batch/instance CAS 的 cancel-pending，
+不改 status/task/history 字段，不新增 schema；全部代际启动/旧未知/恢复/原始 validation
+及计算节点启动文件重验后才取消。失败整组回滚，同 RID 原回执恢复，unknown 不重放。
+[隔离 CPU/CLI 验收](../tests/run_pending_cancel_accept.py) 已通过：精确 A/C 取消，
+B/D 保留并只实际执行一次；测试 CLI 提交前 SIGKILL 全部回滚，提交后丢回执仍恢复
+原结果；两个竞争 RID 一次成功、一次冲突；真实失败 retry 清空当前字段后仍拒绝
+误判为从未启动。故障注入仅针对测试拥有的 CLI 进程和确定事务/回传窗口，不宣称
+覆盖任意网络/NFS 故障。最终脚本 SHA256 为
+`99e28db7c2c73c57dfaf4c885553b85d181cb7fbe30f58b981e002024a2fa192`；
+161 条相关 mock/只读回归通过，运行时来源摘要已实查一致。生产 daemon/config 不变；
+固定来源 CI 待推送后核实。
 
 ## 完整阶段与完成依据
 
@@ -123,8 +137,8 @@ C v1 只执行一次；后续改变来源后 C v2 不会 SKIP 旧绑定的产物
 | 4 | 不可变 artifact validation | 候选 CI/计算节点普通 CPU 通过 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
 | 5 | 仅复验及重新结算 | 候选 CI/计算节点普通 CPU 通过 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
 | 6 | 精确依赖 | 候选 CI/计算节点 CPU 通过 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
-| 7 | 任务 DAG/阻塞路径 | 候选计算节点 CPU 通过，CI 待确认 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待；CAS 依赖更新保留不可变历史 |
-| 8 | bounded 精确事实/成组 pending-only cancel | 未实现 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
+| 7 | 任务 DAG/阻塞路径 | 候选 CI/计算节点 CPU 通过 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待；CAS 依赖更新保留不可变历史 |
+| 8 | bounded 精确事实/成组 pending-only cancel | 候选计算节点 CPU 通过，CI 待确认 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
 | 9 | admission explain/装箱解释 | 未实现 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
 | 10 | allocation 身份/分层失败 | 未实现 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
 | 11 | 磁盘/inode/quota 准入 | 未实现 | 控制面余量；unknown 明确；容量不足不删科学产物 |
