@@ -38,6 +38,67 @@ Replies omit raw command, output, configuration and private paths. Output
 compaction keeps the binding, code and structured result. Legacy receipts may
 have null result; no effect is guessed from text or current task state.
 
+### Candidate diagnostic extensions (source, not a published/deployed release)
+
+The original four contracts and phase values remain unchanged. `version --json`
+also advertises `sched-request-status-many-v1`, `sched-request-validation-v1`,
+`sched-request-result-v1`, `sched-artifact-check-v1` and
+`sched-artifact-rules-v2`. Negotiate these capabilities on the actual receiving
+CLI/daemon deployment before using new commands/rules. Database schema remains 10.
+
+Receipt queries add `receipt_source` (database/ticket/null),
+`receipt_persisted`, nullable `delivery_confirmed` and `batch_persisted`,
+`created_at`, `finished_at`, `observed_at` and `reason_code`.
+A persisted intent ticket is **not** a database acceptance receipt.
+`delivery_confirmed:null` means unknown, not confirmed non-delivery. `done`
+means the request settled; rejected submissions can also be done with nonzero
+code and `batch_persisted:false`. It does not mean training completed.
+
+`request-status ID --wait-sec N --expect-instance INSTANCE --json` waits up to
+0..60 finite seconds, querying fresh private snapshots and closing each before
+sleeping. It never submits, changes RID, or writes a receipt. Query exit code 0
+means the query succeeded, not that the receipt code is 0. At the deadline,
+`wait_timed_out:true` preserves the last phase; it is not a rejection. If a
+previously observed receipt disappears, prior evidence is retained with
+`observation_incomplete:true`, `query_observed_at` and an explicit reason;
+this is not a fresh complete result. Instance/binding changes fail the query.
+Read failure returns nonzero with `query:request_status_error`, never not_found.
+
+`request-status-many ID... --json` supports 1..100 distinct IDs in input order,
+using one DB snapshot per poll. Its named contract returns `requests` and
+`ticket_fallback_atomic:false`: separate delivery tickets are not a single
+atomic filesystem snapshot. It supports the same wait and expected-instance
+options; waiting ends when all requested receipts settle or time expires.
+Longer client waits should resume the same IDs, not redeliver them.
+
+`request-validate` accepts the same complete command/preconditions as `request`.
+It only validates envelope and exact nested CLI syntax; it reads no config/DB,
+does not reserve the RID, and reports `state_checked:false`. File contents,
+confirmation flags, current state, node guards and CAS still apply at execution.
+
+`request ... --json -- MUTATION` returns an opt-in structured result. Without
+the option, original stdout/stderr replay is retained; the option does not enter
+the immutable binding. Missing envelope fields or invalid nested syntax return
+64 before state initialization or request insertion. Errors identify
+`reason_code`, `stage`, `missing_fields`, target kind and facts about **this
+invocation**. They cannot negate an older effect of the same RID. CAS conflict
+still returns 65, now retaining structured error metadata in the existing
+result_json; prior started requests still return 75 without dispatch. Generic
+transport, argument-parser and infrastructure errors must not be interpreted
+as a confirmed negative receipt.
+
+`artifact-check BATCH:TASK --version N --json` reads one frozen task spec and
+the current declared files on the configured compute node. It never initializes
+or migrates state, changes task status, deletes files, retries training, or
+reconstructs the first failure. `passed` is only the current artifact predicate,
+not execution authority or scientific acceptance. Job completion observations
+are logged per rule in daemon.log; stage observations are retained in task logs.
+Log observations are diagnostic, not immutable validation/settlement records.
+Detailed errors distinguish no-match, regex timeout/child failure, invalid JSON,
+missing keys, unequal typed JSON values and filesystem failures. File SHA-256
+is available only when bounded content checks read bytes; existence/min-size
+checks do not hash potentially large checkpoint files.
+
 ## Idempotent submission
 
 `submit FILE --request-id ID --json` binds canonical finite JSON content,

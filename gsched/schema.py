@@ -19,6 +19,7 @@ from ._legacy_execution import (
 )
 from .execution_policy import ExecutionPolicyError, INTERNAL_FIELD, normalize_execution
 from . import recovery
+from .artifacts import ARTIFACT_RULE_KEYS, validate_json_equals
 
 
 SUDO_TOKENS = {"sudo", "su", "runuser"}
@@ -35,7 +36,6 @@ MAX_PATH_LENGTH = 4096
 MAX_ARTIFACTS_PER_GROUP = 64
 MAX_ARTIFACT_RULE_BYTES = 64 * 1024
 MAX_NORMALIZED_TASKS = 10_000
-ARTIFACT_RULE_KEYS = frozenset({"path", "min_bytes", "check", "has_key", "regex"})
 SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 SAFE_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 DANGEROUS_ENV_NAMES = {
@@ -555,6 +555,11 @@ def _validate_artifacts(
         regex = rule.get("regex")
         if regex is not None:
             _validate_regex(regex, f"{rule_where}.regex")
+        if "json_equals" in rule:
+            try:
+                validate_json_equals(rule["json_equals"])
+            except ValueError as exc:
+                raise SchemaError(f"{rule_where}: {exc}") from exc
         if not paths_escape:
             expanded_path = expand_path(path, cfg, cwd_abs)
             _check_path_in_cwd(expanded_path, cwd_abs, rule_where)
@@ -590,6 +595,12 @@ def validate_project_gpu_access(cfg: dict, project: str | None, tasks) -> None:
                 f"project '{project}' 禁止 GPU (gpu_enabled=false 或项目未注册):"
                 f" 任务 '{task.get('id', '?')}' 申请了 GPU；CPU-only 任务仍允许"
             )
+        if gpu:
+            from .config import validate_gpu_affinity_pool
+            try:
+                validate_gpu_affinity_pool(cfg, project)
+            except ConfigError as exc:
+                raise SchemaError(str(exc)) from exc
 
 
 def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> dict:

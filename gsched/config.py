@@ -94,6 +94,19 @@ def parse_gpus(cfg: dict[str, Any]) -> tuple[list[int], dict[int, float], dict[i
     return uniq, mem, mj
 
 
+def validate_gpu_affinity_pool(cfg: dict, project: str | None = None) -> None:
+    """Admission validation, not a barrier to reading/repairing old config."""
+    gpu_pool, _, _ = parse_gpus(cfg)
+    if not gpu_pool:  # Empty/omitted means daemon auto-detect.
+        return
+    for name, project_cfg in cfg.get("projects", {}).items():
+        if project is not None and name != project:
+            continue
+        if (project_cfg.get("gpu_enabled", True) and project_cfg.get("gpu_affinity_hard", False)
+                and not set(project_cfg.get("gpu_affinity", [])).intersection(gpu_pool)):
+            raise ConfigError(f"projects.{name}.gpu_affinity 与显式 gpus 无交集 (gpu_affinity_hard=true)")
+
+
 def config_path() -> str:
     """Bootstrap config path, independent of the installed runtime data root."""
     if os.environ.get("SCHED_CONFIG"):

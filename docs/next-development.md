@@ -49,6 +49,12 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 
 ## 后续候选
 
+- 2026-10-08 通用反馈的第一阶段源码已加入产物逐项诊断、`json_equals`、
+  只读 `artifact-check`、完整请求格式校验/可选 JSON 错误、同 RID 有界回执等待与
+  多 RID 查询，以及显式 GPU 池/硬亲和交叉校验。使用契约见
+  [integration-contract.md](integration-contract.md) 和 [reference.md](reference.md)。
+  这是工作区候选，不代表新版本发布、Linux 全矩阵或生产部署通过。DB schema 仍为 10，
+  默认批次失败策略、名称依赖、真实 wait、资源结算及未知请求守卫未改变。
 - 更多 Linux ABI/架构须先有对应构建、探测、独立安装和实际执行验收，
   再扩大兼容范围；不把当前 x86_64 证据用于未验收环境。
 - 配套客户端的 execution 展示归其仓库独立安排，继续消费公共 CLI，
@@ -57,6 +63,36 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 维护与回退见 [execution-rollout.md](execution-rollout.md)。客户协议、
 科学验收和研究部署由客户仓库独立维护，不作为 sched 发布前置条件。
 已有 GPU 策略、资源准入、drain/resume 和幂等维护请求继续独立维护。
+
+### ND-04：后续失败隔离、复验结算与精确依赖
+
+**状态：设计方向已确认，尚未实现。** 按以下顺序独立开发，不把客户科学状态、
+台账投影、logical experiment、cohort 或 acceptance scope 引入 daemon。
+
+1. 批次新增 opt-in `failure_policy`，默认维持现有冻结派发策略（不自动取消 running）。
+   `continue_independent` 在独立 pending/running 或未决启动尚存时保持 active，
+   保留失败任务，最终有失败仍 blocked；旧 blocked 不自动重开。策略变更须幂等 CLI、
+   revision CAS，新增字段/触发器须正式 schema 迁移。此阶段不宣称已支持任务 DAG。
+2. 增加不可变 artifact validation 记录与独立复验/结算入口。绑定精确 job/version、
+   revision、原始 wait/cleanup、规则和产物证据；不训练、不删文件、不覆盖原失败。
+   当前日志/只读检查仅是诊断，不授予结算权；历史执行权威缺失时禁止补判成功。
+   仅对已分类的瞬时系统错误作有限退避，内容错误不放宽，验收重试与训练次数分开。
+3. 精确依赖冻结 instance/batch 和 task/version 清单；旧名称保持显式兼容语义，
+   不在迁移时绑定到当日最新批次。批次 ID 单独不足以阻止同批次 resubmit 漂移。
+   随后实现任务 DAG、失败源/路径解释、事务内环检查与受审计的依赖更新。
+   A→C、B→D 且 A 失败的验收须证明 B/D 继续、C 等待；同名 A2 成功不得放行 exact A1。
+4. sched 提供 bounded 精确任务事实与按源批次成组 pending-only cancel。当前 pending
+   不代表历史从未启动；必须核对启动意图、attempt、marker、恢复/旧未知记录。
+   成组取消使用一次 CAS，不能重复沿用逐项取消前的 batch revision。替代计划、
+   目标 spec/RID 冻结、reservation、lineage 和 resume 由客户端负责。跨实例/跨台账
+   不承诺原子事务；单实例通用 pending-replace 另按实际需求评估。
+5. admission explain 复用真实派发判断，输出所有资源维度与观测时效；补 allocation
+   不可变身份、磁盘空间/inode/可知 quota 准入及控制面余量。不自动扩大 GPU 池、
+   抢占外部进程、改变模型/HPO 参数或删除科学产物。owner PID 不冒充 GPU worker。
+
+上述持久变更发布前须验证 schema 迁移与旧记录守卫，并核对配套插件严格 JSON、
+等待原因与两侧契约。执行型验收仍在计算节点隔离 state 中进行；生产切换另行授权，
+不以某个客户项目的科学验收作为 sched 发布条件。
 
 ## 0.3.0 历史发布准备
 

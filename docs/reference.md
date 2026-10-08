@@ -1,7 +1,7 @@
 # sched 使用参考（权威版）
 
 > 面向 AI 代理与用户的**功能与命令权威查阅文档**。改调度器行为时同步更新本文件。
-> 版本基准：本次提交的 source/tests（文档同步于 2026-09-01；核心调度行为截至 `e9a44d0`）。发现本文档与实际行为不符 = 调度器 bug，请报告。
+> 版本基准：本次提交的 source/tests。新增诊断接口属于当前源码候选，不表示已发布或部署；使用前核对目标 CLI 的命名合同。
 
 ---
 
@@ -23,6 +23,18 @@
 `sched request-status <request-id> --json` 返回 `not_found/unknown/delivered/done`，
 原绑定摘要、结果码及可用的结构化结果。旧回执可有 null result；输出压缩不会删除新结构化事实。
 不存在回执不证明未执行；unknown 保留原请求，不推断 wait 或触发重试。
+
+当前源码候选支持 `request-status <id> --wait-sec N --expect-instance <instance> --json`
+和 `request-status-many <id>... --json`（1..100 个不同 ID，支持同样的等待选项）。
+N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wait_timed_out:true`。
+回执追加来源、持久化、投递/批次确认和时间信息；`done` 是请求结算，不是训练完成。
+多 ID 的数据库事实来自同一私有快照，ticket 回退不承诺文件系统原子快照。
+读取失败返回非零，不当作 not_found。完整字段与证据保留规则见集成合同。
+
+`request-validate` 使用与 `request` 相同的 envelope 和完整子命令，只校验格式，
+不读写 state、不预占 RID、不检查当前态。`request --json` 是可选结构化结果，
+不会改变原绑定；缺字段/命令语法错误在写入前返回 64，CAS 冲突仍为 65，未知仍为 75。
+“本次调用未执行”不能用于否认该 RID 的历史 effect；文件、确认、主机与 CAS 执行时仍重验。
 
 `sched submit <batch.json> --request-id <id> --expect-instance <instance-id> --expect-project <project> --json`
 绑定有限规范 JSON、项目和可选预期身份，相同绑定保留原 batch ID；改变绑定返回 64。
@@ -93,12 +105,24 @@
 | `resources.host_mem_gib` | number | ✗ | 有限正数主机内存预留（GiB）；缺省 `host_mem_default_gib`，CPU/GPU 任务均计入 |
 | `runtime` | obj | ✗ | `{conda_env:"名"}` ∥ `{venv_alias:"名"}` ∥ `{prefix:"路径"}` 必须且只能选一个；别名须注册、conda env/prefix 目录须在提交时存在；参与指纹 |
 | `progress_regex` | str | ✗ | 从日志尾部提取进度，status 展示 |
-| `artifacts` | obj | ✗ | `{key:{path,...}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`regex:"模式"`；内容校验有读取/执行上限，symlink 与特殊文件拒绝；命中→SKIP |
+| `artifacts` | obj | ✗ | `{key:{path,...}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`json_equals:{"键":值}`/`regex:"模式"`；内容校验有读取/执行上限，symlink 与特殊文件拒绝；命中→SKIP |
 | `execution` | obj | ✗ | 通用冷 backend 与输入 FD 绑定；见 [execution-api.md](execution-api.md) |
 | `probes` | obj | ✗ | 仅任务级 `{fail_on_log,ready_on_log}` 日志门控 |
 | `_force_rerun` | 内部 | — | `force_rerun` 的落库字段，输入中不要提供 |
 
 \* cmd 与 stages 二选一。
+
+候选 `json_equals` 自动解析 JSON，以点分隔的对象键选择值，逐项比较有限 JSON 值，
+布尔值不等于数字，JSON 数字 `1` 与 `1.0` 相等，null 不等于缺键；数组顺序保留、
+对象键顺序无关。最多 64 项，规则组总上限仍为 64 KiB，内容读取上限仍为 1 MiB。
+嵌套键名中的点没有转义语法。规则参与已有 producer 指纹。
+网关与接收 daemon 都须确认 `sched-artifact-rules-v2`；旧版本会拒绝这个新规则。
+
+`sched artifact-check <batch>:<task> --version N --json` 仅在配置的计算节点只读检查
+该版本当前产物；规则通过返回 0、不通过返回 1，异机返回 2。它不初始化 DB、不修改
+任务状态、不清理或重训，不是“复验结算”接口。没有声明时 checks 为空，passed 为 true，
+不意味着产物来源或科学验收通过。初次检查的细节进入 daemon/task 日志；旧失败
+不能靠本次检查还原。存在/min-size 检查不读取大文件，sha256 为 null。
 
 标识符必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`，且不能是 `.`/`..`。已移除或未实现的输入会拒绝：批次级 `gpus`、任务/阶段级 `retry_transform`、阶段级 `probes`；GPU 需求写 `resources.gpu`，probe 只写在任务级。
 
@@ -145,6 +169,10 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 同时运行 `N` 个已经分配 GPU 的 job；独占和共享任务均每个 job 计 1，共享时多个
 计数单位可能落在同一张物理卡上。`resources.gpu:0` 的 CPU-only job 不占该配额。
 项目级禁止 GPU 使用 `gpu_enabled:false`，不能用 `gpu_quota:0` 或空 affinity 模拟。
+显式非空 `gpus` 与启用项目的硬亲和无交集时，新 GPU 提交/dry-run、配置更新、
+daemon 前置检查与热重载拒绝。普通旧配置读取仍允许，以便查询和修正；CPU-only 提交、
+软亲和、已禁用 GPU 的项目不按此交集拒绝。省略/空池是自动探测，不当作零卡配置。
+检查不会自动扩池或改亲和；GPU 池/容量仍是冷配置。
 切回 `true` 后原排队版本继续运行，无需重新提交。配置写入与最终派发共用 submission
 gate；开关读取失败时暂停 GPU 派发，CPU-only 使用最后有效配置。入口、重试和并发
 行为详见 [`project-gpu-access.md`](project-gpu-access.md)。

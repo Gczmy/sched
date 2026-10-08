@@ -604,6 +604,8 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
     cfg: dict[str, Any] | None = None
     try:
         cfg = load_config()
+        from .config import validate_gpu_affinity_pool
+        validate_gpu_affinity_pool(cfg)
     except ConfigError as e:
         issues.append({"id": "configuration", "subject": None, "performed": True,
                        "item": "config.json", "detail": str(e), "level": "fail"})

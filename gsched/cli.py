@@ -1576,6 +1576,54 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_artifact_check(args: argparse.Namespace) -> int:
+    """Read current files against one frozen task spec; never settle a job."""
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        if _is_foreign_host(cfg):
+            print("错误: artifact-check 必须在配置的计算节点检查任务文件", file=sys.stderr)
+            return 2
+        if args.version is not None and args.version < 1:
+            raise ValueError("version 必须为正整数")
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch, task_id = _resolve_task_ref(args.task, conn)
+            params = (batch, task_id, args.version) if args.version is not None else (batch, task_id)
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=?" +
+                               (" AND version=?" if args.version is not None else "") + " ORDER BY version DESC LIMIT 1", params).fetchone()
+            if job is None:
+                raise ValueError("任务或版本不存在")
+            row = conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?", (batch, task_id, job["version"])).fetchone()
+            if row is None:
+                raise ValueError("任务 spec 不存在")
+            spec = json.loads(row["spec"])
+            if not isinstance(spec, dict):
+                raise ValueError("任务 spec 无效")
+            revision = conn.execute("SELECT revision FROM batches WHERE id=?", (batch,)).fetchone()[0]
+            output = {"schema_version": 1, "query": "artifact_check", "contract": CONTRACTS["artifact_check"],
+                      "instance_id": instance_id(conn), "batch_id": batch, "batch_revision": revision,
+                      "job_id": job["id"], "task_id": task_id, "version": job["version"], "recorded_status": job["status"],
+                      "recorded_rc": job["rc"], "effect": "none", "historical_failure_reconstructed": False}
+        # No DB transaction spans file reads or isolated regex checks.
+        checks = artifacts.inspect_declared_artifacts(spec, spec.get("cwd_abs") or ".")
+        output.update(observed_at=state.now(), checks=checks, passed=all(check["passed"] for check in checks))
+        if args.json:
+            print(json.dumps(output, ensure_ascii=False))
+        else:
+            print("当前产物规则通过" if output["passed"] else "当前产物规则未通过")
+            for check in checks:
+                print(f"  {check['scope']}:{check['name']}: {check['reason_code']}")
+            print("只读检查；未改变任务状态，不能代替执行事实或科学验收")
+        return 0 if output["passed"] else 1
+    except (ValueError, ConfigError, state.StateError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_execution(args: argparse.Namespace) -> int:
     if args.task == "list":
         from .execution_queries import list_executions
@@ -3230,6 +3278,8 @@ def _config_set_serialized(args: argparse.Namespace) -> int:
         json.dump(new_cfg, f, indent=2, ensure_ascii=False)
     try:
         load_config(tmp_p)
+        from .config import validate_gpu_affinity_pool
+        validate_gpu_affinity_pool(new_cfg)
     except Exception as e:
         if os.path.exists(tmp_p):
             os.remove(tmp_p)
@@ -3456,7 +3506,7 @@ def _diag_one(conn, j, cfg: dict) -> None:
     """单任务诊断块: 状态 + 命令 + git 对比 + 日志尾部."""
     batch, task = j["batch_id"], j["task_id"]
     print(f"=== {batch}:{task} (v{j['version']}) ===")
-    print(f"  status: {j['status']}  rc: {j['rc'] or '-'}  failure: {j['failure'] or '-'}")
+    print(f"  status: {j['status']}  rc: {j['rc'] if j['rc'] is not None else '-'}  failure: {j['failure'] or '-'}")
     print(f"  retries: {j['retries']}  gpu: {j['gpu'] or '-'}")
     if "runtime" in j.keys() and j["runtime"]:
         print(f"  runtime: {j['runtime']}")
@@ -4050,15 +4100,36 @@ def _canonical_assignment_precondition(raw: Any) -> list[dict[str, Any]] | None:
     return result
 
 
-def cmd_request(args: argparse.Namespace) -> int:
-    """Execute a mutation once with revision-bound durable replay."""
+class RequestValidationError(ValueError):
+    def __init__(self, message: str, reason_code: str = "invalid_request", *, missing_fields=()):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.missing_fields = list(missing_fields)
+
+
+def _request_rejection(args, error: RequestValidationError) -> int:
+    """Describe this invocation only; never negate an older RID's effect."""
+    if getattr(args, "json", False):
+        from .integration import CONTRACTS
+        print(json.dumps({"schema_version": 1, "contract": CONTRACTS["request_validation"],
+                          "request_id": getattr(args, "request_id", None), "valid": False, "code": 64,
+                          "error": {"reason_code": error.reason_code, "stage": "pre_dispatch",
+                                    "message": str(error), "missing_fields": error.missing_fields,
+                                    "target_kind": getattr(args, "expect_kind", "none"),
+                                    "dispatch_entered": False, "request_record_created_this_invocation": False,
+                                    "effect_of_this_invocation": "none"}}, ensure_ascii=False))
+    print(f"错误: {error}", file=sys.stderr)
+    return 64
+
+
+def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
+    """Shared pure validation. No state, files, RID reservation or mutation."""
     request_id = str(getattr(args, "request_id", ""))
     command = list(getattr(args, "command", []) or [])
     if command[:1] == ["--"]:
         command = command[1:]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id):
-        print("错误: request_id 格式无效", file=sys.stderr)
-        return 64
+        raise RequestValidationError("request_id 格式无效", "invalid_request_id")
     allowed = {
         "submit",
         "cancel",
@@ -4073,24 +4144,19 @@ def cmd_request(args: argparse.Namespace) -> int:
         "config",
     }
     if not command or command[0] not in allowed:
-        print("错误: request 只允许调度器 mutation 子命令", file=sys.stderr)
-        return 64
+        raise RequestValidationError("request 只允许调度器 mutation 子命令", "unsupported_mutation")
     if command[0] == "daemon" and (
         len(command) < 2 or command[1] not in {"start", "stop", "drain", "resume"}
     ):
-        print("错误: request 只允许 daemon start/stop/drain/resume", file=sys.stderr)
-        return 64
+        raise RequestValidationError("request 只允许 daemon start/stop/drain/resume", "unsupported_mutation")
     if command[:2] == ["daemon", "drain"] and command[2:] not in ([], ["--stop-when-idle"]):
-        print("错误: request daemon drain 只接受 --stop-when-idle", file=sys.stderr)
-        return 64
+        raise RequestValidationError("request daemon drain 只接受 --stop-when-idle")
     if command[:2] == ["daemon", "resume"] and command[2:]:
-        print("错误: request daemon resume 不接受额外参数", file=sys.stderr)
-        return 64
+        raise RequestValidationError("request daemon resume 不接受额外参数")
     if command[0] == "config" and (
         len(command) < 2 or command[1] != "set"
     ):
-        print("错误: request 只允许 config set", file=sys.stderr)
-        return 64
+        raise RequestValidationError("request 只允许 config set", "unsupported_mutation")
 
     expect_kind = str(getattr(args, "expect_kind", "none") or "none")
     expect_id = getattr(args, "expect_id", None)
@@ -4103,37 +4169,34 @@ def cmd_request(args: argparse.Namespace) -> int:
             getattr(args, "expect_assignments_json", None)
         )
     except ValueError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
-        return 64
+        raise RequestValidationError(str(exc), "invalid_assignments") from exc
 
     if (
         isinstance(expect_revision, bool)
         or not isinstance(expect_revision, int)
         or expect_revision < 0
     ):
-        print("错误: mutation 必须提供非负 --expect-revision", file=sys.stderr)
-        return 64
+        raise RequestValidationError("mutation 必须提供非负 --expect-revision", "invalid_precondition",
+                                     missing_fields=["expect_revision"] if expect_revision is None else [])
 
     target_kind = "none"
     target_id: str | None = None
     if command[0] in {"cancel", "retry", "resubmit"}:
         if len(command) < 2:
-            print("错误: mutation 缺少目标", file=sys.stderr)
-            return 64
+            raise RequestValidationError("mutation 缺少目标", "missing_target")
         target_id = command[1]
         target_kind = "task" if ":" in target_id else "batch"
     elif command[0].startswith("gpu-"):
         if len(command) < 2:
-            print("错误: GPU mutation 缺少目标", file=sys.stderr)
-            return 64
+            raise RequestValidationError("GPU mutation 缺少目标", "missing_target")
         target_id = command[1]
         target_kind = "gpu"
 
     if target_kind != expect_kind or (
         target_kind != "none" and target_id != expect_id
     ):
-        print("错误: mutation precondition 与命令目标不匹配", file=sys.stderr)
-        return 64
+        raise RequestValidationError("mutation precondition 与命令目标不匹配", "target_mismatch",
+                                     missing_fields=["expect_id"] if target_kind != "none" and not expect_id else [])
     if expect_kind == "none":
         if (
             expect_revision != 0
@@ -4148,16 +4211,16 @@ def cmd_request(args: argparse.Namespace) -> int:
                 )
             )
         ):
-            print("错误: 无目标 mutation 只接受 --expect-revision 0", file=sys.stderr)
-            return 64
+            raise RequestValidationError("无目标 mutation 只接受 --expect-revision 0", "invalid_precondition")
     elif (
         not isinstance(expect_id, str)
         or not expect_id
         or not isinstance(expect_status, str)
         or not expect_status
     ):
-        print("错误: mutation precondition 字段不完整", file=sys.stderr)
-        return 64
+        raise RequestValidationError("mutation precondition 字段不完整", "missing_precondition",
+                                     missing_fields=[name for name, value in
+                                                     (("expect_id", expect_id), ("expect_status", expect_status)) if not value])
     if expect_kind == "task" and (
         not isinstance(expect_version, int)
         or isinstance(expect_version, bool)
@@ -4165,30 +4228,27 @@ def cmd_request(args: argparse.Namespace) -> int:
         or not isinstance(expect_id, str)
         or expect_id.count(":") != 1
     ):
-        print("错误: task mutation precondition 无效", file=sys.stderr)
-        return 64
+        raise RequestValidationError("task mutation precondition 无效", "invalid_precondition",
+                                     missing_fields=["expect_version"] if expect_version is None else [])
     if expect_kind != "task" and expect_version is not None:
-        print("错误: 非 task mutation 不接受 version precondition", file=sys.stderr)
-        return 64
+        raise RequestValidationError("非 task mutation 不接受 version precondition", "invalid_precondition")
     if expect_kind == "gpu" and (
         not isinstance(expect_id, str)
         or not expect_id.isdigit()
         or expect_assignments is None
     ):
-        print("错误: GPU mutation precondition 无效", file=sys.stderr)
-        return 64
+        raise RequestValidationError("GPU mutation precondition 无效", "invalid_precondition",
+                                     missing_fields=["expect_assignments_json"] if expect_assignments is None else [])
     if expect_kind != "gpu" and (
         expect_quarantined is not None or expect_assignments is not None
     ):
-        print("错误: 非 GPU mutation 不接受 GPU precondition", file=sys.stderr)
-        return 64
+        raise RequestValidationError("非 GPU mutation 不接受 GPU precondition", "invalid_precondition")
     if expect_quarantined is not None and (
         not isinstance(expect_quarantined, int)
         or isinstance(expect_quarantined, bool)
         or expect_quarantined not in {0, 1}
     ):
-        print("错误: GPU quarantined precondition 无效", file=sys.stderr)
-        return 64
+        raise RequestValidationError("GPU quarantined precondition 无效", "invalid_precondition")
 
     expectation = {
         "kind": expect_kind,
@@ -4203,12 +4263,48 @@ def cmd_request(args: argparse.Namespace) -> int:
         value = getattr(args, "expect_" + key, None)
         if value is not None:
             if not isinstance(value, str) or not value or value.startswith("-") or any(c.isspace() for c in value):
-                print("错误: invalid identity/project precondition", file=sys.stderr)
-                return 64
+                raise RequestValidationError("invalid identity/project precondition", "invalid_precondition")
             if key == "project" and expect_kind not in {"batch", "task"}:
-                print("错误: project precondition requires a batch or task", file=sys.stderr)
-                return 64
+                raise RequestValidationError("project precondition requires a batch or task", "invalid_precondition")
             expectation[key] = value
+    # Parse the exact nested command, but never invoke its handler. The same
+    # parser executes mutations later; preflight does not promise CAS success.
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            _build_parser().parse_args(command)
+        except SystemExit as exc:
+            raise RequestValidationError("mutation 命令参数无效", "invalid_command") from exc
+    return request_id, command, expectation
+
+
+def cmd_request_validate(args) -> int:
+    try:
+        request_id, command, expectation = _request_envelope(args)
+    except RequestValidationError as error:
+        return _request_rejection(args, error)
+    from .integration import CONTRACTS, canonical
+    import hashlib
+    output = {"schema_version": 1, "contract": CONTRACTS["request_validation"],
+              "request_id": request_id, "valid": True, "code": 0,
+              "binding_sha256": hashlib.sha256(canonical({"command": command, "expect": expectation}).encode()).hexdigest(),
+              "target_kind": expectation["kind"], "state_checked": False,
+              "dispatch_entered": False, "request_record_created_this_invocation": False,
+              "effect_of_this_invocation": "none"}
+    print(json.dumps(output, ensure_ascii=False) if args.json else "请求格式有效；未检查当前态，未预占 RID")
+    return 0
+
+
+def cmd_request(args: argparse.Namespace) -> int:
+    """Execute a mutation once with revision-bound durable replay."""
+    try:
+        request_id, command, expectation = _request_envelope(args)
+    except RequestValidationError as error:
+        return _request_rejection(args, error)
+    expect_kind, expect_id = expectation["kind"], expectation["id"]
+    expect_status, expect_version = expectation["status"], expectation["version"]
+    expect_revision, expect_quarantined = expectation["revision"], expectation["quarantined"]
+    expect_assignments = expectation["assignments"]
+    target_kind, target_id = expect_kind, expect_id
     argv_json = json.dumps(
         {"command": command, "expect": expectation},
         ensure_ascii=True,
@@ -4223,39 +4319,69 @@ def cmd_request(args: argparse.Namespace) -> int:
         if load_ticket(request_id) is not None:
             return {"argv": "different submission", "status": "done", "code": 64}
         return conn.execute(
-            "SELECT argv, status, code, stdout, stderr, output_compacted"
+            "SELECT argv, status, code, stdout, stderr, output_compacted, result_json"
             " FROM operation_requests WHERE request_id=?",
             (request_id,),
         ).fetchone()
+
+    def emit(code, result_json, *, replayed=False, dispatch_entered=False):
+        from .integration import CONTRACTS
+        print(json.dumps({"schema_version": 1, "contract": CONTRACTS["request_result"],
+                          "request_id": request_id, "phase": "done", "code": code,
+                          "replayed": replayed, "result": json.loads(result_json) if result_json else None,
+                          "dispatch_entered": dispatch_entered,
+                          "request_record_created_this_invocation": not replayed,
+                          "effect_of_this_invocation": "none" if replayed or not dispatch_entered else "see_receipt"}, ensure_ascii=False))
+
+    def conflict_result(conn, conflict):
+        from .integration import canonical, mutation_result
+        result = json.loads(mutation_result(conn, command, 65, target_kind, target_id))
+        result["error"] = {"reason_code": "precondition_conflict", "stage": "precondition",
+                           "message": conflict["message"], "conflict_reason": conflict["reason_code"],
+                           "actual": conflict["actual"], "target_kind": target_kind,
+                           "expected": expectation, "dispatch_entered": False,
+                           "request_record_created_this_invocation": True,
+                           "effect_of_this_invocation": "none"}
+        return canonical(result)
 
     def replay(existing) -> int | None:
         if existing is None:
             return None
         if existing["argv"] != argv_json:
-            print(
-                "错误: request_id 已绑定到不同 mutation",
-                file=sys.stderr,
-            )
-            return 64
+            return _request_rejection(args, RequestValidationError(
+                "request_id 已绑定到不同 mutation", "request_binding_mismatch"))
         if existing["status"] != "done":
             print(
                 "错误: prior mutation outcome unknown; refusing replay",
                 file=sys.stderr,
             )
+            if getattr(args, "json", False):
+                from .integration import CONTRACTS
+                print(json.dumps({"schema_version": 1, "contract": CONTRACTS["request_result"],
+                                  "request_id": request_id, "phase": "unknown", "code": 75,
+                                  "reason_code": "prior_outcome_unknown", "result": None,
+                                  "dispatch_entered": False, "request_record_created_this_invocation": False,
+                                  "effect_of_this_invocation": "none"}))
             return 75
-        sys.stdout.write(existing["stdout"] or "")
+        if getattr(args, "json", False):
+            emit(int(existing["code"]), existing["result_json"], replayed=True)
+        else:
+            sys.stdout.write(existing["stdout"] or "")
         sys.stderr.write(existing["stderr"] or "")
         return int(existing["code"])
 
-    def precondition_conflict(conn: sqlite3.Connection) -> str | None:
+    def precondition_conflict(conn: sqlite3.Connection) -> dict | None:
+        def changed(reason, message, actual=None):
+            return {"reason_code": reason, "message": message, "actual": actual}
+
         from .integration import instance_id
         if "instance" in expectation and instance_id(conn) != expectation["instance"]:
-            return "scheduler instance changed"
+            return changed("instance_changed", "scheduler instance changed", {"instance": instance_id(conn)})
         if "project" in expectation:
             batch = expect_id.split(":", 1)[0] if expect_kind == "task" else expect_id
             owner = conn.execute("SELECT project FROM batches WHERE id=?", (batch,)).fetchone()
             if owner is None or owner[0] != expectation["project"]:
-                return "scheduler project changed"
+                return changed("project_changed", "scheduler project changed", {"project": owner[0] if owner else None})
         if expect_kind == "none":
             return None
         if expect_kind == "batch":
@@ -4264,17 +4390,17 @@ def cmd_request(args: argparse.Namespace) -> int:
                 (expect_id,),
             ).fetchone()
             if row is None:
-                return "batch absent"
+                return changed("target_absent", "batch absent")
             if row["status"] != expect_status:
-                return (
+                return changed("status_changed", (
                     f"batch status changed: expected {expect_status},"
                     f" found {row['status']}"
-                )
+                ), dict(row))
             if row["revision"] != expect_revision:
-                return (
+                return changed("revision_changed", (
                     f"batch revision changed: expected {expect_revision},"
                     f" found {row['revision']}"
-                )
+                ), dict(row))
             return None
         if expect_kind == "task":
             batch_id, task_id = expect_id.split(":", 1)
@@ -4286,46 +4412,46 @@ def cmd_request(args: argparse.Namespace) -> int:
                 (batch_id, task_id),
             ).fetchone()
             if row is None:
-                return "task absent"
+                return changed("target_absent", "task absent")
             actual_status = {
                 "waiting_quota": "pending",
                 "waiting_dep": "pending",
             }.get(row["status"], row["status"])
             if actual_status != expect_status or row["version"] != expect_version:
-                return (
+                return changed("task_changed", (
                     f"task changed: expected {expect_status} v{expect_version},"
                     f" found {actual_status} v{row['version']}"
-                )
+                ), {**dict(row), "status": actual_status})
             if row["revision"] != expect_revision:
-                return (
+                return changed("revision_changed", (
                     f"batch revision changed: expected {expect_revision},"
                     f" found {row['revision']}"
-                )
+                ), {**dict(row), "status": actual_status})
             return None
         row = conn.execute(
             "SELECT status, quarantined, revision FROM gpus WHERE idx=?",
             (int(expect_id),),
         ).fetchone()
         if row is None:
-            return "GPU absent"
+            return changed("target_absent", "GPU absent")
         if row["status"] != expect_status:
-            return (
+            return changed("status_changed", (
                 f"GPU status changed: expected {expect_status},"
                 f" found {row['status']}"
-            )
+            ), dict(row))
         if (
             expect_quarantined is not None
             and row["quarantined"] != expect_quarantined
         ):
-            return (
+            return changed("quarantine_changed", (
                 "GPU quarantine changed:"
                 f" expected {expect_quarantined}, found {row['quarantined']}"
-            )
+            ), dict(row))
         if row["revision"] != expect_revision:
-            return (
+            return changed("revision_changed", (
                 f"GPU revision changed: expected {expect_revision},"
                 f" found {row['revision']}"
-            )
+            ), dict(row))
         assignments = [
             {"job_id": item["job_id"], "vram_gib": item["vram_gib"]}
             for item in conn.execute(
@@ -4335,10 +4461,10 @@ def cmd_request(args: argparse.Namespace) -> int:
             ).fetchall()
         ]
         if assignments != expect_assignments:
-            return (
+            return changed("assignments_changed", (
                 "GPU assignments changed:"
                 f" expected {expect_assignments}, found {assignments}"
-            )
+            ), {**dict(row), "assignments": assignments})
         return None
 
     unbound = command[0] in {"daemon", "config"}
@@ -4358,25 +4484,33 @@ def cmd_request(args: argparse.Namespace) -> int:
                 (request_id, argv_json, state.now()),
             )
             if conflict is not None:
-                stderr = f"错误: mutation precondition failed: {conflict}\n"
+                stderr = f"错误: mutation precondition failed: {conflict['message']}\n"
+                result_json = conflict_result(conn, conflict)
                 conn.execute(
                     "UPDATE operation_requests SET status='done', code=65,"
-                    " stdout='', stderr=?, finished_at=? WHERE request_id=?",
-                    (stderr, state.now(), request_id),
+                    " stdout='', stderr=?, finished_at=?, result_json=? WHERE request_id=?",
+                    (stderr, state.now(), result_json, request_id),
                 )
+                if getattr(args, "json", False):
+                    emit(65, result_json)
                 sys.stderr.write(stderr)
                 return 65
 
         code, stdout, stderr, _callbacks = _run_captured_mutation(command)
         with state.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            from .integration import mutation_result
+            result_json = mutation_result(conn, command, code, target_kind, target_id)
             conn.execute(
                 "UPDATE operation_requests"
-                " SET status='done', code=?, stdout=?, stderr=?, finished_at=?"
+                " SET status='done', code=?, stdout=?, stderr=?, finished_at=?, result_json=?"
                 " WHERE request_id=? AND status='started'",
-                (code, stdout, stderr, state.now(), request_id),
+                (code, stdout, stderr, state.now(), result_json, request_id),
             )
-        sys.stdout.write(stdout)
+        if getattr(args, "json", False):
+            emit(code, result_json, dispatch_entered=True)
+        else:
+            sys.stdout.write(stdout)
         sys.stderr.write(stderr)
         return code
 
@@ -4398,7 +4532,7 @@ def cmd_request(args: argparse.Namespace) -> int:
         if conflict is not None:
             code = 65
             stdout = ""
-            stderr = f"错误: mutation precondition failed: {conflict}\n"
+            stderr = f"错误: mutation precondition failed: {conflict['message']}\n"
         else:
             conn.execute("SAVEPOINT request_mutation")
             code, stdout, stderr, deferred = _run_captured_mutation(command, conn)
@@ -4407,7 +4541,8 @@ def cmd_request(args: argparse.Namespace) -> int:
                 deferred.clear()
             conn.execute("RELEASE request_mutation")
         from .integration import mutation_result
-        result_json = mutation_result(conn, command, code, target_kind, target_id)
+        result_json = (conflict_result(conn, conflict) if conflict is not None else
+                       mutation_result(conn, command, code, target_kind, target_id))
         conn.execute(
             "UPDATE operation_requests"
             " SET status='done', code=?, stdout=?, stderr=?, finished_at=?, result_json=?"
@@ -4421,7 +4556,10 @@ def cmd_request(args: argparse.Namespace) -> int:
             effect()
         except Exception as exc:
             print(f"警告: mutation 已提交，但提交后副作用失败: {exc}", file=sys.stderr)
-    sys.stdout.write(stdout)
+    if getattr(args, "json", False):
+        emit(code, result_json, dispatch_entered=conflict is None)
+    else:
+        sys.stdout.write(stdout)
     sys.stderr.write(stderr)
     return code
 
@@ -4430,10 +4568,54 @@ def cmd_integration_query(args) -> int:
     from . import integration
     state.set_read_only(True)
     try:
-        output = integration.identity() if args._subcommand == "identity" else integration.request_status(args.request_id)
+        if args._subcommand == "identity":
+            output = integration.identity()
+        else:
+            wait_sec = getattr(args, "wait_sec", 0)
+            if not math.isfinite(wait_sec) or not 0 <= wait_sec <= 60:
+                raise ValueError("--wait-sec 必须是 0..60 的有限秒数")
+            expected = getattr(args, "expect_instance", None)
+            if expected is not None and not re.fullmatch(r"[0-9a-f]{32}", expected):
+                raise ValueError("--expect-instance 必须是 32 位小写十六进制实例 ID")
+            deadline = time.monotonic() + wait_sec
+            previous: dict[str, dict] = {}
+            observed_instance = None
+            while True:
+                many = args._subcommand == "request-status-many"
+                output = (integration.request_status_many(args.request_ids) if many
+                          else integration.request_status(args.request_id))
+                current_instance = output["instance_id"]
+                if expected is not None and current_instance != expected:
+                    raise ValueError("scheduler instance unavailable or changed")
+                if observed_instance is not None and current_instance != observed_instance:
+                    raise ValueError("scheduler instance changed during wait")
+                observed_instance = current_instance
+                rows = output["requests"] if many else [output]
+                for row in rows:
+                    prior = previous.get(row["request_id"])
+                    if prior and prior["found"] and not row["found"]:
+                        observed_at = row["observed_at"]
+                        row.update(prior)
+                        row.update(observation_incomplete=True, query_observed_at=observed_at,
+                                   reason_code="prior_receipt_evidence_retained")
+                    if prior and prior["found"] and row["found"] and prior["binding_sha256"] != row["binding_sha256"]:
+                        raise ValueError("request binding changed during wait")
+                    previous[row["request_id"]] = dict(row)
+                settled = all(row["phase"] == "done" and not row.get("observation_incomplete", False) for row in rows)
+                remaining = deadline - time.monotonic()
+                output["wait_timed_out"] = bool(wait_sec and not settled and remaining <= 0)
+                if settled or remaining <= 0:
+                    break
+                # Each query closes its snapshot before sleeping. No writer,
+                # open transaction, submit, or RID change occurs in this loop.
+                time.sleep(min(0.5, remaining))
         print(json.dumps(output, ensure_ascii=False))
         return 0
-    except (state.StateError, ValueError) as error:
+    except (state.StateError, ValueError, OSError) as error:
+        if args._subcommand != "identity":
+            print(json.dumps({"schema_version": 1, "query": "request_status_error",
+                              "reason_code": "invalid_query" if isinstance(error, ValueError) else "query_unavailable",
+                              "code": 1, "observation_complete": False}))
         print(f"错误: {error}", file=sys.stderr)
         return 1
     finally:
@@ -4460,9 +4642,7 @@ def cmd_version(args) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    state.set_read_only(False)
-    state.set_query_only(False)
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="sched", description=f"sched v{__version__} 统一任务调度框架"
     )
@@ -4477,12 +4657,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="structured version and schema compatibility")
     p.set_defaults(fn=cmd_version)
 
-    for query in ("identity", "request-status"):
+    for query in ("identity", "request-status", "request-status-many"):
         p = sub.add_parser(query, help="read-only integration identity or receipt")
         if query == "request-status":
             p.add_argument("request_id")
+        if query == "request-status-many":
+            p.add_argument("request_ids", nargs="+")
+        if query != "identity":
+            p.add_argument("--wait-sec", type=float, default=0, help="只读等待原回执，0..60 秒；不重投")
+            p.add_argument("--expect-instance", help="验证查询实例，不匹配时拒绝继续等待")
         p.add_argument("--json", action="store_true")
         p.set_defaults(fn=cmd_integration_query)
+
+    p = sub.add_parser("artifact-check", help="计算节点只读检查当前产物，不复验结算或重训")
+    p.add_argument("task", help="<batch-id-or-name>:<task>")
+    p.add_argument("--version", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_artifact_check)
 
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
@@ -4674,29 +4865,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_gpu_free)
 
-    p = sub.add_parser(
-        "request",
-        help="以 durable request_id 最多执行一次 mutation",
-    )
-    p.add_argument("request_id")
-    p.add_argument(
-        "--expect-kind",
-        choices=["none", "batch", "task", "gpu"],
-        default="none",
-    )
-    p.add_argument("--expect-id")
-    p.add_argument("--expect-instance")
-    p.add_argument("--expect-project")
-    p.add_argument("--expect-status")
-    p.add_argument("--expect-version", type=int)
-    p.add_argument("--expect-quarantined", type=int, choices=[0, 1])
-    p.add_argument("--expect-revision", type=int, required=True)
-    p.add_argument(
-        "--expect-assignments-json",
-        help='GPU 当前 assignments JSON，如 [{"job_id":"j","vram_gib":1.5}]',
-    )
-    p.add_argument("command", nargs="+")
-    p.set_defaults(fn=cmd_request)
+    for request_command in ("request", "request-validate"):
+        p = sub.add_parser(request_command, help="幂等 mutation" if request_command == "request" else "只校验完整请求格式，不读写 state")
+        p.add_argument("request_id")
+        p.add_argument("--expect-kind", choices=["none", "batch", "task", "gpu"], default="none")
+        p.add_argument("--expect-id")
+        p.add_argument("--expect-instance")
+        p.add_argument("--expect-project")
+        p.add_argument("--expect-status")
+        p.add_argument("--expect-version", type=int)
+        p.add_argument("--expect-quarantined", type=int, choices=[0, 1])
+        p.add_argument("--expect-revision", type=int)
+        p.add_argument("--expect-assignments-json", help='GPU 当前 assignments JSON，如 [{"job_id":"j","vram_gib":1.5}]')
+        p.add_argument("--json", action="store_true", help="结构化结果；不改变请求绑定")
+        p.add_argument("command", nargs="+")
+        p.set_defaults(fn=cmd_request if request_command == "request" else cmd_request_validate)
 
     p = sub.add_parser("daemon", help="daemon 生命周期")
     p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume", "foreground"])
@@ -4727,14 +4910,26 @@ def main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--json", action="store_true", help="结构化项目 GPU 访问策略与用量")
     p_list.set_defaults(fn=cmd_project_list)
 
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    state.set_read_only(False)
+    state.set_query_only(False)
+    ap = _build_parser()
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
         ap.print_help()
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check"}:
         return args.fn(args)
+    if command == "request":
+        try:
+            _request_envelope(args)
+        except RequestValidationError as error:
+            return _request_rejection(args, error)
     daemon_action = getattr(args, "action", None) if command == "daemon" else None
     daemon_write_action = daemon_action
     if command == "request":

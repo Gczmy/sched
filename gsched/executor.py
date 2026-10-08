@@ -624,16 +624,20 @@ def _artifact_validation_command(
     cwd: str,
     *,
     paths_escape: bool,
+    stage_index: int | None = None,
 ) -> str:
     """Build a shell-safe post-stage validator command."""
     package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     program = (
         "import json,sys;"
         "sys.path.insert(0,sys.argv[1]);"
-        "from gsched.artifacts import all_pass,check_artifacts;"
+        "from gsched.artifacts import inspect_artifacts;"
         "rules=json.loads(sys.argv[2]);"
-        "sys.exit(0 if all_pass(check_artifacts("
-        "rules,sys.argv[3],paths_escape=sys.argv[4]=='1')) else 1)"
+        "checks=inspect_artifacts(rules,sys.argv[3],paths_escape=sys.argv[4]=='1');"
+        "print('[sched] artifact_check '+json.dumps({'schema_version':1,"
+        "'event':'stage_artifact_check','stage_index':json.loads(sys.argv[5]),"
+        "'checks':checks},ensure_ascii=True,separators=(',',':')),flush=True);"
+        "sys.exit(0 if all(row['passed'] for row in checks.values()) else 1)"
     )
     argv = [
         sys.executable,
@@ -644,6 +648,7 @@ def _artifact_validation_command(
         json.dumps(artifacts, ensure_ascii=True, separators=(",", ":")),
         cwd,
         "1" if paths_escape else "0",
+        json.dumps(stage_index),
     ]
     return " ".join(shlex.quote(argument) for argument in argv)
 
@@ -1043,6 +1048,7 @@ class Executor:
                     artifacts,
                     cwd,
                     paths_escape=stage.get("paths_escape", False),
+                    stage_index=i,
                 )
                 if fingerprint and stage_checkpoint_dir:
                     sidecar_path = os.path.join(

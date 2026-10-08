@@ -33,6 +33,7 @@ from .artifacts import (
     bounded_regex_last_match,
     check_artifacts,
     check_declared_artifacts,
+    inspect_declared_artifacts,
     unlink_artifact,
 )
 from .allocator import Allocator
@@ -2293,6 +2294,8 @@ class Dispatcher:
             new_cfg = load_config(
                 self._config_path, apply_runtime_state=False
             )
+            from .config import validate_gpu_affinity_pool
+            validate_gpu_affinity_pool(new_cfg)
             old_gpu_list, old_mem, _ = parse_gpus(self.cfg)
             new_gpu_list, new_mem, new_mj = parse_gpus(new_cfg)
             old_native_roots = getattr(
@@ -3464,9 +3467,7 @@ class Dispatcher:
                     self.log_line(
                         f"job {j['id']} ready probe 存量 spec 非法: {exc}"
                     )
-                if spec is not None and check_declared_artifacts(
-                    spec, spec.get("cwd_abs") or "."
-                ):
+                if spec is not None and self._completion_artifacts_valid(j, spec, "probe_ready"):
                     state.update_job(
                         conn,
                         j["id"],
@@ -3532,9 +3533,7 @@ class Dispatcher:
             except ValueError as exc:
                 spec = None
                 self.log_line(f"job {j['id']} 存量 spec 非法, 产物验证失败: {exc}")
-            if spec is not None and check_declared_artifacts(
-                spec, spec.get("cwd_abs") or "."
-            ):
+            if spec is not None and self._completion_artifacts_valid(j, spec, "exit_zero"):
                 state.update_job(conn, j["id"], status="done", rc=rc,
                                  finished_at=state.now())
                 self.log_line(f"job {j['id']} done rc=0 产物校验通过")
@@ -3567,6 +3566,22 @@ class Dispatcher:
         self._release_gpu_for_job(conn, j)
         self._maybe_retry(conn, j)
         return cleanup_paths
+
+    def _completion_artifacts_valid(self, job, spec, context) -> bool:
+        """Retain original per-rule observations in the existing daemon log.
+
+        These are diagnostic observations, not a durable validation/settlement
+        authority. No artifact content or raw regex match is written.
+        """
+        identity = dict(job)
+        details = inspect_declared_artifacts(spec, spec.get("cwd_abs") or ".")
+        for detail in details:
+            observation = {"schema_version": 1, "event": "artifact_check",
+                           "job_id": identity["id"], "batch_id": identity.get("batch_id"),
+                           "task_id": identity.get("task_id"), "version": identity.get("version"),
+                           "context": context, "observed_at": state.now(), **detail}
+            self.log_line("artifact_check " + json.dumps(observation, ensure_ascii=True, separators=(",", ":")))
+        return all(detail["passed"] for detail in details)
 
     def _record_recovery_settlement(self, conn, job, outcome, authority):
         try:
