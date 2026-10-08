@@ -41,7 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。写 schema 为 10，完整只读范围为 1–10；0.3.1 不兼容新写库。
+没有新增参数的旧 request 绑定保持原样。当前失败隔离源码候选写 schema 11，完整只读范围为 1–11；
+已发布 0.4.0 写 schema 10，不能回接 schema 11。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 ## 1. 心智模型
 
@@ -79,12 +80,33 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 | `project` | str | ✅ | 项目名，必须在 config.projects 注册 |
 | `mode` | str | ✗ | `mix`（缺省）；旧 `strict` 只识别历史持久态，不接受新提交 |
 | `priority` | int | ✗ | 项目内批次优先级，默认 0；整数越大越先考虑 |
+| `failure_policy` | str | ✗ | 源码候选：`freeze`（默认）或 `continue_independent`；网关与 daemon 均须支持 `sched-batch-policy-v1` |
 | `cwd` | str | ✗ | 缺省为该批次的 project root；支持 `{ROOT}`/`{PROJECT:name}`/`{VENV:key}` 模板 |
 | `env` | obj | ✗ | 字符串环境变量映射（最终覆盖，优先级高于自动注入）；变量名/值必须安全，shell bootstrap 与动态加载注入变量会被拒绝 |
 | `depends_on` | [str] | ✗ | 上游批次名数组；每项同样须为安全标识符，上游 done 前挂起 |
 | `force_rerun` | bool | ✗ | true = 全部任务绕过任务 SKIP 与 stage checkpoint |
 | `notify` | bool/obj | ✗ | 覆盖通知配置 |
 | `sweep` | obj | ✗ | `{matrix:{参数:[值]},max_parallel:N}` 笛卡尔积展开 |
+
+候选失败策略不改变 task 终态或原始执行事实。默认 `freeze` 在任一最新任务失败时
+冻结后续派发，running 不自动取消。`continue_independent` 仅对显式启用的批次生效：
+最新 pending/running/interrupted、旧 running、未决启动 marker 或非终态 execution attempt
+尚存时保持 active，允许其余可派发任务继续；最终有失败仍 blocked，不把部分成功标为 done。
+此阶段没有任务 DAG，任务之间的科学依赖必须由客户控制，不能把它当作依赖隔离功能。
+
+`sched batch-policy <batch-ref> --json` 使用私有只读快照查询策略，不初始化/迁移 state；
+schema 10 及以前返回 `freeze` 和 `source:legacy_default`。新策略不追加到现有严格
+status/task/history JSON，使用独立合同 `sched-batch-policy-v1`。
+写操作必须在计算节点通过完整 batch ID、状态和 revision 的 `sched request` CAS 执行：
+
+```bash
+sched request policy-01 --json --expect-kind batch --expect-id example-20261008000000000 --expect-status blocked --expect-revision 17 -- batch-policy example-20261008000000000 --failure-policy continue_independent --yes --reopen
+```
+
+省略 `--reopen` 只改变策略，不重开旧 blocked；`--reopen` 仅允许有最新 pending/等待/running
+的 blocked 批次和 `continue_independent`，不重试失败任务、不生成新 version。done/discarded
+和历史 strict 批次禁止修改；queued 可修改策略但不绕过依赖解锁。策略变化递增 revision（同值不递增），
+同 RID 原绑定重放只返回原回执。失败策略不放宽主机、租约、原执行身份或未知启动守卫。
 
 ### 任务级
 
@@ -335,6 +357,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `run --project P [--gpus 1\|--cpu-only] [--cpus N] [--duration MIN] [--cwd DIR] [--out PATH] [--venv NAME] [--dry-run] -- cmd...` | 单条命令提交 | 非 dry-run 仅计算节点；不用 inbox；批次 priority 固定 0 |
 | `status [batch-ref] [--project P] [--detail] [--json] [--limit N] [--cursor TOKEN] [--job-cursor TOKEN]` | 最新版本当前态 | 缺省 200，钳制到 1..1000；`--cursor` 翻批次页，`--job-cursor` 独立翻任务页 |
 | `task <batch-ref>:<task> [--json]` | 单任务全部版本详情 | `--json` 输出单一、版本化 JSON 文档 |
+| `batch-policy <batch-ref> [--json]` | 候选失败策略只读查询 | 写操作只能经 batch CAS 的 request；`--failure-policy freeze\|continue_independent --yes`，可显式 `--reopen` |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
 | `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |
@@ -400,7 +423,7 @@ screen/租约被删除但 daemon 仍存活，它不会自动绑定后续新租�
 - `daemon status --json` 是不打开数据库的只读查询，输出 `schema_version:1` 与和 `status.daemon_health` 相同的健康字段：`node`、`query_host`、`pid`、`observed_at`（Unix 秒）、`process_state`（`running/stopped/unknown`）、`health_state`（`healthy/delayed/stalled/stopped/unknown`）、`heartbeat_age_s`、`tick_ok_age_s`、`frozen`、`draining`、`read_error`。年龄不可读或不存在时为 null；`read_error` 为 null、`health_file_unreadable` 或 `timestamp_in_future`。同物理节点且 lease 与进程启动标识一致才确认进程存活，跨节点不探测本机同号 PID。原进程退出/被复用或目标本机确认 lease、PID、心跳均不存在才确认 stopped。健康要求心跳 <60 秒且成功 tick ≤90 秒；tick >90 秒为 stalled，心跳新鲜不能掩盖 tick 停滞；已确认 stopped 与读错误优先。draining 是独立派发状态，不覆盖健康故障。这个查询结果只用于展示，不改变生命周期、租约或写操作校验。
 - 看板 daemon 提示必须消费结构化健康数据；不解析中文展示文本。SSH/API 错误、格式错误、缓存过期或浏览器本地 TTL 到期均显示状态未知并禁用 daemon 操作；旧采样可保留供查看。只有新鲜且确认 stopped 的状态可启用 start，不能把心跳过期当成启动依据。旧 CLI 不支持该 JSON 命令时提示未知，需配套升级查询 CLI。
 - 配置的 `node` 本机执行 `status/task/history/diag/log/list-gpus` 等数据库查询时，先以私有只读快照核验 schema 版本、必需对象/列与 WAL 文件头；完整、私有的 v1–v7 WAL 库均直接进入私有快照上的 `mode=ro + query_only` 查询，不对源库执行迁移或 writer 事务。0.2.1写 schema 为 7，保留不可变 execution owner binding，新增独立确认队列与已记录健康；旧库写操作会迁移。快照遇到 daemon 写突发时最多重试 8 次并做有界退避（累计 sleep 上限 1.585 秒）；首次建库、缺损 schema、非 WAL 库或权限漂移仍进入带有界锁重试的现有 writer 初始化路径。高于当前版本的库在本机与网关查询都 fail-closed。纯文件查询 `markers`、`notify-inbox`、`daemon status` 以及 `config get` 不检查或打开数据库。混版部署时，必须先由用户人工完成旧 daemon 切换，再运行 `init_db` 或任何可能触发迁移的写命令；只读查询不会代替这个部署步骤。
-- `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop/drain/resume` 与 `config set`；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
+- `request` 只包装 `submit`、`cancel`、`retry`、`resubmit`、`gpu-free`、`gpu-ignore`、`gpu-ok`、`daemon start/stop/drain/resume`、`config set` 和候选 `batch-policy` 写操作；未列出的 mutation 有意 fail-closed。`gpu-set-mem` 是重启时会被 `config.gpus` 或硬件探测覆盖、且未纳入 revision/CAS 的临时 state/list-gpus 记录，不由 `request` 包装。每次 request 都必须提供非负 `--expect-revision`；无目标的 submit/daemon/config 使用 `0`。task/batch 绑定所属 batch 的 `revision`，其中目标必须使用完整 batch ID（不能用批次名）；GPU 绑定自己的 `revision`，且 GPU 必须额外传 `--expect-assignments-json`（与 status 返回的已排序数组完全一致）。被包装命令使用规范顺序：目标紧跟子命令，选项随后。revision 由 SQLite trigger 在批次状态/候选失败策略、task/job 代际与 job 状态变化，以及 GPU 状态/quarantine/ignore 确认/assignment、`gpu_jobs` membership/装箱值变化时递增，所以状态值绕一圈回到原值的 ABA 仍返回 65。task 示例：`sched request retry-42 --expect-kind task --expect-id batch-20260829-000000:train --expect-status failed --expect-version 1 --expect-revision 17 -- retry batch-20260829-000000:train`。GPU 示例：`sched request gpu-42 --expect-kind gpu --expect-id 0 --expect-status assigned --expect-quarantined 0 --expect-revision 9 --expect-assignments-json '[{"job_id":"batch-task-v1","vram_gib":1.5}]' -- gpu-free 0 --yes`。
 - 对数据库 mutation，业务写入与 ledger 的 done/code/output 在一个外层事务中原子提交；嵌套 submit/retry/resubmit 的 `commit()` 被外层事务接管，daemon 唤醒只在提交后发生，marker 由 daemon 按数据库权威状态协调。`retry`/`resubmit` 的最终事务、`clean` 的发布重跑阶段以及 `cancel` 的任务分类与写入，都会在读取权威状态前取得 SQLite writer claim，防止 daemon 在状态校验与首个 job/task mutation 之间收敛或派发任务。daemon 的节点重启恢复、接管终态判定与重试发布也使用同一 writer 顺序；已落库的 cancel request 或 `kill_reason=cancelled` 永远优先于自动重试/恢复回队。`daemon start/stop/drain/resume` 与 `config set` 不绑定 SQLite 事务，进程中断留下 started 时返回 75，拒绝猜测外部结果。相同 request-id 和完全相同绑定重放已保存退出码/输出而不重复执行；绑定变化返回 64，前置条件冲突返回 65。stdout/stderr 捕获各自最多 2 MiB；旧 done 输出定期压缩为 tombstone（清空输出但永久保留 argv 绑定与退出码），因此 tombstone 重放保持退出码且不重复 mutation，但不再重放旧文本。
 - 本地 `submit` 与网关 inbox payload 都可在 submission gate 外做预览校验和计算指纹，但最终写入前必须在同一 gate 内按最新同名代际重验依赖存在性、完整依赖图、批次 ID 与同名终态，并原子提交批次/任务/job（inbox 同时提交请求回执）。因此并发提交不能分别基于旧快照发布 `A → B`、`B → A` 环，也不会在 `clean` 两阶段之间或 `retry`/`resubmit` 事务中途插入第二个同名非终态批次；反向顺序会在重开旧批次前拒绝已有的同名非终态实例，`clean` 在删产物前和发布重跑前各重验一次。daemon 退出门禁生效时 payload 与 pending 请求保留供恢复后重试。
 - state 根目录优先级：`SCHED_STATE` > 已加载的 `config.state_dir` > `~/.sched`。相对 `config.state_dir` 以 bootstrap config 所在目录为基准解析；`node` 必须是安全的单一路径分量。共享 state 上的登录节点查询仍定位 `config.node` 的节点目录。
@@ -413,7 +436,7 @@ screen/租约被删除但 daemon 仍存活，它不会自动绑定后续新租�
 任务:  pending → running → done / failed / blocked / cancelled / timed_out / interrupted
        pending → skip (指纹命中, 与成功等价)
 批次:  queued → active → done | blocked (等 retry/resubmit)
-       blocked → active (retry 或 resubmit)
+       blocked → active (retry/resubmit，或候选 batch-policy 显式 --reopen)
        done → active (resubmit，或 clean 确有最新 skip 重排)
        blocked/queued → discarded (退役终态, 不可 retry/resubmit)
 GPU:   free → assigned → releasing → free; 外部占用 → unmanaged; 连续健康异常 → quarantined

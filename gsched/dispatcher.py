@@ -1275,7 +1275,7 @@ class Dispatcher:
         """P1: 批次终态. done = 全部任务成功终态 (done/skip);
         任一 failed/blocked/cancelled/timed_out -> blocked (interrupted 除外 R4).
 
-        blocked 只能由 retry/resubmit 显式重开；done 可由 resubmit，或确有
+        blocked 只能由 retry/resubmit 或 CAS batch-policy --reopen 显式重开；done 可由 resubmit，或确有
         最新 skip 重排的 clean 显式重开。daemon 不根据历史遗留的
         pending/waiting 行猜测人工意图。"""
         marker_effects: list[tuple[str, str, str, str, str | None]] = []
@@ -1313,6 +1313,22 @@ class Dispatcher:
                     " LIMIT 1",
                     (b["id"], b["id"]),
                 ).fetchone()
+                from .batch_policy import failure_policy
+                if b["status"] == "active" and failure_policy(b) == "continue_independent":
+                    # Latest unfinished tasks keep independent dispatch active;
+                    # every generation's unknown execution/launch facts also
+                    # prevent *both* successful and failed terminal publication.
+                    unfinished = any(s not in ("done", "skip", "failed", "blocked", "cancelled", "timed_out")
+                                     for s in statuses)
+                    if unfinished or stale_running:
+                        continue
+                    unknown_attempt = conn.execute(
+                        "SELECT 1 FROM execution_attempts e JOIN jobs j ON j.id=e.job_id"
+                        " WHERE j.batch_id=? AND e.phase NOT IN ('exited','not_started') LIMIT 1",
+                        (b["id"],),
+                    ).fetchone()
+                    if unknown_attempt or self._batch_has_unresolved_launch_marker(conn, b["id"]):
+                        continue
                 nominal_terminal_success = all(
                     status in ("done", "skip") for status in statuses
                 )
@@ -2696,6 +2712,7 @@ class Dispatcher:
                                     norm.get("notify"),
                                     norm.get("project"),
                                     norm.get("priority", 0),
+                                    failure_policy=norm["failure_policy"],
                                 )
                                 for (
                                     i2,

@@ -623,6 +623,11 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
     mode = spec.get("mode", "mix")
     if mode != "mix":
         raise SchemaError("legacy mode=strict is retired; use a configured execution backend")
+    from .batch_policy import validate_failure_policy
+    try:
+        failure_policy = validate_failure_policy(spec.get("failure_policy", "freeze"))
+    except ValueError as error:
+        raise SchemaError(str(error)) from error
     try:
         reserved = native_exec_reserved_batch_names(cfg)
     except NativeExecProfileError as error:
@@ -756,6 +761,7 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
     return {
         "name": name,
         "mode": mode,
+        "failure_policy": failure_policy,
         "depends_on": depends_on,
         "cwd": spec.get("cwd", "{ROOT}"),
         "cwd_abs": batch_cwd_abs,

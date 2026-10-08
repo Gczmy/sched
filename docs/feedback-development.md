@@ -8,27 +8,38 @@
 
 第一阶段源码提交 `5c9a170` 加入产物逐项诊断、`json_equals`、只读
 `artifact-check`、请求格式/JSON 拒绝、同 RID 有界等待/多 RID 查询与
-GPU 池/硬亲和交叉校验。包版本仍为 0.4.0、DB schema 10，不能仅凭
-版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
+GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；后续阶段 3 候选写 schema 11。
+包版本仍为 0.4.0，不能仅凭版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
 
 该提交的 [CI](https://github.com/Gczmy/sched/actions/runs/37845958558) 失败：
 九个 Python/native 回归矩阵均为同一处路由 fixture 未携带完整取消前置条件。
 `ba5e5e7` 只补齐 fixture 的 kind/id/status，不放宽 CLI 校验；29 项相关
-本地回归通过。该修复的完整 CI 仍须独立核对。
+本地回归通过。`ba5e5e7` 的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37846875009)
+14 项均通过。
 
 新增 [Linux CLI 验收](../tests/run_feedback_accept.py) 经真实 CPU 子进程检查
 rc=0、有效/无效 JSON、类型不匹配、regex no-match/timeout、缺失文件，
 以及只读检查不改状态/版本/文件/启动次数、同 RID、CAS 拒绝、查询和重启。
 所有调度器操作走 CLI；临时 state 与生产隔离。纳入 CI 不代表已经通过。
+`de43077` 的 [CI](https://github.com/Gczmy/sched/actions/runs/37848312749) 因验收脚本
+在首次 tick 前把 queued 等待误判为 draining 而失败；`f7d561d` 修正状态/CAS 断言，
+其 [独立 CI](https://github.com/Gczmy/sched/actions/runs/37849442135) 14 项均通过，包含新增
+CPU/CLI 验收、default/native 独立安装与四组候选构建；这仍不等于 HPDC 验收或部署。
 它不模拟真实 SSH，不代替网关 delivered/落盘延迟/断线的跨主机验收，
 也不证明真实 CUDA、持久 backend 或历史失败的根因。
+
+阶段 3 源码候选增加默认 freeze/opt-in continue_independent、私有只读 batch-policy、
+request CAS 策略变更与显式重开。写库升级至 schema 11，旧批次默认 freeze；不改写旧
+状态、任务、wait/身份、未知尝试与回执。独立任务继续派发不代表支持 DAG。
+[CPU/CLI 失败隔离验收](../tests/run_batch_policy_accept.py) 已纳入候选 CI，
+尚未取得该候选的完整 Linux CI 或计算节点证据，不代表发布或生产已升级。
 
 ## 完整阶段与完成依据
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
 | 2 | 已提交修复验收 | 进行中 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
-| 3 | opt-in 独立失败策略 | 未实现 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
+| 3 | opt-in 独立失败策略 | 源码候选、验收中 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
 | 4 | 不可变 artifact validation | 未实现 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
 | 5 | 仅复验及重新结算 | 未实现 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
 | 6 | 精确依赖 | 未实现 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
@@ -42,7 +53,7 @@ rc=0、有效/无效 JSON、类型不匹配、regex no-match/timeout、缺失文
 | ND-03 | CPU auto 容量 | 未实现 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
 | 硬隔离 | per-job affinity/cgroup | 未实现 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
-阶段 3–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
+阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。
 客户端负责替代 spec/RID 冻结、reservation、lineage 与跨系统恢复，
 不把客户台账或科学 gate 引入 daemon；单实例 pending-replace 依需求评估。

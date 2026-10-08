@@ -775,6 +775,7 @@ def _cmd_submit_impl(args: argparse.Namespace) -> int:
                 conn, bid, norm["name"], norm["mode"], norm["depends_on"],
                 None, norm["cwd"], norm["env"], norm.get("notify"),
                 norm.get("project"), norm.get("priority", 0),
+                failure_policy=norm["failure_policy"],
             )
         except sqlite3.IntegrityError:
             # M13: 并发 submit 同时通过定案 6 检查 -> 撞主键, 转友好错误
@@ -1574,6 +1575,74 @@ def cmd_status(args: argparse.Namespace) -> int:
     if memory:
         print(f"=== 主机内存 ===\n  声明预留 {memory['used_gib']:g} / {memory['total_gib']:g} GiB")
     return 0
+
+
+def cmd_batch_policy(args: argparse.Namespace) -> int:
+    """Read policy without migrating, or mutate within a CAS-bound request."""
+    from .batch_policy import failure_policy, validate_failure_policy
+    from .integration import CONTRACTS, instance_id
+    writing = args.failure_policy is not None
+    if writing and state._bound_connection.get() is None:
+        print("错误: batch-policy 写操作必须通过完整 batch CAS 的 sched request", file=sys.stderr)
+        return 64
+    if not writing and args.reopen:
+        print("错误: --reopen 需要 --failure-policy continue_independent", file=sys.stderr)
+        return 64
+    if writing and not args.yes:
+        print("未确认: batch-policy 写操作需要 --yes", file=sys.stderr)
+        return 1
+    state.set_read_only(not writing)
+    try:
+        cfg = load_config()
+        if writing and _is_foreign_host(cfg) and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1":
+            print("错误: batch-policy 写操作必须在配置的计算节点执行", file=sys.stderr)
+            return 2
+        with state.connect() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
+            batch_id = args.batch if writing else _resolve_batch_ref(args.batch, conn)
+            batch = state.get_batch(conn, batch_id)
+            if batch is None:
+                print("错误: 批次不存在", file=sys.stderr)
+                return 65 if writing else 1
+            stored = "failure_policy" in batch.keys()
+            if writing:
+                policy = validate_failure_policy(args.failure_policy)
+                if not stored:
+                    raise state.StateError("batch-policy 写操作需要 schema 11")
+                if batch["mode"] != "mix":
+                    print("错误: 历史 strict 批次不能通过 batch-policy 修改或重开", file=sys.stderr)
+                    return 65
+                if batch["status"] not in ("queued", "active", "blocked"):
+                    print("错误: 终态/退役批次不能修改 failure_policy", file=sys.stderr)
+                    return 65
+                if args.reopen:
+                    eligible = conn.execute(
+                        "SELECT 1 FROM jobs j WHERE batch_id=? AND status IN ('pending','waiting_quota','waiting_dep','running')"
+                        " AND version=(SELECT MAX(j2.version) FROM jobs j2"
+                        " WHERE j2.batch_id=j.batch_id AND j2.task_id=j.task_id) LIMIT 1", (batch_id,),
+                    ).fetchone()
+                    if policy != "continue_independent" or batch["status"] != "blocked" or not eligible:
+                        print("错误: --reopen 仅适用于有未完成任务的 blocked 批次和 continue_independent", file=sys.stderr)
+                        return 65
+                conn.execute("UPDATE batches SET failure_policy=?,status=? WHERE id=?",
+                             (policy, "active" if args.reopen else batch["status"], batch_id))
+                batch = state.get_batch(conn, batch_id)
+            output = {"schema_version": 1, "query": "batch_policy", "contract": CONTRACTS["batch_policy"],
+                      "instance_id": instance_id(conn), "batch_id": batch_id, "project": batch["project"],
+                      "batch_revision": batch["revision"], "status": batch["status"],
+                      "failure_policy": failure_policy(batch), "source": "stored" if stored else "legacy_default",
+                      "effect": "policy_updated" if writing else "none", "task_dag_supported": False}
+        if args.json:
+            print(json.dumps(output, ensure_ascii=False))
+        else:
+            print(f"{batch_id}: failure_policy={output['failure_policy']} status={output['status']} revision={output['batch_revision']}")
+        return 0
+    except (ValueError, ConfigError, state.StateError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
 
 
 def cmd_artifact_check(args: argparse.Namespace) -> int:
@@ -4142,6 +4211,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
         "gpu-ok",
         "daemon",
         "config",
+        "batch-policy",
     }
     if not command or command[0] not in allowed:
         raise RequestValidationError("request 只允许调度器 mutation 子命令", "unsupported_mutation")
@@ -4186,6 +4256,10 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
             raise RequestValidationError("mutation 缺少目标", "missing_target")
         target_id = command[1]
         target_kind = "task" if ":" in target_id else "batch"
+    elif command[0] == "batch-policy":
+        if len(command) < 2:
+            raise RequestValidationError("batch-policy 缺少目标", "missing_target")
+        target_kind, target_id = "batch", command[1]
     elif command[0].startswith("gpu-"):
         if len(command) < 2:
             raise RequestValidationError("GPU mutation 缺少目标", "missing_target")
@@ -4271,9 +4345,11 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
     # parser executes mutations later; preflight does not promise CAS success.
     with contextlib.redirect_stderr(io.StringIO()):
         try:
-            _build_parser().parse_args(command)
+            parsed = _build_parser().parse_args(command)
         except SystemExit as exc:
             raise RequestValidationError("mutation 命令参数无效", "invalid_command") from exc
+    if command[0] == "batch-policy" and parsed.failure_policy is None:
+        raise RequestValidationError("request batch-policy 需要 --failure-policy", "unsupported_mutation")
     return request_id, command, expectation
 
 
@@ -4865,6 +4941,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_gpu_free)
 
+    p = sub.add_parser("batch-policy", help="只读查询批次失败策略；写操作经 request CAS")
+    p.add_argument("batch")
+    p.add_argument("--failure-policy", choices=["freeze", "continue_independent"])
+    p.add_argument("--reopen", action="store_true", help="显式重开有未完成任务的 blocked 批次，不重试失败任务")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_batch_policy)
+
     for request_command in ("request", "request-validate"):
         p = sub.add_parser(request_command, help="幂等 mutation" if request_command == "request" else "只校验完整请求格式，不读写 state")
         p.add_argument("request_id")
@@ -4923,7 +5007,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "batch-policy"}:
         return args.fn(args)
     if command == "request":
         try:

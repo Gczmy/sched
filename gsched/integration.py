@@ -23,6 +23,7 @@ CONTRACTS = {
     "request_result": "sched-request-result-v1",
     "artifact_check": "sched-artifact-check-v1",
     "artifact_rules": "sched-artifact-rules-v2",
+    "batch_policy": "sched-batch-policy-v1",
 }
 
 
@@ -81,6 +82,9 @@ def mutation_result(conn, command, code, kind, target):
         row = conn.execute("SELECT project, revision, status FROM batches WHERE id=?", (target,)).fetchone()
         if row:
             result["effect"] = {"batch_id": target, "project": row[0], "batch_revision": row[1], "status": row[2]}
+            if command[0] == "batch-policy":
+                result["effect"]["failure_policy"] = conn.execute(
+                    "SELECT failure_policy FROM batches WHERE id=?", (target,)).fetchone()[0]
     return canonical(result)
 
 

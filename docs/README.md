@@ -7,7 +7,7 @@
 | --- | --- |
 | [开发与提交检查](../CONTRIBUTING.md) | 公共 CI、隐私检查与本地提交钩子 |
 | [reference.md](reference.md) | 配置、CLI、JSON、状态机与写操作契约 |
-| [integration-contract.md](integration-contract.md) | 实例身份、结构化回执、幂等提交及候选等待/请求/产物诊断接口 |
+| [integration-contract.md](integration-contract.md) | 实例身份、结构化回执、幂等提交及候选等待/请求/产物诊断/批次失败策略接口 |
 | [sqlite-lock-safety.md](sqlite-lock-safety.md) | SQLite 锁修复、事务诊断与旧 schema 回补边界 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [execution-boundary.md](execution-boundary.md) | 通用执行层、项目 adapter 和独立发布边界 |

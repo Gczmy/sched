@@ -44,7 +44,39 @@ The original four contracts and phase values remain unchanged. `version --json`
 also advertises `sched-request-status-many-v1`, `sched-request-validation-v1`,
 `sched-request-result-v1`, `sched-artifact-check-v1` and
 `sched-artifact-rules-v2`. Negotiate these capabilities on the actual receiving
-CLI/daemon deployment before using new commands/rules. Database schema remains 10.
+CLI/daemon deployment before using new commands/rules. These diagnostic extensions
+alone use schema 10; the subsequent failure-isolation candidate uses schema 11.
+
+### Candidate batch failure policy
+
+The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
+uses schema 11 (read range 1–11); released 0.4.0 cannot open this new writer state.
+Migration adds `batches.failure_policy` with default `freeze` and a monotonic
+revision trigger, without rewriting status, job versions, execution identity,
+unknown attempts, receipts or instance identity. Migration is atomic.
+
+New submissions may opt into `failure_policy:continue_independent`. Default
+freeze semantics remain unchanged. Independent dispatch continues while latest
+unfinished tasks, old running generations or unresolved launch/attempt facts
+remain; final partial failure still settles blocked. There is no task DAG yet.
+Old blocked batches are never automatically reopened.
+
+`batch-policy BATCH --json` returns a private read-only snapshot with
+schema_version, query=batch_policy, contract, instance_id, batch_id, project,
+batch_revision, status, failure_policy, source, effect and task_dag_supported=false.
+Old schemas return freeze/source=legacy_default without migration. Current
+status/task/history schemas and strict field sets remain unchanged.
+
+Policy updates require `request` with batch kind, full ID, current status and
+revision, then `batch-policy ID --failure-policy POLICY --yes`. Instance/project
+expectations remain available. The policy and receipt commit in one transaction;
+policy changes increment revision, same-value updates do not. The receipt effect
+for this command also reports failure_policy. CAS 65 and same-RID replay retain
+the original result. Direct writes are rejected with 64 before state access.
+Changing policy alone never reopens blocked. Explicit `--reopen` requires
+continue_independent, blocked and a latest pending/waiting/running task; it does
+not retry failed tasks, create versions, cancel running or infer unknown waits.
+Done/discarded and historical strict policy updates are rejected; queued updates do not unlock dependencies.
 
 Receipt queries add `receipt_source` (database/ticket/null),
 `receipt_persisted`, nullable `delivery_confirmed` and `batch_persisted`,

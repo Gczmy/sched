@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS batches (
   created_at  TEXT NOT NULL,
   project     TEXT,
   priority    INTEGER NOT NULL DEFAULT 0,
-  revision    INTEGER NOT NULL DEFAULT 0
+  revision    INTEGER NOT NULL DEFAULT 0,
+  failure_policy TEXT NOT NULL DEFAULT 'freeze'
+    CHECK(failure_policy IN ('freeze','continue_independent'))
 );
 CREATE INDEX IF NOT EXISTS idx_batches_name_created
   ON batches(name, created_at DESC);
@@ -212,7 +214,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 10
+DB_SCHEMA_VERSION = 11
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -241,6 +243,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "scheduler_identity_immutable", "scheduler_identity_retained",
         "submission_request_immutable", "submission_request_retained",
         "revision_batch_status",
+        "revision_batch_failure_policy",
         "revision_task_insert",
         "revision_task_delete",
         "revision_task_membership",
@@ -273,7 +276,7 @@ _REQUIRED_MIGRATED_COLUMNS = {
                                    "retry_after", "last_cleanup_at", "cleanup_error", "acknowledged_at", "acknowledgement"},
     "execution_owners": {"job_id", "binding"},
     "execution_attempts": {"attempt_id", "job_id", "job_version", "backend_id", "backend_config_sha256", "phase", "identity", "observation", "cancel_reason", "created_at", "launch_intent_at", "finished_at"},
-    "batches": {"notify", "project", "priority", "revision"},
+    "batches": {"notify", "project", "priority", "revision", "failure_policy"},
     "tasks": {"project"},
     "jobs": {"project", "progress"},
     "native_sessions": {
@@ -539,6 +542,9 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 11:
+        required_objects["trigger"].discard("revision_batch_failure_policy")
+        required_columns["batches"].discard("failure_policy")
     if version < 10:
         required_objects["table"].difference_update({"scheduler_identity", "submission_requests"})
         required_objects["trigger"].difference_update({"scheduler_identity_immutable", "scheduler_identity_retained"})
@@ -1063,6 +1069,7 @@ def _initialize_database() -> None:
         migrate_native_session_log_attempts(conn)
         migrate_native_monitor_launch_attempts(conn)
         migrate_revisions(conn)
+        migrate_batch_failure_policy(conn)
         migrate_legacy_job_statuses(conn)
         if needs_owner_backfill:
             migrate_owner_operations(conn)
@@ -1229,6 +1236,18 @@ def migrate_native_monitor_launch_attempts(conn: sqlite3.Connection) -> None:
         "  AND NEW.monitor_launch_attempted_at IS NOT OLD.monitor_launch_attempted_at"
         " BEGIN SELECT RAISE(ABORT, 'native monitor launch intent is immutable'); END;"
     )
+
+
+def migrate_batch_failure_policy(conn: sqlite3.Connection) -> None:
+    """Schema 11: existing batches keep freeze; no status/history backfill."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+    if "failure_policy" not in columns:
+        conn.execute("ALTER TABLE batches ADD COLUMN failure_policy TEXT NOT NULL DEFAULT 'freeze'"
+                     " CHECK(failure_policy IN ('freeze','continue_independent'))")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS revision_batch_failure_policy"
+                 " AFTER UPDATE OF failure_policy ON batches"
+                 " WHEN OLD.failure_policy IS NOT NEW.failure_policy"
+                 " BEGIN UPDATE batches SET revision=revision+1 WHERE id=NEW.id; END")
 
 
 def migrate_revisions(conn: sqlite3.Connection) -> None:
@@ -1697,12 +1716,15 @@ def insert_batch(
     notify: Any = None,
     project: str | None = None,
     priority: int = 0,
+    failure_policy: str = "freeze",
 ) -> None:
     import json
+    from .batch_policy import validate_failure_policy
+    validate_failure_policy(failure_policy)
 
     conn.execute(
-        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project,priority)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO batches (id,name,mode,depends_on,gpus,cwd,env,notify,status,created_at,project,priority,failure_policy)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             bid,
             name,
@@ -1716,6 +1738,7 @@ def insert_batch(
             now(),
             project,
             priority,
+            failure_policy,
         ),
     )
 
