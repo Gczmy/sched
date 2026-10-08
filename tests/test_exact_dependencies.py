@@ -295,7 +295,7 @@ class ExactDependencyTests(TempStateCase):
         self.assertEqual("legacy_name", result["dependencies"][0]["kind"])
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(14, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(identity, instance_id(conn))
             self.assertEqual("[]", state.get_batch(conn, "child-1")["depends_on_exact"])
             self.assertEqual(before, state.get_batch(conn, "child-1")["revision"])

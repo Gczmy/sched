@@ -753,6 +753,16 @@ def validate_batch(spec: dict, cfg: dict, *, check_gpu_access: bool = True) -> d
             raise SchemaError(f"tasks[{i}].recovery: {error}") from error
         norm_tasks.append(nt)
 
+    try:
+        from . import task_dependencies
+        for raw, normalized in zip(tasks, norm_tasks):
+            for key in ("depends_on", "depends_on_exact"):
+                if key in raw:
+                    normalized[key] = raw[key]
+        task_dependencies.validate_input(norm_tasks)
+    except ValueError as error:
+        raise SchemaError(str(error)) from error
+
     if check_gpu_access:
         validate_project_gpu_access(cfg, project, norm_tasks)
 

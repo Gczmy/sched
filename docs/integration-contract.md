@@ -74,12 +74,24 @@ status/task/history fields remain unchanged: status.batches.depends_on contains
 legacy names only, not the complete dependency set. Consumers must negotiate the
 new query to see exact bindings. See [reference](reference.md).
 
+The subsequent task DAG candidate writes schema 15 (complete reads 1–15) and adds
+`sched-task-dependencies-v1`. Local task/version and external exact selectors are
+frozen only on acceptance, never rebound by resubmit. `dependency-update` accepts
+bounded inline JSON through task/instance CAS request, updates only a never-started
+current pending version and appends an immutable linked event. Graph cycle checks,
+event, revision and receipt are atomic; replay/unknown rules are unchanged.
+Recorded blocking paths do not probe artifacts/markers or grant dispatch authority;
+batch gates are queried separately. Existing status/task/history field sets stay
+unchanged, including raw task status versus displayed status.wait_reason. Consumers
+must negotiate the independent contract before claiming full task DAG visibility.
+
 ### Candidate batch failure policy
 
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
 introduced schema 11; the later artifact-validation candidate writes 12 (read
 range 1–12); the subsequent revalidation candidate writes 13 (reads 1–13).
-The later exact-dependency candidate writes 14 (reads 1–14).
+The later exact-dependency candidate writes 14 (reads 1–14); the subsequent task
+DAG candidate writes 15 (reads 1–15).
 Released 0.4.0 cannot open these new writer states.
 Migration adds `batches.failure_policy` with default `freeze` and a monotonic
 revision trigger, without rewriting status, job versions, execution identity,
@@ -88,12 +100,14 @@ unknown attempts, receipts or instance identity. Migration is atomic.
 New submissions may opt into `failure_policy:continue_independent`. Default
 freeze semantics remain unchanged. Independent dispatch continues while latest
 unfinished tasks, old running generations or unresolved launch/attempt facts
-remain; final partial failure still settles blocked. There is no task DAG yet.
+remain; final partial failure still settles blocked. This policy alone creates no
+task DAG; the subsequent schema 15 contract above adds explicit frozen task edges.
 Old blocked batches are never automatically reopened.
 
 `batch-policy BATCH --json` returns a private read-only snapshot with
 schema_version, query=batch_policy, contract, instance_id, batch_id, project,
-batch_revision, status, failure_policy, source, effect and task_dag_supported=false.
+batch_revision, status, failure_policy, source, effect and task_dag_supported
+(true only if the task dependency event table is available in this snapshot).
 Old schemas return freeze/source=legacy_default without migration. Current
 status/task/history schemas and strict field sets remain unchanged.
 

@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前精确依赖源码候选写 schema 14，完整只读范围为 1–14；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验候选写 11/12/13，都不能回接 schema 14。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前任务 DAG 源码候选写 schema 15，完整只读范围为 1–15；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖候选写 11/12/13/14，都不能回接 schema 15。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched artifact-validations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 只读查询首次验证摘要；`--validation-id ID` 读取同任务/版本的一条完整冻结证据，与 cursor
@@ -55,6 +55,61 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 证据重新结算。code=0 表示事件提交，须检查 effect.settled，不等于任务成功。
 `artifact-revalidations <batch>:<task> --json` 只读查询事件，`--event-id ID` 读取一条完整证据；
 有限系统退避、显式重开和全部守卫见 [仅产物复验](artifact-revalidation.md)。
+
+## 候选任务 DAG 与受审计依赖更新（schema 15）
+
+任务可使用 `depends_on:[{"task_id":"a","version":1}]` 指定同批次来源，
+以及任务级 `depends_on_exact` 指定已有同实例来源（格式同批次 exact）。新批次
+本地来源只接受存在的 task/version 1，允许前向引用，拒绝重复和环。接受事务在
+所有任务插入后冻结来源 instance/batch/task/version、job/spec/fingerprint，以及
+目标 job/spec；目标运行时缓存指纹仍按现有启动/clean 合同更新，不重绑来源。
+随后检查包含任务边、精确批次门槛及旧动态名称门槛的混合图。
+环检查最多 100,000 个 job/batch 节点及 100,000 条边，超限拒绝，不将部分检查当作通过。
+
+派发、实际启动及 SKIP 前复用批次 exact 的来源核验：当前声明产物、公开执行的
+原始 wait/cleanup、所有代际运行/未知 attempt/旧 session/launch marker 都影响准入。
+任务未满足时为 `status --json` 的 `pending` / `wait_reason:dependency`；
+task/history 保持其原始 waiting_dep 状态合同。不自动取消 running。
+`continue_independent` 下 A→C、B→D 的 A 失败仍允许 B/D 执行，C 等待原 A v1。
+默认 `freeze` 仍冻结整个批次；等待依赖的任务尚存时 opt-in 批次保持 active。
+retry 的同版本可能改变来源当前态，但 resubmit/同名新批次从不替换固定选择；
+resubmit 继承生效的冻结来源，不隐式改为 latest。
+任务 SKIP 的生产者还必须具有相同任务/精确批次绑定；改变选择不会复用旧绑定
+生产的指纹成功态。旧名称兼容缓存不因此改成精确选择，科学输入仍须反映在任务规范中。
+
+`sched task-dependencies <batch>:<task> [--version N] --json` 使用独立合同
+`sched-task-dependencies-v1`。返回当前冻结清单/摘要、当前与上一事件 ID，以及已记录
+失败源/路径；`--event-id <id>` 返回该版本的一条不可变历史事件，不授予执行权。
+默认 limit=100，允许 1..1000；cursor 是 0..10000 的实时偏移量。路径最多 32 层、
+每个被访问 job 保留一条路径，不枚举所有路径；depth_truncated 单独表示深度截断。
+游标容量不足时 truncated=true、next_cursor=null、cursor_limit_reached=true，不能当成完整结果。
+批次级门槛须另查 batch-dependencies。续页、来源状态和目标 revision 独立变化，
+不得合并成完整当前态。查询不读产物/marker，不迁移；记录成功仍需派发时重新检查。
+现有 status/task/history 严格字段保持，status 中 depends_on 仍只列旧批次名称。
+
+依赖更新只能通过完整 task/instance CAS request：
+
+```sh
+sched request <request-id> --json --expect-kind task --expect-id <batch-id>:c \
+  --expect-status pending --expect-version 1 --expect-revision <revision> \
+  --expect-instance <instance-id> -- dependency-update <batch-id>:c \
+  --dependencies-json '<exact-source-list>' --yes
+```
+
+输入是最多 64 KiB 的**内联** exact JSON，不是文件路径；字节与命令一起绑定原 RID。
+使用完整 batch ID 和精确来源 version；`[]` 显式解除任务自身依赖，但不解除批次门槛。
+只更新当前未启动的 pending 版本：拒绝已有 start/pgid/retries/rc、当前 attempt、
+任一代际运行/未知 attempt/旧 session/marker、活跃或不可知进程组、当前分配或待处理控制请求，以及旧执行元数据。
+CAS、来源冻结、环检查、事件、revision 与 request 回执同事务；失败回滚事件/变更，
+保留拒绝回执。新事件链接旧事件，原 spec 和原始批次 exact 列不被覆盖。不训练、
+不删产物、不创建新任务版本、不终止任务；同 RID replay 不增加事件，unknown 仍为 75。
+direct 调用/缺少 instance 为 64，冲突为 65；网关拒绝，即使设置 foreign-write。
+`--reopen` 只显式重开 continue_independent 的 blocked 批次，不重试任何失败任务。
+
+schema 15 仅新增 append-only task_dependency_events、索引、保留触发器与 revision
+触发器。迁移不回填/绑定旧任务、名称、wait 或科学事实，现代等待态和未知回执保留。
+旧库 query 仍为只读、task_dag_supported=false；有声明但无接受绑定时不授予派发权。
+能力取决于实际 schema/命名合同，不依赖尚未变更的包版本号。
 
 ## 1. 心智模型
 
@@ -105,7 +160,7 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 冻结后续派发，running 不自动取消。`continue_independent` 仅对显式启用的批次生效：
 最新 pending/running/interrupted、旧 running、未决启动 marker 或非终态 execution attempt
 尚存时保持 active，允许其余可派发任务继续；最终有失败仍 blocked，不把部分成功标为 done。
-此阶段没有任务 DAG，任务之间的科学依赖必须由客户控制，不能把它当作依赖隔离功能。
+失败策略本身不创建任务 DAG；后续 schema 15 的任务依赖见前文。科学依赖/验收仍由客户控制。
 
 `sched batch-policy <batch-ref> --json` 使用私有只读快照查询策略，不初始化/迁移 state；
 schema 10 及以前返回 `freeze` 和 `source:legacy_default`。新策略不追加到现有严格
@@ -165,7 +220,7 @@ schema 10 及以上写升级不归一化已有等待态或递增对应 revision�
 原 status/task/history 字段集不变；status.batches.depends_on **仅含旧名称条件**，
 不能据其为空断言无依赖，完整依赖须协商新合同后查询。配套旧插件仍能解析 status，
 但没有 exact 依赖展示，插件功能独立开发。这里仍是批次级门槛，不是任务 DAG；
-受审计的依赖更新与任务失败路径属于后续阶段。
+后续 schema 15 的受审计任务依赖更新与失败路径见前文，批次原始 exact 列仍不可覆盖。
 
 ### 任务级
 
@@ -178,6 +233,8 @@ schema 10 及以上写升级不归一化已有等待态或递增对应 revision�
 | `env` | obj | ✗ | 任务级安全字符串环境变量（最终覆盖）；与批次级采用同一注入变量拒绝规则 |
 | `duration_min` | num | 推荐 | 有限正数分钟；超时看门狗 kill |
 | `max_retry` | int | ✗ | 自动重试次数（缺省 1；0=失败即 blocked）|
+| `depends_on` | [obj] | ✗ | 候选任务 DAG：本批次显式 task_id/version，初始只允许 version 1；不使用名称 latest |
+| `depends_on_exact` | [obj] | ✗ | 候选任务 DAG：已有同实例 instance/batch/task/version 来源，接受时冻结 |
 | `resources.gpu` | 0/1 | ✗ | 0=CPU-only；缺省占 1 GPU |
 | `resources.gpu_share` | bool | ✗ | true=允许共享装箱（需全局 co_locate 开启）|
 | `resources.vram_gib` | num | 共卡必填 | 峰值显存声明（GiB）；独占时用于容量校验 |
@@ -418,6 +475,8 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `task <batch-ref>:<task> [--json]` | 单任务全部版本详情 | `--json` 输出单一、版本化 JSON 文档 |
 | `batch-policy <batch-ref> [--json]` | 候选失败策略只读查询 | 写操作只能经 batch CAS 的 request；`--failure-policy freeze\|continue_independent --yes`，可显式 `--reopen` |
 | `batch-dependencies <batch-ref> [--json]` | 候选精确绑定/动态名称事实 | 私有只读快照，不检查产物或 marker；--limit 1..1000，实时 --cursor 非负偏移量 |
+| `task-dependencies <batch>:<task> [--json]` | 候选任务 DAG/已记录阻塞路径 | --version/--event-id；有界路径不替代派发核验，批次门槛另查 |
+| `dependency-update <batch>:<task> --dependencies-json '<list>' --yes` | 候选受审计依赖更新 | 仅计算节点 task/instance CAS request；未启动版本、事务环检查、不可变历史 |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
 | `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |

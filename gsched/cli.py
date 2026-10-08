@@ -813,6 +813,9 @@ def _cmd_submit_impl(args: argparse.Namespace) -> int:
                 "runtime_prefix": t.get("runtime_prefix"),
             }
             _persist_native_exec_metadata(t, spec_json)
+            for key in ("depends_on", "depends_on_exact"):
+                if key in t:
+                    spec_json[key] = t[key]
             state.insert_task(
                 conn, bid, t["id"], 1, spec_json, i,
                 norm.get("project"),
@@ -821,6 +824,11 @@ def _cmd_submit_impl(args: argparse.Namespace) -> int:
                 conn, f"{bid}-{t['id']}-v1", bid, t["id"], 1,
                 fp, stage_fps, norm.get("project"),
             )
+        from .task_dependencies import bind_new_batch
+        try:
+            bind_new_batch(conn, bid)
+        except (ValueError, TypeError, RecursionError) as error:
+            raise state.StateError(f"任务依赖接受失败: {error}") from error
         if ticket is not None:
             from .integration import complete_submission
             complete_submission(conn, ticket, {"outcome": "accepted", "batch_id": bid,
@@ -1641,7 +1649,7 @@ def cmd_batch_policy(args: argparse.Namespace) -> int:
                       "instance_id": instance_id(conn), "batch_id": batch_id, "project": batch["project"],
                       "batch_revision": batch["revision"], "status": batch["status"],
                       "failure_policy": failure_policy(batch), "source": "stored" if stored else "legacy_default",
-                      "effect": "policy_updated" if writing else "none", "task_dag_supported": False}
+                      "effect": "policy_updated" if writing else "none", "task_dag_supported": _task_dag_available(conn)}
         if args.json:
             print(json.dumps(output, ensure_ascii=False))
         else:
@@ -1678,7 +1686,7 @@ def cmd_batch_dependencies(args: argparse.Namespace) -> int:
                       "binding_sha256": digest({"legacy": json.loads(batch["depends_on"] or "[]"), "exact": dependencies.stored(batch)}),
                       "dependencies": selected, "total": len(facts), "truncated": more,
                       "next_cursor": args.cursor + len(selected) if more else None,
-                      "effect": "none", "external_artifacts_checked": False, "task_dag_supported": False}
+                      "effect": "none", "external_artifacts_checked": False, "task_dag_supported": _task_dag_available(conn)}
             output["launch_markers_checked"] = False
         if args.json:
             print(json.dumps(output, ensure_ascii=False))
@@ -1686,6 +1694,83 @@ def cmd_batch_dependencies(args: argparse.Namespace) -> int:
             print(f"{batch_id}: {output['total']} dependency facts; recorded state only")
         return 0
     except (ValueError, TypeError, ConfigError, state.StateError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
+def _task_dag_available(conn):
+    from .task_dependencies import available
+    return available(conn)
+
+
+def _dependency_selectors(raw):
+    from .dependencies import normalize
+    if not isinstance(raw, str) or len(raw.encode()) > 64 * 1024:
+        raise ValueError("dependencies-json 超过 64 KiB 上限")
+    return normalize(json.loads(raw))
+
+
+def cmd_dependency_update(args):
+    from . import task_dependencies
+    if state._bound_connection.get() is None or task_dependencies.request_id.get() is None:
+        print("错误: dependency-update 必须通过完整 task CAS 的 request", file=sys.stderr)
+        return 64
+    if not args.yes:
+        print("未确认: dependency-update 需要 --yes", file=sys.stderr)
+        return 1
+    try:
+        cfg = load_config()
+        if _is_foreign_host(cfg):
+            raise ValueError("dependency-update 必须在配置的计算节点执行")
+        batch, task = args.task.split(":", 1)
+        with state.connect() as conn:
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1", (batch, task)).fetchone()
+            if job is None:
+                raise ValueError("任务不存在")
+            event_id = task_dependencies.update(conn, job, _dependency_selectors(args.dependencies_json), reopen=args.reopen)
+        print(json.dumps({"dependency_event_id": event_id}))
+        return 0
+    except (ValueError, TypeError, state.StateError, ConfigError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 65
+
+
+def cmd_task_dependencies(args):
+    from . import task_dependencies
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        load_config()
+        if not 1 <= args.limit <= 1000 or not 0 <= args.cursor <= 10_000 or (args.version is not None and args.version < 1):
+            raise ValueError("limit 需 1..1000、cursor 需 0..10000、version 需正整数")
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch_ref, task = args.task.split(":", 1)
+            batch = _resolve_batch_ref(batch_ref, conn)
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=?" + (" AND version=?" if args.version else "") + " ORDER BY version DESC LIMIT 1",
+                               (batch, task, args.version) if args.version else (batch, task)).fetchone()
+            if job is None:
+                raise ValueError("任务不存在")
+            if args.event_id:
+                if args.cursor:
+                    raise ValueError("event-id 与 cursor 互斥")
+                event = conn.execute("SELECT * FROM task_dependency_events WHERE event_id=? AND job_id=?", (args.event_id, job["id"])).fetchone() if task_dependencies.available(conn) else None
+                if event is None:
+                    raise ValueError("该任务版本没有此依赖事件")
+                latest = task_dependencies.latest(conn, job)
+                result = {"event": task_dependencies.decode_event(event), "effective": latest["event_id"] == event["event_id"],
+                          "external_artifacts_checked": False, "launch_markers_checked": False}
+            else:
+                result = task_dependencies.facts(conn, job, limit=args.limit, cursor=args.cursor)
+            result.update(schema_version=1, contract=CONTRACTS["task_dependencies"], query="task_dependencies",
+                          instance_id=instance_id(conn), batch_id=batch, task_id=task, version=job["version"],
+                          batch_revision=state.get_batch(conn, batch)["revision"], effect="none",
+                          task_dag_supported=task_dependencies.available(conn), dispatch_ready=None)
+        print(json.dumps(result, ensure_ascii=False) if args.json else f"{batch}:{task}: recorded task dependency facts")
+        return 0
+    except (ValueError, TypeError, state.StateError, ConfigError, RecursionError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
     finally:
@@ -2946,6 +3031,16 @@ def cmd_resubmit(args: argparse.Namespace) -> int:
                 project,
             )
             labels.append(f"{task_id}->v{new_version}")
+        from . import task_dependencies
+        try:
+            for prepared in prepared_specs:
+                old = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=? AND version=?",
+                                   (batch, prepared["task_id"], prepared["old_version"])).fetchone()
+                new = state.get_job(conn, f"{batch}-{prepared['task_id']}-v{prepared['new_version']}")
+                task_dependencies.inherit(conn, old, new)
+            task_dependencies.validate_cycles(conn, [f"{batch}-{p['task_id']}-v{p['new_version']}" for p in prepared_specs])
+        except (ValueError, TypeError, RecursionError) as error:
+            raise state.StateError(f"任务依赖继承失败: {error}") from error
         if current_batch["status"] in ("done", "blocked"):
             conn.execute(
                 "UPDATE batches SET status='active' WHERE id=?", (batch,)
@@ -4234,8 +4329,9 @@ def _run_captured_mutation(
     captured_stderr = _BoundedTextCapture()
     callbacks: list[Any] = []
     code = 1
-    from . import artifact_revalidation
+    from . import artifact_revalidation, task_dependencies
     token = artifact_revalidation.request_id.set(request_id)
+    dependency_token = task_dependencies.request_id.set(request_id)
     try:
         with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(
             captured_stderr
@@ -4252,6 +4348,7 @@ def _run_captured_mutation(
         captured_stderr.write(f"错误: mutation 执行异常: {exc}\n")
     finally:
         artifact_revalidation.request_id.reset(token)
+        task_dependencies.request_id.reset(dependency_token)
     return code, captured_stdout.getvalue(), captured_stderr.getvalue(), callbacks
 
 
@@ -4340,6 +4437,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
         "config",
         "batch-policy",
         "artifact-revalidate",
+        "dependency-update",
     }
     if not command or command[0] not in allowed:
         raise RequestValidationError("request 只允许调度器 mutation 子命令", "unsupported_mutation")
@@ -4379,7 +4477,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
 
     target_kind = "none"
     target_id: str | None = None
-    if command[0] in {"cancel", "retry", "resubmit", "artifact-revalidate"}:
+    if command[0] in {"cancel", "retry", "resubmit", "artifact-revalidate", "dependency-update"}:
         if len(command) < 2:
             raise RequestValidationError("mutation 缺少目标", "missing_target")
         target_id = command[1]
@@ -4483,6 +4581,13 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
             or not re.fullmatch("[0-9a-f]{64}", parsed.validation_id)
             or not 0 <= parsed.system_retries <= 2 or (parsed.reopen and not parsed.settle)):
         raise RequestValidationError("artifact-revalidate 需要精确 task/instance、有效原记录 ID 与复验参数", "invalid_precondition")
+    if command[0] == "dependency-update":
+        if target_kind != "task" or not re.fullmatch("[0-9a-f]{32}", expectation.get("instance", "")):
+            raise RequestValidationError("dependency-update 需要完整 task/instance CAS", "invalid_precondition")
+        try:
+            _dependency_selectors(parsed.dependencies_json)
+        except (ValueError, RecursionError) as error:
+            raise RequestValidationError(str(error), "invalid_command") from error
     return request_id, command, expectation
 
 
@@ -4891,6 +4996,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_batch_dependencies)
 
+    p = sub.add_parser("task-dependencies", help="只读冻结任务 DAG 和已记录阻塞路径，不授予派发权")
+    p.add_argument("task")
+    p.add_argument("--version", type=int)
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--cursor", type=int, default=0)
+    p.add_argument("--event-id", help="读取这个版本的一条不可变依赖事件；与 cursor 互斥")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_task_dependencies)
+
+    p = sub.add_parser("dependency-update", help="经 task/instance CAS request 更新未启动版本的冻结依赖")
+    p.add_argument("task")
+    p.add_argument("--dependencies-json", required=True, help="内联 exact JSON，随 RID 冻结；不是文件路径")
+    p.add_argument("--reopen", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_dependency_update)
+
     p = sub.add_parser("artifact-validations", help="只读查询不可变首次产物验证记录，不检查当前文件")
     p.add_argument("task", help="<batch-id-or-name>:<task>")
     p.add_argument("--version", type=int)
@@ -5174,7 +5295,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update"}:
         return args.fn(args)
     if command == "request":
         try:

@@ -134,6 +134,8 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched task <batch>:<task> --json` | 单任务与各版本详情 |
 | `sched batch-policy <batch> --json` | 源码候选失败策略只读查询；写操作必须经完整 batch CAS 的 request 和 --yes，旧 blocked 只在显式 --reopen 时重开 |
 | `sched batch-dependencies <batch> --json` | 候选 exact 绑定/动态名称事实只读查询；不读产物或 marker，不授予派发权；分页见 reference |
+| `sched task-dependencies <batch>:<task> --json` | 候选任务 DAG/已记录阻塞路径；--event-id 查不可变历史；不授予派发权 |
+| `sched dependency-update <batch>:<task> --dependencies-json '<exact-list>' --yes` | 只能经 task/instance CAS request 更新未启动版本；保留旧绑定，事务内检查混合环 |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
 | `sched artifact-validations <batch>:<task> --json` | 候选首次验证摘要；--validation-id 读取一条完整证据，不检查当前文件或重新结算 |
@@ -160,7 +162,8 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 
 候选 `depends_on_exact` 冻结同实例的完整 batch/task/version，以及接受时的 job/spec/fingerprint。
 旧名称保留动态 latest 兼容，不在迁移时补绑。`status.batches.depends_on` 仍只包含旧名称，
-完整依赖须协商 `sched-batch-dependencies-v1` 后使用独立查询；这不是任务 DAG 或科学 acceptance。
+批次完整依赖须协商 `sched-batch-dependencies-v1` 后使用独立查询；候选任务 DAG 另协商
+`sched-task-dependencies-v1`，本地 task/version 与 external exact 绑定均冻结，不授予科学 acceptance。
 
 项目禁用 GPU 时，排队 GPU 任务的 `wait_reason` 为 `project_gpu_disabled`。使用此功能前需同步更新配套插件；旧插件的严格校验不接受这个新值。
 
@@ -174,8 +177,8 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 
 ## 状态与资源语义
 
-- 任务：`pending → running → done / failed / blocked / cancelled / timed_out / interrupted`；`pending → skip` 表示产物指纹命中，属于成功终态。
-- 批次：依赖未满足为 `queued`，解锁后为 `active`；全部成功终态为 `done`，默认任一失败终态为 `blocked`；候选 opt-in `continue_independent` 在独立未完成任务/未决启动尚存时保持 active，最终有失败仍 blocked。旧 blocked 不自动重开；没有任务 DAG。`blocked/queued` 可人工退役为 `discarded`。
+- 任务：`pending → running → done / failed / blocked / cancelled / timed_out / interrupted`；`pending → skip` 表示产物指纹命中，属于成功终态。候选任务 DAG 未满足时仍为 pending/dependency，不因上游失败自动取消。
+- 批次：依赖未满足为 `queued`，解锁后为 `active`；全部成功终态为 `done`，默认任一失败终态为 `blocked`；候选 opt-in `continue_independent` 在独立未完成任务/未决启动尚存时保持 active，最终有失败仍 blocked。旧 blocked 不自动重开；候选任务 DAG 在派发前复核精确源，不替换版本。`blocked/queued` 可人工退役为 `discarded`。
 - GPU：`free → assigned → releasing → free`。外部 compute PID 或 compute/topology/utilization 探测不确定时立即 `unmanaged`；只有进程列表完整且为空、利用率可读且大于 0 的信号连续 3 tick 才确认，确认期间即使显示 `free` 也禁止派发。`unmanaged` 连续 2 次干净采样自动恢复，`quarantined` 需 `gpu-ok` 解除。
 - `projects[P].gpu_enabled` 必须为布尔值，省略为 `true`。热更新为 `false` 后拒绝新 GPU 提交与手动 GPU retry/resubmit，暂停派发已排队 GPU 任务；运行中任务正常结束，CPU-only 不受影响。恢复为 `true` 后原排队版本继续运行。
 - `projects[P].gpu_quota` 省略或为 `0` 表示无限制；正整数限制并发 running GPU job 数，不是物理卡数。共享 job 各计 1，CPU-only 不计。禁止 GPU 使用 `gpu_enabled:false`，不能用零配额或空 affinity 代替。

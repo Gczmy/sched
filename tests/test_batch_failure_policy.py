@@ -66,7 +66,7 @@ class BatchPolicyCliTests(TempStateCase):
         self.assertEqual("freeze", result["failure_policy"])
         self.assertEqual("stored", result["source"])
         self.assertEqual("none", result["effect"])
-        self.assertFalse(result["task_dag_supported"])
+        self.assertTrue(result["task_dag_supported"])
         self.assertEqual(revision, self.batch_revision())
         self.assertNotIn("failure_policy", self.status_json()["batches"][0])
 

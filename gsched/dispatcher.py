@@ -260,6 +260,9 @@ def _inbox_task_spec(
         "runtime_prefix": task.get("runtime_prefix"),
     }
     _persist_native_exec_metadata(task, persisted)
+    for key in ("depends_on", "depends_on_exact"):
+        if key in task:
+            persisted[key] = task[key]
     return persisted
 
 
@@ -2748,6 +2751,8 @@ class Dispatcher:
                                         stage_fps,
                                         norm.get("project"),
                                     )
+                                from .task_dependencies import bind_new_batch
+                                bind_new_batch(submit_conn, bid)
                                 state.finish_control_request(
                                     submit_conn, r["id"], f"已入队 {bid}"
                                 )
@@ -4154,14 +4159,7 @@ class Dispatcher:
                         )
                         continue
                     if b["status"] == "active":
-                        if exact:
-                            ready = self._exact_dependencies_successful(conn, b)
-                            conn.execute("UPDATE jobs SET status=? WHERE batch_id=?"
-                                         " AND status IN ('pending','waiting_quota','waiting_dep')"
-                                         " AND version=(SELECT MAX(j2.version) FROM jobs j2"
-                                         " WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)"
-                                         " AND ((? AND status='waiting_dep') OR (NOT ? AND status!='waiting_dep'))",
-                                         ("pending" if ready else "waiting_dep", b["id"], ready, ready))
+                        self._refresh_task_dependencies(conn, b)
                         continue
                     if all(self._batch_successful(conn, d) for d in deps) and self._exact_dependencies_successful(conn, b):
                         changed = conn.execute(
@@ -4170,15 +4168,42 @@ class Dispatcher:
                             (b["id"],),
                         ).rowcount
                         if changed:
+                            self._refresh_task_dependencies(conn, b)
                             self.log_line(
                                 f"批次 {b['name']} 依赖解锁 -> active"
                             )
 
     def _exact_dependencies_successful(self, conn, batch) -> bool:
-        from .dependencies import stored, matched, recorded_clear
+        from .dependencies import stored
+        try:
+            return self._bound_dependencies_successful(conn, stored(batch))
+        except (ValueError, TypeError, json.JSONDecodeError, RecursionError):
+            return False
+
+    def _task_dependencies_successful(self, conn, job) -> bool:
+        from .task_dependencies import stored
+        try:
+            return self._bound_dependencies_successful(conn, stored(conn, job))
+        except (ValueError, TypeError, json.JSONDecodeError, RecursionError):
+            return False
+
+    def _refresh_task_dependencies(self, conn, batch):
+        batch_ready = self._exact_dependencies_successful(conn, batch)
+        jobs = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND status IN ('pending','waiting_quota','waiting_dep')"
+                            " AND version=(SELECT MAX(j2.version) FROM jobs j2 WHERE j2.batch_id=jobs.batch_id AND j2.task_id=jobs.task_id)",
+                            (batch["id"],)).fetchall()
+        for job in jobs:
+            ready = batch_ready and self._task_dependencies_successful(conn, job)
+            if ready and job["status"] == "waiting_dep":
+                state.update_job(conn, job["id"], status="pending")
+            elif not ready and job["status"] != "waiting_dep":
+                state.update_job(conn, job["id"], status="waiting_dep")
+
+    def _bound_dependencies_successful(self, conn, bindings) -> bool:
+        from .dependencies import matched, recorded_clear
         from .artifact_validation import wait_snapshot
         try:
-            for source in stored(batch):
+            for source in bindings:
                 for task in source["tasks"]:
                     job = matched(conn, source, task)
                     if job is None or not recorded_clear(conn, source, task):
@@ -4192,7 +4217,7 @@ class Dispatcher:
                         return False
                     if not self._terminal_job_successful(conn, job):
                         return False
-        except (ValueError, TypeError, json.JSONDecodeError):
+        except (ValueError, TypeError, json.JSONDecodeError, RecursionError):
             return False
         return True
 
@@ -4356,6 +4381,8 @@ class Dispatcher:
                     exact_ready[job["batch_id"]] = self._exact_dependencies_successful(conn, state.get_batch(conn, job["batch_id"]))
                 if not exact_ready[job["batch_id"]]:
                     continue  # Recheck after a CLI reopen between unlock and dispatch.
+                if not self._task_dependencies_successful(conn, job):
+                    continue
                 if self._task_has_unresolved_launch_marker(
                     conn,
                     job["batch_id"],
@@ -4437,7 +4464,7 @@ class Dispatcher:
 
             for j in ready:
                 batch = state.get_batch(conn, j["batch_id"])
-                if not self._exact_dependencies_successful(conn, batch):
+                if not self._exact_dependencies_successful(conn, batch) or not self._task_dependencies_successful(conn, j):
                     conn.execute("UPDATE jobs SET status='waiting_dep' WHERE id=? AND status IN ('pending','waiting_quota')", (j["id"],))
                     continue  # Earlier candidates may have started a source generation this tick.
                 if self._launch_marker_alive(j):
@@ -4929,7 +4956,7 @@ class Dispatcher:
         b = state.get_batch(conn, j["batch_id"])
         if b is None:
             raise ValueError(f"job {j['id']} batch no longer exists")
-        if not self._exact_dependencies_successful(conn, b):
+        if not self._exact_dependencies_successful(conn, b) or not self._task_dependencies_successful(conn, j):
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
@@ -4995,6 +5022,14 @@ class Dispatcher:
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
         # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验
         # pending + active batch + latest task generation。
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        b = state.get_batch(conn, j["batch_id"])
+        live_job = state.get_job(conn, j["id"])
+        if not self._exact_dependencies_successful(conn, b) or not self._task_dependencies_successful(conn, live_job):
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
         cur = conn.execute(
             "UPDATE jobs SET status='running', started_at=?"
             " WHERE id=? AND status='pending'"
@@ -5305,7 +5340,7 @@ class Dispatcher:
         # 产物生产者 = 同项目同任务名最近一个终态 job (跨批次实例:
         # 每次 submit 都生成新 batch id, 同 batch 内永远没有"前序版本")
         prev = conn.execute(
-            "SELECT j.fingerprint FROM jobs j"
+            "SELECT j.* FROM jobs j"
             " WHERE j.project=? AND j.task_id=?"
             "   AND j.status IN ('done','skip') AND j.fingerprint IS NOT NULL"
             "   AND j.id != ?"
@@ -5314,6 +5349,15 @@ class Dispatcher:
              j["task_id"], j["id"]),
         ).fetchone()
         if not prev or not prev["fingerprint"]:
+            return False
+        from .task_dependencies import stored as task_bindings
+        from .dependencies import stored as batch_bindings
+        try:
+            if task_bindings(conn, j) != task_bindings(conn, prev):
+                return False
+            if batch_bindings(state.get_batch(conn, j["batch_id"])) != batch_bindings(state.get_batch(conn, prev["batch_id"])):
+                return False
+        except (ValueError, TypeError, RecursionError):
             return False
         return current_fingerprint == prev["fingerprint"]
 

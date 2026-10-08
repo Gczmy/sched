@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 14
+DB_SCHEMA_VERSION = 15
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -240,14 +240,16 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "submission_requests",
         "artifact_validations",
         "artifact_revalidations",
+        "task_dependency_events",
     },
-    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job"},
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job"},
     "trigger": {
         "scheduler_identity_immutable", "scheduler_identity_retained",
         "submission_request_immutable", "submission_request_retained",
         "revision_batch_status",
         "revision_batch_failure_policy",
         "batch_exact_dependencies_immutable",
+        "task_dependency_immutable", "task_dependency_retained", "revision_task_dependency",
         "artifact_validation_immutable", "artifact_validation_retained",
         "artifact_revalidation_immutable", "artifact_revalidation_retained",
         "revision_task_insert",
@@ -274,6 +276,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "task_dependency_events": {"seq", "event_id", "request_id", "job_id", "job_version", "instance_id", "target_sha256", "previous_event_id", "bindings", "observed_at"},
     "artifact_revalidations": {"event_id", "request_id", "initial_validation_id", "job_id", "job_version",
                                "passed", "settled", "reason", "payload", "observed_at"},
     "artifact_validations": {"validation_id", "completion_key", "job_id", "job_version", "instance_id",
@@ -553,6 +556,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 15:
+        required_objects["table"].discard("task_dependency_events")
+        required_objects["index"].discard("task_dependency_job")
+        required_objects["trigger"].difference_update({"task_dependency_immutable", "task_dependency_retained", "revision_task_dependency"})
+        del required_columns["task_dependency_events"]
     if version < 14:
         required_objects["trigger"].discard("batch_exact_dependencies_immutable")
         required_columns["batches"].discard("depends_on_exact")
@@ -1078,6 +1086,7 @@ def _initialize_database() -> None:
     from .recovery_watch import SCHEMA as RECOVERY_WATCH_SCHEMA
     from .artifact_validation import SCHEMA as ARTIFACT_VALIDATION_SCHEMA
     from .artifact_revalidation import SCHEMA as ARTIFACT_REVALIDATION_SCHEMA
+    from .task_dependencies import SCHEMA as TASK_DEPENDENCY_SCHEMA
     with connect() as conn:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
             from .integration import instance_id
@@ -1085,7 +1094,7 @@ def _initialize_database() -> None:
         previous_schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
         needs_owner_backfill = (previous_schema_version < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)

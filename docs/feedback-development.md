@@ -8,7 +8,7 @@
 
 第一阶段源码提交 `5c9a170` 加入产物逐项诊断、`json_equals`、只读
 `artifact-check`、请求格式/JSON 拒绝、同 RID 有界等待/多 RID 查询与
-GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4/5 引入 11/12/13，阶段 6 后续候选写 14。
+GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4/5/6 引入 11/12/13/14，阶段 7 后续候选写 15。
 包版本仍为 0.4.0，不能仅凭版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
 
 该提交的 [CI](https://github.com/Gczmy/sched/actions/runs/37845958558) 失败：
@@ -97,8 +97,22 @@ Python 必须满足项目版本要求。计算角色还要求已核对的 Linux/
 替换失败原版本。[CPU/CLI 验收](../tests/run_exact_dependencies_accept.py) 已纳入候选 CI；
 本阶段计算节点隔离 CPU/CLI 已通过：失败源的成功子集继续、v2/同名新批次不替换
 失败原 v1、显式选择原批次 v2 后只运行一次、重启保持绑定/等待/执行次数。
-实际测试源码/脚本摘要已核对，私有证据不入仓库；本阶段完整 CI 尚待推送后确认。
+实际测试源码/脚本摘要已核对，私有证据不入仓库；固定来源
+`b40c95bd472d6ebcc7f79d441cbf8c6de5b32c49` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37858263574) 14 项通过。
 详细行为与旧 status 字段边界见 [reference](reference.md)。
+
+阶段 7 候选增加本地 task/version 与任务级 external exact DAG、独立
+task-dependencies 的有界已记录路径，以及 task/instance CAS 的 dependency-update。
+事件不可变且链接旧绑定，事务内检查任务/批次混合环，resubmit 继承生效的固定选择。
+计算节点最终候选隔离验收通过：A 失败时 B/D 继续、C 等待；A v2 成功不自动替换；
+显式 CAS 更新保留旧事件，同 RID 不重复；成环更新原子拒绝；私有 daemon 重启后
+C v1 只执行一次；后续改变来源后 C v2 不会 SKIP 旧绑定的产物。
+最终候选 [CPU/CLI 脚本](../tests/run_task_dependencies_accept.py) SHA256 为
+`2193aee454c6d8f58a0505eb7b621716cec1324382465ee4b1caa364b028e488`，
+源码/测试摘要已实查一致；16 条 Linux 私有 fixture 和 143 条相关回归通过。
+现有看板严格字段/等待原因已只读核对，无配套仓库改动。
+不占真实 GPU、不重启生产 daemon、不更改生产配置；完整候选 CI 待推送后确认。
 
 ## 完整阶段与完成依据
 
@@ -108,8 +122,8 @@ Python 必须满足项目版本要求。计算角色还要求已核对的 Linux/
 | 3 | opt-in 独立失败策略 | 候选 CI/计算节点 CPU 通过 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
 | 4 | 不可变 artifact validation | 候选 CI/计算节点普通 CPU 通过 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
 | 5 | 仅复验及重新结算 | 候选 CI/计算节点普通 CPU 通过 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
-| 6 | 精确依赖 | 候选计算节点 CPU 通过，CI 待确认 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
-| 7 | 任务 DAG/阻塞路径 | 未实现 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待 |
+| 6 | 精确依赖 | 候选 CI/计算节点 CPU 通过 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
+| 7 | 任务 DAG/阻塞路径 | 候选计算节点 CPU 通过，CI 待确认 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待；CAS 依赖更新保留不可变历史 |
 | 8 | bounded 精确事实/成组 pending-only cancel | 未实现 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
 | 9 | admission explain/装箱解释 | 未实现 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
 | 10 | allocation 身份/分层失败 | 未实现 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |

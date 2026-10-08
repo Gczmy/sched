@@ -166,3 +166,14 @@ schema 10 及以上升级保留等待态；更旧库仍执行已有的历史等�
 不能启动新写库；回退仍依赖已验证的升级前恢复点，不能删依赖或降低 schema。
 精确来源和混合名称环在提交接受事务内检查，旧名称兼容语义保持，不能把未知或
 来源失效当成功。此阶段无任务 DAG、依赖更新或科学发布合同，见 [reference](reference.md)。
+
+## 后续候选任务 DAG schema 15
+
+新增 append-only task_dependency_events、查询索引与不可变/保留/revision 触发器。
+初始选择在所有任务插入后绑定；受审计 task CAS 更新产生新事件并链接旧事件，
+不覆盖原始 spec 或批次 exact 列。混合 job/batch 环检查、事件、revision 与回执
+处于同一事务。迁移不生成历史依赖事件，不重写现代等待态、旧执行身份或未知请求。
+完整 schema 1–15 只读查询不迁移；所有 10–14 旧 writer 均不能回接新写库，
+回退使用已验证的升级前恢复点，禁止删事件或降低 user_version。
+任务声明、CAS 内联输入和只读路径边界见 [reference](reference.md)；
+[CPU/CLI 验收](../tests/run_task_dependencies_accept.py) 不占真实 GPU、不替换生产安装。
