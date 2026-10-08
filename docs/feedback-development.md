@@ -34,29 +34,69 @@ request CAS 策略变更与显式重开。写库升级至 schema 11，旧批次�
 [CPU/CLI 失败隔离验收](../tests/run_batch_policy_accept.py) 已纳入候选 CI；
 `113818e` 的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37850633202)
 14 项均通过，包含真实 CPU/CLI 默认冻结、策略改变不自动重开、CAS 显式重开与独立失败
-最终 blocked。尚未取得计算节点证据，不代表发布或生产已升级。
+最终 blocked。后续固定候选 `12967f9` 在计算节点的同一 CPU/CLI 脚本也通过；
+不代表发布或生产已升级。
 
 阶段 4 后续候选追加不可变首次 dispatcher 验证和独立只读查询。原始执行身份、wait/cleanup、
 规则和逐项文件证据冻结；历史 wait 缺失明确未验证，不补判成功。schema 12 添加空表，
 查询旧库不迁移。本阶段不提供复验/结算写接口；完整规则见 [artifact-validation](artifact-validation.md)。
 `6758f60` 的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37852236705) 14 项均通过，
 包含普通 CPU 和 public backend 原始 wait/产物证据、只读检查/重启不改原记录。
-尚未取得计算节点证据，不代表部署。
+后续固定候选 `12967f9` 在计算节点通过普通 CPU 首次验证/重启不变验收；
+public backend 的本阶段证据来自 Linux CI，不把它描述为计算节点 native 验收。
 
 阶段 5 后续候选加入 task CAS/instance request 的仅产物复验、显式重新结算、有限系统
 退避和不可变事件查询。旧 wait 缺失、原规则/尝试不匹配、文件变化或未决执行不补判；
 code=0 只表示事件已提交。新 CPU/public backend 验收以 pidfd 精确暂停临时 daemon 的
 正则子进程产生真实超时，验证未改文件/原 wait 且训练启动次数不增加；脚本已扩展，
-尚未取得本阶段完整 CI/计算节点证据，见 [复验合同](artifact-revalidation.md)。
+`12967f9` 的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37854068642) 14 项均通过，
+包含普通 CPU 与 public backend 的实际超时和重新结算。计算节点的隔离普通 CPU/CLI
+验收也已通过；这不等于真实 GPU 验收、正式发布或生产切换，见 [复验合同](artifact-revalidation.md)。
+
+## 两主机隔离回执验收
+
+[手工验收脚本](../tests/run_gateway_feedback_accept.py) 使用一个新建的共享目录，
+计算节点与网关运行不同角色。所有调度器读写仍走 CLI；不自行打开共享 SQLite，
+不编辑 state，不申请新租约，不读取生产配置。脚本只生成一个 CPU-only 任务，
+daemon 使用 fake GPU；错误时保留 fixture，只有显式 cleanup 且 CLI 确认私有 daemon
+已停止后才清理本次创建的临时目录。
+
+使用固定候选源码和两边都可见、尚不存在的 `ACCEPT_ROOT`；在源码目录运行
+`PYTHONPATH="$ACCEPT_SOURCE" python tests/run_gateway_feedback_accept.py <role> --root "$ACCEPT_ROOT"`。
+Python 必须满足项目版本要求。计算角色还要求已核对的 Linux/Slurm 租约 shell；
+节点身份取自该 shell，而不是网关或旧会话记录。
+
+1. 计算节点 `prepare`：初始化独立身份和配置，daemon 保持 stopped/drained。
+2. 网关新连接 `deliver --pause-after-delivery`：投递后不回传 submit 回执/批次 ID；
+   观察 `TRANSPORT_DISCONNECT_WINDOW` 后断开本次测试 SSH 客户端。
+3. 网关另一个新连接 `ticket`：仅按原 RID 恢复 delivered ticket；有界查询仍报告
+   未入库，显式同 RID/同绑定 replay 不重复投递。这不是任意断线时点的混沌验收。
+4. 计算节点 `consume`：启动私有 drained daemon，收编 inbox，但不启动 worker。
+5. 网关新连接 `confirm`：私有 DB/WAL 快照确认同 RID 的 done/database 接受回执，
+   与 ticket 的 binding digest 一致；显式 replay 后仍只有一个 pending job。
+6. 计算节点 `finish`：恢复派发，验证一次实际 CPU 执行、原 wait/产物证据；
+   私有 daemon 排空重启后仍无第二次执行。
+7. 网关新连接 `final`：身份、原 RID、接受回执和一次执行计数均保持不变。
+8. 计算节点 `cleanup`：只清理这个已停止的独立 fixture。
+
+实际节点、会话、租约、目录和原始回执记录保存在仓库外。此验收不覆盖未知 intent
+窗口的故障注入，也不证明任意 NFS 故障、真实 CUDA 或生产部署安全。
+
+2026-10-08：固定实现来源 `12967f99a7ed79dbda9292d5784e70212e3684a0`
+通过上述两主机隔离验收：实际 SSH 投递后断开并重连，ticket/database 回执保持
+同一绑定，计算节点收编及私有 daemon 重启前后仅一批次/一版本/一次 CPU 执行。
+新增手工脚本 SHA256 为
+`d8350023c0b5af686ece5c7fb7c8184bbf0012716aa2547104ebcc9c6c839306`。
+使用私有临时源码和 state，不替换生产安装；具体原始证据不纳入公共仓库。
 
 ## 完整阶段与完成依据
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
-| 2 | 已提交修复验收 | 进行中 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
-| 3 | opt-in 独立失败策略 | 源码候选、验收中 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
-| 4 | 不可变 artifact validation | 源码候选、验收中 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
-| 5 | 仅复验及重新结算 | 源码候选、验收中 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
+| 2 | 已提交修复验收 | 候选 CI/CPU/两主机验收通过 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
+| 3 | opt-in 独立失败策略 | 候选 CI/计算节点 CPU 通过 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
+| 4 | 不可变 artifact validation | 候选 CI/计算节点普通 CPU 通过 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
+| 5 | 仅复验及重新结算 | 候选 CI/计算节点普通 CPU 通过 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
 | 6 | 精确依赖 | 未实现 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
 | 7 | 任务 DAG/阻塞路径 | 未实现 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待 |
 | 8 | bounded 精确事实/成组 pending-only cancel | 未实现 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
