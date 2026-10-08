@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 12
+DB_SCHEMA_VERSION = 13
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -238,14 +238,16 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "scheduler_identity",
         "submission_requests",
         "artifact_validations",
+        "artifact_revalidations",
     },
-    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job"},
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job"},
     "trigger": {
         "scheduler_identity_immutable", "scheduler_identity_retained",
         "submission_request_immutable", "submission_request_retained",
         "revision_batch_status",
         "revision_batch_failure_policy",
         "artifact_validation_immutable", "artifact_validation_retained",
+        "artifact_revalidation_immutable", "artifact_revalidation_retained",
         "revision_task_insert",
         "revision_task_delete",
         "revision_task_membership",
@@ -270,6 +272,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "artifact_revalidations": {"event_id", "request_id", "initial_validation_id", "job_id", "job_version",
+                               "passed", "settled", "reason", "payload", "observed_at"},
     "artifact_validations": {"validation_id", "completion_key", "job_id", "job_version", "instance_id",
                              "batch_revision", "context", "spec_sha256", "rules_sha256", "wait_sha256",
                              "evidence_sha256", "passed", "wait_verified", "payload", "observed_at"},
@@ -547,6 +551,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 13:
+        required_objects["table"].discard("artifact_revalidations")
+        required_objects["index"].discard("artifact_revalidation_job")
+        required_objects["trigger"].difference_update({"artifact_revalidation_immutable", "artifact_revalidation_retained"})
+        del required_columns["artifact_revalidations"]
     if version < 12:
         required_objects["table"].discard("artifact_validations")
         required_objects["index"].discard("artifact_validation_job")
@@ -1063,13 +1072,14 @@ def _initialize_database() -> None:
     from .recovery_state import SCHEMA as RECOVERY_SCHEMA
     from .recovery_watch import SCHEMA as RECOVERY_WATCH_SCHEMA
     from .artifact_validation import SCHEMA as ARTIFACT_VALIDATION_SCHEMA
+    from .artifact_revalidation import SCHEMA as ARTIFACT_REVALIDATION_SCHEMA
     with connect() as conn:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
             from .integration import instance_id
             instance_id(conn)  # Never mint a replacement identity for damaged state.
         needs_owner_backfill = (conn.execute("PRAGMA user_version").fetchone()[0] < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)

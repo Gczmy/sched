@@ -8,7 +8,7 @@
 
 第一阶段源码提交 `5c9a170` 加入产物逐项诊断、`json_equals`、只读
 `artifact-check`、请求格式/JSON 拒绝、同 RID 有界等待/多 RID 查询与
-GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3 引入 11，阶段 4 后续候选写 12。
+GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4 引入 11/12，阶段 5 后续候选写 13。
 包版本仍为 0.4.0，不能仅凭版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
 
 该提交的 [CI](https://github.com/Gczmy/sched/actions/runs/37845958558) 失败：
@@ -38,8 +38,16 @@ request CAS 策略变更与显式重开。写库升级至 schema 11，旧批次�
 
 阶段 4 后续候选追加不可变首次 dispatcher 验证和独立只读查询。原始执行身份、wait/cleanup、
 规则和逐项文件证据冻结；历史 wait 缺失明确未验证，不补判成功。schema 12 添加空表，
-查询旧库不迁移。未实现复验/结算写接口；完整规则见 [artifact-validation](artifact-validation.md)。
-Linux CPU 与 public backend 真实验收已扩展，尚未取得该阶段完整 CI/计算节点证据。
+查询旧库不迁移。本阶段不提供复验/结算写接口；完整规则见 [artifact-validation](artifact-validation.md)。
+`6758f60` 的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37852236705) 14 项均通过，
+包含普通 CPU 和 public backend 原始 wait/产物证据、只读检查/重启不改原记录。
+尚未取得计算节点证据，不代表部署。
+
+阶段 5 后续候选加入 task CAS/instance request 的仅产物复验、显式重新结算、有限系统
+退避和不可变事件查询。旧 wait 缺失、原规则/尝试不匹配、文件变化或未决执行不补判；
+code=0 只表示事件已提交。新 CPU/public backend 验收以 pidfd 精确暂停临时 daemon 的
+正则子进程产生真实超时，验证未改文件/原 wait 且训练启动次数不增加；脚本已扩展，
+尚未取得本阶段完整 CI/计算节点证据，见 [复验合同](artifact-revalidation.md)。
 
 ## 完整阶段与完成依据
 
@@ -48,7 +56,7 @@ Linux CPU 与 public backend 真实验收已扩展，尚未取得该阶段完整
 | 2 | 已提交修复验收 | 进行中 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
 | 3 | opt-in 独立失败策略 | 源码候选、验收中 | 默认冻结兼容、独立任务继续、running/未知启动不变、CAS/schema 迁移 |
 | 4 | 不可变 artifact validation | 源码候选、验收中 | 精确 job/version、规则/产物/wait/cleanup 绑定，失败历史不可覆盖 |
-| 5 | 仅复验及重新结算 | 未实现 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
+| 5 | 仅复验及重新结算 | 源码候选、验收中 | 不训练/不删文件、幂等/CAS、原执行权威与失效证据拒绝、有限系统错误退避 |
 | 6 | 精确依赖 | 未实现 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
 | 7 | 任务 DAG/阻塞路径 | 未实现 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待 |
 | 8 | bounded 精确事实/成组 pending-only cancel | 未实现 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |

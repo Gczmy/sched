@@ -220,6 +220,62 @@ class Acceptance:
         self.cli("config", "set", "-f", str(patch), "--yes", expect=1)
         assert self.config.read_bytes() == original_config
         print("PASS: disjoint hard affinity is rejected without changing config", flush=True)
+        self.revalidation()
+
+    def revalidation(self):
+        from revalidation_accept_support import StopFirstRegex
+        root = self.root / "revalidation"
+        root.mkdir()
+        # A bounded but non-instant regex gives the pidfd injector a window.
+        # The unchanged input passes when the deliberately stopped checker is
+        # replaced by a fresh checker; the training worker is never stopped.
+        pattern = "^(a+)+$|ok"
+        content = "a" * 21 + "!ok"
+        spec = {"name": "revalidation", "project": "example", "cwd": "revalidation", "tasks": [{
+            "id": "task", "max_retry": 0, "resources": {"gpu": 0, "cpus": 1},
+            "cmd": [sys.executable, "-I", "-c", worker_program(content)],
+            "artifacts": {"result": {"path": "result.json", "regex": pattern}}}]}
+        path = self.root / "revalidation.json"
+        path.write_text(json.dumps(spec))
+        self.cli("daemon", "resume")
+        self.cli("daemon", "start", "--fake")
+        fault = StopFirstRegex(self.data("daemon", "status", "--json")["pid"], pattern)
+        try:
+            batch = self.data("submit", str(path), "--json")["batch_id"]
+            fault.check()
+            original_job = self.wait(lambda: self.task(batch), lambda r: r["jobs"][0]["status"] == "blocked")
+            self.cli("daemon", "drain", "--stop-when-idle")
+            self.wait(lambda: self.data("daemon", "status", "--json"), lambda r: r["health_state"] == "stopped")
+        finally:
+            fault.close()
+        summary = self.data("artifact-validations", f"{batch}:task", "--version", "1", "--json")
+        assert len(summary["validations"]) == 1
+        source = summary["validations"][0]
+        frozen = self.data("artifact-validations", f"{batch}:task", "--validation-id", source["validation_id"], "--json")
+        assert source["wait_verified"] and not source["passed"]
+        assert frozen["validations"][0]["payload"]["checks"][0]["reason_code"] == "regex_timeout"
+        before_bytes = (root / "result.json").read_bytes()
+        instance = self.data("identity", "--json")["instance_id"]
+        def request(rid, settle=False):
+            current = self.task(batch)
+            return ["request", rid, "--json", "--expect-kind", "task", "--expect-id", f"{batch}:task",
+                "--expect-status", "blocked", "--expect-version", "1", "--expect-revision", str(current["batch_revision"]),
+                "--expect-instance", instance, "--", "artifact-revalidate", f"{batch}:task",
+                "--validation-id", source["validation_id"], *(["--settle"] if settle else []), "--yes"]
+        only = self.data(*request("only-revalidate"))["result"]["effect"]
+        assert only["artifact_rules_passed"] and not only["settled"]
+        assert self.task(batch) == original_job
+        args = request("settle-revalidation", settle=True)
+        first = self.data(*args)
+        again = self.data(*args)
+        assert first["result"]["effect"]["settled"] and again["replayed"] and first["result"] == again["result"]
+        final = self.task(batch)["jobs"][0]
+        assert final["status"] == "done" and final["rc"] == 0 and final["version"] == 1
+        assert (root / "runs.txt").read_text() == "run\n" and (root / "result.json").read_bytes() == before_bytes
+        assert self.data("artifact-validations", f"{batch}:task", "--validation-id", source["validation_id"], "--json") == frozen
+        events = self.data("artifact-revalidations", f"{batch}:task", "--json")
+        assert len(events["events"]) == 2 and sum(e["settled"] for e in events["events"]) == 1
+        print("PASS: real injected regex timeout, artifact-only recovery, original wait/failure retained, one training run and same-RID replay", flush=True)
 
 
 def main():

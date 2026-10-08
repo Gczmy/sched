@@ -62,6 +62,16 @@ def _isolated_child_env() -> dict[str, str]:
     return child_env
 
 
+REGEX_CHECK_PROGRAM = (
+    "import json,re,sys\n"
+    "last=None\n"
+    "text=sys.stdin.buffer.read().decode('utf-8','replace')\n"
+    "for match in re.finditer(sys.argv[1],text):\n"
+    " last=match.group(0)[:int(sys.argv[2])]\n"
+    "sys.stdout.write(json.dumps(last))\n"
+)
+
+
 def bounded_regex_result(
     pattern: str,
     content: bytes | str,
@@ -92,21 +102,13 @@ def bounded_regex_result(
     payload = content.encode("utf-8", "replace") if isinstance(content, str) else content
     if not isinstance(payload, bytes) or len(payload) > 1024 * 1024:
         return finish("content_too_large")
-    program = (
-        "import json,re,sys\n"
-        "last=None\n"
-        "text=sys.stdin.buffer.read().decode('utf-8','replace')\n"
-        "for match in re.finditer(sys.argv[1],text):\n"
-        " last=match.group(0)[:int(sys.argv[2])]\n"
-        "sys.stdout.write(json.dumps(last))\n"
-    )
     try:
         completed = subprocess.run(
             [
                 sys.executable,
                 "-I",
                 "-c",
-                program,
+                REGEX_CHECK_PROGRAM,
                 pattern,
                 str(max_match_chars),
             ],
@@ -150,6 +152,7 @@ def inspect_artifact(
     rule: dict[str, Any] | None,
     *,
     dir_fd: int | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Validate one regular-file artifact through an already-open descriptor."""
     started = time.monotonic()
@@ -164,6 +167,9 @@ def inspect_artifact(
         reason = {errno.ENOENT: "missing_file", errno.EACCES: "permission_denied",
                   errno.EPERM: "permission_denied", errno.ELOOP: "unsafe_path"}.get(exc.errno, "io_error")
         return finish(reason, f"{prefix}: {exc}", errno=exc.errno)
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return finish("validation_budget_exceeded", "复验时间预算已用尽")
 
     if not isinstance(path, str) or not path or "\0" in path:
         return finish("invalid_path", "路径无效")
@@ -247,6 +253,8 @@ def inspect_artifact(
             chunks: list[bytes] = []
             remaining = max_content_bytes + 1
             while remaining:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return finish("validation_budget_exceeded", "复验时间预算已用尽")
                 chunk = os.read(fd, min(64 * 1024, remaining))
                 if not chunk:
                     break
@@ -309,10 +317,13 @@ def inspect_artifact(
                 re.compile(rx)
             except (re.error, OverflowError, RecursionError) as exc:
                 return finish("invalid_regex", f"无效正则: {exc}")
+            remaining = 1 if deadline is None else min(1, deadline - time.monotonic())
+            if remaining <= 0:
+                return finish("validation_budget_exceeded", "复验时间预算已用尽")
             regex_result = bounded_regex_result(
                 rx,
                 content,
-                timeout=1,
+                timeout=remaining,
                 max_match_chars=0,
             )
             evidence["regex"] = {k: v for k, v in regex_result.items() if k != "match"}
@@ -377,6 +388,7 @@ def _inspect_artifact_beneath(
     cwd: str,
     path: str,
     rule: dict[str, Any],
+    *, deadline: float | None = None,
 ) -> dict[str, Any]:
     """Open every component below cwd without following intermediate links."""
     location = _beneath_parts(cwd, path)
@@ -403,7 +415,7 @@ def _inspect_artifact_beneath(
             )
             opened.append(child_fd)
             parent_fd = child_fd
-        return inspect_artifact(parts[-1], rule, dir_fd=parent_fd)
+        return inspect_artifact(parts[-1], rule, dir_fd=parent_fd, deadline=deadline)
     except OSError as exc:
         reason = {errno.ENOENT: "missing_file", errno.EACCES: "permission_denied",
                   errno.EPERM: "permission_denied", errno.ELOOP: "unsafe_path",
@@ -505,6 +517,7 @@ def inspect_artifacts(
     cwd: str | None = None,
     *,
     paths_escape: bool = False,
+    deadline: float | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Validate an artifact mapping, resolving relative paths against ``cwd``."""
     if not isinstance(artifacts, dict):
@@ -513,6 +526,9 @@ def inspect_artifacts(
         return {"<paths_escape>": _inspection_error("invalid_rule", "必须是布尔")}
     result: dict[str, dict[str, Any]] = {}
     for key, rule in artifacts.items():
+        if deadline is not None and time.monotonic() >= deadline:
+            result[str(key)] = _inspection_error("validation_budget_exceeded", "复验时间预算已用尽")
+            continue
         if not isinstance(key, str) or not isinstance(rule, dict):
             result[str(key)] = _inspection_error("invalid_rule", "规则必须是对象")
             continue
@@ -524,11 +540,11 @@ def inspect_artifacts(
             path = raw_path
             if cwd is not None and not os.path.isabs(path):
                 path = os.path.normpath(os.path.join(cwd, path))
-            result[key] = inspect_artifact(path, rule)
+            result[key] = inspect_artifact(path, rule, deadline=deadline)
         elif cwd is None:
             result[key] = _inspection_error("invalid_path", "缺少任务 cwd")
         else:
-            result[key] = _inspect_artifact_beneath(cwd, raw_path, rule)
+            result[key] = _inspect_artifact_beneath(cwd, raw_path, rule, deadline=deadline)
     return result
 
 
@@ -544,7 +560,8 @@ def all_pass(result: dict[str, str | None]) -> bool:
     return all(v is None for v in result.values())
 
 
-def inspect_declared_artifacts(spec: dict[str, Any], cwd: str, *, stop_on_failure: bool = False) -> list[dict[str, Any]]:
+def inspect_declared_artifacts(spec: dict[str, Any], cwd: str, *, stop_on_failure: bool = False,
+                               deadline: float | None = None) -> list[dict[str, Any]]:
     """Inspect task and stage declarations; never infer execution success."""
     if not isinstance(spec, dict) or not isinstance(cwd, str) or not cwd:
         return [{"scope": "task", "name": "<spec>", **_inspection_error("invalid_spec", "任务 spec/cwd 无效")}]
@@ -567,7 +584,7 @@ def inspect_declared_artifacts(spec: dict[str, Any], cwd: str, *, stop_on_failur
             )
     details = []
     for scope, artifacts, paths_escape in groups:
-        group = inspect_artifacts(artifacts, cwd, paths_escape=paths_escape)
+        group = inspect_artifacts(artifacts, cwd, paths_escape=paths_escape, deadline=deadline)
         details.extend({"scope": scope, "name": key, **detail} for key, detail in group.items())
         if stop_on_failure and any(not detail["passed"] for detail in group.values()):
             break

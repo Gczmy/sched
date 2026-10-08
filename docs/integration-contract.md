@@ -54,13 +54,22 @@ reads one exact task/version record and verifies full payload/header digests.
 Live ID keyset pages are not a complete snapshot. Queries never migrate old
 schemas or reconstruct original waits; migration appends an empty table only.
 Existing status/task/history field sets stay unchanged. These records grant no
-settlement authority; revalidation/settlement writes are a later stage.
+settlement authority. The later artifact-only revalidation candidate writes
+schema 13 (complete read range 1–13) and advertises `sched-artifact-revalidations-v1`.
+`artifact-revalidate` requires task CAS/instance via request; default only appends
+an immutable event, explicit --settle requires original wait/rules/file evidence.
+Code 0 means the event committed, not artifact or job success. Inspect effect
+revalidation_id, artifact_rules_passed, settled and reason. Same RID replays without
+file reads; unknown remains 75. No worker launch, deletion or version creation.
+`artifact-revalidations` is a separate passive, bounded event query. Existing
+status/task/history fields remain unchanged. See [revalidation](artifact-revalidation.md).
 
 ### Candidate batch failure policy
 
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
 introduced schema 11; the later artifact-validation candidate writes 12 (read
-range 1–12). Released 0.4.0 cannot open either new writer state.
+range 1–12); the subsequent revalidation candidate writes 13 (reads 1–13).
+Released 0.4.0 cannot open these new writer states.
 Migration adds `batches.failure_policy` with default `freeze` and a monotonic
 revision trigger, without rewriting status, job versions, execution identity,
 unknown attempts, receipts or instance identity. Migration is atomic.

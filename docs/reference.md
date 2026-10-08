@@ -41,14 +41,20 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前不可变产物验证源码候选写 schema 12，完整只读范围为 1–12；
-已发布 0.4.0 写 schema 10、失败隔离候选写 11，都不能回接 schema 12。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前仅产物复验源码候选写 schema 13，完整只读范围为 1–13；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证候选写 11/12，都不能回接 schema 13。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched artifact-validations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 只读查询首次验证摘要；`--validation-id ID` 读取同任务/版本的一条完整冻结证据，与 cursor
 互斥。查询不读任务文件、不迁移、不重新结算；旧库明确 unavailable，不回填历史 wait。
 实时 ID 续页不是完整快照；通过记录不等于取得科学验收或重新结算权，详见
 [不可变产物验证](artifact-validation.md)。
+
+`artifact-revalidate <full-batch-id>:<task> --validation-id ID --yes` 必须由完整 task CAS
+和 instance 的 `request` 包装，仅追加复验事件；显式 `--settle` 才按原始 wait/规则/文件
+证据重新结算。code=0 表示事件提交，须检查 effect.settled，不等于任务成功。
+`artifact-revalidations <batch>:<task> --json` 只读查询事件，`--event-id ID` 读取一条完整证据；
+有限系统退避、显式重开和全部守卫见 [仅产物复验](artifact-revalidation.md)。
 
 ## 1. 心智模型
 

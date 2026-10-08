@@ -1,6 +1,7 @@
 # 不可变产物验证记录（源码候选）
 
-当前候选提供首次验证记录和只读查询，**尚无复验或重新结算写接口**。
+阶段 4 候选提供首次验证记录和只读查询；后续阶段 5 的独立写接口见
+[仅产物复验](artifact-revalidation.md)，这些查询本身仍不授予结算权。
 包版本仍为 0.4.0；必须查询实际部署的 `version --json` 中
 `contracts.artifact_validations=sched-artifact-validations-v1` 与 schema 范围。
 推送、CI、计算节点验收、正式发布和生产切换分别记录，不能混用。
@@ -67,13 +68,13 @@ next_cursor、evidence_included，以及 `effect:none`、`historical_failure_rec
 
 ## schema 与后续开发
 
-写库升级到 schema 12；完整 schema 1–12 支持只读。旧库没有表时返回
+本阶段引入 schema 12；后续复验候选写 13，完整 schema 1–13 支持只读。旧库没有表时返回
 `available:false,reason:migration_required`，不迁移、不从历史状态回填。写初始化原子
 添加空表/索引/不可变触发器，不改已有任务、版本、状态、revision、身份、wait 或未知回执。
 schema 11 候选及已发布 0.4.0 不能直接启动新写库；回退使用升级前已验证的恢复点，
 不能删表或回改 user_version。
 
-阶段 5 才实现独立复验/结算，需要新追加观察、CAS/幂等与原始执行权威、规则和文件来源
+阶段 5 独立复验/结算接口需要新追加观察、CAS/幂等与原始执行权威、规则和文件来源
 校验；不能把本页查询的 passed=true 或 wait_verified=true 单独当作重新结算许可。
 精确依赖、DAG、allocation 身份和分层 worker/validator 失败同样按
 [完整清单](feedback-development.md) 独立开发。

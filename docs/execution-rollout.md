@@ -147,3 +147,11 @@ schema 8 可读恢复 queue/settlement，但 watch 为 null；0.2.2 无法打开
 恢复点回退，不删除记录或降低 user_version。原始 wait 在落盘前丢失仍为 unknown，
 当前产物不能补权威。冻结记录不构成复验/结算授权，具体合同见
 [artifact-validation](artifact-validation.md)。正式发布及生产升级仍按独立验收流程执行。
+
+## 候选仅产物复验 schema 13
+
+后续候选添加空的 artifact_revalidations 表/索引/不可变触发器；不迁移或补造历史 wait、
+复验或结算决定。完整 1–13 只读兼容，旧库查询不迁移。12/11 候选和已发布 0.4.0
+不能直接启动新写库；回退依赖已验证的升级前恢复点，不能删事件或降低 schema。
+原任务改变、新事件及 request 终态回执同事务；代码/记录写入失败整体回滚。
+业务复验失败仍保存事件，code=0 不是任务 done；见 [产物复验](artifact-revalidation.md)。

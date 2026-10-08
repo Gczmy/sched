@@ -1695,7 +1695,14 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
 
 def cmd_artifact_validations(args: argparse.Namespace) -> int:
     """Query frozen completion observations; do not inspect files or migrate."""
-    from .artifact_validation import list_records
+    if args._subcommand == "artifact-revalidations":
+        from .artifact_revalidation import list_records as event_records
+        list_records = lambda conn, batch, task, **kw: event_records(conn, batch, task,
+            version=kw["version"], limit=kw["limit"], cursor=kw["cursor"], event_id=kw["validation_id"])
+        name, items = "artifact_revalidations", "events"
+    else:
+        from .artifact_validation import list_records
+        name, items = "artifact_validations", "validations"
     from .integration import CONTRACTS, instance_id
     state.set_read_only(True)
     try:
@@ -1710,23 +1717,55 @@ def cmd_artifact_validations(args: argparse.Namespace) -> int:
                 raise ValueError("任务或版本不存在")
             result = list_records(conn, batch, task_id, version=args.version, limit=args.limit,
                                   cursor=args.cursor, validation_id=args.validation_id)
-            output = {"schema_version": 1, "query": "artifact_validations",
-                      "contract": CONTRACTS["artifact_validations"], "instance_id": instance_id(conn),
+            output = {"schema_version": 1, "query": name,
+                      "contract": CONTRACTS[name], "instance_id": instance_id(conn),
                       "batch_id": batch, "task_id": task_id, "version_filter": args.version,
                       "historical_failure_reconstructed": False, "settlement_authority": False,
                       "evidence_included": args.validation_id is not None, **result}
         if args.json:
             print(json.dumps(output, ensure_ascii=False))
         else:
-            print("首次产物验证记录（只读，不重新结算）" if result["available"] else "旧库未保存此类记录；查询不迁移")
-            for record in result["validations"]:
-                print(f"  {record['validation_id']} v{record['job_version']} passed={record['passed']} wait_verified={record['wait_verified']}")
+            label = "产物复验事件" if name == "artifact_revalidations" else "首次产物验证记录"
+            print(label + "（只读，不重新结算）" if result["available"] else "旧库未保存此类记录；查询不迁移")
+            for record in result[items]:
+                print(f"  {record.get('validation_id') or record.get('event_id')} v{record['job_version']} passed={record['passed']}")
         return 0
     except (ValueError, ConfigError, state.StateError, RecursionError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
     finally:
         state.set_read_only(False)
+
+
+def cmd_artifact_revalidate(args: argparse.Namespace) -> int:
+    from . import artifact_revalidation as revalidation, artifact_validation as initial
+    if state._bound_connection.get() is None or revalidation.request_id.get() is None:
+        print("错误: artifact-revalidate 必须通过完整 task CAS 的 sched request", file=sys.stderr)
+        return 64
+    if not args.yes:
+        print("未确认: artifact-revalidate 需要 --yes", file=sys.stderr)
+        return 1
+    try:
+        cfg = load_config()
+        if _is_foreign_host(cfg):
+            raise ValueError("artifact-revalidate 必须在配置的计算节点执行")
+        batch, task = args.task.split(":", 1)
+        with state.connect() as conn:
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=? ORDER BY version DESC LIMIT 1", (batch, task)).fetchone()
+            if job is None:
+                raise ValueError("任务不存在")
+            source = conn.execute("SELECT * FROM artifact_validations WHERE validation_id=?", (args.validation_id,)).fetchone()
+            if source is None:
+                raise ValueError("原始验证记录不存在，不能从当前文件补造")
+            spec = json.loads(conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?", (batch, task, job["version"])).fetchone()[0])
+            result = revalidation.perform(conn, job, spec, initial.decode(source), settle=args.settle,
+                                          reopen=args.reopen, system_retries=args.system_retries)
+        print(json.dumps({"query": "artifact_revalidation", "event_id": result["event_id"],
+                          "passed": result["passed"], "settled": result["settled"], "reason": result["reason"]}, ensure_ascii=False))
+        return 0
+    except (ValueError, state.StateError, ConfigError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 65
 
 
 def cmd_execution(args: argparse.Namespace) -> int:
@@ -4142,11 +4181,14 @@ class _BoundedTextCapture(io.TextIOBase):
 def _run_captured_mutation(
     command: list[str],
     conn: sqlite3.Connection | None = None,
+    request_id: str | None = None,
 ) -> tuple[int, str, str, list[Any]]:
     captured_stdout = _BoundedTextCapture()
     captured_stderr = _BoundedTextCapture()
     callbacks: list[Any] = []
     code = 1
+    from . import artifact_revalidation
+    token = artifact_revalidation.request_id.set(request_id)
     try:
         with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(
             captured_stderr
@@ -4161,6 +4203,8 @@ def _run_captured_mutation(
     except Exception as exc:
         code = 1
         captured_stderr.write(f"错误: mutation 执行异常: {exc}\n")
+    finally:
+        artifact_revalidation.request_id.reset(token)
     return code, captured_stdout.getvalue(), captured_stderr.getvalue(), callbacks
 
 
@@ -4248,6 +4292,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
         "daemon",
         "config",
         "batch-policy",
+        "artifact-revalidate",
     }
     if not command or command[0] not in allowed:
         raise RequestValidationError("request 只允许调度器 mutation 子命令", "unsupported_mutation")
@@ -4287,7 +4332,7 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
 
     target_kind = "none"
     target_id: str | None = None
-    if command[0] in {"cancel", "retry", "resubmit"}:
+    if command[0] in {"cancel", "retry", "resubmit", "artifact-revalidate"}:
         if len(command) < 2:
             raise RequestValidationError("mutation 缺少目标", "missing_target")
         target_id = command[1]
@@ -4386,6 +4431,11 @@ def _request_envelope(args: argparse.Namespace) -> tuple[str, list[str], dict]:
             raise RequestValidationError("mutation 命令参数无效", "invalid_command") from exc
     if command[0] == "batch-policy" and parsed.failure_policy is None:
         raise RequestValidationError("request batch-policy 需要 --failure-policy", "unsupported_mutation")
+    if command[0] == "artifact-revalidate" and (target_kind != "task" or "instance" not in expectation
+            or not re.fullmatch("[0-9a-f]{32}", expectation.get("instance", ""))
+            or not re.fullmatch("[0-9a-f]{64}", parsed.validation_id)
+            or not 0 <= parsed.system_retries <= 2 or (parsed.reopen and not parsed.settle)):
+        raise RequestValidationError("artifact-revalidate 需要精确 task/instance、有效原记录 ID 与复验参数", "invalid_precondition")
     return request_id, command, expectation
 
 
@@ -4647,14 +4697,14 @@ def cmd_request(args: argparse.Namespace) -> int:
             stderr = f"错误: mutation precondition failed: {conflict['message']}\n"
         else:
             conn.execute("SAVEPOINT request_mutation")
-            code, stdout, stderr, deferred = _run_captured_mutation(command, conn)
+            code, stdout, stderr, deferred = _run_captured_mutation(command, conn, request_id=request_id)
             if code:
                 conn.execute("ROLLBACK TO request_mutation")
                 deferred.clear()
             conn.execute("RELEASE request_mutation")
         from .integration import mutation_result
         result_json = (conflict_result(conn, conflict) if conflict is not None else
-                       mutation_result(conn, command, code, target_kind, target_id))
+                       mutation_result(conn, command, code, target_kind, target_id, request_id=request_id))
         conn.execute(
             "UPDATE operation_requests"
             " SET status='done', code=?, stdout=?, stderr=?, finished_at=?, result_json=?"
@@ -4795,6 +4845,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--validation-id", help="读取该任务的一条完整冻结证据，与 cursor 互斥")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_artifact_validations)
+
+    p = sub.add_parser("artifact-revalidations", help="只读查询产物复验和结算事件")
+    p.add_argument("task")
+    p.add_argument("--version", type=int)
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor")
+    p.add_argument("--event-id", dest="validation_id")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_artifact_validations)
+
+    p = sub.add_parser("artifact-revalidate", help="经 task CAS request 仅复验，显式 settle 才重新结算")
+    p.add_argument("task")
+    p.add_argument("--validation-id", required=True)
+    p.add_argument("--system-retries", type=int, default=0, help="0..2 次系统错误退避；不重训")
+    p.add_argument("--settle", action="store_true")
+    p.add_argument("--reopen", action="store_true", help="结算后无其他失败时显式恢复 blocked 批次派发")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_artifact_revalidate)
 
     p = sub.add_parser("init", help="生成 config.json (M0)")
     p.add_argument("--config", help="config.json 路径 (默认 {STATE}/config.json)")
@@ -5052,7 +5120,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "batch-policy"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy"}:
         return args.fn(args)
     if command == "request":
         try:

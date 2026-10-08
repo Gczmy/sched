@@ -254,6 +254,45 @@ class Acceptance:
         self.cli("submit", path, expect=1)
         print("PASS: nonadministrator argv, absent backend and retired strict admission rejected", flush=True)
 
+    def revalidation(self):
+        from revalidation_accept_support import StopFirstRegex
+        pattern = "^(A+)+$|OK"
+        _, path, spec = self.batch("text", "text", ("a" * 21 + "!ok").encode())
+        spec["tasks"][0]["artifacts"] = {"result": {"path": "result.txt", "regex": pattern}}
+        path.write_text(json.dumps(spec))
+        fault = StopFirstRegex(self.data("daemon", "status", "--json")["pid"], pattern)
+        try:
+            batch = self.submit(path)
+            fault.check()
+            self.wait_job(batch, {"blocked"})
+        finally:
+            fault.close()
+        self.cli("daemon", "drain", "--stop-when-idle")
+        deadline = time.monotonic() + 30
+        while self.data("daemon", "status", "--json")["health_state"] != "stopped":
+            assert time.monotonic() < deadline
+            time.sleep(.2)
+        self.reap_known(self.daemon_pid)
+        original = self.attempt(batch)
+        assert original["phase"] == "exited" and original["observation"]["returncode"] == 0
+        source = self.data("artifact-validations", f"{batch}:work", "--json")["validations"][0]
+        assert not source["passed"] and source["wait_verified"]
+        task = self.data("task", f"{batch}:work", "--json")
+        before = (self.projects["text"] / "runs.txt").read_bytes()
+        identity = self.data("identity", "--json")["instance_id"]
+        args = ["request", "native-revalidation", "--json", "--expect-kind", "task", "--expect-id", f"{batch}:work",
+                "--expect-status", "blocked", "--expect-version", "1", "--expect-revision", str(task["batch_revision"]),
+                "--expect-instance", identity, "--", "artifact-revalidate", f"{batch}:work",
+                "--validation-id", source["validation_id"], "--settle", "--yes"]
+        result = self.data(*args)
+        assert result["result"]["effect"]["settled"], result
+        assert self.data(*args)["replayed"]
+        assert self.attempt(batch) == original
+        assert (self.projects["text"] / "runs.txt").read_bytes() == before
+        self.cli("daemon", "resume")
+        self.start()
+        print("PASS: artifact-only settlement binds the original public-backend terminal wait and never restarts execution", flush=True)
+
     def cancel(self):
         (self.projects["text"] / "release").unlink(missing_ok=True)
         _, path, _ = self.batch("text", "hold", b"ignore\n")
@@ -494,7 +533,7 @@ class Acceptance:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", action="append", choices=("basic", "rejection", "cancel", "duration", "drain", "drift", "ordinary", "missing", "restart", "persistent_restart", "persistent_loss"))
+    parser.add_argument("--case", action="append", choices=("basic", "revalidation", "rejection", "cancel", "duration", "drain", "drift", "ordinary", "missing", "restart", "persistent_restart", "persistent_loss"))
     args = parser.parse_args()
     if sys.platform != "linux": raise SystemExit("acceptance requires local Linux")
     from gsched.execution import BackendUnavailable, LinuxFdBackend
@@ -505,7 +544,7 @@ def main():
         if os.environ.get("SCHED_REQUIRE_NATIVE") == "1":
             raise
         native_available = False
-    cases = args.case or (("rejection", "basic", "drain", "cancel", "duration", "drift", "ordinary", "missing", "restart", "persistent_restart", "persistent_loss")
+    cases = args.case or (("rejection", "basic", "revalidation", "drain", "cancel", "duration", "drift", "ordinary", "missing", "restart", "persistent_restart", "persistent_loss")
                           if native_available else ("ordinary", "missing"))
     if not native_available and any(case not in ("ordinary", "missing") for case in cases):
         raise SystemExit("requested acceptance case requires an explicitly built native backend")

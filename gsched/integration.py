@@ -25,6 +25,7 @@ CONTRACTS = {
     "artifact_rules": "sched-artifact-rules-v2",
     "batch_policy": "sched-batch-policy-v1",
     "artifact_validations": "sched-artifact-validations-v1",
+    "artifact_revalidations": "sched-artifact-revalidations-v1",
 }
 
 
@@ -70,7 +71,7 @@ def identity():
     return output
 
 
-def mutation_result(conn, command, code, kind, target):
+def mutation_result(conn, command, code, kind, target, request_id=None):
     # Metadata from the same mutation transaction; never infer process effects.
     result = {"outcome": "acknowledged" if code == 0 else "rejected", "effect": None}
     if code == 0 and kind == "task":
@@ -79,6 +80,12 @@ def mutation_result(conn, command, code, kind, target):
         if row:
             result["effect"] = {"batch_id": batch, "task": task, "version": row[0],
                                 "status": row[1], "project": row[2], "batch_revision": row[3]}
+            if command[0] == "artifact-revalidate":
+                event = conn.execute("SELECT event_id,passed,settled,reason FROM artifact_revalidations WHERE request_id=?", (request_id,)).fetchone()
+                if event is None:
+                    raise state.StateError("revalidation request has no durable event")
+                result["effect"].update(revalidation_id=event["event_id"], artifact_rules_passed=bool(event["passed"]),
+                                        settled=bool(event["settled"]), reason=event["reason"])
     elif code == 0 and kind == "batch":
         row = conn.execute("SELECT project, revision, status FROM batches WHERE id=?", (target,)).fetchone()
         if row:
