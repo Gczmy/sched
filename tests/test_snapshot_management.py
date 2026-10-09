@@ -123,6 +123,28 @@ class SnapshotManagementTests(TempStateCase):
             self.apply(preview)
         self.assertFalse(os.path.lexists(manager._journal(identifier)))
 
+    def test_inplace_change_between_digest_and_unlink_is_retained(self):
+        identifier, preview = self.prepared()
+        point = snapshot._point(identifier)
+        payload = os.path.join(point, "config.json")
+        original_open = os.open
+        changed = False
+        def replace_after_digest(path, flags, *args, **kwargs):
+            nonlocal changed
+            fd = original_open(path, flags, *args, **kwargs)
+            if os.path.normpath(path) == point and flags & os.O_DIRECTORY and not changed:
+                with open(payload, "ab") as stream:
+                    stream.write(b"changed after final digest")
+                changed = True
+            return fd
+        with mock.patch.object(manager.os, "open", side_effect=replace_after_digest):
+            with self.assertRaises(state.StateError):
+                self.apply(preview)
+        self.assertTrue(changed)
+        self.assertTrue(os.path.exists(payload))
+        self.assertTrue(os.path.exists(os.path.join(point, "database.db")))
+        self.assertEqual("pruning", snapshot._json(manager._journal(identifier))["phase"])
+
     def test_unrecorded_copy_content_or_empty_directory_is_not_pruned(self):
         identifier, preview = self.prepared()
         extra = os.path.join(snapshot._point(identifier), "files", "unknown-ticket")

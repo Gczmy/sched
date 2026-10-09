@@ -175,7 +175,10 @@ def _inventory(point):
                     or relative in {os.path.join("before-rollback", n) for n in snapshot.DATABASE_FILES}):
                 raise facts.SnapshotConflict("snapshot prune contains unexpected file")
             value = snapshot._file_fact(path, private=True)
-            files[relative] = {**value, "dev": info.st_dev, "ino": info.st_ino}
+            if snapshot._signature(snapshot._stat(path, private=True)) != snapshot._signature(info):
+                raise facts.SnapshotConflict("snapshot prune file changed while binding inventory")
+            files[relative] = {**value, "dev": info.st_dev, "ino": info.st_ino,
+                               "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}
             total += value["bytes"]
             if total > MAX_BYTES or time.monotonic() > deadline:
                 raise facts.SnapshotConflict("snapshot prune byte/time bound exceeded")
@@ -269,8 +272,8 @@ def _validate_journal(identifier, journal):
     if type(body.get("options")) is not dict or type(body.get("binding")) is not dict or type(body.get("close_record")) is not dict:
         raise facts.SnapshotConflict("snapshot prune journal authority bindings missing")
     for value in body["files"].values():
-        if (type(value) is not dict or set(value) != {"bytes", "sha256", "dev", "ino"}
-                or any(type(value.get(k)) is not int or value[k] < 0 for k in ("bytes", "dev", "ino"))
+        if (type(value) is not dict or set(value) != {"bytes", "sha256", "dev", "ino", "mtime_ns", "ctime_ns"}
+                or any(type(value.get(k)) is not int or value[k] < 0 for k in ("bytes", "dev", "ino", "mtime_ns", "ctime_ns"))
                 or type(value.get("sha256")) is not str or re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is None):
             raise facts.SnapshotConflict("snapshot prune journal file binding invalid")
     for value in body["directories"].values():
@@ -308,7 +311,10 @@ def _remove(identifier, journal):
             continue
         parent = _directory(point, parent_name, plan)
         info = snapshot._stat(path, private=True)
-        actual = {**snapshot._file_fact(path, private=True), "dev": info.st_dev, "ino": info.st_ino}
+        actual = {**snapshot._file_fact(path, private=True), "dev": info.st_dev, "ino": info.st_ino,
+                  "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}
+        if snapshot._signature(snapshot._stat(path, private=True)) != snapshot._signature(info):
+            raise facts.SnapshotConflict("snapshot prune file changed during final digest check")
         if actual != expected:
             raise facts.SnapshotConflict("snapshot prune original file changed")
         if name in KEEP_FILES:
@@ -318,7 +324,8 @@ def _remove(identifier, journal):
             if [os.fstat(fd).st_dev, os.fstat(fd).st_ino] != plan["directories"][parent_name]:
                 raise facts.SnapshotConflict("snapshot prune parent changed")
             current = os.stat(os.path.basename(name), dir_fd=fd, follow_symlinks=False)
-            if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                    or snapshot._signature(current) != snapshot._signature(info)):
                 raise facts.SnapshotConflict("snapshot prune file changed before unlink")
             os.unlink(os.path.basename(name), dir_fd=fd)
             os.fsync(fd)

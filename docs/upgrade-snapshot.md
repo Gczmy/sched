@@ -110,7 +110,8 @@ sched snapshot prune <snapshot-id> --retention-days 30 --keep-last 2 \
 ```
 
 执行取得稳定独占维护锁，重新核对原关闭记录、配置/state/物理主机绑定、manifest、
-目录 inode 和每个文件摘要；预览变化拒绝，不另选恢复点。删除前持久化原 pruning
+目录 inode、每个文件摘要及 mtime/ctime；最终 unlink 前再核对身份、大小和时间，
+拒绝摘要检查后的原 inode 内改写。预览变化拒绝，不另选恢复点。删除前持久化原 pruning
 意图，按原目录 FD 删除精确副本，逐步 fsync；故障保留现场，同一参数/摘要才可续接。
 不接受符号链接、硬链接、目录替换或未知文件。每阶段最多 30 秒，单文件 128 MiB、
 总量 1 GiB/10,000 项；忙或超限保留原记录。
