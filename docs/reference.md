@@ -204,6 +204,12 @@ admission-explain 增加 cpu_isolation 并复用池/claim 判断，池满仍报�
 设备事实；schema 1–20 返回 migration_required，不升级或探测 BPF。安装未知保留原
 CPU/GPU；原 CPU removed 引用和设备 released 记录均满足后才放行资源。此项没有
 实际设备安装接入或写 CLI，默认 JSON/FD4 不变；详见 [设备记录](device-scopes.md)。
+
+`sched device-inventory --json` 是计算节点显式只读设备探测，不读 DB 或迁移；网关
+禁止执行，即使设置 foreign-write override。UUID/PCI/driver minor/节点核对成功才
+报告完整映射，runtime_probed=true 但 admission/wait/physical boundary=false。返回
+失败不等于空映射；MIG 未知不能用于整卡放行。未接实际安装，见[设备映射](device-inventory.md)。
+
 精确原 owner 的租约检查最多有效 45 秒，缺失/过期/配置滞后为 unknown，不探测网关。
 GPU quota=0 仍是无限制。
 旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。

@@ -351,6 +351,33 @@ load 拒绝；v1 序列化不变，不执行 attach。最终来源完整 native 
 真实 GPU 未改动。
 尚无实际设备安装、NVIDIA 映射或特权正向证据，未发布或部署。
 合同见 [设备生命周期](device-scopes.md)。
+固定提交 `9ff56eec7772eda2749f1c62a276349555905b75` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37889794900) 14 项全部通过。
+
+后续[设备映射候选](device-inventory.md)增加显式计算节点 device-inventory 和原
+allocation 纯规则选择。UUID/PCI、driver minor/major、节点 inode/rdev 和前后采样
+一致才返回完整映射；CPU-only 不包含 GPU/control/UVM，MIG enabled/unknown 不授予
+整卡策略。没有新增安装配置、schema 或 daemon 行为，不把映射当隔离成功。
+计算节点最初发现 minor_number 不是可用 CSV 字段，修正为 driver information 取
+Device Minor 并核对原 UUID；最终实际 CLI 已取得完整映射，MIG N/A 明确保留 unknown。
+20 条专项回归通过，含真实有界 CPU helper/超时/超限回收；只读 CLI 无 state/配置
+写入、wrong-host/foreign-write 拒绝通过，没有 BPF attach 或真实 GPU 计算。
+
+首次全量回归发现既有 FIFO 测试的 TextIOWrapper.readline 预读第二行后
+communicate 绕过缓冲导致空输出；实际两个 CPU child 确定性复现 buffered 丢失与
+unbuffered 保留。独立提交 `ffc8af66c3a10b4cba6805fabc2330f257337143` 只改该测试，
+同时到达的两行输出与原 1 秒检查界限均保留，计算节点 25 次检查全部通过；没有
+放宽 runtime FIFO/身份守卫。其 CI 结果另行查询，不把首次失败或源码推送计作完整绿色。
+
+包含 FIFO 修复的最终设备映射来源在计算节点运行 995 条 native 回归：990 通过、
+5 跳过，157.223 秒、退出码 0；其中 3 条正向 scope 仍因没有明确委派而跳过，
+另两条为 native 缺失与 Darwin 专项，不算作实际隔离成功。同来源设备专项 20 条
+通过，只读实际 CLI 获得四卡映射，配置不变、没有创建 state，错误主机仍拒绝。
+196 文件 runtime/native/fixture/构建脚本清单 SHA256 为
+`2b148f9e0f982ea8882842f64816e4981a9b9ab1668b7ac04cfc08b538071a1f`，
+本地与计算节点前后核对一致。生产健康只通过已部署 CLI 查询，未替换安装或配置。
+设备策略实际安装、原 allocation 冻结关联、可靠 MIG 不支持/未知区分与特权
+正向 CPU/GPU 故障矩阵仍未完成；不把只读硬件映射记为这些项目的验收。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -367,7 +394,7 @@ load 拒绝；v1 序列化不变，不执行 attach。最终来源完整 native 
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语与 schema 21 设备记录候选；实际设备接入/正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语、schema 21 记录与原设备映射候选；实际设备接入/正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

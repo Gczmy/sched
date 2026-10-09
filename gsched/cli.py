@@ -1909,6 +1909,26 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def cmd_device_inventory(args: argparse.Namespace) -> int:
+    import subprocess
+    from . import device_inventory
+    from .integration import CONTRACTS
+    try:
+        cfg = load_config()
+        if sys.platform != "linux" or not str(cfg.get("node") or "").strip() or _is_foreign_host(cfg):
+            raise ValueError("device-inventory 必须在 config.node 指定的 Linux 计算节点执行")
+        inventory = device_inventory.capture()
+        result = {"schema_version": 1, "query": "device_inventory", "contract": CONTRACTS["device_inventory"],
+                  "node": str(cfg["node"]), "effect": "read_only_probe", "runtime_probed": True,
+                  "admission_granted": False, "wait_authority_granted": False, "physical_boundary_verified": False,
+                  "observed_at": time.time(), "inventory_sha256": execution_digest(inventory), "inventory": inventory}
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0
+    except (OSError, ValueError, ConfigError, subprocess.SubprocessError, TypeError, KeyError, RecursionError) as error:
+        print(f"错误: device-inventory 查询失败: {error}", file=sys.stderr)
+        return 1
+
+
 def cmd_device_scopes(args: argparse.Namespace) -> int:
     from . import device_scope_state
     from .integration import CONTRACTS, instance_id
@@ -5578,6 +5598,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cursor")
     p.set_defaults(fn=cmd_cpu_isolation)
 
+    p = sub.add_parser("device-inventory", help="计算节点只读 NVIDIA UUID/minor/设备节点映射；不安装策略或授予执行权")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_device_inventory)
+
     p = sub.add_parser("device-scopes", help="只读原设备策略 intent/程序绑定/未决生命周期；不探测 BPF 或授予执行权")
     p.add_argument("--scope-id")
     p.add_argument("--json", action="store_true")
@@ -5643,7 +5667,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "device-scopes"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "device-scopes", "device-inventory"}:
         return args.fn(args)
     if command == "request":
         try:

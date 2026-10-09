@@ -62,6 +62,8 @@ limit 默认 20、范围 1–100，使用实时 keyset，不是完整快照。�
 不可变历史、安装未知、取消／代际变化、原 CPU 删除引用、资源保留、禁止 CPU 降级、
 schema 20 只读与无回填迁移、查询字节边界；均为 synthetic 证据，不算 BPF 验收。
 
-尚未完成：scheduler 实际设备安装与 NVIDIA 控制/UVM/MIG/逐卡设备映射、持久 owner
+后续[设备映射候选](device-inventory.md)提供 control/UVM/整卡原 UUID/minor/节点核对，
+不改变这里的被动查询或实际安装状态。尚未完成：scheduler 实际设备安装、原 inventory
+冻结/MIG/能力区分、持久 owner
 设备故障矩阵、授权正向 CPU/BPF/真实 GPU 验收、被动新鲜根健康观察、原租约实际结束
 及授权发布／生产切换。此记录层不缩小或替代这些交付。

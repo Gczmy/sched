@@ -35,6 +35,7 @@ CONTRACTS = {
     "cpu_isolation": "sched-cpu-isolation-v1",
     "cpu_scopes": "sched-cpu-scope-state-v1",
     "device_scopes": "sched-device-scope-state-v1",
+    "device_inventory": "sched-device-inventory-v1",
     "cpu_cgroup": "sched-cpu-cgroup-v1",
     "artifact_validations": "sched-artifact-validations-v1",
     "artifact_revalidations": "sched-artifact-revalidations-v1",

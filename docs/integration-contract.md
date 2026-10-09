@@ -156,6 +156,19 @@ execution authority. Default status/task/history, wait_reason and FD4 remain
 unchanged. Bounds and incomplete hardware acceptance are specified in
 [device lifecycle](device-scopes.md).
 
+### Candidate exact device inventory
+
+`sched-device-inventory-v1` is an explicit compute-only hardware diagnostic,
+not a DB query or deployment mutation. It brackets index/UUID/PCI topology,
+driver minor and exact character-node identity; unknown/partial data never
+becomes a successful empty map. The pure policy selector binds only the original
+fresh non-simulated allocation UUID/index, excluding NVIDIA nodes for CPU-only.
+MIG enabled/unknown cannot grant a full-GPU rule. `runtime_probed` is true only
+for this opt-in query; admission/wait/physical-boundary authority remains false.
+It does not alter default status/task/history, schema 21 or passive device-scopes.
+No actual device installation or frozen allocation inventory exists yet; see
+[device inventory](device-inventory.md).
+
 ### Candidate resource explanation
 
 The source resource-explanation candidate advertises `sched-admission-explain-v1`

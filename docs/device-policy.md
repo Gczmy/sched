@@ -54,7 +54,8 @@ context 见 [Linux v6.8 UAPI](https://github.com/torvalds/linux/blob/v6.8/includ
 逃逸沙箱。实际设备访问受已有祖先限制；放行不保证 CUDA 成功。
 
 设备 intent/生命周期已有 [独立记录层候选](device-scopes.md)，但尚未接入实际安装；
-尚未实现控制/UVM/MIG/逐卡 UUID 与设备号映射、
+后续[设备映射候选](device-inventory.md)提供 control/UVM/整卡 UUID/driver minor 的显式
+只读核对与纯规则选择，但尚未冻结到 allocation 或接入安装；MIG 映射、
 必要 CPU 设备白名单、持久 owner 故障恢复接入和被动健康观察。因此不能声称现有
 cpu_isolation.mode=cgroup 限制 GPU，不能从 CUDA_VISIBLE_DEVICES 或 GPU claim 推断
 设备隔离。正式 GPU 验收与生产切换需要另行授权。
