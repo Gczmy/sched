@@ -577,7 +577,11 @@ class ReviewLifecycleRaceTests(TempStateCase):
             [sys.executable, "-c", script],
             cwd=os.path.dirname(os.path.dirname(__file__)),
             env=child_env,
-            text=True,
+            # TextIOWrapper.readline may prefetch the result line; communicate
+            # then reads the raw pipe and loses that buffered result. Raw,
+            # unbuffered readline consumes only the readiness line.
+            text=False,
+            bufsize=0,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -590,9 +594,11 @@ class ReviewLifecycleRaceTests(TempStateCase):
             process.kill()
             process.communicate()
             self.fail("FIFO launch marker child did not become ready")
-        self.assertEqual("ready", process.stdout.readline().strip())
-
         try:
+            # Ensure both tiny lines are available together, so a buffered
+            # reader regression is deterministic rather than timing-dependent.
+            process.wait(timeout=1)
+            self.assertEqual(b"ready", process.stdout.readline().strip())
             stdout, stderr = process.communicate(timeout=1)
         except subprocess.TimeoutExpired:
             process.kill()
@@ -600,7 +606,7 @@ class ReviewLifecycleRaceTests(TempStateCase):
             self.fail("FIFO launch marker inspection blocked")
 
         self.assertEqual(0, process.returncode, stderr)
-        self.assertEqual("True", stdout.strip())
+        self.assertEqual(b"True", stdout.strip())
 
     def test_symlink_launch_marker_fails_closed_without_process_probe(self) -> None:
         marker = state.launch_marker_path("symlink-job")
