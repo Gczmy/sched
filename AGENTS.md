@@ -64,7 +64,8 @@
 | `docs/storage-admission.md` | 候选 opt-in 存储准入与控制面余量；用户 quota 未知不等于无限制 |
 | `docs/daemon-lease.md` | 候选持久 daemon 启动来源、只读租约查询与持续校验；未知不冒充有效 |
 | `docs/cpu-capacity.md` | 候选 CPU auto 保守容量、冻结运行预留与零值兼容；不等于 per-job 硬隔离 |
-| `docs/execution-constraints.md` | 候选公开 backend 启动约束；scope/controller/设备策略与 scheduler 集成尚待实现 |
+| `docs/execution-constraints.md` | 候选公开 backend 启动约束；scope 持久事务/设备策略与 scheduler 集成尚待实现 |
+| `docs/cpu-scopes.md` | 候选委派 cpuset scope 原语；明确委派、原 inode 恢复只观察与空 scope 清理，不是可用 cgroup CLI |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |

@@ -4,7 +4,8 @@
 源码提供通用 `LaunchConstraints` 和 `sched-execution-constraints/v1`；该原语本身不
 新增任务字段或迁移。后续 [scheduler 亲和层](cpu-isolation.md) 显式冷配置启用、
 以 schema 18 持久化 CPU 分配/释放，并提供独立 CLI；Agent 仍只通过 sched CLI 操作。
-scope 创建/持久绑定/清理/恢复与设备策略尚需后续实现。
+另有 [委派 CPU scope 原语](cpu-scopes.md) 管理唯一 intent/inode、配置、被动恢复和
+空 scope 清理；scheduler 持久事务/恢复接入与设备策略尚需后续实现。
 
 ## 通用 backend 接口
 

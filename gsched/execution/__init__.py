@@ -19,6 +19,7 @@ from .backend import (
 )
 from .persistent import PersistentLinuxFdBackend, PersistentOwner, OwnerUnavailable
 from .constraints import LaunchConstraints, CONSTRAINTS_VERSION
+from .scopes import CpuScopeIntent, CpuScopeBinding, DelegatedCpuScopes, ScopeUnavailable, SCOPE_VERSION
 
 __all__ = [
     "INTERFACE_VERSION", "BackendUnavailable", "ExecutionEnvelope",
@@ -26,4 +27,5 @@ __all__ = [
     "SubprocessBackend", "retained_owners",
     "PersistentLinuxFdBackend", "PersistentOwner", "OwnerUnavailable",
     "LaunchConstraints", "CONSTRAINTS_VERSION",
+    "CpuScopeIntent", "CpuScopeBinding", "DelegatedCpuScopes", "ScopeUnavailable", "SCOPE_VERSION",
 ]

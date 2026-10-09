@@ -263,8 +263,24 @@ admission-explain 共用池/claim 决策，查询不探测网关，未知原 own
 本地与计算节点一致。初次 CLI 的 native fixture cwd 不符合已有注册 root 契约，
 只修测试程序的固定工作目录，没有放宽执行校验。CPU 亲和可被应用扩大，不是
 非可越界 cpuset；cgroup scope/设备策略仍未实现、未取得真实委派/设备验收。
-具体可用候选与剩余边界见 [CPU 亲和](cpu-isolation.md)。本项 CI 待固定提交后
-确认，未发布/部署；没有新租约、真实 GPU 使用或生产变更。
+具体可用候选与剩余边界见 [CPU 亲和](cpu-isolation.md)。固定提交
+`3fd4f488fc075cd1c798f1a206f430ece3eba510` 的
+[CI #37878283268](https://github.com/Gczmy/sched/actions/runs/37878283268) 全部 14 项
+通过；未发布/部署，没有新租约、真实 GPU 使用或生产变更。
+
+第三层候选新增独立 [CPU scope 原语](cpu-scopes.md)，不改变 schema 18 或默认派发。
+调用方需先持久化唯一 intent，再持久化真实 inode 后配置；明确要求已有 private
+单用户 cpuset 委派，不启用父 controller、不改 Slurm 父级。配置仅限新子 scope，
+请求/有效 CPU 和 NUMA 集合都核对；恢复只观察原 inode，不能重建、改配或再启动。
+有后代/直属进程、身份替换、内核上下文变化或清理未知均保留，不由空 scope 补造
+wait；同 UID 委派不当作恶意程序沙箱。16 条纯模型检查通过；指定计算租约内
+完整 native 回归运行 896 条，892 通过、4 跳过（其中 2 条正向 scope 测试因无委派
+明确跳过，不计 kernel 验收成功）。runtime/fixture 169 文件 SHA256 为
+`5a90c3ba2f4b1f87ab373e3ff08562c496f959312a2b2e01e10e2bca2d37dd65`，
+本地与计算节点一致。同一最终来源的 CPU 亲和 CLI 六组全部通过：普通/fake-GPU/
+native mask、释放/取消、原 owner 崩溃重连和冷配置/默认 off 没有回归，未创建实际
+cgroup 或动生产。scheduler 持久 intent/claim/资源事件、scope 漂移和取消/
+timeout/失效租约恢复接入仍待实现，设备与授权生产切换也未完成；本项 CI 待确认。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |

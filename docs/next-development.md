@@ -168,6 +168,11 @@ allocation CPU 绑定/活动 claim、原清理事实释放与持久 owner 重连
 affinity，不能称为硬隔离。scope 持久绑定/清理/恢复和设备策略仍未实现；当前计算
 环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
 
+后续 [委派 CPU scope 原语](cpu-scopes.md) 提供唯一 intent/原 inode 绑定、子 cpuset
+配置与有效集合核对、恢复仅观察和确认空 scope 清理；不修改父 controller，不因
+配置失败降级或重建旧名字。尚未接入 scheduler 的持久事务、claim 和生命周期；
+缺少明确测试委派时不宣称正向内核验收通过，仍不是完整 cgroup/设备交付。
+
 ### 已确认的设计方向
 
 1. 显式增加 `cpus_total: "auto"` 与可选正整数 `cpus_auto_max`，保留
