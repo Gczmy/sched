@@ -43,6 +43,17 @@
 现有[CPU 亲和专项](../tests/run_cpu_isolation_accept.py) 已有实际 mask/后代、取消、
 原 wait 和持久 owner 重连证据，主要故障使用控制器夹具。两套证据的组合仍需专项验收。
 
+联合入口为[启动祖先与 affinity 验收](../tests/run_launch_affinity_accept.py)：
+
+```sh
+PYTHONPATH=. python3 tests/run_launch_affinity_accept.py --require-native
+```
+
+须从指定原租约 shell 执行，并为该解释器独立构建 native。入口仅将测试自身及其
+私有 daemon 限为两个已有 CPU；固定预算仍为 120，不改变原 Slurm anchor 的 mask。
+退出前通过 CLI 确认私有 daemon 停止，保留受管 state/logs。[联合合成回归](../tests/test_compatibility_affinity.py)
+覆盖预算/有限池、未知/过期、漂移与原 claim 保留；不是该入口已通过的实机证明。
+
 | 后续项目 | 完成判据 |
 | --- | --- |
 | 兼容模式 + 固定 120 + affinity | 实际来源与有限 CPU 池、非重叠 claim、worker/后代 mask、池耗尽补位、取消和原资源释放 |
