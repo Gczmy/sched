@@ -200,6 +200,26 @@ CPU inode removal and referencing device release remain distinct requirements.
 access. Privileged positive acceptance and rollout remain outstanding; see
 [device controller](device-controller.md).
 
+### Candidate original MIG capability
+
+`device-inventory --with-mig-capability --json` separately negotiates
+`sched-device-inventory-mig-v1`, with inventory v2 and explicit mig_support statuses.
+The default v1 command/shape/probe sequence remains unchanged. An isolated bounded
+read-only NVML helper verifies the original UUID before/after GetMigMode; only its
+verified NOT_SUPPORTED result distinguishes unsupported MIG from CSV N/A. Other
+API failures, permission errors, missing APIs or contradictory modes do not authorize
+whole-GPU policy selection. Both complete CSV/NVML brackets and original driver/library
+versions must match; no model whitelist, MIG mutation or new hardware authority.
+
+Explicit device installation now requires v2, frozen to the original allocation/
+CPU inode/lease/intent before effects. Writer schema 24 guards this new persisted
+evidence without new tables or historical rewrites; complete read support is 1–24,
+writer 23 or older cannot reopen 24. Legacy frozen v1 remains v1/unknown for N/A,
+never upgraded from a current probe. Passive binding queries do not load NVML.
+Default status/task/history, FD4 and wait_reason remain unchanged. Read-only
+hardware capability is not GPU permission/CUDA acceptance; see
+[MIG capability](mig-capability.md).
+
 ### Candidate resource explanation
 
 The source resource-explanation candidate advertises `sched-admission-explain-v1`

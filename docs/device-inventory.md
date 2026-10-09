@@ -36,11 +36,14 @@ mknod/modprobe、sudo、设备策略安装或 Slurm 父级配置接口。utility
 原选中卡、nvidiactl 和 nvidia-uvm；不猜 UVM-tools、DRM、NVLink 或 nvidia-caps。
 需要额外设备的工作负载须另行扩展精确协议和验收，不能自动放行整个 major。
 
-当前只支持已明确记录 MIG current/pending 均 Disabled 的整卡选择；Enabled、N/A、
+v1 只支持已明确记录 MIG current/pending 均 Disabled 的整卡选择；Enabled、N/A、
 未知或缺少字段不能作为未分区证据。MIG GI/CI/capabilities 映射尚未实现，不能用
 整卡节点代替 MIG 权限；官方接口见
 [MIG 设备说明](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/device-nodes-and-capabilities.html)。
 映射完整不表示特权安装可用、设备 FD 无继承或 CUDA 可运行。
+后续 [原 UUID MIG 能力候选](mig-capability.md) 显式可选 v2 查询，额外冻结两次
+NVML GetMigMode 的身份/版本/原结果；只有明确不支持时才区分 N/A，其他未知仍拒绝。
+新设备 controller 采样要求 v2，旧 v1 原记录保留，不补写或偷偷改变默认诊断。
 
 ## 显式只读诊断
 
@@ -76,7 +79,7 @@ limit 默认 20、范围 1–100，精确 ID 与 cursor 互斥。单记录 256 K
 allocation 链的总查询预算 4 MiB；超限拒绝，实时 keyset 分页不是完整当前快照。
 查询只走私有 DB/WAL 快照，不采样硬件、迁移旧库或改变 revision；所有 runtime/
 admission/wait/physical 标志均 false。原记录过期仍可以查询，不解释为当前健康。
-完整 schema 1–21 返回 migration_required；当前完整只读范围 1–23。schema 21 及更旧
+完整 schema 1–21 返回 migration_required；当前完整只读范围 1–24。schema 21 及更旧
 writer 不可回接新库，回退只使用升级前验证恢复点，不能手改 state 或降低 schema。
 
 ## 验收与未完成项
@@ -91,5 +94,6 @@ writer 不可回接新库，回退只使用升级前验证恢复点，不能手�
 冻结绑定的[纯事务回归](../tests/test_device_inventory_state.py)检查原身份/策略/时效、
 不变历史、故障拒绝、分页/字节边界、旧库不迁移与 21→22 无回填；不是内核验收。
 后续 schema 23 [显式设备 controller](device-controller.md) 已接通安装/原 handle 启动/
-恢复仅观察，writer 22 及更旧不得回接 23。仍未实现 N/A 的可靠能力区分、MIG 精确
-权限或完成正向 BPF/真实 GPU 验收；未发布或部署。
+恢复仅观察，schema 24 [MIG 能力候选](mig-capability.md) 区分原 GetMigMode 不支持/
+未知并保留 v1；writer 23 及更旧不得回接 24。仍未实现 MIG 精确权限或完成正向
+BPF/真实 GPU 验收；未发布或部署。

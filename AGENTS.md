@@ -70,6 +70,7 @@
 | `docs/device-scopes.md` | 候选 schema 21 原设备意图/程序绑定/CAS、无重放与资源释放守卫 |
 | `docs/device-inventory.md` | 候选只读 UUID/driver minor/设备节点映射、原 allocation 冻结绑定与纯新鲜重验；非 GPU 验收 |
 | `docs/device-controller.md` | 候选 schema 23 显式设备安装/原 retained handle 启动/恢复仅观察；未知不重装，正向验收未完成 |
+| `docs/mig-capability.md` | 候选 schema 24/v2 原 UUID NVML MIG 能力与 N/A 区分；旧 v1 不补写，非 GPU 权限验收 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |

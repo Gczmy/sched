@@ -41,9 +41,9 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前显式设备接入候选写 schema 23，完整只读范围为 1–23；
-已发布 0.4.0 写 schema 10；候选 writer 11–22 均不能回接 schema 23。原映射绑定表于 22 引入，
-23 为不可变 allocation 的设备必需标志添加语义守卫，不回填旧事实。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前 MIG 能力证据候选写 schema 24，完整只读范围为 1–24；
+已发布 0.4.0 写 schema 10；候选 writer 11–23 均不能回接 schema 24。原映射绑定表于 22 引入，
+23 记录设备必需标志，24 守卫新 v2 MIG 能力证据，均不回填旧事实。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -210,6 +210,10 @@ CPU/GPU；原 CPU removed 引用和设备 released 记录均满足后才放行�
 禁止执行，即使设置 foreign-write override。UUID/PCI/driver minor/节点核对成功才
 报告完整映射，runtime_probed=true 但 admission/wait/physical boundary=false。返回
 失败不等于空映射；MIG 未知不能用于整卡放行。显式冷配置接入见[设备 controller](device-controller.md)，不表示真实隔离验收已完成。
+`device-inventory --with-mig-capability --json` 另协商 `sched-device-inventory-mig-v1`，
+返回 v2 完整原 NVML 证据及外层 mig_support；仅原 GetMigMode 明确不支持才区分
+N/A，其他错误仍 unknown。默认 v1 不增加字段或 NVML 探测；原证据/有限采样与
+schema 24 兼容边界见 [MIG 能力](mig-capability.md)。
 
 `sched device-inventory-bindings [--scope-id ID] [--limit N] [--cursor ID] --json`
 协商独立 `sched-device-inventory-binding-v1`。schema 22 冻结原完整映射、allocation/

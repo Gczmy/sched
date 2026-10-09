@@ -36,6 +36,19 @@ def captured(csv=CSV):
     return inventory.from_facts(csv, csv, MAJORS, nodes, information, CONTEXT)
 
 
+def capabilities(csv=CSV, *, code=0, current=0, pending=0, phase="mig"):
+    return {"interface_version": "sched-mig-capability/v1", "driver_version": "550.1", "library_version": "12.550.1",
+            "entries": [{"uuid": c["uuid"], "phase": phase, "code": code, "identity_verified": phase == "mig",
+                         "current": current if code == 0 and phase == "mig" else None,
+                         "pending": pending if code == 0 and phase == "mig" else None} for c in inventory.parse_smi(csv)]}
+
+
+def captured_mig(csv=CSV, *, evidence=None):
+    nodes, information = facts(csv)
+    return inventory.from_facts(csv, csv, MAJORS, nodes, information, CONTEXT,
+                                 mig_capabilities=capabilities(csv) if evidence is None else evidence)
+
+
 def reservation(index=1, uuid=SECOND):
     return dict(gpu_id=index, gpu_uuid=uuid, simulated=False, topology_status="recorded_sample", topology_observed_at=99)
 
@@ -124,7 +137,7 @@ class DeviceInventoryTests(unittest.TestCase):
                 inventory.select_policy(original, [], now=now)
 
 
-class DeviceCaptureModels(unittest.TestCase):
+class DeviceCaptureFixture(unittest.TestCase):
     def setUp(self):
         self.nodes, self.information = facts()
         self.descriptors = {n: 20 + i for i, n in enumerate(self.nodes)}
@@ -158,6 +171,7 @@ class DeviceCaptureModels(unittest.TestCase):
         self.read_mock = self.read_patch.start()
         self.addCleanup(self.read_patch.stop)
 
+class DeviceCaptureModels(DeviceCaptureFixture):
     def test_capture_uses_only_nonfollowing_path_descriptors_and_closes_all(self):
         with mock.patch.object(inventory, "_query", return_value=CSV) as query:
             self.assertEqual(captured(), inventory.capture())

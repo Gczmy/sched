@@ -41,7 +41,7 @@ class DeviceControllerTests(fixture.CpuScopeFixture):
         self.parent = ScopeParent(self.parent.path, self.parent.device, self.parent.inode,
                                   mapping.CONTEXT["boot_id"], mapping.CONTEXT["mount_namespace"], self.parent.uid)
         self.cfg["device_isolation"] = {"mode": "nvidia"}
-        self.sampled = mapping.captured()
+        self.sampled = mapping.captured_mig()
         self.installed, self.query_ok = [], True
         outer = self
 
@@ -73,7 +73,7 @@ class DeviceControllerTests(fixture.CpuScopeFixture):
 
         for target, kwargs in (("gsched.device_scope_controller.preflight", {}),
                               ("gsched.device_scope_controller.DeviceScope", {"side_effect": ModelDevice}),
-                              ("gsched.device_scope_controller.inventory.capture", {"side_effect": lambda: copy.deepcopy(self.sampled)}),
+                              ("gsched.device_scope_controller.inventory.capture", {"side_effect": lambda **kwargs: copy.deepcopy(self.sampled)}),
                               ("gsched.device_scope_controller.time.time", {"return_value": 100})):
             patch = mock.patch(target, **kwargs)
             patched = patch.start()
@@ -179,12 +179,12 @@ class DeviceControllerTests(fixture.CpuScopeFixture):
         with state.connect() as conn:
             self.assertEqual("installed", ledger.load(conn, intent.scope_id)[1][-1]["kind"])
 
-    def test_schema23_semantic_guard_refuses_older_writer_without_rewriting_records(self):
+    def test_current_semantic_guard_refuses_older_writer_without_rewriting_records(self):
         job, identifier, intent = self.prepare()
         with state.connect() as conn:
             original = ledger.load(conn, intent.scope_id)
-            self.assertEqual(23, conn.execute("PRAGMA user_version").fetchone()[0])
-        with mock.patch.object(state, "DB_SCHEMA_VERSION", 22), self.assertRaises(state.StateError):
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
+        with mock.patch.object(state, "DB_SCHEMA_VERSION", state.DB_SCHEMA_VERSION - 1), self.assertRaises(state.StateError):
             state.init_db()
         with state.connect() as conn:
             self.assertEqual(original, ledger.load(conn, intent.scope_id))

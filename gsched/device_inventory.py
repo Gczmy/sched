@@ -6,18 +6,21 @@ cards cannot grant a full-GPU policy; capability/DRM device guesses are forbidde
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
 import os
 import re
 import selectors
 import stat
 import subprocess
+import sys
 import threading
 import time
 
 from .execution import DevicePolicy, DeviceRule
 
 VERSION = "sched-device-inventory/v1"
+VERSION_MIG = "sched-device-inventory/v2"
 MAX_GPUS = 128
 MAX_TEXT = 64 * 1024
 MAX_AGE = 5
@@ -129,7 +132,7 @@ class DeviceNode:
         return DeviceRule("char", self.major, self.minor, 6)  # read/write, never mknod
 
 
-def from_facts(before, after, majors, nodes, information, context):
+def from_facts(before, after, majors, nodes, information, context, *, mig_capabilities=None):
     """Pure, bounded bracket verification; no kernel effects or admission."""
     cards, later = parse_smi(before), parse_smi(after)
     if cards != later:
@@ -153,14 +156,21 @@ def from_facts(before, after, majors, nodes, information, context):
         if type(node) is not DeviceNode or node.name != name or (node.major, node.minor) != (major, minor) or (major, minor) in seen:
             raise ValueError("device node does not match driver/baseline or aliases another rule")
         seen.add((major, minor))
-    return {"interface_version": VERSION, "context": dict(context), "cards": cards,
-            "nodes": {name: nodes[name].to_dict() for name in sorted(nodes)}}
+    result = {"interface_version": VERSION, "context": dict(context), "cards": cards,
+              "nodes": {name: nodes[name].to_dict() for name in sorted(nodes)}}
+    if mig_capabilities is not None:
+        from .mig_capability import reconcile
+        reconcile(mig_capabilities, cards)
+        result.update(interface_version=VERSION_MIG, mig_capabilities=json.loads(json.dumps(mig_capabilities)))
+    return result
 
 
 def select_policy(inventory, reservations, *, now=None):
     """Freeze only the original exact GPU reservation, never index==minor."""
-    if (type(inventory) is not dict or set(inventory) != {"interface_version", "context", "cards", "nodes"}
-            or inventory.get("interface_version") != VERSION
+    modern = type(inventory) is dict and inventory.get("interface_version") == VERSION_MIG
+    keys = {"interface_version", "context", "cards", "nodes"} | ({"mig_capabilities"} if modern else set())
+    if (type(inventory) is not dict or set(inventory) != keys
+            or inventory.get("interface_version") not in {VERSION, VERSION_MIG}
             or type(inventory["nodes"]) is not dict or len(inventory["nodes"]) > len(CPU_DEVICES) + len(SHARED_DEVICES) + MAX_GPUS
             or type(reservations) is not list or len(reservations) > MAX_GPUS):
         raise ValueError("invalid device policy selection")
@@ -174,13 +184,16 @@ def select_policy(inventory, reservations, *, now=None):
     nodes = {name: DeviceNode(**value) for name, value in inventory["nodes"].items()}
     major_text = f"Character devices:\n{nodes['nvidiactl'].major} nvidia\n{nodes['nvidia-uvm'].major} nvidia-uvm\nBlock devices:\n"
     infos = {c["pci"]: f"GPU UUID: {c['uuid']}\nDevice Minor: {c['minor']}\n" for c in cards}
-    checked = from_facts(csv, csv, major_text, nodes, infos, inventory["context"])
+    checked = from_facts(csv, csv, major_text, nodes, infos, inventory["context"],
+                         mig_capabilities=inventory.get("mig_capabilities"))
     if checked != inventory:
         raise ValueError("device inventory is not canonical")
     now = time.time() if now is None else now
     if type(now) not in (int, float) or not math.isfinite(now):
         raise ValueError("invalid device selection time")
     selected, used = [], set()
+    from .mig_capability import reconcile
+    capabilities = reconcile(inventory["mig_capabilities"], cards) if modern else None
     for reservation in reservations:
         if (type(reservation) is not dict or type(reservation.get("gpu_id")) is not int
                 or reservation.get("simulated") is not False or reservation.get("topology_status") != "recorded_sample"
@@ -191,7 +204,9 @@ def select_policy(inventory, reservations, *, now=None):
         card = next((c for c in cards if c["index"] == reservation["gpu_id"]), None)
         if card is None or card["uuid"] != reservation.get("gpu_uuid"):
             raise ValueError("original GPU index/UUID differs from device inventory")
-        if card["mig_current"] != "disabled" or card["mig_pending"] != "disabled":
+        unsupported = capabilities is not None and capabilities[card["uuid"]] == "not_supported"
+        if (not unsupported and (card["mig_current"] != "disabled" or card["mig_pending"] != "disabled")
+                or capabilities is not None and capabilities[card["uuid"]] == "unknown"):
             raise ValueError("MIG enabled or unknown cannot grant a full-GPU device policy")
         used.add(card["index"])
         selected.append("nvidia" + str(card["minor"]))
@@ -211,17 +226,17 @@ def _read(path):
         os.close(descriptor)
 
 
-def _query(deadline):
+def _query(deadline, *, uuids=None):
     global _pending_query
     if not _query_lock.acquire(blocking=False):
         raise ValueError("device topology query already in progress")
     try:
-        return _query_locked(deadline)
+        return _query_locked(deadline, uuids=uuids)
     finally:
         _query_lock.release()
 
 
-def _query_locked(deadline):
+def _query_locked(deadline, *, uuids=None):
     global _pending_query
     if _pending_query is not None:
         if _pending_query.poll() is None:
@@ -232,6 +247,13 @@ def _query_locked(deadline):
     if deadline <= time.monotonic():
         raise TimeoutError("device topology query deadline already expired")
     command = ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,mig.mode.current,mig.mode.pending", "--format=csv,noheader,nounits"]
+    if uuids is not None:
+        from .mig_capability import ENTRY
+        if (type(uuids) is not list or not 1 <= len(uuids) <= MAX_GPUS
+                or any(type(u) is not str or UUID.fullmatch(u) is None for u in uuids)
+                or len(set(uuids)) != len(uuids)):
+            raise ValueError("invalid original MIG probe UUID targets")
+        command = [sys.executable, "-I", "-S", "-c", ENTRY, json.dumps(uuids)]
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True)
     _pending_query = process
     try:
@@ -261,15 +283,18 @@ def _query_locked(deadline):
         _pending_query = None  # Remains bound if actual wait/kill failed.
 
 
-def capture():
+def capture(*, include_mig=False):
     """Compute-only caller; O_PATH identifies nodes without opening a device."""
     if not hasattr(os, "O_PATH"):
         raise ValueError("device inventory requires Linux O_PATH")
+    if type(include_mig) is not bool:
+        raise ValueError("include_mig must be explicit boolean")
     deadline = time.monotonic() + MAX_AGE
     root = os.open("/dev", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         before = _query(deadline)
         cards = parse_smi(before)
+        mig_before = json.loads(_query(deadline, uuids=[c["uuid"] for c in cards])) if include_mig else None
         context = {"boot_id": _read("/proc/sys/kernel/random/boot_id").strip(),
                    "mount_namespace": os.readlink("/proc/self/ns/mnt"),
                    "dev_device": os.fstat(root).st_dev, "dev_inode": os.fstat(root).st_ino}
@@ -288,6 +313,11 @@ def capture():
             finally:
                 os.close(descriptor)
         after = _query(deadline)
+        mig_after = json.loads(_query(deadline, uuids=[c["uuid"] for c in cards])) if include_mig else None
+        if mig_after != mig_before:
+            raise ValueError("original MIG capability changed during device capture")
+        if include_mig and mig_before is None:
+            raise ValueError("original MIG capability missing")
         # Detect node/root/namespace replacement during the same bracket.
         root_now = os.stat("/dev", follow_symlinks=False)
         if context != {"boot_id": _read("/proc/sys/kernel/random/boot_id").strip(),
@@ -304,6 +334,6 @@ def capture():
                 raise ValueError("device inventory node changed")
         if time.monotonic() > deadline:
             raise TimeoutError("device inventory bracket expired")
-        return from_facts(before, after, majors, nodes, information, context)
+        return from_facts(before, after, majors, nodes, information, context, mig_capabilities=mig_before)
     finally:
         os.close(root)

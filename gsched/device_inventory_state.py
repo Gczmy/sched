@@ -85,6 +85,10 @@ def freeze(conn, scope_id, sampled, observed_at):
         raise state.StateError("device inventory observation is stale or future")
     # Bound and copy the caller's complete evidence before any persistent write.
     sampled = json.loads(_encoded(sampled))
+    if type(sampled) is not dict:
+        raise state.StateError("device inventory evidence must be an object")
+    if sampled.get("interface_version") == inventory.VERSION_MIG and conn.execute("PRAGMA user_version").fetchone()[0] < 24:
+        raise state.StateError("MIG capability binding requires schema 24")
     value, events, original, intent = _original(conn, scope_id, active=True)
     if events[-1]["kind"] != "reserved":
         raise state.StateError("device inventory cannot be added after installation intent")
@@ -126,9 +130,11 @@ def load(conn, scope_id):
             or type(binding["schema_version"]) is not int or binding["schema_version"] != 1
             or type(binding["version"]) is not int or binding["version"] < 1
             or any(binding[k] != row[k] for k in ("scope_id", "allocation_id", "job_id"))
-            or digest(binding["inventory"]) != binding["inventory_sha256"]
+            or type(binding["inventory"]) is not dict or digest(binding["inventory"]) != binding["inventory_sha256"]
             or not 0 <= _time(binding["frozen_at"]) - _time(binding["observed_at"]) <= inventory.MAX_AGE):
         raise state.StateError("original device inventory binding corrupt")
+    if binding["inventory"].get("interface_version") == inventory.VERSION_MIG and conn.execute("PRAGMA user_version").fetchone()[0] < 24:
+        raise state.StateError("original MIG capability binding schema marker missing")
     value, _, original, intent = _original(conn, identifier)
     if (any(binding[k] != value[k] for k in
             ("scope_id", "allocation_id", "job_id", "instance_id", "version", "lease_id", "allocation_sha256"))

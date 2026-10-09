@@ -268,3 +268,13 @@ attachment/完整映射/lease 新鲜检查后，CPU 与设备 launch_intent 同�
 配置与 native/query 检查不等于权限或实际设备访问验收。尚无授权特权正向 BPF/
 真实 GPU 故障矩阵、发布或生产切换；回退仍只用升级前验证恢复点。
 完整约束见 [设备 controller](device-controller.md)。
+
+## 后续候选原 MIG 能力证据 schema 24
+
+不新增 SQL 表或补写旧事实；新显式设备安装要求 inventory v2 的原 UUID/NVML
+GetMigMode 原返回、版本与双采样一致证据，writer 23 及更旧不能回接 24。
+当前完整只读范围 1–24，旧冻结 v1 原文/摘要保持不变，不由当前探测补判历史 N/A。
+默认诊断仍 v1，可选 --with-mig-capability 独立协商。明确不支持、supported 与 unknown
+分开；身份/版本/CSV 冲突、权限/driver/接口错误不授予整卡规则或新启动 handle。
+只读实际观察不是特权 BPF/CUDA 正向证据；MIG 权限与正式发布/生产切换未完成。
+回退仍只用升级前验证恢复点，完整合同见 [原 MIG 能力](mig-capability.md)。

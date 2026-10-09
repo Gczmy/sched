@@ -41,7 +41,9 @@ def unknown(scope_id, reason):
 
 
 def _sample():
-    result = inventory.capture()
+    result = inventory.capture(include_mig=True)
+    if result.get("interface_version") != inventory.VERSION_MIG:
+        raise state.StateError("explicit device installation requires original MIG capability evidence")
     return result, time.time()
 
 

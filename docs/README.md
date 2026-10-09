@@ -38,6 +38,7 @@
 | [device-scopes.md](device-scopes.md) | 候选 schema 21 不可变设备意图/程序绑定/CAS、恢复与资源保留 |
 | [device-inventory.md](device-inventory.md) | 候选 UUID/driver minor/节点映射、schema 22 原 allocation 冻结绑定与纯新鲜重验 |
 | [device-controller.md](device-controller.md) | 候选 schema 23 显式设备安装/原 handle 启动/恢复观察；真实正向验收未完成 |
+| [mig-capability.md](mig-capability.md) | 候选 schema 24/v2 原 UUID NVML MIG 能力区分、原证据冻结与旧 v1 保留；非隔离验收 |
 | [execution-constraints.md](execution-constraints.md) | 候选三种 backend 的启动前 CPU/cgroup FD 原语；scheduler 硬隔离整体尚未完成 |
 | [repository-hygiene.md](repository-hygiene.md) | 仓库中的隐私信息和运行记录边界 |
 

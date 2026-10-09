@@ -15,7 +15,7 @@ import test_device_inventory as mapping
 import test_device_scope_state as scope_fixture
 
 
-class DeviceInventoryStateTests(affinity.CpuIsolationFixture):
+class DeviceInventoryFixture(affinity.CpuIsolationFixture):
     configured = scope_fixture.DeviceScopeStateTests.configured
     cpu_observation = staticmethod(scope_fixture.DeviceScopeStateTests.cpu_observation)
     installed_data = staticmethod(scope_fixture.DeviceScopeStateTests.installed_data)
@@ -70,6 +70,7 @@ class DeviceInventoryStateTests(affinity.CpuIsolationFixture):
             binding = ledger.freeze(conn, intent.scope.intent.scope_id, captured, 99)
         return job, identifier, intent, captured, binding
 
+class DeviceInventoryStateTests(DeviceInventoryFixture):
     def test_cpu_binding_freezes_full_evidence_and_original_identities(self):
         job, identifier, intent, captured, binding = self.frozen()
         with state.connect() as conn:

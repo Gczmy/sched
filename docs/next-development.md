@@ -188,7 +188,8 @@ scheduler 实际安装、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改�
 原 allocation 的明确未分区整卡或 CPU-only 基线；显式 device-inventory 仅在计算节点
 只读探测，不读 DB。后续 schema 22 候选冻结原 allocation/CPU scope/device intent 的
 完整映射并提供纯新鲜重验。后续 schema 23 [显式设备 controller](device-controller.md)
-接入安装、原 handle 启动与恢复仅观察；MIG/N/A 的可靠能力区分、授权正向
+接入安装、原 handle 启动与恢复仅观察；后续 schema 24 [原 UUID MIG 能力](mig-capability.md)
+区分 GetMigMode 明确不支持/未知，不回填 v1。MIG 精确权限、授权正向
 CPU/BPF/真实 GPU/owner 故障矩阵、被动新鲜根健康及发布仍待完成。
 
 ### 已确认的设计方向

@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 23
+DB_SCHEMA_VERSION = 24
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {

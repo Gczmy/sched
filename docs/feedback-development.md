@@ -424,6 +424,27 @@ PYTHONPATH 而中止，未算通过；只修正调用环境后同来源重跑通
 本地与计算节点前后核对一致。不执行 BPF attach、真实 GPU 计算或 Slurm 父级准备，
 不修改生产安装/config/daemon；模型、默认 off 兼容与拒绝路径不是特权正向验收。
 
+固定 controller 提交 `151a5452745f291b16ac285ec981b6db3e451340` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37896797236) 已完成 success，
+14/14 作业通过；没有发布或部署。
+
+后续 schema 24 [MIG 能力候选](mig-capability.md) 使用固定只读 NVML getter helper，
+GetMigMode 前后核对原 UUID，只将该函数明确 NOT_SUPPORTED 与其他 API 错误区分。
+默认 v1/N/A=unknown 不变；显式 v2 保留完整原始证据，新设备 controller 要求 v2。
+前后能力变化、CSV 冲突、未知/启用 MIG 均拒绝 GPU 规则；旧 v1 记录不回填，
+23→24 保留原历史，旧 writer 不可回接。没有启用 MIG 或扩大设备权限。
+
+该最终来源在指定计算租约内显式 native 构建后运行 1051 条完整回归：1046 通过、
+5 跳过，170.026 秒、退出码 0；跳过原因仍为三条缺少明确委派的正向 scope、
+native 缺失和 Darwin 专项，不计实际隔离成功。20 条 MIG 专项及六组 CPU/CLI 全部
+通过，普通目录/fake 设备拒绝路径通过。真实可选只读 NVML 诊断取得完整映射，
+GetMigMode 明确返回 not_supported，原 UUID 前后校验成功；默认 v1 查询仍保持
+unknown，没有创建 state 或更改配置。203 文件 runtime/native/fixture/构建脚本
+清单 SHA256 为
+`651d685f0746428a7e83b527e2adb927584fbbb067e8bb686d167ff798b9aed3`，
+本地与计算节点前后核对一致。未执行 BPF attach、真实 GPU 计算、Slurm 父级准备
+或生产修改；特权正向矩阵、被动新鲜根健康及原租约真实结束仍未完成。
+
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
 | 2 | 已提交修复验收 | 候选 CI/CPU/两主机验收通过 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
@@ -439,7 +460,7 @@ PYTHONPATH 而中止，未算通过；只修正调用环境后同来源重跑通
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结与 schema 23 显式接入候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结/schema 23 显式接入与 schema 24 MIG 区分候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

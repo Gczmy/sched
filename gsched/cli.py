@@ -1917,11 +1917,17 @@ def cmd_device_inventory(args: argparse.Namespace) -> int:
         cfg = load_config()
         if sys.platform != "linux" or not str(cfg.get("node") or "").strip() or _is_foreign_host(cfg):
             raise ValueError("device-inventory 必须在 config.node 指定的 Linux 计算节点执行")
-        inventory = device_inventory.capture()
-        result = {"schema_version": 1, "query": "device_inventory", "contract": CONTRACTS["device_inventory"],
+        include_mig = getattr(args, "with_mig_capability", False)
+        inventory = device_inventory.capture(include_mig=True) if include_mig else device_inventory.capture()
+        result = {"schema_version": 1, "query": "device_inventory", "contract": CONTRACTS["device_inventory_mig" if include_mig else "device_inventory"],
                   "node": str(cfg["node"]), "effect": "read_only_probe", "runtime_probed": True,
                   "admission_granted": False, "wait_authority_granted": False, "physical_boundary_verified": False,
                   "observed_at": time.time(), "inventory_sha256": execution_digest(inventory), "inventory": inventory}
+        if include_mig:
+            from .mig_capability import reconcile
+            statuses = reconcile(inventory["mig_capabilities"], inventory["cards"])
+            result["mig_support"] = [{"gpu_id": c["index"], "gpu_uuid": c["uuid"],
+                                      "status": statuses[c["uuid"]]} for c in inventory["cards"]]
         print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
         return 0
     except (OSError, ValueError, ConfigError, subprocess.SubprocessError, TypeError, KeyError, RecursionError) as error:
@@ -5620,6 +5626,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_cpu_isolation)
 
     p = sub.add_parser("device-inventory", help="计算节点只读 NVIDIA UUID/minor/设备节点映射；不安装策略或授予执行权")
+    p.add_argument("--with-mig-capability", action="store_true", help="显式原 UUID NVML MIG 能力核对；未知不等于不支持")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_device_inventory)
 

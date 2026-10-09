@@ -13,7 +13,7 @@ import tempfile
 from run_feedback_accept import Acceptance
 
 
-def run():
+def run(include_mig=False):
     if sys.platform != "linux":
         raise RuntimeError("Run on an authorized Linux compute lease, never the laptop/gateway.")
     temporary = tempfile.mkdtemp(prefix="sched-device-inventory-cli-")
@@ -21,13 +21,18 @@ def run():
     fixture = Acceptance(root)
     before = hashlib.sha256(fixture.config.read_bytes()).hexdigest()
     try:
-        result = fixture.cli("device-inventory", "--json", expect=None)
+        flags = ["--with-mig-capability"] if include_mig else []
+        result = fixture.cli("device-inventory", *flags, "--json", expect=None)
         assert result.returncode in (0, 1), result
         assert not (root / "state").exists(), "read-only inventory initialized scheduler state"
         assert hashlib.sha256(fixture.config.read_bytes()).hexdigest() == before
         if result.returncode == 0:
             report = json.loads(result.stdout)
-            assert report["contract"] == "sched-device-inventory-v1" and report["node"] == fixture.cfg["node"]
+            contract = "sched-device-inventory-mig-v1" if include_mig else "sched-device-inventory-v1"
+            assert report["contract"] == contract and report["node"] == fixture.cfg["node"]
+            if include_mig:
+                assert report["inventory"]["interface_version"] == "sched-device-inventory/v2"
+                assert all(r["status"] in ("supported", "not_supported", "unknown") for r in report["mig_support"])
             assert report["runtime_probed"] is True and report["effect"] == "read_only_probe"
             for key in ("admission_granted", "wait_authority_granted", "physical_boundary_verified"):
                 assert report[key] is False
@@ -43,7 +48,7 @@ def run():
         fixture.cfg["node"] = "different-compute.example.invalid"
         fixture.config.write_text(json.dumps(fixture.cfg))
         fixture.env["SCHED_ALLOW_FOREIGN_WRITE"] = "1"
-        result = fixture.cli("device-inventory", "--json", expect=1)
+        result = fixture.cli("device-inventory", *flags, "--json", expect=1)
         assert not result.stdout and "必须在" in result.stderr and not (root / "state").exists()
         print("PASS: wrong-host probe rejected even with foreign-write override; no daemon/DB/BPF effects", flush=True)
     except BaseException:
@@ -55,4 +60,6 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    if sys.argv[1:] not in ([], ["--with-mig-capability"]):
+        raise SystemExit("usage: run_device_inventory_accept.py [--with-mig-capability]")
+    run(bool(sys.argv[1:]))

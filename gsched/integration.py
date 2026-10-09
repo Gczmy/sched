@@ -38,6 +38,7 @@ CONTRACTS = {
     "device_inventory_bindings": "sched-device-inventory-binding-v1",
     "device_cgroup": "sched-device-cgroup-v1",
     "device_inventory": "sched-device-inventory-v1",
+    "device_inventory_mig": "sched-device-inventory-mig-v1",
     "cpu_cgroup": "sched-cpu-cgroup-v1",
     "artifact_validations": "sched-artifact-validations-v1",
     "artifact_revalidations": "sched-artifact-revalidations-v1",
