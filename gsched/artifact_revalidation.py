@@ -61,6 +61,8 @@ def source_binding(conn, job, spec, record):
             or record["rules_sha256"] != digest(initial.rules_snapshot(spec))
             or any(payload.get(k) != job[k] for k in ("batch_id", "task_id", "fingerprint", "retries", "started_at"))):
         raise ValueError("original validation binding changed")
+    if payload.get("allocation_id") != dict(job).get("allocation_id"):
+        raise ValueError("original allocation binding changed")
     if not isinstance(payload["checks"], list) or not 1 <= len(payload["checks"]) <= MAX_RULES:
         raise ValueError("artifact-only revalidation requires 1..32 original rule observations")
 

@@ -56,8 +56,11 @@ def completion_key(job, context):
     # Ordinary legacy retries reuse a version: retain each original observation
     # by its recorded retry counter and start, never overwrite the first failure.
     job = dict(job)
-    return digest({"job_id": job["id"], "version": job["version"], "context": context,
-                   "retries": job.get("retries", 0), "started_at": job.get("started_at")})
+    binding = {"job_id": job["id"], "version": job["version"], "context": context,
+               "retries": job.get("retries", 0), "started_at": job.get("started_at")}
+    if job.get("allocation_id") is not None:
+        binding["allocation_id"] = job["allocation_id"]
+    return digest(binding)
 
 
 def prior_completion(conn, job, context):
@@ -107,6 +110,7 @@ def record_initial(conn, job, spec, context, checks, *, rc, ordinary_wait=None):
                         (job["batch_id"], job["task_id"], job["version"])).fetchone()
     if (current is None or task is None or current["status"] != "running"
             or any(current[key] != job[key] for key in ("batch_id", "task_id", "version", "started_at", "retries"))
+            or dict(current).get("allocation_id") != dict(job).get("allocation_id")
             or current["rc"] != rc or json.loads(task["spec"]) != spec):
         raise state.StateError("artifact completion binding changed")
     old = prior_completion(conn, job, context)
@@ -127,6 +131,8 @@ def record_initial(conn, job, spec, context, checks, *, rc, ordinary_wait=None):
                "recorded_rc": rc, "kill_reason": current["kill_reason"], "wait": wait,
                "rules": rules, "checks": checks, "passed": all(item["passed"] for item in checks),
                "observed_at": state.now(), "batch_revision": batch["revision"]}
+    if dict(current).get("allocation_id") is not None:
+        payload["allocation_id"] = current["allocation_id"]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     if len(encoded.encode()) > MAX_RECORD_BYTES:
         raise state.StateError("artifact validation exceeds bounded record size; settlement retained")

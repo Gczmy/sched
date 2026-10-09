@@ -755,6 +755,7 @@ class Executor:
         # 泄漏给子任务 —— LD_LIBRARY_PATH/CONDA_PREFIX 抢载导致跨 env import 冲突)
         self.sanitize_env = sanitize_env
         self._procs: dict[int, subprocess.Popen] = {}  # pgid -> proc
+        self._supervisor_waits: dict[int, tuple[str, int]] = {}
         self._dead_pgroups: set[int] = set()
         self._execution_prepared: dict[str, Any] = {}
         self._execution_owners: dict[str, Any] = {}
@@ -1116,6 +1117,7 @@ class Executor:
                 pass_fds=tuple(popen_kwargs.get("pass_fds", ())), start_new_session=True,
             )
             proc = prepared.launch().process
+            self._supervisor_waits.pop(proc.pid, None)
             self._dead_pgroups.discard(proc.pid)
             if launch_marker:
                 assert intent is not None
@@ -1125,6 +1127,7 @@ class Executor:
                     intent.fd,
                     intent.nonce,
                 )
+                proc._sched_launch_start_token = marker_token
             log_f.close()
             self._procs[proc.pid] = proc
             return proc.pid
@@ -1185,6 +1188,7 @@ class Executor:
         rc = proc.poll()
         if rc is None:
             return None
+        self._retain_supervisor_wait(pgid, proc)
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
@@ -1200,6 +1204,29 @@ class Executor:
         except OSError:
             return None
         return None
+
+    def _retain_supervisor_wait(self, pgid, proc):
+        """Retain only an actual Popen wait bound at original marker publish.
+
+        This cache does not change poll_rc's legacy settlement return value or
+        prove group cleanup. It is never reconstructed after daemon restart.
+        """
+        token = getattr(proc, "_sched_launch_start_token", None)
+        rc = getattr(proc, "returncode", None)
+        if type(rc) is not int or not _is_strong_start_token(token):
+            return
+        if len(self._supervisor_waits) >= 1024 and pgid not in self._supervisor_waits:
+            self._supervisor_waits.pop(next(iter(self._supervisor_waits)))
+        self._supervisor_waits[pgid] = (token, rc)
+
+    def take_supervisor_wait(self, pgid, identity):
+        """Consume a retained wait only for the exact original pid/start token."""
+        token_rc = getattr(self, "_supervisor_waits", {}).pop(pgid, None)
+        if token_rc is None or identity != (pgid, token_rc[0]):
+            return None
+        return {"source": "local_supervisor_wait", "pid": pgid, "start_token": token_rc[0],
+                "returncode": token_rc[1], "binding_verified": True,
+                "subject": "scheduler_supervisor_command_chain"}
 
     @staticmethod
     def _close_process_owner(proc) -> None:
@@ -1227,6 +1254,8 @@ class Executor:
                         proc.wait(timeout=1)
                     except Exception:
                         pass
+                    else:
+                        self._retain_supervisor_wait(pgid, proc)
                     self._close_process_owner(proc)
                 if len(self._dead_pgroups) >= 1024:
                     self._dead_pgroups.clear()
@@ -1255,6 +1284,7 @@ class Executor:
                     except (OSError, subprocess.SubprocessError):
                         pass
                     else:
+                        self._retain_supervisor_wait(pgid, proc)
                         if len(self._dead_pgroups) >= 1024:
                             self._dead_pgroups.clear()
                         self._dead_pgroups.add(pgid)

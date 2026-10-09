@@ -9,7 +9,7 @@
 第一阶段源码提交 `5c9a170` 加入产物逐项诊断、`json_equals`、只读
 `artifact-check`、请求格式/JSON 拒绝、同 RID 有界等待/多 RID 查询与
 GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4/5/6 引入 11/12/13/14，阶段 7 后续候选写 15。
-包版本仍为 0.4.0，不能仅凭版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
+阶段 10 后续 allocation 候选写 16。包版本仍为 0.4.0，不能仅凭版本号推断这些候选能力已部署。合同以 [集成接口](integration-contract.md) 为准。
 
 该提交的 [CI](https://github.com/Gczmy/sched/actions/runs/37845958558) 失败：
 九个 Python/native 回归矩阵均为同一处路由 fixture 未携带完整取消前置条件。
@@ -145,7 +145,25 @@ mock/只读回归通过。最终 CPU/CLI 脚本 SHA256 为
 `bd6d98131c47865214bc627bfd28c104b969abc6fbdd8ad1e50af73ae88abc95`，
 运行时源码/脚本摘要已核对一致，私有节点/租约事实不入仓库。
 最终只读资源格式守卫另通过 14 条本地及计算节点查询回归，最终来源的 CPU/CLI 脚本通过。
-最终来源及完整 CI 仍须在提交后分别核实，不能把解释报告当作启动许可。
+固定来源 `22c20f80c172bce6817bd5ed6c1dd143c07448bf` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37864183197) 14 项均通过。
+不能把解释报告当作启动许可。
+
+阶段 10 候选追加不可变 allocation 与分层观察，写 schema 16；普通 retry 即使
+复用 job/version 也独立关联，首次 validation key 包含 allocation，不覆盖旧失败。
+监控声明、scheduler 分类、原 supervisor/backend-child wait 与产物/资源事实分开。
+计算节点首次隔离验收发现 SIGKILL wait 在 Popen 被移除后丢失，修复为有界精确
+pid/start-token 内存保留，不改变兼容 poll_rc 或从历史日志/文件补判。
+最终 [CPU/CLI 验收](../tests/run_allocation_accept.py) 通过：rc=1 与 rc=0/产物失败
+分别保留；ready/done 仍呈现非零 supervisor wait；fake GPU 记账释放不声称物理占用；
+普通 retry 保留前次不可变失败、实际运行两次；只读/私有 daemon 重启不新增运行。
+最终脚本 SHA256 为
+`ef5c0e7ea88c727a0e20c0e59115cc62851be239ef5bb781d5d37ad02c4392cd`。
+计算节点扩展回归 336 条通过（4 条因 native 不可用跳过），包括实际普通 CPU
+执行与恢复；本地 109 条 mock/私有只读回归通过。
+owner service/直接 child 区分、真正旧 schema 15 迁移不回填、同秒 retry、事务回滚
+及历史 pending cancel 守卫纳入回归。未测试真实 CUDA、未修改生产 daemon/config。
+固定来源与完整 CI 仍须提交后核实；完整合同见 [allocation-evidence](allocation-evidence.md)。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -156,8 +174,8 @@ mock/只读回归通过。最终 CPU/CLI 脚本 SHA256 为
 | 6 | 精确依赖 | 候选 CI/计算节点 CPU 通过 | 冻结 instance/batch/task/version；名称显式兼容；同名或 resubmit 不漂移 |
 | 7 | 任务 DAG/阻塞路径 | 候选 CI/计算节点 CPU 通过 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待；CAS 依赖更新保留不可变历史 |
 | 8 | bounded 精确事实/成组 pending-only cancel | 候选 CI/计算节点 CPU 通过 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
-| 9 | admission explain/装箱解释 | 候选计算节点 CPU 通过，CI 待确认 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
-| 10 | allocation 身份/分层失败 | 未实现 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
+| 9 | admission explain/装箱解释 | 候选 CI/计算节点 CPU 通过 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
+| 10 | allocation 身份/分层失败 | 候选计算节点 CPU 通过，CI 待确认 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
 | 11 | 磁盘/inode/quota 准入 | 未实现 | 控制面余量；unknown 明确；容量不足不删科学产物 |
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 未实现 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |

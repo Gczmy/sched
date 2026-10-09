@@ -177,3 +177,15 @@ schema 10 及以上升级保留等待态；更旧库仍执行已有的历史等�
 回退使用已验证的升级前恢复点，禁止删事件或降低 user_version。
 任务声明、CAS 内联输入和只读路径边界见 [reference](reference.md)；
 [CPU/CLI 验收](../tests/run_task_dependencies_accept.py) 不占真实 GPU、不替换生产安装。
+
+## 后续候选 allocation schema 16
+
+新增空的 allocations/allocation_events、不可变/保留触发器、jobs.allocation_id
+NULL 指针及 revision/回队清空触发器。迁移不生成历史分配/退出事件，不重写原
+状态、wait、执行身份、未知尝试、请求回执或 instance。启动前提交不可变分配意图，
+不能把意图当作子进程已出生；原 owner/marker/恢复守卫仍生效。
+完整 schema 1–16 只读查询不迁移。schema 10–15 writer 均不能回接新写库；回退只能
+使用已验证的升级前恢复点，禁止删分配/事件或降低 user_version。
+新 validation key 按 allocation 区分同版本 retry，旧 key/证据不改写。
+独立查询、上限和真实 wait/监控/产物边界见 [allocation-evidence](allocation-evidence.md)；
+生产排空、安装和切换须另行授权，CPU/fake-GPU 验收不证明真实 CUDA/worker 归属。

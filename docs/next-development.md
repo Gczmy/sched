@@ -56,7 +56,7 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
   这是已提交的源码候选，不代表新版本发布、Linux 全矩阵或生产部署通过。DB schema 仍为 10，
   默认批次失败策略、名称依赖、真实 wait、资源结算及未知请求守卫未改变。
 - 后续失败隔离源码候选加入 opt-in `failure_policy` 和 `batch-policy` 独立合同。
-  该阶段引入 schema 11；后续首次验证/复验/精确依赖/任务 DAG 候选写 12/13/14/15（当前完整只读 1–15）；默认 freeze 保留，旧 blocked 不自动重开。
+  该阶段引入 schema 11；后续首次验证/复验/精确依赖/任务 DAG/allocation 候选写 12/13/14/15/16（当前完整只读 1–16）；默认 freeze 保留，旧 blocked 不自动重开。
   策略写操作通过 batch CAS request，显式 --reopen 不重试失败任务。该阶段本身没有任务 DAG，
   不包含不可变复验/结算。CI/计算节点验收与发布状态分别见交付清单。
 - 后续候选追加不可变首次 dispatcher 产物验证和 `artifact-validations` 只读查询。
@@ -78,7 +78,7 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 
 完整分阶段清单与验收状态见 [feedback-development.md](feedback-development.md)。
 
-**状态：第 1–4 项及第 5 项的 admission explain 已有源码候选，验收/发布独立记录；allocation 身份、磁盘准入尚未实现。** 候选语义见 [reference](reference.md)，不代表已部署。按以下顺序独立开发，不把客户科学状态、
+**状态：第 1–4 项及第 5 项的 admission explain/allocation 已有源码候选，验收/发布独立记录；磁盘准入尚未实现。** 候选语义见 [reference](reference.md) 和 [allocation-evidence](allocation-evidence.md)，不代表已部署。按以下顺序独立开发，不把客户科学状态、
 台账投影、logical experiment、cohort 或 acceptance scope 引入 daemon。
 
 1. 批次新增 opt-in `failure_policy`，默认维持现有冻结派发策略（不自动取消 running）。

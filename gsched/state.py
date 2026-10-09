@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 15
+DB_SCHEMA_VERSION = 16
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -241,8 +241,9 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "artifact_validations",
         "artifact_revalidations",
         "task_dependency_events",
+        "allocations", "allocation_events",
     },
-    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job"},
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job", "allocation_job", "allocation_event_order", "allocation_event_job"},
     "trigger": {
         "scheduler_identity_immutable", "scheduler_identity_retained",
         "submission_request_immutable", "submission_request_retained",
@@ -250,6 +251,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "revision_batch_failure_policy",
         "batch_exact_dependencies_immutable",
         "task_dependency_immutable", "task_dependency_retained", "revision_task_dependency",
+        "allocation_immutable", "allocation_retained", "allocation_event_immutable", "allocation_event_retained", "revision_job_allocation", "allocation_clear_pending",
         "artifact_validation_immutable", "artifact_validation_retained",
         "artifact_revalidation_immutable", "artifact_revalidation_retained",
         "revision_task_insert",
@@ -276,6 +278,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "allocations": {"allocation_id", "job_id", "ordinal", "payload", "payload_sha256"},
+    "allocation_events": {"event_id", "allocation_id", "job_id", "seq", "layer", "payload"},
     "task_dependency_events": {"seq", "event_id", "request_id", "job_id", "job_version", "instance_id", "target_sha256", "previous_event_id", "bindings", "observed_at"},
     "artifact_revalidations": {"event_id", "request_id", "initial_validation_id", "job_id", "job_version",
                                "passed", "settled", "reason", "payload", "observed_at"},
@@ -292,7 +296,7 @@ _REQUIRED_MIGRATED_COLUMNS = {
     "execution_attempts": {"attempt_id", "job_id", "job_version", "backend_id", "backend_config_sha256", "phase", "identity", "observation", "cancel_reason", "created_at", "launch_intent_at", "finished_at"},
     "batches": {"notify", "project", "priority", "revision", "failure_policy", "depends_on_exact"},
     "tasks": {"project"},
-    "jobs": {"project", "progress"},
+    "jobs": {"project", "progress", "allocation_id"},
     "native_sessions": {
         "session_id", "job_id", "job_version", "evaluation_domain",
         "owner_kind", "profile_id", "profile_sha256", "project_root_path",
@@ -556,6 +560,12 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 16:
+        required_objects["table"].difference_update({"allocations", "allocation_events"})
+        required_objects["index"].difference_update({"allocation_job", "allocation_event_order", "allocation_event_job"})
+        required_objects["trigger"].difference_update({"allocation_immutable", "allocation_retained", "allocation_event_immutable", "allocation_event_retained", "revision_job_allocation", "allocation_clear_pending"})
+        del required_columns["allocations"], required_columns["allocation_events"]
+        required_columns["jobs"].discard("allocation_id")
     if version < 15:
         required_objects["table"].discard("task_dependency_events")
         required_objects["index"].discard("task_dependency_job")
@@ -1087,6 +1097,7 @@ def _initialize_database() -> None:
     from .artifact_validation import SCHEMA as ARTIFACT_VALIDATION_SCHEMA
     from .artifact_revalidation import SCHEMA as ARTIFACT_REVALIDATION_SCHEMA
     from .task_dependencies import SCHEMA as TASK_DEPENDENCY_SCHEMA
+    from .allocation import SCHEMA as ALLOCATION_SCHEMA, migrate as migrate_allocations
     with connect() as conn:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
             from .integration import instance_id
@@ -1094,7 +1105,8 @@ def _initialize_database() -> None:
         previous_schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
         needs_owner_backfill = (previous_schema_version < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA + ALLOCATION_SCHEMA)
+        migrate_allocations(conn)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)
         migrate_incidents(conn)
@@ -1720,6 +1732,10 @@ def release_gpu(conn: sqlite3.Connection, job_id: str) -> None:
     gpu = conn.execute(
         "SELECT gpu_id FROM gpu_jobs WHERE job_id=?", (job_id,)
     ).fetchone()
+    if gpu is not None:
+        from .allocation import record
+        record(conn, job_id, "resource", {"event": "reservation_released", "gpu_id": gpu["gpu_id"],
+                                         "physical_ownership_verified": False, "wait_authority": False})
     conn.execute("DELETE FROM gpu_jobs WHERE job_id=?", (job_id,))
     if gpu is None:
         # 无 gpu_jobs 行 (历史/异常): 回退旧逻辑 (镜像列反查)
@@ -1969,8 +1985,13 @@ def mark_native_session_timed_out(
 
 
 def update_job(conn: sqlite3.Connection, job_id: str, **fields: Any) -> None:
+    observed = {"status", "rc", "failure", "kill_reason", "pgid", "finished_at"}.intersection(fields)
+    before = get_job(conn, job_id) if observed else None
     cols = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
+    if before is not None and dict(before).get("allocation_id"):
+        from .allocation import state_change
+        state_change(conn, dict(before), fields)
 
 
 # ---------- 控制请求队列 (事故记录 4: cancel 转发 daemon) ----------

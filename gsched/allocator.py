@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import json
 import subprocess
+import time
 from typing import Any
 
 from .state import (
@@ -378,7 +379,9 @@ class Allocator:
 
         previous = getattr(self, "_uuid_map", None)
         self._uuid_map = mapping
+        self._uuid_observed_at = time.time()
         if previous is not None and previous != mapping:
+            self._uuid_observed_at = None
             return None
         return mapping
 

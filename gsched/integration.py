@@ -28,6 +28,7 @@ CONTRACTS = {
     "task_dependencies": "sched-task-dependencies-v1",
     "task_facts": "sched-task-facts-v1",
     "admission_explain": "sched-admission-explain-v1",
+    "allocations": "sched-allocations-v1",
     "artifact_validations": "sched-artifact-validations-v1",
     "artifact_revalidations": "sched-artifact-revalidations-v1",
 }

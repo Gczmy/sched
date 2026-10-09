@@ -8,7 +8,7 @@ import sqlite3
 import time
 
 from . import state
-from .execution_policy import IDENTITY_SCHEMA, INTERFACE_VERSION, canonical_bytes
+from .execution_policy import IDENTITY_SCHEMA, INTERFACE_VERSION, canonical_bytes, digest
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS execution_attempts (
@@ -146,6 +146,10 @@ def bind_owner(conn, job_id, binding):
     conn.execute("INSERT INTO execution_owners(job_id,binding) VALUES(?,?)",
                  (job_id, canonical_bytes(binding).decode()))
     conn.execute("INSERT INTO execution_owner_operations(job_id) VALUES(?)", (job_id,))
+    from .allocation import record
+    from .execution.persistent import public_binding
+    record(conn, job_id, "owner", {"binding": public_binding(binding), "subject": "execution_owner_service",
+                                  "worker_identity": None, "wait_authority": False})
 
 
 def get(conn: sqlite3.Connection, job_id: str):
@@ -181,6 +185,9 @@ def reserve(conn, job_id: str, binding: dict, profile: dict, node: str, schedule
     }
     conn.execute("INSERT INTO execution_attempts (attempt_id,job_id,job_version,backend_id,backend_config_sha256,phase,identity,created_at) VALUES(?,?,?,?,?,'prepared',?,?)",
                  (attempt_id, job_id, job["version"], binding["backend_id"], binding["backend_config_sha256"], canonical_bytes(identity).decode(), state.now()))
+    from .allocation import record
+    record(conn, job_id, "execution", {"event": "attempt_reserved", "identity": identity,
+                                      "process_birth_verified": False, "worker_identity": None})
     return identity
 
 
@@ -214,6 +221,11 @@ def observe(conn, job_id: str, observation: dict, *, phase: str | None = None) -
         return
     conn.execute("UPDATE execution_attempts SET phase=?,observation=?,finished_at=? WHERE job_id=?",
                  (phase, encoded, state.now() if terminal else None, job_id))
+    from .allocation import record
+    record(conn, job_id, "process", {"event": "execution_observation", "attempt_id": row["attempt_id"],
+                                   "identity_sha256": digest(json.loads(row["identity"])),
+                                   "subject": "execution_backend_direct_child", "phase": phase,
+                                   "observation": observation, "worker_identity": None})
     if terminal:
         conn.execute("UPDATE execution_owner_operations SET cleanup_state='pending',retry_after=0 WHERE job_id=? AND cleanup_state='active'",
                      (job_id,))

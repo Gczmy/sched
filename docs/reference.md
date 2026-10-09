@@ -41,8 +41,15 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前任务 DAG 源码候选写 schema 15，完整只读范围为 1–15；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖候选写 11/12/13/14，都不能回接 schema 15。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前 allocation 源码候选写 schema 16，完整只读范围为 1–16；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG 候选写 11/12/13/14/15，都不能回接 schema 16。包版本尚未变更，能力须查询实际部署的合同与 schema。
+
+`sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
+提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
+版本的有界分层事件和首次 validation 引用。每次真实启动意图独立关联，即使普通
+retry 复用版本也不复用 allocation。原 wait、监控声明、scheduler 分类与产物/资源
+事实分别记录，不把 owner/supervisor PID 当作科学 worker。只读、不迁移、不探测
+当前进程/文件、不重新结算；截断/旧库/超限边界见 [allocation-evidence](allocation-evidence.md)。
 
 `sched artifact-validations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 只读查询首次验证摘要；`--validation-id ID` 读取同任务/版本的一条完整冻结证据，与 cursor

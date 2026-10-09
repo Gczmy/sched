@@ -203,7 +203,7 @@ class TaskDependencyTests(TempStateCase):
         self.assertFalse(self.query("c")["task_dag_supported"])
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(15, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(0, conn.execute("SELECT count(*) FROM task_dependency_events").fetchone()[0])
             self.assertEqual("waiting_dep", state.get_job(conn, "dag-c-v1")["status"])
             self.assertEqual(revision, state.get_batch(conn, "dag")["revision"])

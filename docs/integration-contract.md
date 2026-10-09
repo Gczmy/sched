@@ -104,7 +104,27 @@ resource release or new versions occur. Ordinary cancel and strict status/task/h
 contracts are unchanged. Client replacement plans/reservations/lineage remain outside
 the daemon; this is not cross-system atomic pending-replace. See [reference](reference.md).
 
-### Candidate batch failure policy
+### Candidate allocation observations
+
+The later source candidate advertises `sched-allocations-v1`, with independent
+`allocations` summaries and exact-ID layered evidence. Schema 16 adds immutable
+allocation/event tables and a nullable current job pointer; migration never
+backfills historical allocation, wait or worker identities. Ordinary retries
+using the same job/version receive independent random allocation IDs, also bound
+in new artifact-validation completion keys. Existing keys are unchanged.
+
+Resource intent, original supervisor/backend-child waits, monitor claims,
+scheduler classification and artifact references remain separate. Persistent
+owner service PIDs never stand in for workers. Actual SIGKILL Popen waits are
+retained only in a bounded local pid/start-token cache; missing/restarted or
+mismatched evidence remains unknown, never a synthesized successful exit.
+The passive query uses a private DB/WAL snapshot, does not probe processes,
+hardware, owners or current artifacts, and grants no settlement/execution authority.
+Truncation, byte bounds, compatibility and CPU/fake-GPU acceptance are specified
+in [allocation evidence](allocation-evidence.md). Strict status/task/history
+fields and wait_reason remain unchanged; consumers must negotiate this contract.
+
+### Candidate resource explanation
 
 The source resource-explanation candidate advertises `sched-admission-explain-v1`
 without changing schema 15 or strict status/task/history fields. Its independent
@@ -118,11 +138,14 @@ resource_fit is null when relevant evidence is unknown; admission_granted remain
 Final dependency/artifact/marker/owner/recovery/launch checks are not granted by this
 diagnostic. Bounds and legacy-capacity compatibility are documented in [reference](reference.md).
 
+### Candidate batch failure policy
+
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
 introduced schema 11; the later artifact-validation candidate writes 12 (read
 range 1–12); the subsequent revalidation candidate writes 13 (reads 1–13).
 The later exact-dependency candidate writes 14 (reads 1–14); the subsequent task
-DAG candidate writes 15 (reads 1–15).
+DAG candidate writes 15 (reads 1–15). The later allocation candidate writes 16
+(complete reads 1–16); earlier writers cannot reopen that state.
 Released 0.4.0 cannot open these new writer states.
 Migration adds `batches.failure_policy` with default `freeze` and a monotonic
 revision trigger, without rewriting status, job versions, execution identity,

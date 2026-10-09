@@ -1907,6 +1907,37 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def cmd_allocations(args: argparse.Namespace) -> int:
+    from .allocation import query
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch, task_id = _resolve_task_ref(args.task, conn)
+            if conn.execute("SELECT 1 FROM jobs WHERE batch_id=? AND task_id=?", (batch, task_id)).fetchone() is None:
+                raise ValueError("任务不存在")
+            result = query(conn, batch, task_id, version=args.version, allocation_id=args.allocation_id,
+                           limit=args.limit, cursor=args.cursor)
+            output = {"schema_version": 1, "query": "allocations", "contract": CONTRACTS["allocations"],
+                      "instance_id": instance_id(conn), "batch_id": batch, "task_id": task_id,
+                      "version_filter": args.version, "effect": "none", "settlement_authority": False,
+                      "historical_failure_reconstructed": False, "worker_identity_inferred": False, **result}
+        if args.json:
+            print(json.dumps(output, ensure_ascii=False))
+        else:
+            print("不可变分配/分层观察（只读，不授予执行或结算权）")
+            for item in result["allocations"]:
+                print(f"  {item['allocation_id']} v{item['version']} attempt={item['ordinal']}")
+        return 0
+    except (ValueError, ConfigError, state.StateError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_artifact_validations(args: argparse.Namespace) -> int:
     """Query frozen completion observations; do not inspect files or migrate."""
     if args._subcommand == "artifact-revalidations":
@@ -5111,6 +5142,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_admission_explain)
 
+    p = sub.add_parser("allocations", help="只读不可变启动/资源关联及分层观察，不探测进程或当前产物")
+    p.add_argument("task", help="<batch-id-or-name>:<task>")
+    p.add_argument("--version", type=int)
+    p.add_argument("--allocation-id", help="读取一条完整分配和有界事件")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_allocations)
+
     p = sub.add_parser("task-facts", help="有界精确代际事实，只读私有快照，不授予取消权")
     p.add_argument("batch", help="完整 batch ID，不按名称解析")
     p.add_argument("--tasks-json", required=True, help="内联 task_id/version 数组，1..100 项")
@@ -5406,7 +5446,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations"}:
         return args.fn(args)
     if command == "request":
         try:

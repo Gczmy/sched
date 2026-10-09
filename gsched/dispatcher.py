@@ -3284,6 +3284,11 @@ class Dispatcher:
                                      "start_token": waited_identity[1] if waited_identity else None,
                                      "binding_verified": waited_identity is not None,
                                      "subject": "scheduler_supervisor_command_chain"}
+                take_wait = getattr(self.executor, "take_supervisor_wait", None)
+                if not native_exec and callable(take_wait):
+                    retained = take_wait(j["pgid"], waited_identity or self._read_launch_identity(j))
+                    if isinstance(retained, dict) and ordinary_wait is None:
+                        ordinary_wait = {**retained, "group_clean": True}
                 cleanup_jobs.extend(
                     self._handle_job_done(
                         conn,
@@ -3465,6 +3470,14 @@ class Dispatcher:
                 )
                 return []
 
+        from .allocation import ordinary_wait as record_allocation_wait
+        current_wait_job = state.get_job(conn, j["id"])
+        if (current_wait_job is None or dict(current_wait_job).get("allocation_id") != dict(j).get("allocation_id")):
+            self.log_line(f"job {j['id']} settlement retained: allocation binding changed")
+            return []
+        if ordinary_wait is not None or not process_exit_authoritative:
+            record_allocation_wait(conn, current_wait_job, ordinary_wait, rc if rc is not None else j["rc"])
+
         job_snapshot = dict(j)
         cleanup_paths = [
             ("launch", job_snapshot),
@@ -3622,6 +3635,9 @@ class Dispatcher:
         """
         from . import artifact_validation
         if conn is not None:
+            current = state.get_job(conn, job["id"])
+            if current is None or dict(current).get("allocation_id") != dict(job).get("allocation_id"):
+                raise state.StateError("artifact allocation binding changed")
             prior = artifact_validation.prior_completion(conn, job, context)
             if prior is not None:
                 if prior["spec_sha256"] != artifact_validation.digest(spec) or prior["payload"]["recorded_rc"] != rc:
@@ -4863,6 +4879,8 @@ class Dispatcher:
             pgid=None,
             kill_reason=None,
         )
+        from .allocation import reserve as reserve_allocation
+        reserve_allocation(conn, j["id"], spec, self)
         conn.commit()
         prior_inflight = getattr(self, "_launch_inflight", None)
         if isinstance(prior_inflight, dict):

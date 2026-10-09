@@ -9,7 +9,7 @@ from contextvars import ContextVar
 
 from . import state
 from .execution_policy import digest, IDENTITY_SCHEMA, INTERFACE_VERSION
-from .integration import canonical
+from .integration import canonical, instance_id
 from ._legacy_execution import NATIVE_EXEC_ALL_INTERNAL_FIELDS
 
 MAX_TASKS = 100
@@ -24,6 +24,7 @@ METADATA = {
     "native_sessions": "job_id", "gpu_jobs": "job_id", "control_requests": "job_id",
     "recovery_settlements": "job_id", "recovery_queue": "job_id", "recovery_watch": "root_job_id",
     "artifact_validations": "job_id", "artifact_revalidations": "job_id",
+    "allocations": "job_id", "allocation_events": "job_id",
 }
 
 
@@ -121,6 +122,7 @@ def facts(conn, batch, selectors, *, ignore_request_id=None):
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
     complete_schema = schema_version >= 10 and state._schema_is_complete(conn, schema_version)
+    iid = instance_id(conn) if schema_version >= 10 else None
     total_records, total_bytes, result = 0, 0, []
     for selected in selectors:
         params = (batch["id"], selected["task_id"])
@@ -193,6 +195,21 @@ def facts(conn, batch, selectors, *, ignore_request_id=None):
             reasons.append("prior_artifact_validation")
         if metadata["artifact_revalidations"]:
             reasons.append("prior_artifact_revalidation")
+        if any(row["job_id"] not in known_not_started for row in metadata["allocations"]):
+            reasons.append("prior_allocation_without_not_started_authority")
+        for row in metadata["allocations"]:
+            if row["job_id"] not in known_not_started:
+                continue
+            from .allocation import _allocation, _event
+            allocated = _allocation(row)
+            attempt = attempts[row["job_id"]]
+            terminal = [_event(event) for event in metadata["allocation_events"]
+                        if event["allocation_id"] == row["allocation_id"] and event["layer"] == "process"]
+            if (allocated["instance_id"] != iid or allocated["version"] != attempt["job_version"]
+                    or not terminal or terminal[-1]["data"].get("attempt_id") != attempt["attempt_id"]
+                    or terminal[-1]["data"].get("phase") != "not_started"
+                    or terminal[-1]["data"].get("observation") != json.loads(attempt["observation"] or "null")):
+                reasons.append("allocation_not_bound_to_original_not_started:" + row["allocation_id"])
         if any(row["authority"] != "not_started" or row["job_id"] not in known_not_started or row["decision"] == "pending" for row in metadata["recovery_settlements"]):
             reasons.append("recovery_authority_or_intent_unresolved")
         if any(row["predecessor_job_id"] not in known_not_started for row in metadata["recovery_queue"]):
