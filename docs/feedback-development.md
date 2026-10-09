@@ -331,6 +331,26 @@ cgroup controller 仍不安装设备策略，不把该原语计作完整 GPU 硬
 `cb43a505263b3bea4c170b50e8659f22cff6d3b482635f2d7ce8ae57f9106ba8`，
 本地与计算节点核对一致。没有特权 BPF/真实设备访问证据；生产、Slurm 父级和
 真实 GPU 未改动，尚未发布或部署。
+该原语固定提交 `25dea450442037e67949c16d2f14c300044f1c99` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37887117738) 14 项全部通过。
+
+后续 schema 21 设备记录源码候选新增原 allocation/instance/lease/job/version/CPU inode/
+策略摘要/程序绑定与不可变 CAS 链。安装与启动意图各只消耗一次；unknown 不重装或
+CPU 降级，现有 controller 对设备记录拒绝 CPU-only 启动。原 CPU removed 与设备
+released 分开，真实原删除事件引用落库前保留 CPU/GPU 资源，cold off/任务终态不绕过。
+只读 device-scopes 不探测 BPF，旧完整 schema 1–20 返回 migration_required，不回填。
+20 条纯事务回归通过，包括既有 CPU/分配/claim/实例历史在 20→21 迁移时逐项不变。
+专项共 39 条通过，含端序跨查询主机保持原摘要、异端序拒绝安装和真实无特权
+load 拒绝；v1 序列化不变，不执行 attach。最终来源完整 native 回归运行 975 条：
+970 通过、5 跳过，其中 3 条正向 scope 项仍因无明确委派跳过，不计实际隔离成功。
+193 文件 runtime/fixture/构建脚本清单 SHA256 为
+`b4de7496c74c09aeb68222c3fe454a66dad066ca82a45201249d39f0993cb4a9`，
+本地与计算节点核对一致；同来源普通目录委派拒绝 CLI 通过。
+同一最终来源的 CPU 亲和 CLI 六组全部通过，涵盖普通/fake-GPU/native mask、取消/
+清理释放、原 owner 崩溃重连不重复执行，以及冷配置/默认 off；生产、Slurm 父级和
+真实 GPU 未改动。
+尚无实际设备安装、NVIDIA 映射或特权正向证据，未发布或部署。
+合同见 [设备生命周期](device-scopes.md)。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -347,7 +367,7 @@ cgroup controller 仍不安装设备策略，不把该原语计作完整 GPU 硬
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 原语、亲和/CPU claim、持久 scope 与 schema 20 显式 cgroup 派发/清理源码候选；正向内核/设备验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语与 schema 21 设备记录候选；实际设备接入/正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

@@ -140,6 +140,22 @@ cleanup_ready before external removal. Passive cgroup fit remains unknown, not
 a root-availability claim. Positive kernel/device acceptance is still outstanding;
 see [scope lifecycle](cpu-scopes.md).
 
+### Candidate device scope lifecycle
+
+Schema 21 adds empty immutable device intent/event tables and the separately
+negotiated `sched-device-scope-state-v1` query. `device-scopes --json` binds the
+original allocation/lease/generation, configured CPU inode and exact device
+policy/program identity. Installation and launch intents are one-shot CAS;
+unknown results retain reservations, never authorize reinstall or CPU-only
+fallback. Original CPU removal and the referencing device release are distinct
+recorded facts, not a synthesized wait or proof of program garbage collection.
+The existing controller refuses device-bound CPU-only launches until the actual
+device-handle integration exists. Queries use private snapshots, never probe BPF
+or migrate complete schemas 1–20, and explicitly grant no kernel-health or
+execution authority. Default status/task/history, wait_reason and FD4 remain
+unchanged. Bounds and incomplete hardware acceptance are specified in
+[device lifecycle](device-scopes.md).
+
 ### Candidate resource explanation
 
 The source resource-explanation candidate advertises `sched-admission-explain-v1`

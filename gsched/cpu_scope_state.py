@@ -237,11 +237,17 @@ def advance(conn, scope_id, expected_event_id, kind, data=None):
         latest = conn.execute("SELECT MAX(version) FROM jobs WHERE batch_id=? AND task_id=?", (job["batch_id"], job["task_id"])).fetchone()[0]
         if job["status"] != "running" or job["allocation_id"] != value["allocation_id"] or job["pgid"] is not None or job["kill_reason"] or batch["status"] != "active" or job["version"] != latest:
             raise state.StateError("CPU scope effect no longer belongs to an active unlaunched generation")
+    if kind == "launch_intent":
+        from .device_scope_state import cpu_launch_guard
+        cpu_launch_guard(conn, value["allocation_id"], value["job_id"])
     return _append(conn, value, events, kind, data)
 
 
 def release_allowed(conn, allocation_id, job_id):
     """Unknown or nonterminal scope retains claims even after terminal job CAS."""
+    from .device_scope_state import release_allowed as device_ready
+    if not device_ready(conn, allocation_id, job_id):
+        return False
     row = conn.execute("SELECT scope_id FROM cpu_scopes WHERE allocation_id=? AND job_id=?", (allocation_id, job_id)).fetchone()
     if row is None:
         from .allocation import _allocation as decode_allocation
@@ -257,7 +263,8 @@ def unresolved(conn):
     """A cold switch to off must not bypass an old unresolved scope."""
     row = conn.execute("SELECT scope_id FROM cpu_scopes WHERE COALESCE((SELECT kind FROM cpu_scope_events e WHERE e.scope_id=cpu_scopes.scope_id ORDER BY seq DESC LIMIT 1),'missing') NOT IN ('removed','abandoned') ORDER BY scope_id LIMIT 1").fetchone()
     if row is None:
-        return False
+        from .device_scope_state import unresolved as device_pending
+        return device_pending(conn)
     load(conn, row[0])  # Missing/corrupt evidence is an error, not an empty pool.
     return True
 
@@ -276,7 +283,8 @@ def request_cleanup(conn, job, *, cleanup_source):
     _, events = load(conn, row[0])
     last = events[-1]
     if last["kind"] in TERMINAL:
-        return True
+        from .device_scope_state import finish_removed
+        return finish_removed(conn, identifier, job["id"])
     if last["kind"] == "reserved":
         advance(conn, row[0], last["event_id"], "abandoned")
         return True

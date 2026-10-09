@@ -119,7 +119,7 @@ linux_fd_owner 仍认证重连原 owner/child，不重新 start。配置匹配�
 完整事件链，列表提供有界实时分页，不探测内核或改变 revision。命名合同
 sched-cpu-scope-state-v1 与通用原语合同独立；所有 admission/wait/physical boundary
 标记为 false。完整 schema 1–18 查询明确 migration_required，不做初始化或回填；
-当前完整只读范围为 1–20；旧 writer 不得回接 schema 20，回退只用升级前验证
+当前后续设备记录候选的完整只读范围为 1–21；旧 writer 不得回接更高写库，回退只用升级前验证
 恢复点，不能手改 user_version。admission-explain 的 cgroup fit 明确 unknown，
 因为当前没有新鲜原委派观察供被动解释，不能把租约检查当作根目录可用性。
 
@@ -152,3 +152,6 @@ scope、FD 关闭和序列化边界；普通目录拒绝在 Linux 计算节点�
 
 另有独立 [设备策略原语](device-policy.md) 源码候选，提供原 scope 的有界白名单
 安装/恢复核对，不自动接入本 controller；schema 20 的 scope 观察仍不证明设备隔离。
+后续 [schema 21 设备记录](device-scopes.md) 绑定原 allocation/inode/策略，已记录
+设备 intent 时现有 controller 拒绝 CPU-only 启动；原 CPU removed 与设备 released
+记录分开，未知不借 cold off/任务终态释放。仍没有实际 BPF 安装接入。

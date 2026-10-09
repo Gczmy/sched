@@ -131,6 +131,28 @@ class DeviceScopeModelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 DeviceBinding(self.intent, number, "d" * 16)
 
+    def test_persisted_intent_digest_does_not_depend_on_query_host_endianness(self):
+        original = self.intent.to_dict()
+        other = "big" if sys.byteorder == "little" else "little"
+        with mock.patch.object(devices.sys, "byteorder", other):
+            restored = DeviceIntent.from_dict(original)
+            self.assertEqual(original, restored.to_dict())
+
+    def test_foreign_bytecode_cannot_install_or_fall_back_to_cpu(self):
+        other = "big" if sys.byteorder == "little" else "little"
+        intent = DeviceIntent(self.binding, self.intent.policy, other)
+        handle = DeviceScope(self.scope, intent)
+        with self.assertRaises(BackendUnavailable) as refused:
+            handle.install()
+        self.assertEqual("device_intent_foreign_byteorder", refused.exception.reason)
+        self.native.device_program_query.assert_not_called()
+        self.native.device_program_load.assert_not_called()
+        self.native.device_program_attach.assert_not_called()
+        with self.assertRaises(RuntimeError):
+            handle.install()
+        with self.assertRaises(RuntimeError):
+            self.scope.constraints()
+
     def test_install_once_guard_and_original_attachment_observation(self):
         handle = DeviceScope(self.scope, self.intent)
         with self.assertRaises(BackendUnavailable):

@@ -6,7 +6,7 @@ Recovery only observes; unknown installation never retries or detaches a policy.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import os
 import re
@@ -60,12 +60,15 @@ class DevicePolicy:
             raise ValueError("invalid serialized device policy")
         return cls(tuple(DeviceRule(**r) for r in value["rules"]))
 
-    def compile(self):
+    def compile(self, *, byteorder=None):
+        byteorder = sys.byteorder if byteorder is None else byteorder
+        if type(byteorder) is not str or byteorder not in ("little", "big"):
+            raise ValueError("invalid device bytecode endianness")
         # No maps, helpers, paths or wildcard nodes. JMP32 compares unsigned
         # device numbers correctly even when bit 31 is set in an immediate.
         instructions = []
         def emit(code, dst=0, src=0, offset=0, immediate=0):
-            registers = dst | (src << 4) if sys.byteorder == "little" else (dst << 4) | src
+            registers = dst | (src << 4) if byteorder == "little" else (dst << 4) | src
             instructions.append([code, registers, offset, immediate])
         emit(0x61, 2, 1, 0)  # access_type
         emit(0xbf, 3, 2)
@@ -94,7 +97,7 @@ class DevicePolicy:
         emit(0x95)
         for index in (6, 9):
             instructions[index][2] = deny - index - 1
-        encoding = "<BBhi" if sys.byteorder == "little" else ">BBhi"
+        encoding = "<BBhi" if byteorder == "little" else ">BBhi"
         return b"".join(struct.pack(encoding, code, regs, offset,
                 immediate if immediate < 0x80000000 else immediate - 0x100000000)
                 for code, regs, offset, immediate in instructions)
@@ -104,14 +107,16 @@ class DevicePolicy:
 class DeviceIntent:
     scope: CpuScopeBinding
     policy: DevicePolicy
+    byteorder: str = field(default_factory=lambda: sys.byteorder)
 
     def __post_init__(self):
-        if type(self.scope) is not CpuScopeBinding or type(self.policy) is not DevicePolicy:
+        if (type(self.scope) is not CpuScopeBinding or type(self.policy) is not DevicePolicy
+                or type(self.byteorder) is not str or self.byteorder not in ("little", "big")):
             raise ValueError("device intent requires original scope and exact policy")
 
     @property
     def program_sha256(self):
-        return hashlib.sha256(self.policy.compile()).hexdigest()
+        return hashlib.sha256(self.policy.compile(byteorder=self.byteorder)).hexdigest()
 
     def to_dict(self):
         return dict(scope=self.scope.to_dict(), policy=self.policy.to_dict(), program_sha256=self.program_sha256)
@@ -120,10 +125,15 @@ class DeviceIntent:
     def from_dict(cls, value):
         if type(value) is not dict or set(value) != {"scope", "policy", "program_sha256"}:
             raise ValueError("invalid serialized device intent")
-        result = cls(CpuScopeBinding.from_dict(value["scope"]), DevicePolicy.from_dict(value["policy"]))
-        if value["program_sha256"] != result.program_sha256:
-            raise ValueError("device intent bytecode digest differs")
-        return result
+        scope = CpuScopeBinding.from_dict(value["scope"])
+        policy = DevicePolicy.from_dict(value["policy"])
+        # The v1 digest already binds the encoding. Verify both bounded formats
+        # without reinterpreting the persisted bytes using the query host's ABI.
+        for byteorder in ("little", "big"):
+            result = cls(scope, policy, byteorder)
+            if value["program_sha256"] == result.program_sha256:
+                return result
+        raise ValueError("device intent bytecode digest differs")
 
 
 @dataclass(frozen=True)
@@ -187,11 +197,13 @@ class DeviceScope:
             raise RuntimeError("device installation already consumed or restored")
         self._phase = "installing"
         self.scope._phase = "device_installing"
+        if self.intent.byteorder != sys.byteorder:
+            _refuse("device_intent_foreign_byteorder")
         native = _native()
         self._empty()
         if native.device_program_query(self.scope._fd)["program_ids"]:
             _refuse("device_scope_already_has_policy")
-        program = native.device_program_load(self.intent.policy.compile())
+        program = native.device_program_load(self.intent.policy.compile(byteorder=self.intent.byteorder))
         try:
             identity = native.device_program_info(program)
             binding = DeviceBinding(self.intent, identity["program_id"], identity["program_tag"])

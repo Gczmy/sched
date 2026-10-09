@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 20
+DB_SCHEMA_VERSION = 21
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -245,8 +245,9 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "daemon_leases", "daemon_lease_events",
         "cpu_assignments",
         "cpu_scopes", "cpu_scope_events",
+        "device_scopes", "device_scope_events",
     },
-    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job", "allocation_job", "allocation_event_order", "allocation_event_job", "daemon_lease_kind", "cpu_assignment_allocation", "cpu_scope_job"},
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job", "allocation_job", "allocation_event_order", "allocation_event_job", "daemon_lease_kind", "cpu_assignment_allocation", "cpu_scope_job", "device_scope_job"},
     "trigger": {
         "scheduler_identity_immutable", "scheduler_identity_retained",
         "submission_request_immutable", "submission_request_retained",
@@ -258,6 +259,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "daemon_lease_immutable", "daemon_lease_retained", "daemon_lease_event_immutable", "daemon_lease_event_retained",
         "cpu_assignment_immutable",
         "cpu_scope_immutable", "cpu_scope_retained", "cpu_scope_event_immutable", "cpu_scope_event_retained",
+        "device_scope_immutable", "device_scope_retained", "device_scope_event_immutable", "device_scope_event_retained",
         "artifact_validation_immutable", "artifact_validation_retained",
         "artifact_revalidation_immutable", "artifact_revalidation_retained",
         "revision_task_insert",
@@ -284,6 +286,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "device_scopes": {"scope_id", "allocation_id", "job_id", "payload", "payload_sha256"},
+    "device_scope_events": {"event_id", "scope_id", "seq", "kind", "payload"},
     "cpu_scopes": {"scope_id", "allocation_id", "job_id", "payload", "payload_sha256"},
     "cpu_scope_events": {"event_id", "scope_id", "seq", "kind", "payload"},
     "cpu_assignments": {"cpu", "allocation_id", "job_id"},
@@ -571,6 +575,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 21:
+        required_objects["table"].difference_update({"device_scopes", "device_scope_events"})
+        required_objects["index"].discard("device_scope_job")
+        required_objects["trigger"].difference_update({"device_scope_immutable", "device_scope_retained", "device_scope_event_immutable", "device_scope_event_retained"})
+        del required_columns["device_scopes"], required_columns["device_scope_events"]
     if version < 19:
         required_objects["table"].difference_update({"cpu_scopes", "cpu_scope_events"})
         required_objects["index"].discard("cpu_scope_job")
@@ -1127,6 +1136,7 @@ def _initialize_database() -> None:
     from .cluster_lease import SCHEMA as DAEMON_LEASE_SCHEMA
     from .cpu_isolation import SCHEMA as CPU_ISOLATION_SCHEMA
     from .cpu_scope_state import SCHEMA as CPU_SCOPE_SCHEMA
+    from .device_scope_state import SCHEMA as DEVICE_SCOPE_SCHEMA
     with connect() as conn:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
             from .integration import instance_id
@@ -1134,7 +1144,7 @@ def _initialize_database() -> None:
         previous_schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
         needs_owner_backfill = (previous_schema_version < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA + ALLOCATION_SCHEMA + DAEMON_LEASE_SCHEMA + CPU_ISOLATION_SCHEMA + CPU_SCOPE_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA + ALLOCATION_SCHEMA + DAEMON_LEASE_SCHEMA + CPU_ISOLATION_SCHEMA + CPU_SCOPE_SCHEMA + DEVICE_SCOPE_SCHEMA)
         migrate_allocations(conn)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)

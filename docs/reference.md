@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前 cgroup 接入源码候选写 schema 20，完整只读范围为 1–20；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim/scope 记录候选写 11/12/13/14/15/16/17/18/19，都不能回接 schema 20。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前设备 scope 记录候选写 schema 21，完整只读范围为 1–21；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim/scope 记录与 cgroup 接入候选写 11/12/13/14/15/16/17/18/19/20，都不能回接 schema 21。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -196,8 +196,14 @@ admission-explain 增加 cpu_isolation 并复用池/claim 判断，池满仍报�
 查询不探测 cgroup/Slurm/进程、不修改 DB 或授予启动/wait 权限。`recorded_phase` 不是
 当前内核健康，`cpu_release_recorded_ready` 也不替代实际清理和原执行守卫。
 旧完整 schema 1–18 返回 migration_required，不迁移或回填；分页是实时 keyset，不是
-完整快照。当前没有启用 cgroup 的配置或 scope 写 CLI，默认查询为空；此记录层不是
-已接通的硬隔离派发。详见 [scope 生命周期](cpu-scopes.md)。
+完整快照。已有显式 cgroup/delegated_root 冷配置，没有 scope 写 CLI；默认 off 查询
+为空，正向内核/设备验收仍未完成。详见 [scope 生命周期](cpu-scopes.md)。
+
+`sched device-scopes [--scope-id ID] [--limit N] [--cursor ID] --json` 提供独立
+`sched-device-scope-state-v1` 合同，只读原设备意图/程序绑定和有界链。schema 21 不回填
+设备事实；schema 1–20 返回 migration_required，不升级或探测 BPF。安装未知保留原
+CPU/GPU；原 CPU removed 引用和设备 released 记录均满足后才放行资源。此项没有
+实际设备安装接入或写 CLI，默认 JSON/FD4 不变；详见 [设备记录](device-scopes.md)。
 精确原 owner 的租约检查最多有效 45 秒，缺失/过期/配置滞后为 unknown，不探测网关。
 GPU quota=0 仍是无限制。
 旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。

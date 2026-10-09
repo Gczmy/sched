@@ -1,6 +1,6 @@
 # 候选 per-job CPU 亲和
 
-此功能在 schema 18 引入，当前后续 cgroup 接入候选 writer 为 schema 20，未发布、未部署。实际 CLI 需报告命名合同
+此功能在 schema 18 引入，当前后续设备记录候选 writer 为 schema 21，未发布、未部署。实际 CLI 需报告命名合同
 `sched-cpu-isolation-v1`；包版本相同不表示旧安装已支持。只通过 sched CLI 操作 state。
 
 ## 显式启用与边界
@@ -75,7 +75,8 @@ schema 18 原子新增空 cpu_assignments 表/索引/更新禁止触发器，不
 [scope 生命周期记录](cpu-scopes.md)，默认 affinity 不创建 scope；有 scope 记录时
 原 CPU claim 要等 recorded removed/未创建 abandoned，未知不能借终态释放，也不能
 仅 affinity 启动降级。schema 20 接通独立委派 cpuset 与 cleanup_ready，不改变
-默认 affinity。完整 schema 1–20 只读查询不迁移；旧 writer 不得回接更高写库，回退只能使用已验证的升级前恢复点，不能删
+默认 affinity。后续 schema 21 新增 [设备记录与资源守卫](device-scopes.md)，尚无设备
+安装接入；完整 schema 1–21 只读查询不迁移，旧 writer 不得回接更高写库，回退只能使用已验证的升级前恢复点，不能删
 claim、降低 user_version 或手改 state。发布与生产切换仍按
 [独立 rollout](execution-rollout.md) 另行授权。
 

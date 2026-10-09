@@ -1909,6 +1909,26 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def cmd_device_scopes(args: argparse.Namespace) -> int:
+    from . import device_scope_state
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            result = {"schema_version": 1, "query": "device_scopes", "contract": CONTRACTS["device_scopes"],
+                      "instance_id": instance_id(conn), "node": str(cfg["node"]), "effect": "none",
+                      **device_scope_state.query(conn, scope_id=args.scope_id, limit=args.limit, cursor=args.cursor)}
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0
+    except (ValueError, ConfigError, state.StateError, TypeError, KeyError, sqlite3.Error, RecursionError) as error:
+        print(f"错误: device-scopes 查询失败: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_cpu_scopes(args: argparse.Namespace) -> int:
     from . import cpu_scope_state
     from .integration import CONTRACTS, instance_id
@@ -5558,6 +5578,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cursor")
     p.set_defaults(fn=cmd_cpu_isolation)
 
+    p = sub.add_parser("device-scopes", help="只读原设备策略 intent/程序绑定/未决生命周期；不探测 BPF 或授予执行权")
+    p.add_argument("--scope-id")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor")
+    p.set_defaults(fn=cmd_device_scopes)
+
     p = sub.add_parser("cpu-scopes", help="只读原 CPU scope intent/inode/未决生命周期；不探测内核或授予执行权")
     p.add_argument("--scope-id")
     p.add_argument("--json", action="store_true")
@@ -5616,7 +5643,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "device-scopes"}:
         return args.fn(args)
     if command == "request":
         try:

@@ -201,6 +201,9 @@ class Controller:
         from .cpu_isolation import policy
         if conn.in_transaction:
             raise state.StateError("CPU scope launch probes must occur outside DB writer")
+        from .device_scope_state import for_allocation
+        if for_allocation(conn, job["allocation_id"], job["id"]) is not None:
+            raise state.StateError("device scope requires original retained device handle; CPU-only launch refused")
         if policy(self.dispatcher._read_gpu_policy()) != self.policy or not self.dispatcher._cluster_lease.update():
             raise state.StateError("CPU scope cold policy or original lease changed")
         if not self.preflight():

@@ -229,3 +229,14 @@ schema 1–20 查询不迁移，schema 19 及更旧 writer 不可回接新库。
 未决旧 scope 也保留资源并阻止排空完成。不能通过删事件或降 user_version 回退。
 当前只具源码、模型与拒绝路径证据，正向 cpuset/故障恢复/设备和生产切换尚未完成；
 外部明确委派、授权验证和升级前恢复点是启用前提，不自动修改父 cgroup。
+
+## 后续候选设备记录 schema 21
+
+原子新增空 device_scopes/device_scope_events、唯一 allocation 和不可变/保留触发器，
+不回填旧设备事实。安装/启动 CAS 与原 scope/program binding 保持一次性，unknown
+不重装/卸载；CPU removed 尚未完成设备 released 时仍保留预留，cold off/终态不绕过。
+现有 CPU controller 对设备记录拒绝 CPU-only 启动，尚未接通真实 BPF 安装。
+独立 device-scopes 查询不探测 kernel，不授予执行/wait；schema 1–20 不迁移，当前
+完整只读范围 1–21。schema 20 及更旧 writer 不可回接新库，回退只用升级前验证恢复点。
+正向 CPU/BPF/GPU 故障矩阵与授权安装/生产切换仍未完成，不能将记录层当作硬隔离部署。
+合同见 [设备生命周期](device-scopes.md)。

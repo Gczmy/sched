@@ -180,7 +180,10 @@ CPU claim 绑定的 intent、原 inode、配置/启动/清理的一次 CAS，未
 
 独立 [设备策略原语](device-policy.md) 源码候选新增有界精确白名单、原 CPU scope
 与程序摘要/ID/tag 绑定、一次安装和恢复只观察；无替换/卸载/失败降级。尚未接入
-scheduler 设备持久记录、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改变当前 GPU 权限。
+scheduler 实际安装、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改变当前 GPU 权限。
+后续 [schema 21 设备记录](device-scopes.md) 冻结原 inode/策略/代际并 CAS 消耗安装/
+启动意图，unknown 保留原预留，原 CPU removed 后另记设备 released；只有独立
+只读查询，没有实际设备安装接入。正式设备故障矩阵/正向验收与发布仍未完成。
 
 ### 已确认的设计方向
 
