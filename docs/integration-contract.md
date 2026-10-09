@@ -138,6 +138,21 @@ resource_fit is null when relevant evidence is unknown; admission_granted remain
 Final dependency/artifact/marker/owner/recovery/launch checks are not granted by this
 diagnostic. Bounds and legacy-capacity compatibility are documented in [reference](reference.md).
 
+### Candidate storage admission
+
+The source candidate advertises `sched-storage-explain-v1`, with opt-in
+storage_admission (disabled by default) and nonnegative disk_gib/disk_inodes task
+reservations. Only compute dispatch probes output/control-plane filesystems and
+locally readable current-UID quota; unsupported/remote/group/project quotas are
+not inferred unlimited. Known insufficient quota always rejects; optional unknown
+user quota is explicitly reported, and require_user_quota makes it a blocking unknown.
+Independent storage-explain and admission-explain's nested storage use retained,
+identity/config/spec/running-bound observations, expire after 30 seconds, and share
+the actual pure decision. Queries never probe gateway filesystems or grant launch
+authority. Strict status/task/history and wait_reason remain unchanged; no schema
+migration or historical backfill is added. Optional allocation filesystem bindings
+are reservations, not hard isolation or physical ownership. See [storage admission](storage-admission.md).
+
 ### Candidate batch failure policy
 
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer

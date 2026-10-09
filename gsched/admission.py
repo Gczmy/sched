@@ -195,6 +195,10 @@ def explain(conn, cfg, batch, job, spec):
     gpu = gpu_plan(conn, adapter, job["id"], spec, project) if not cpu_only else None
     reasons = list(budget["reasons"])
     unknown = list(budget["unknown"])
+    from . import storage
+    storage_check = storage.explain(conn, cfg, job, spec)
+    reasons.extend(storage_check["reasons"])
+    unknown.extend(storage_check["unknown"])
     if gpu:
         reasons += gpu["reasons"]
         unknown += sorted({key for card in gpu["candidates"] for key in card.get("unknown", [])})
@@ -241,10 +245,11 @@ def explain(conn, cfg, batch, job, spec):
             "budget": budget, "gpu": gpu, "reasons": list(dict.fromkeys(reasons)), "unknown": sorted(set(unknown)),
             "order": {"rank_before_gates": rank, "truncated": order_truncated, "limit": MAX_READY,
                       "policy": "project_priority_desc_batch_priority_desc_fifo", "preemption": False, "smaller_jobs_may_backfill": True},
-            "resource_fit": None if unknown else budget["allowed"] and (gpu is None or gpu["allowed"]),
+            "resource_fit": None if unknown else budget["allowed"] and (gpu is None or gpu["allowed"]) and storage_check["allowed"] is True,
             "unchecked_dispatch_gates": external, "admission_granted": False, "effect": "none",
             "source": "private_database_snapshot_and_separately_recorded_daemon_observations",
-            "hard_isolation": False, "disk_inode_quota_admission": "not_implemented",
+            "hard_isolation": False, "storage": storage_check,
+            "disk_inode_quota_admission": "enabled" if storage_check["enabled"] else "disabled",
             "continuous_lease_validation": "not_implemented"}
 
 

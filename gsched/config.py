@@ -259,6 +259,11 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         raise ConfigError(f"{p}: 缺少 venvs (语义名 -> 解释器路径)")
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用
     from .resources import finite_number
+    from .storage import policy as storage_policy
+    try:
+        storage_policy(cfg)
+    except ValueError as error:
+        raise ConfigError(f"{p}: {error}") from error
     for key, default, positive in (
         ("host_mem_total_gib", 0, False),
         ("host_mem_reserve_gib", 16, False),

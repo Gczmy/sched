@@ -78,7 +78,7 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
 
 完整分阶段清单与验收状态见 [feedback-development.md](feedback-development.md)。
 
-**状态：第 1–4 项及第 5 项的 admission explain/allocation 已有源码候选，验收/发布独立记录；磁盘准入尚未实现。** 候选语义见 [reference](reference.md) 和 [allocation-evidence](allocation-evidence.md)，不代表已部署。按以下顺序独立开发，不把客户科学状态、
+**状态：第 1–4 项及第 5 项的 admission explain/allocation/opt-in 存储准入已有源码候选，验收/发布独立记录。** 候选语义见 [reference](reference.md)、[allocation-evidence](allocation-evidence.md) 和 [storage-admission](storage-admission.md)，不代表已部署。按以下顺序独立开发，不把客户科学状态、
 台账投影、logical experiment、cohort 或 acceptance scope 引入 daemon。
 
 1. 批次新增 opt-in `failure_policy`，默认维持现有冻结派发策略（不自动取消 running）。

@@ -4355,10 +4355,14 @@ class Dispatcher:
             gpu_policy = self._read_gpu_policy()
         except RuntimeError as error:
             self.log_line(f"本轮暂停 GPU 派发: {error}")
-            if self.cfg.get("host_mem_total_gib", 0):
+            if self.cfg.get("host_mem_total_gib", 0) or self.cfg.get("storage_admission", {}).get("enabled", False):
                 return  # Never admit from stale memory limits after a failed reload.
             gpu_policy = {}  # CPU-only work continues using the last valid config.
         admission_cfg = dict(self.cfg)
+        from . import storage
+        storage_cfg = {**self.cfg, "storage_admission": gpu_policy.get("storage_admission", {})}
+        self._storage_dispatch_enabled = storage.policy(storage_cfg)["enabled"]
+        storage_cache, self._storage_reports = {"_deadline": time.monotonic() + 10}, {}
         if gpu_policy:
             for key, default in (("host_mem_total_gib", 0), ("host_mem_reserve_gib", 16),
                                  ("host_mem_default_gib", 8)):
@@ -4557,6 +4561,14 @@ class Dispatcher:
                     if first in admission.WAIT_REASONS:
                         resource_waits[j["id"]] = first
                     continue
+                if storage.policy(storage_cfg)["enabled"]:
+                    if conn.in_transaction:
+                        conn.commit()
+                    storage_check = storage.capture(conn, storage_cfg, j, spec, cache=storage_cache)
+                    self._storage_reports[j["id"]] = storage_check
+                    storage.publish(self._storage_reports)
+                    if not storage_check["allowed"]:
+                        continue  # Do not reserve GPU/CPU, clean files or start.
                 if is_cpu_only:
                     gpu = None  # CPU-only: 不占 GPU 槽位
                 else:
@@ -4772,6 +4784,34 @@ class Dispatcher:
         if "execution" in spec:
             revalidate_binding(spec, self.cfg, str(b["project"]), json.loads(b["env"] or "{}"))
 
+        from . import storage
+        self._storage_launch_observation = None
+        storage_enabled = getattr(self, "_storage_dispatch_enabled", storage.policy(self.cfg)["enabled"])
+        if storage_enabled:
+            try:
+                current_storage_cfg = self._read_gpu_policy()
+            except RuntimeError:
+                self.log_line(f"job {j['id']} waits for readable storage configuration")
+                reports = getattr(self, "_storage_reports", {})
+                reports[j["id"]] = {"allowed": False, "enabled": True, "job_id": j["id"],
+                    "reasons": [], "unknown": ["storage_configuration_unreadable"], "filesystems": []}
+                storage.publish(reports)
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                return False
+            storage_cfg = {**self.cfg, "storage_admission": current_storage_cfg.get("storage_admission", {})}
+            if conn.in_transaction:
+                conn.commit()
+            checked = storage.capture(conn, storage_cfg, j, spec)
+            reports = getattr(self, "_storage_reports", {})
+            reports[j["id"]] = checked
+            storage.publish(reports)
+            if not checked["allowed"]:
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                return False
+            self._storage_launch_observation = checked
+
         if self._prepare_launch_marker(j):
             self.log_line(
                 f"job {j['id']} 存在未决 launch marker; 本轮不派发"
@@ -4817,6 +4857,23 @@ class Dispatcher:
                     self._release_in_tx(conn, j["id"])
                     self.log_line(f"job {j['id']} waits for fresh VRAM admission")
                     return False
+
+        if storage_enabled and self._storage_launch_observation.get("enabled"):
+            # Fingerprint/recovery/GPU checks may have taken longer than the
+            # filesystem sample's dispatch TTL, or running reservations changed.
+            from .admission import running_snapshot
+            prior = self._storage_launch_observation
+            if not 0 <= time.time() - prior["observed_at"] <= 5 or prior["running_sha256"] != running_snapshot(conn):
+                if conn.in_transaction:
+                    conn.commit()
+                checked = storage.capture(conn, storage_cfg, j, spec)
+                reports[j["id"]] = checked
+                storage.publish(reports)
+                if not checked["allowed"]:
+                    if gpu is not None:
+                        self._release_in_tx(conn, j["id"])
+                    return False
+                self._storage_launch_observation = checked
 
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
         # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验

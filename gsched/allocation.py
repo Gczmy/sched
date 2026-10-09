@@ -127,11 +127,16 @@ def reserve(conn, job_id, spec, dispatcher):
                "cpu_reservation": dispatcher._task_cpus(spec),
                "host_memory_reservation_gib": host_mem_gib(spec, getattr(dispatcher, "cfg", {})),
                "declared_resources": {key: value for key, value in (spec.get("resources") or {}).items()
-                                      if key in {"gpu", "cpus", "host_mem_gib", "vram_gib", "gpu_share"}},
+                                      if key in {"gpu", "cpus", "host_mem_gib", "vram_gib", "gpu_share", "disk_gib", "disk_inodes"}},
                "gpu_reservations": reservations,
                "backend_binding_sha256": digest(spec["_execution_binding"]) if spec.get("_execution_binding") else None,
                "semantics": "launch_intent_not_process_birth", "hard_isolation": False,
                "lease_identity": None, "worker_identity": None, "observed_at": state.now()}
+    storage = getattr(dispatcher, "_storage_launch_observation", None)
+    if (isinstance(storage, dict) and storage.get("allowed") is True and storage.get("job_id") == job_id
+            and storage.get("spec_sha256") == digest(spec)):
+        payload["storage_filesystems"] = [item["filesystem_id"] for item in storage["filesystems"] if "task" in item["roles"]]
+        payload["storage_observation_sha256"] = digest(storage)
     # Resource declarations are scalar schema-validated data, not env/cmd/root.
     encoded = _bounded(payload)
     conn.execute("INSERT INTO allocations VALUES(?,?,?,?,?)", (identifier, job_id, ordinal, encoded, digest(payload)))

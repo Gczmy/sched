@@ -60,6 +60,7 @@
 | `docs/artifact-validation.md` | 候选不可变首次产物验证与只读查询，不授予复验结算权 |
 | `docs/artifact-revalidation.md` | 候选仅产物复验/重新结算，原始证据与 task CAS request 守卫 |
 | `docs/allocation-evidence.md` | 候选不可变启动分配与进程/监控/产物/资源分层，不推断 worker 身份 |
+| `docs/storage-admission.md` | 候选 opt-in 存储准入与控制面余量；用户 quota 未知不等于无限制 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -141,6 +142,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched cancel-pending <full-batch-id> --tasks-json '<binding-list>' --yes` | 只能经一次 batch/instance CAS request；核对全部代际和启动文件，任一成员冲突整组拒绝；不发送信号 |
 | `sched admission-explain <batch>:<task> --json` | 候选只读资源/逐卡装箱解释；--version 选择精确版本；观测缺失/过期明确 unknown，不授予派发权 |
 | `sched allocations <batch>:<task> --json` | 候选不可变分配摘要；--allocation-id 读取有界分层事件与首次验证引用，不探测当前进程/文件 |
+| `sched storage-explain <batch>:<task> --json` | 候选只读计算节点存储观察；--version 选精确版本，不探测网关、不授予执行权 |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
 | `sched artifact-validations <batch>:<task> --json` | 候选首次验证摘要；--validation-id 读取一条完整证据，不检查当前文件或重新结算 |

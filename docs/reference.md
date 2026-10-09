@@ -187,7 +187,13 @@ daemon 观测最多有效 90 秒，fresh VRAM 仍只有效 5 秒；未来时间�
 CPU/内存/显存都是调度器声明预留，不是 per-job affinity/cgroup 硬限制。cpus_total=0
 仍只回退 CPU-only 并发，不限制 GPU 任务的 CPU 总量；GPU quota=0 仍是无限制。
 旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。
-持续租约验证、磁盘/inode/quota 准入和硬隔离仍未实现，不能把该查询当成这些能力。
+后续存储源码候选在该查询嵌套独立 storage 报告，复用存储派发决策；相关必需证据
+未知时 resource_fit 为 null。`sched storage-explain <batch>:<task> [--version N] --json`
+使用独立 `sched-storage-explain-v1`：最多 30 秒的计算节点观察，不探测网关，
+缺失/配置或运行集合变化明确 unknown。默认关闭的 `storage_admission` 可热更新，
+检查输出与 state 文件系统的字节/inode、可知当前 UID quota，容量不足不清理科学文件。
+严格 status/task/history 和 wait_reason 不变；全部配置/范围见 [storage-admission](storage-admission.md)。
+持续租约验证和硬隔离仍未实现，不能把这些查询当成上述能力。
 
 ## 1. 心智模型
 
@@ -319,6 +325,7 @@ schema 10 及以上写升级不归一化已有等待态或递增对应 revision�
 | `resources.profile_key` | str | ✗ | 历史实测峰值键，装箱取 max(声明, 实测) |
 | `resources.cpus` | int | ✗ | 正整数 CPU 核数声明；缺省时 CPU-only=1，GPU job=`gpu_job_cpus`（默认 8）|
 | `resources.host_mem_gib` | number | ✗ | 有限正数主机内存预留（GiB）；缺省 `host_mem_default_gib`，CPU/GPU 任务均计入 |
+| `resources.disk_gib / disk_inodes` | number / int | ✗ | 候选非负存储声明预留，缺省 0；启用 storage_admission 时每输出文件系统记全额，不是硬 quota |
 | `runtime` | obj | ✗ | `{conda_env:"名"}` ∥ `{venv_alias:"名"}` ∥ `{prefix:"路径"}` 必须且只能选一个；别名须注册、conda env/prefix 目录须在提交时存在；参与指纹 |
 | `progress_regex` | str | ✗ | 从日志尾部提取进度，status 展示 |
 | `artifacts` | obj | ✗ | `{key:{path,...}}`；规则：存在(缺省)/`"check":"json"`/`min_bytes:N`/`has_key:"键"`/`json_equals:{"键":值}`/`regex:"模式"`；内容校验有读取/执行上限，symlink 与特殊文件拒绝；命中→SKIP |
@@ -374,6 +381,7 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 | `co_locate / co_locate_safety / co_locate_max_jobs / co_locate_freeze_pct` | 共享总开关与阈值；默认 `false / 0.7 / 3 / 85` |
 | `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 配额；默认 `0 / 8 / 2`。`cpus_total=0` 时仅以 `max_cpu_jobs` 限 CPU-only 并发 |
 | `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
+| `storage_admission` | 候选 opt-in 磁盘/inode/可知用户 quota 准入；默认 enabled=false，其余余量/unknown 策略见 [存储合同](storage-admission.md)，支持热更新 |
 | `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
 | `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
@@ -558,6 +566,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `task-facts <full-batch-id> --tasks-json '<task/version-list>' --json` | 候选有界精确代际事实 | 私有只读快照；不读启动文件，不授予取消权；超限报错 |
 | `cancel-pending <full-batch-id> --tasks-json '<binding-list>' --yes` | 候选成组未启动任务取消 | 仅计算节点一次 batch/instance CAS request；任一成员冲突整组拒绝 |
 | `admission-explain <batch>:<task> [--version N] --json` | 候选只读资源/逐卡装箱解释 | 共用派发预算/选卡函数；计算节点观测有时效；unknown 不授予派发权 |
+| `storage-explain <batch>:<task> [--version N] --json` | 候选只读存储解释 | 共用存储决策；字节/inode/用户 quota 范围明确；不探测网关、不授予执行权 |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
 | `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |

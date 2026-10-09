@@ -169,7 +169,26 @@ Python 3.10 任务 DAG 验收发现旧已完成 allocation 误阻止未启动新
 其余仓库/普通回归/native 项通过，candidate 被阻断，不能记录为完整绿色。
 后续单独修复仅限定当前版本的 allocation 守卫，保留跨代际运行/未知/marker/进程组
 守卫及不可变旧记录；增加旧版本已完成允许新版本更新、同版本 retry 清空仍拒绝的回归。
-修复提交的完整 CI 仍待核实；完整合同见 [allocation-evidence](allocation-evidence.md)。
+修复固定来源 `873dca533f53ed3411a91e3ae15f93740483242c` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37867186601) 14 项均通过，
+计算节点任务 DAG 验收通过，包括新依赖绑定不误 SKIP 旧产物；31 条相关
+mock/只读回归通过。完整合同见 [allocation-evidence](allocation-evidence.md)。
+
+阶段 11 候选增加 opt-in storage_admission：磁盘字节/inode、当前 UID 可知的本地
+quota、输出与 state 控制面余量。默认关闭；声明预留不是硬 quota，组/项目/远程
+quota 未知不冒充无限制。独立 storage-explain 与 admission-explain 嵌套报告共享
+实际纯决策，已记录观察有身份/配置/运行绑定与 30 秒时效；不探测网关。
+最终计算节点 [CPU/CLI 验收](../tests/run_storage_accept.py) 通过：极大声明拒绝发生
+在 GPU 分配/worker/产物清理之前，小任务补位一次，控制面 floor 热更新恢复，
+实际用户 quota 不可读时明确 unknown，require_user_quota 暂停、显式可选后只运行一次。
+最终脚本 SHA256 为
+`15592f03b12e412405acf621d01d3f3a96eb19ddb3892b7749e5e174a2ed1814`。
+计算节点扩展回归运行 206 条：205 通过、1 条 native 不可用跳过；本地 101 条
+mock/只读回归通过。源码/脚本摘要已核对一致，测试 daemon 停止后只清理自有临时
+fixture；不填满磁盘、不改 kernel quota、不 mount、不占真实 GPU、不改生产。
+配置读取失败暂停而非把任务误判执行失败；超时 helper 不重复创建，tick 探测预算
+耗尽明确未知。旧库不迁移/补证，strict status/task/history/wait_reason 不变，配套
+插件已只读核对。固定提交完整 CI 尚待确认；完整合同见 [storage-admission](storage-admission.md)。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -181,8 +200,8 @@ Python 3.10 任务 DAG 验收发现旧已完成 allocation 误阻止未启动新
 | 7 | 任务 DAG/阻塞路径 | 候选 CI/计算节点 CPU 通过 | 事务内环检查；A→C、B→D 且 A 失败时 B/D 继续、C 等待；CAS 依赖更新保留不可变历史 |
 | 8 | bounded 精确事实/成组 pending-only cancel | 候选 CI/计算节点 CPU 通过 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
 | 9 | admission explain/装箱解释 | 候选 CI/计算节点 CPU 通过 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
-| 10 | allocation 身份/分层失败 | 候选计算节点 CPU 通过，CI 待确认 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
-| 11 | 磁盘/inode/quota 准入 | 未实现 | 控制面余量；unknown 明确；容量不足不删科学产物 |
+| 10 | allocation 身份/分层失败 | 候选 CI/计算节点 CPU 通过 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
+| 11 | 磁盘/inode/quota 准入 | 候选计算节点 CPU 通过，CI 待确认 | 控制面余量；unknown 明确；容量不足不删科学产物 |
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 未实现 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 未实现 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |

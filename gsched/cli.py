@@ -1907,6 +1907,36 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def cmd_storage_explain(args: argparse.Namespace) -> int:
+    from .storage import explain
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch, task_id = _resolve_task_ref(args.task, conn)
+            if args.version is not None and args.version < 1:
+                raise ValueError("version 必须为正整数")
+            params = (batch, task_id, args.version) if args.version is not None else (batch, task_id)
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=?" +
+                               (" AND version=?" if args.version is not None else "") + " ORDER BY version DESC LIMIT 1", params).fetchone()
+            if job is None:
+                raise ValueError("精确任务/版本不存在")
+            spec = json.loads(conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?", (batch, task_id, job["version"])).fetchone()[0])
+            result = {"schema_version": 1, "query": "storage_explain", "contract": CONTRACTS["storage_explain"],
+                      "instance_id": instance_id(conn), "batch_id": batch, "task_id": task_id, "version": job["version"],
+                      "job_id": job["id"],
+                      "effect": "none", "admission_granted": False, "hard_isolation": False, **explain(conn, cfg, job, spec)}
+        print(json.dumps(result, ensure_ascii=False) if args.json else "存储准入记录（只读，不授予派发权）\n" + json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except (ValueError, ConfigError, state.StateError, TypeError, RecursionError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_allocations(args: argparse.Namespace) -> int:
     from .allocation import query
     from .integration import CONTRACTS, instance_id
@@ -5142,6 +5172,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_admission_explain)
 
+    p = sub.add_parser("storage-explain", help="只读计算节点已记录的磁盘/inode/用户 quota 准入，不探测网关")
+    p.add_argument("task")
+    p.add_argument("--version", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_storage_explain)
+
     p = sub.add_parser("allocations", help="只读不可变启动/资源关联及分层观察，不探测进程或当前产物")
     p.add_argument("task", help="<batch-id-or-name>:<task>")
     p.add_argument("--version", type=int)
@@ -5446,7 +5482,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain"}:
         return args.fn(args)
     if command == "request":
         try:
