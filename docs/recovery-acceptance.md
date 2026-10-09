@@ -107,6 +107,21 @@ schema 10→25 的历史身份/未知
 CPython 3.10/3.14 二进制资产矩阵。正式新版本须另定版本号、重新固定来源/CI，
 不能覆盖已发布的 v0.4.0；schema 10 writer 不能回接新写库。
 
+## 2026-10-09 升级恢复点来源的真实 GPU 结果
+
+固定来源 `b6c806e3a21a419a24f7881ae3bb5c7bc9c9ffe0` 在独立 state 的
+Linux x86_64 / Python 3.12.3 / RTX A5000 环境重新通过上述全部 8 项真实 CUDA
+恢复验收，进程退出码 0。测试前后 267 个归档源码文件逐项核对一致；native 从
+相同源码显式编译，构建工具和与系统解释器同版的开发头文件仅在临时目录使用，
+没有安装系统包。结束后 CLI 确认私有 daemon 停止，GPU compute 进程为空，
+两卡空闲显存恢复测试前水平。实际路径、设备身份和原始日志仅保留于私有证据。
+
+该来源的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37926803183) 14/14
+成功，四份原始 CI ZIP 的来源、digest、manifest 和独立安装证据已核验；尚未发布
+或切换生产。此次仍为默认 CPU/device isolation off 和 standalone 路径，不证明
+正向 cpuset/BPF、设备 scope 故障或真实 Slurm 租约结束，也不扩大正式 native ABI 范围。
+后续仅发布说明生成规则/文档的改动须独立核验新来源 CI，不能改写这些原始 ZIP。
+
 ## 发布边界
 
 四组分支按 A → B → C → D 审查/合并。本次 PR 完成不等于已发布新版本或已升级生产。

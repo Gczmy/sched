@@ -29,6 +29,14 @@ def run(args, cwd, env):
     return result.stdout
 
 
+def release_notes_for_commit(text, commit):
+    for document in ("execution-rollout", "upgrade-snapshot"):
+        text = text.replace(
+            f"(../{document}.md)",
+            f"(https://github.com/Gczmy/sched/blob/{commit}/docs/{document}.md)")
+    return f"Source commit: `{commit}`.\n\n" + text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commit", required=True, help="full 40-character reviewed source commit")
@@ -131,11 +139,9 @@ owner.close();prepared.close()
             print("PASS:", label, "candidate installs independently", flush=True)
         release_notes = source / "docs" / "releases" / (package_version + ".md")
         if release_notes.is_file():
-            release_text = release_notes.read_text(encoding="utf-8").replace(
-                "(../execution-rollout.md)",
-                f"(https://github.com/Gczmy/sched/blob/{commit}/docs/execution-rollout.md)")
             (destination / "RELEASE_NOTES.md").write_text(
-                f"Source commit: `{commit}`.\n\n" + release_text, encoding="utf-8")
+                release_notes_for_commit(release_notes.read_text(encoding="utf-8"), commit),
+                encoding="utf-8")
     notes = destination / "INSTALL.md"
     notes.write_text(f"""# sched {package_version} candidate
 
