@@ -39,7 +39,9 @@ class SupervisorUnitTests(TempStateCase):
 
     def test_restarts_only_after_owned_child_wait_and_normal_exit_finishes(self):
         failed, success = FakeChild(-9), FakeChild(0)
-        with mock.patch.object(subprocess, "Popen", side_effect=[failed, success]) as launch, mock.patch.object(supervisor.time, "sleep"), mock.patch.object(supervisor.time, "monotonic", side_effect=[0, 2, 3]):
+        with mock.patch.object(subprocess, "Popen", side_effect=[failed, success]) as launch, mock.patch.object(supervisor, "time", mock.Mock(wraps=time)) as clock:
+            clock.sleep.return_value = None
+            clock.monotonic.side_effect = [0, 2, 3]
             self.assertEqual(0, supervisor.foreground(fake=True, supervise=True, restart_delay_sec=1))
         self.assertEqual(2, launch.call_count)
         self.assertFalse(os.path.exists(os.path.join(state.host_dir(), supervisor.CONTROL)))
@@ -48,15 +50,22 @@ class SupervisorUnitTests(TempStateCase):
         with mock.patch.object(subprocess, "Popen", return_value=FakeChild(1)) as launch:
             self.assertEqual(1, supervisor.foreground(fake=True))
             self.assertEqual(1, launch.call_count)
-        with mock.patch.object(subprocess, "Popen", return_value=FakeChild(1)) as launch, mock.patch.object(supervisor.time, "sleep"), mock.patch.object(supervisor.time, "monotonic", side_effect=[0, 2, 3]):
+        with mock.patch.object(subprocess, "Popen", return_value=FakeChild(1)) as launch, mock.patch.object(supervisor, "time", mock.Mock(wraps=time)) as clock:
+            clock.sleep.return_value = None
+            clock.monotonic.side_effect = [0, 2, 3]
             self.assertEqual(1, supervisor.foreground(fake=True, supervise=True, restart_delay_sec=1, max_restarts=1))
             self.assertEqual(2, launch.call_count)
 
     def test_stop_in_restart_gap_prevents_new_child(self):
         def sleep(_): supervisor.request_stop()
-        with mock.patch.object(subprocess, "Popen", return_value=FakeChild(-9)) as launch, mock.patch.object(supervisor.time, "sleep", side_effect=sleep), mock.patch.object(supervisor.time, "monotonic", side_effect=[0, 0, 0]):
+        # The restart clock is local to the supervisor. In particular the
+        # maintenance fence keeps its real timeout while request_stop persists.
+        with mock.patch.object(subprocess, "Popen", return_value=FakeChild(-9)) as launch, mock.patch.object(supervisor, "time", mock.Mock(wraps=time)) as clock:
+            clock.sleep.side_effect = sleep
+            clock.monotonic.side_effect = [0, 0, 0]
             self.assertEqual(0, supervisor.foreground(fake=True, supervise=True, restart_delay_sec=1))
             self.assertEqual(1, launch.call_count)
+            self.assertEqual(3, clock.monotonic.call_count)
 
     def test_stale_heartbeat_never_allows_live_lease_takeover(self):
         dispatcher = Dispatcher(self.cfg, fake=True)

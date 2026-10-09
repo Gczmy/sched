@@ -5,7 +5,7 @@ import time
 from dataclasses import asdict
 from unittest import mock
 
-from gsched import cli, cluster_lease, cpu_isolation, scope_health as health, state
+from gsched import cli, cluster_lease, cpu_isolation, cpu_scope_controller, scope_health as health, state
 from gsched.execution_policy import digest
 import test_cpu_scope_controller as scopes
 import test_device_scope_controller as devices
@@ -129,9 +129,13 @@ class RootHealthTests(RootHealthFixture):
             health.record(self.controller, facts=facts, observed_at=now)
 
     def test_durable_publication_does_not_reset_original_launch_freshness(self):
-        with mock.patch("gsched.cpu_scope_controller.time.monotonic", side_effect=[0, 0, 6]):
+        # Patch this controller's clock, not the shared stdlib module: writer
+        # admission has its own timeout and must not consume this probe timeline.
+        with mock.patch.object(cpu_scope_controller, "time", mock.Mock(wraps=time)) as clock:
+            clock.monotonic.side_effect = [0, 0, 6]
             with self.assertRaises(state.StateError):
                 self.controller.preflight()
+            self.assertEqual(3, clock.monotonic.call_count)
         self.assertFalse(self.controller.admission_current())
         self.assertEqual("unknown", self.read()["status"])
 
