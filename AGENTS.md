@@ -138,6 +138,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched dependency-update <batch>:<task> --dependencies-json '<exact-list>' --yes` | 只能经 task/instance CAS request 更新未启动版本；保留旧绑定，事务内检查混合环 |
 | `sched task-facts <full-batch-id> --tasks-json '<task/version-list>' --json` | 候选有界精确代际事实；不检查启动文件、不授予取消权；超限报错 |
 | `sched cancel-pending <full-batch-id> --tasks-json '<binding-list>' --yes` | 只能经一次 batch/instance CAS request；核对全部代际和启动文件，任一成员冲突整组拒绝；不发送信号 |
+| `sched admission-explain <batch>:<task> --json` | 候选只读资源/逐卡装箱解释；--version 选择精确版本；观测缺失/过期明确 unknown，不授予派发权 |
 | `sched execution <batch>:<task> --json` | 通用执行尝试、身份绑定与原始退出／清理事实；owner_health 只表示已记录观察，不探测服务 |
 | `sched execution list --json` | 跨任务筛选和实时分页；续页不能合并为完整当前态，具体契约见 execution-api |
 | `sched artifact-validations <batch>:<task> --json` | 候选首次验证摘要；--validation-id 读取一条完整证据，不检查当前文件或重新结算 |

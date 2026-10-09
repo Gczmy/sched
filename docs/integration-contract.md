@@ -106,6 +106,18 @@ the daemon; this is not cross-system atomic pending-replace. See [reference](ref
 
 ### Candidate batch failure policy
 
+The source resource-explanation candidate advertises `sched-admission-explain-v1`
+without changing schema 15 or strict status/task/history fields. Its independent
+query shares budget and GPU-selection decisions with dispatch, returns simultaneous
+resource rejections and per-card packing reasons, and never probes gateway hardware.
+Current DB facts and separately recorded compute-node observations are not one
+atomic snapshot. Observations expire after 90 seconds; fresh VRAM keeps its 5-second
+limit. Identity/config/usage changes, missing evidence and stale timestamps are explicit
+unknowns, not inferred capacity. Resource reservations are not per-job hard isolation.
+resource_fit is null when relevant evidence is unknown; admission_granted remains false.
+Final dependency/artifact/marker/owner/recovery/launch checks are not granted by this
+diagnostic. Bounds and legacy-capacity compatibility are documented in [reference](reference.md).
+
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
 introduced schema 11; the later artifact-validation candidate writes 12 (read
 range 1–12); the subsequent revalidation candidate writes 13 (reads 1–13).

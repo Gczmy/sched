@@ -87,6 +87,7 @@ jobs:
           python tests/run_exact_dependencies_accept.py
           python tests/run_task_dependencies_accept.py
           python tests/run_pending_cancel_accept.py
+          python tests/run_admission_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh

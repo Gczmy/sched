@@ -149,6 +149,37 @@ sched request <rid> --json --expect-kind batch --expect-id <full-batch-id> \
 没有新增持久表或迁移，status/task/history 严格字段保持。跨实例替代计划、目标 spec/RID、
 reservation 和 lineage 由客户端保存，不承诺跨系统原子替换。
 
+## 候选资源准入与逐卡装箱解释
+
+`sched admission-explain <batch>:<task> [--version N] --json` 使用独立合同
+`sched-admission-explain-v1`，不改 status/task/history 字段或 schema 15。
+可在网关查询：私有 DB/WAL 快照提供当前预留和任务绑定，计算节点 daemon 的独立
+带时间戳观测提供 GPU 容量、冻结/防抖、fresh VRAM、物理主机内存和未触页预留。
+查询不初始化/迁移 state，不探测网关硬件、不连接 owner、不检查任务产物、不派发。
+
+预算及选卡函数与实际派发共用，不从展示用 wait_reason 推导。返回全部同时不满足的
+CPU 总量/CPU-only 并发、主机内存静态预算与物理余量、批次 max_parallel、项目 GPU
+开关/并发 job 配额，以及逐卡硬亲和、quarantine/ignore、冻结/利用率防抖、独占占卡、
+全局/卡级/项目级 pack 上限、声明/缓存峰值、容量/safety 和 fresh VRAM/外部占用原因。
+共享选择仍按放入后归一化负载和亲和优先；小任务可补位，不抢占。优先级排序最多
+读取 10000 候选，超出时 order.truncated=true、rank_before_gates=null，不伪造完整位置。
+
+daemon 观测最多有效 90 秒，fresh VRAM 仍只有效 5 秒；未来时间、身份/配置不匹配、
+缺失或不可读均明确 unknown。物理内存观测还绑定当时 running 的 job/spec/pgid；
+运行集合变化后不把旧未触页余量当作当前余量。DB 与观测不是原子跨文件快照。
+最多 512 卡、10000 个 running 记录及 4 MiB running spec、单目标 spec 1 MiB；超出
+返回非零。查询只读：不删文件、不改 revision、分配、状态、回执或训练次数。
+
+`resource_fit` 只表示这个有时效的资源快照能否容纳；相关观测未知时为 null。
+`admission_granted:false` 始终不授予启动权。实际依赖产物、marker/执行身份、恢复 smoke、
+最终 CAS/内核权限仍需派发时核验，unchecked_dispatch_gates 明确列出；旧失败/等待的
+科学原因也不能由此补判成功。retry 退避、批次状态、当前代际和 drain 单独显示。
+
+CPU/内存/显存都是调度器声明预留，不是 per-job affinity/cgroup 硬限制。cpus_total=0
+仍只回退 CPU-only 并发，不限制 GPU 任务的 CPU 总量；GPU quota=0 仍是无限制。
+旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。
+持续租约验证、磁盘/inode/quota 准入和硬隔离仍未实现，不能把该查询当成这些能力。
+
 ## 1. 心智模型
 
 ```
@@ -517,6 +548,7 @@ runtime/B13 关键子集 → task_default_env 缺省值 → batch/task env 覆�
 | `dependency-update <batch>:<task> --dependencies-json '<list>' --yes` | 候选受审计依赖更新 | 仅计算节点 task/instance CAS request；未启动版本、事务环检查、不可变历史 |
 | `task-facts <full-batch-id> --tasks-json '<task/version-list>' --json` | 候选有界精确代际事实 | 私有只读快照；不读启动文件，不授予取消权；超限报错 |
 | `cancel-pending <full-batch-id> --tasks-json '<binding-list>' --yes` | 候选成组未启动任务取消 | 仅计算节点一次 batch/instance CAS request；任一成员冲突整组拒绝 |
+| `admission-explain <batch>:<task> [--version N] --json` | 候选只读资源/逐卡装箱解释 | 共用派发预算/选卡函数；计算节点观测有时效；unknown 不授予派发权 |
 | `history [batch-ref] [--status S] [--project P] [--json] [--limit N] [--cursor TOKEN]` | 终态历史（保留各版本） | 缺省 50，钳制到 1..200；cursor 用于 JSON 稳定键集分页 |
 | `markers` | 批次终态 marker 一行查看 | 纯文件查询，不打开数据库 |
 | `log <batch-ref>:<task> [-f] [-n N]` | 任务日志 | |

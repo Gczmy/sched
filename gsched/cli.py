@@ -1777,6 +1777,41 @@ def cmd_task_dependencies(args):
         state.set_read_only(False)
 
 
+def cmd_admission_explain(args):
+    from . import admission
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        batch_ref, task_id = _parse_task_ref(args.task)
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            batch_id = _resolve_batch_ref(batch_ref, conn)
+            batch = state.get_batch(conn, batch_id) if batch_id else None
+            if batch is None:
+                raise ValueError("批次不存在")
+            version = args.version
+            if version is None:
+                version = conn.execute("SELECT MAX(version) FROM jobs WHERE batch_id=? AND task_id=?", (batch_id, task_id)).fetchone()[0]
+            job = conn.execute("SELECT * FROM jobs WHERE batch_id=? AND task_id=? AND version=?", (batch_id, task_id, version)).fetchone()
+            raw = conn.execute("SELECT spec FROM tasks WHERE batch_id=? AND id=? AND version=?", (batch_id, task_id, version)).fetchone()
+            if job is None or raw is None:
+                raise ValueError("精确任务版本不存在")
+            if len(raw[0].encode()) > 1024 * 1024:
+                raise ValueError("任务 spec 超过 1 MiB 查询容量")
+            spec = json.loads(raw[0])
+            if not isinstance(spec, dict):
+                raise ValueError("任务 spec 不是对象")
+            output = admission.explain(conn, cfg, batch, job, spec)
+        print(json.dumps(output, ensure_ascii=False, allow_nan=False) if args.json else
+              f"{job['id']}: {', '.join(output['reasons'] + output['unknown']) or '资源快照可容纳'}；未授予派发权")
+        return 0
+    except (ValueError, TypeError, KeyError, state.StateError, ConfigError, RecursionError, OverflowError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_task_facts(args):
     from . import pending_cancel
     from .integration import CONTRACTS, instance_id
@@ -5070,6 +5105,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_dependency_update)
 
+    p = sub.add_parser("admission-explain", help="只读资源/装箱解释，复用派发判断，不探测网关或授予派发权")
+    p.add_argument("task", help="<batch-id-or-name>:<task>")
+    p.add_argument("--version", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_admission_explain)
+
     p = sub.add_parser("task-facts", help="有界精确代际事实，只读私有快照，不授予取消权")
     p.add_argument("batch", help="完整 batch ID，不按名称解析")
     p.add_argument("--tasks-json", required=True, help="内联 task_id/version 数组，1..100 项")
@@ -5365,7 +5406,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain"}:
         return args.fn(args)
     if command == "request":
         try:

@@ -4440,10 +4440,9 @@ class Dispatcher:
             # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU).
             # cpus_total 未配置(0) -> 回退 max_cpu_jobs: CPU-only 并发上限 (定案 7 旧语义),
             # GPU 任务不受 CPU 约束 (旧版行为).
-            cpus_total = int(self.cfg.get("cpus_total", 0) or 0)
-            max_cpu_jobs = int(self.cfg.get("max_cpu_jobs", DEFAULT_MAX_CPU_JOBS))
             used_cpu = self._cpu_in_use(conn)
             used_memory = admission.memory_usage(conn, admission_cfg)
+            memory_sampled_at = time.time()
             memory_sample = admission.host_memory() if admission_cfg.get("host_mem_total_gib", 0) else None
             outstanding_memory = admission.memory_outstanding(conn, admission_cfg) if memory_sample else 0
             launched_memory = 0.0
@@ -4461,6 +4460,10 @@ class Dispatcher:
                 running_per_batch[r["batch_id"]] = r["n"]
             # B11c: refresh per-project running GPU counts
             self._update_project_quota_used(conn)
+
+            from .admission import capture_runtime, publish_runtime
+            publish_runtime(capture_runtime(self, conn, {**admission_cfg, "projects": gpu_policy.get("projects", {})},
+                                            memory_sample, outstanding_memory, memory_sampled_at))
 
             for j in ready:
                 batch = state.get_batch(conn, j["batch_id"])
@@ -4524,28 +4527,21 @@ class Dispatcher:
                             f"job {j['id']} 存量 spec 非法, 已隔离: {exc}"
                         )
                     continue
-                if not is_cpu_only and not project_gpu_enabled(gpu_policy, project):
-                    continue
-                # GPU quota does not apply to CPU-only work.
-                if not is_cpu_only and not self._project_quota_available(conn, project):
-                    continue
-                # B14 L4: sweep.max_parallel -- 同批 running 达上限则等下轮
-                if mp and running_per_batch.get(j["batch_id"], 0) >= mp:
-                    resource_waits[j["id"]] = "parallel"
-                    continue
-                if cpus_total > 0 and used_cpu + task_cpus > cpus_total:
-                    resource_waits[j["id"]] = "cpu"
-                    # CPU 配额不足: 本任务等下轮 (CPU 超卖禁止, 与 GPU 同纪律)
-                    # 批内补位: continue 让后面的小任务可插队 (大任务等 GPU 释放同轮再试)
-                    continue
-                if not admission.memory_available(admission_cfg, used_memory, task_memory,
-                                                  memory_sample, launched_memory, outstanding_memory):
-                    resource_waits[j["id"]] = "host_memory"
+                from .admission import budgets
+                budget = budgets(self.cfg, {**admission_cfg, "projects": gpu_policy.get("projects", {})}, project,
+                                 cpu_only=is_cpu_only, cpus=task_cpus, memory=task_memory, parallel=mp,
+                                 used_cpu=used_cpu, cpu_jobs=cpu_only_running, used_memory=used_memory,
+                                 memory_sample=memory_sample, outstanding_memory=outstanding_memory,
+                                 launched_memory=launched_memory, batch_running=running_per_batch.get(j["batch_id"], 0),
+                                 project_running=self._project_quota_used.get(project, 0))
+                if not budget["allowed"]:
+                    # Preserve the displayed legacy first wait while the separate
+                    # explanation contract retains every simultaneous rejection.
+                    first = budget["reasons"][0]
+                    if first in admission.WAIT_REASONS:
+                        resource_waits[j["id"]] = first
                     continue
                 if is_cpu_only:
-                    if cpus_total <= 0 and cpu_only_running >= max_cpu_jobs:
-                        resource_waits[j["id"]] = "cpu"
-                        continue  # 回退模式: CPU-only 并发上限 (旧语义)
                     gpu = None  # CPU-only: 不占 GPU 槽位
                 else:
                     # A rejection is request-specific unless the allocator can
@@ -4680,222 +4676,9 @@ class Dispatcher:
         return state.now()
 
     def _assign_in_tx(self, conn, job_id: str, spec: dict | None = None, project: str | None = None) -> int | None:
-        """事务内 assign (定案 39 L2 共享装箱).
-
-        独占任务 (gpu_share 缺省 false): free 卡 -> assigned (现状语义);
-        声明 resources.vram_gib 时跳过容量不足的卡 (异构适配, 定案 46 B).
-        共享任务 (gpu_share=true 且 config co_locate=true): free 卡 ∪ 有余量的
-        assigned 卡 (SUM(vram_gib)+新任务 ≤ co_locate_safety×容量 且 未冻结 且
-        每卡任务数 < co_locate_max_jobs) -> **归一化负载选卡 (min
-        (used+task_vram)/cap, 定案 46 A; 非 First-Fit)**.
-        组合缺格 (gpu_share=true × co_locate=false): 按独占跑 + 告警 (声明是意愿,
-        全局开关是许可). 鲸鱼排除: vram_gib > safety×容量 -> 返回 None (装箱必失败,
-        由调用方按无卡处理).
-        """
-        spec = spec or {}
-        from . import gpu_admission
-        if gpu_admission.policy(self.cfg, project) is not None:
-            return gpu_admission.assign(conn, self, job_id, spec, project, getattr(self, "_gpu_admission_samples", {}))
-        resources = spec.get("resources") or {}
-        gpu_share = bool(resources.get("gpu_share"))
-        co_locate = bool(self.cfg.get("co_locate", False))
-        if gpu_share and not co_locate:
-            self.log_line(f"job {job_id} gpu_share=true 但 co_locate 未开启 -> 按独占跑 + 告警")
-            gpu_share = False
-        # B12-b: 项目级开关 (与门第三项): 项目 colocate=false -> 降级独占。
-        # 独占占整卡后他人本就不可 pack (S7), 天然零跨项目干扰, 无需额外隔离。
-        if gpu_share and project:
-            if (self._projects.get(project) or {}).get("colocate") is False:
-                self.log_line(
-                    f"job {job_id}: 项目 {project} 已禁用 colocate -> gpu_share 降级独占"
-                )
-                gpu_share = False
-        # 装箱值 = max(声明 vram_gib, profile_cache.peak_gib) (定案 39 L1, profile 命中)
-        task_vram = None
-        if gpu_share:
-            task_vram = float(resources.get("vram_gib", 0.0) or 0.0)
-            pk = resources.get("profile_key")
-            if pk:
-                row = conn.execute(
-                    "SELECT peak_gib FROM profile_cache WHERE profile_key=?",
-                    (_profile_cache_key(project, pk),),
-                ).fetchone()
-                if row and row["peak_gib"]:
-                    task_vram = max(task_vram, float(row["peak_gib"]))
-            safety = float(self.cfg.get("co_locate_safety", 0.7))
-        # 独占任务: 第一张能装下的 free 卡 (定案 6 每卡独占; 2026-08-17 方案 B:
-        # 异构容量适配——任务声明 resources.vram_gib 时跳过容量不足的卡, 防大任务
-        # 被派到小卡 OOM. 未声明维持现状 (不声明不校验).)
-        excl_vram = None
-        if not gpu_share:
-            v = resources.get("vram_gib")
-            if v is not None:
-                try:
-                    excl_vram = float(v)
-                except (TypeError, ValueError):
-                    excl_vram = None
-            # B11c: project card selection.
-            # affinity_hard=true: 只允许 affinity 列内的卡 (硬隔离, 防跨项目混卡 OOM);
-            #   全忙 -> 返回 None 由调用方按无卡处理 (下轮重试)。
-            # 默认(软): 亲和卡优先, 不满足可借其他卡。
-            affinity = self._project_affinity(project) if project else []
-            hard = self._project_affinity_hard(project) if project else False
-            valid = set(self.allocator.gpu_list)
-            if hard and affinity:
-                gpu_order = [i for i in affinity if i in valid]
-            else:
-                gpu_order = list(affinity) + [i for i in self.allocator.gpu_list if i not in affinity]
-            for idx in gpu_order:
-                if self._gpu_dispatch_suppressed(idx):
-                    continue
-                row = conn.execute(
-                    "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
-                ).fetchone()
-                if not row or row["quarantined"]:
-                    continue
-                if row["status"] == "free":
-                    if excl_vram is not None:
-                        cap = self.allocator.mem_total(idx)
-                        if cap > 0 and excl_vram > cap:
-                            continue  # declared peak exceeds card capacity
-                    conn.execute(
-                        "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
-                        (job_id, state.now(), idx),
-                    )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
-                        " VALUES (?,?,?,?)",
-                        (idx, job_id, task_vram, state.now()),
-                    )
-                    return idx
-            self._assign_reject_scope = "project" if hard and affinity else "all"
-            return None
-
-        # 共享任务: 归一化负载装箱 (定案 40 Least-Loaded + 2026-08-17 方案 A).
-        #   动机: First-Fit 会把轻任务全堆 GPU0 (raft 峰值 0.3-0.6GiB 摸不到显存
-        #   约束, 仅靠任务数上限换卡) -> GPU0 满载 GPU1/2/3 空转. 改为候选
-        #   (free ∪ 有余量 assigned) 中选负载率最低的一张, 轻任务均匀分散到全部卡.
-        #   2026-08-17 异构升级: 选卡标准从"绝对已用最小"(min used) 改为
-        #   "负载率最低"(min used/cap)——16GB+24GB 混用时按比例均衡, 轻任务
-        #   自动倾向大卡 (绝对 used 会优先堆小卡, 大卡空转). free 卡 used=0
-        #   负载率 0 天然优先. 平局取最小 idx (确定性, 与定案 2 声明顺序一致).
-        #   独占卡 (gpu_jobs 含 vram_gib IS NULL 行) 视为满: 独占占整卡不可再装箱,
-        #   否则 SUM(NULL)=0 会骗过装箱 (First-Fit 也会放, Least-Loaded 会优先选).
-        best_idx: int | None = None
-        best_load = float("inf")
-        preferred_idx: int | None = None
-        preferred_load = float("inf")
-        cap_skipped = False   # B12-c: 候选卡中是否有因项目级上限被跳过
-        self._assign_reject_scope = "all"   # 默认: 无卡对所有 GPU 任务一视同仁
-        # B11c: shared packing honors the same hard/soft affinity semantics
-        affinity_s = self._project_affinity(project) if project else []
-        hard_s = self._project_affinity_hard(project) if project else False
-        valid_s = set(self.allocator.gpu_list)
-        affinity_set = set(affinity_s)
-        if hard_s and affinity_s:
-            gpu_order_s = [i for i in affinity_s if i in valid_s]
-        else:
-            gpu_order_s = list(affinity_s) + [i for i in self.allocator.gpu_list if i not in affinity_s]
-        for idx in gpu_order_s:
-            if self._gpu_dispatch_suppressed(idx):
-                continue
-            row = conn.execute(
-                "SELECT status, quarantined FROM gpus WHERE idx=?", (idx,)
-            ).fetchone()
-            if not row or row["quarantined"]:
-                continue
-            if row["status"] == "free":
-                used = 0.0
-                cap = self.allocator.mem_total(idx)
-                # H5 修复: free 卡同样做鲸鱼排除 (docstring 承诺: vram_gib >
-                # safety×容量 -> 不装箱), 否则大任务被装上小空卡启动即 OOM
-                if cap > 0 and task_vram > safety * cap:
-                    continue
-            elif row["status"] == "assigned":
-                if idx in self._frozen_gpus:
-                    continue
-                excl = conn.execute(
-                    "SELECT COUNT(*) AS n FROM gpu_jobs WHERE gpu_id=? AND vram_gib IS NULL",
-                    (idx,),
-                ).fetchone()
-                if excl and excl["n"]:
-                    continue  # 卡上有独占任务, 占整卡
-                cap = self.allocator.mem_total(idx)
-                if cap <= 0:
-                    continue  # 容量未知: 不冒险共享
-                used = self.allocator.vram_used(conn, idx)
-                if used + task_vram > safety * cap:
-                    continue
-                # B12-c: 三级打包上限. 全局/卡级是物理容量属性 -> 约束卡上
-                # 总任务数; 项目级是策略属性 -> 只数该项目在此卡的 任务
-                # (不同计数器, 不能折叠进一个 min 数). 超额只挡新 pack 不驱逐
-                # (定案 Q5: 自然排水).
-                cap_all = int(self.cfg.get("co_locate_max_jobs", 3))
-                gcap = self._gpu_max_jobs.get(idx)
-                if gcap is not None:
-                    cap_all = min(cap_all, int(gcap))
-                if self.allocator.job_count(conn, idx) >= cap_all:
-                    cap_skipped = True
-                    continue
-                pmax = (self._projects.get(project or "") or {}).get("max_jobs")
-                if pmax is not None:
-                    proj_n = conn.execute(
-                        "SELECT COUNT(*) AS n FROM gpu_jobs gj"
-                        " JOIN jobs j ON j.id=gj.job_id"
-                        " WHERE gj.gpu_id=? AND j.project=?",
-                        (idx, project),
-                    ).fetchone()["n"]
-                    if proj_n >= int(pmax):
-                        cap_skipped = True
-                        continue
-            else:
-                continue
-            # 归一化负载 = 放入后负载率 (used+task)/cap 最小 — 回答"放哪张最均衡"
-            # (当前负载 used/cap 会误选: 16GB@4GiB(0.25) vs 24GB@8GiB(0.33),
-            #  放 8GiB 任务后 16GB->0.75 反而失衡, 应选 24GB->0.67)
-            if cap > 0:
-                load = (used + task_vram) / cap
-            else:
-                load = 0.0  # free 且容量未知: 第一个任务总能放 (现状语义)
-            if idx in affinity_set:
-                if load < preferred_load:
-                    preferred_load = load
-                    preferred_idx = idx
-            elif load < best_load:
-                best_load = load
-                best_idx = idx
-        if preferred_idx is not None:
-            best_idx = preferred_idx
-        if best_idx is None:
-            # B12-c: 项目级上限挡住 ≠ 全卡满。scope=project 时调用方不置
-            # gpu_full, 同 tick 后续其他项目的任务仍可尝试该卡。
-            self._assign_reject_scope = "project" if cap_skipped else "all"
-            if cap_skipped and job_id not in self._cap_warned:
-                self._cap_warned.add(job_id)
-                self.log_line(
-                    f"job {job_id}: 暂无余量卡 (打包上限"
-                    f" 全局={self.cfg.get('co_locate_max_jobs', 3)}"
-                    f" 卡级={self._gpu_max_jobs or '-'}"
-                    f" 项目级={(self._projects.get(project or '') or {}).get('max_jobs', '-')}"
-                    ") —— 等待自然排水"
-                )
-            return None
-        self._cap_warned.discard(job_id)
-        srow = conn.execute(
-            "SELECT status FROM gpus WHERE idx=?", (best_idx,)
-        ).fetchone()
-        if srow["status"] == "free":
-            conn.execute(
-                "UPDATE gpus SET status='assigned', job_id=?, updated_at=? WHERE idx=?",
-                (job_id, state.now(), best_idx),
-            )
-        # 镜像列语义 (首个 assign 为镜像): 已有镜像不动, 新 job 只加 gpu_jobs 行
-        conn.execute(
-            "INSERT OR REPLACE INTO gpu_jobs (gpu_id, job_id, vram_gib, updated_at)"
-            " VALUES (?,?,?,?)",
-            (best_idx, job_id, task_vram, state.now()),
-        )
-        return best_idx
+        """Allocate the exact shared resource decision, with no diagnostic policy fork."""
+        from .admission import allocate
+        return allocate(conn, self, job_id, spec or {}, project)
 
     def _release_in_tx(self, conn, job_id: str) -> None:
         """事务内释放: 多归属计数释放 (§3.2e B). 复用 state.release_gpu."""
