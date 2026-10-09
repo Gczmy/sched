@@ -36,12 +36,12 @@
 原租约确认失效后，后来同节点的新租约不能自动解除锁存，恢复须在指定目标租约显式重启。
 详见[租约合同](daemon-lease.md)、[CPU 亲和](cpu-isolation.md)与[CPU 容量](cpu-capacity.md)。
 
-## 后续交付与验收
+## 交付与验收
 
 现有[启动祖先专项](../tests/run_launch_ancestry_accept.py) 已有真实既有租约来源及
 控制器夹具 unknown/invalid/restart 证据，配置使用 CPU auto，上限一。
 现有[CPU 亲和专项](../tests/run_cpu_isolation_accept.py) 已有实际 mask/后代、取消、
-原 wait 和持久 owner 重连证据，主要故障使用控制器夹具。两套证据的组合仍需专项验收。
+原 wait 和持久 owner 重连证据，主要故障使用控制器夹具。
 
 联合入口为[启动祖先与 affinity 验收](../tests/run_launch_affinity_accept.py)：
 
@@ -70,3 +70,15 @@ PYTHONPATH=. python3 tests/run_launch_affinity_accept.py --require-native --faul
 生产 daemon/config 或共享 cgroup。真实租约结束另用授权测试租约或自然到期观察；
 fixture CANCELLED 不算真实结束证据。原 owner 重连必须保留 attempt/身份/mask/wait，不重新 start。
 没有特权环境时正向硬隔离专项保持未完成；不以缺条件 skip 或模型结果记成功。
+
+2026-10-09 已在用户指定的既有计算租约完成上述联合入口，固定源码为
+`6420b3a9ccd5f08050e9e61c74d9666ead21e93b`，使用系统 CPython 3.12.3 独立构建 native。
+真实原 job/step/anchor、有限池/非重叠 claim、worker/后代 mask、补位/取消/释放、
+两种 backend 原 wait、全部私有故障与原 owner 崩溃重连均通过，退出码 0；
+收尾通过 CLI 确认私有 daemon stopped、无活动 CPU claim，验收后逐文件核对源码未改变。
+私有来源、节点、租约标识、state 和日志另存，不写入公开仓库。
+
+实机验收发现并修复了 claim 启动前漏读原 anchor 的问题：现在每次选择 CPU 前
+重新观察冻结的原 anchor，缺失或漂移仍拒绝，即使缓存决策为 valid。
+原始内核上下文不带该观察；合成回归另覆盖真实调用路径，不能预填 anchor 掩盖缺口。
+当前候选已完成联合验收和恢复点管理；最终 main CI/发布准备独立核对，生产切换另行安排。

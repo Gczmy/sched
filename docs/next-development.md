@@ -6,7 +6,8 @@ execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
 [v0.5.0](releases/0.5.0.md) 已从 `7471c1c` 正式发布，写 schema 25、完整只读 1–25；下文各阶段的 schema 是引入边界，
 不是当前兼容上限。实际接收端使用 `sched version --json` 核对 named contracts/schema。
 
-当前后续工作按[学生账号兼容路线](student-compatibility.md) 补齐联合验收与恢复点管理。
+0.6.0 候选已按[学生账号兼容路线](student-compatibility.md) 完成联合实机验收与恢复点管理；
+最终 main 来源、完整 CI 与发布准备另行核对。
 缺少 cpuset/BPF 权限的环境暂停正向硬隔离专项；生产切换独立安排。
 
 ## 历史版本 0.2.1

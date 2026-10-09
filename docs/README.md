@@ -32,7 +32,7 @@
 | [0.4.0 Release 说明](releases/0.4.0.md) | 已发布集成合同、schema 10 与独立消费端兼容边界 |
 | [0.5.0 Release 说明](releases/0.5.0.md) | 固定来源、完整 CI、原始资产、租约/CPU 能力与 schema 25；生产切换另行安排 |
 | [0.6.0 候选说明](releases/0.6.0.md) | 后续有界恢复点目录、保留期清理和兼容模式联合验收；固定来源/CI/产物另行记录 |
-| [student-compatibility.md](student-compatibility.md) | 无 cpuset/BPF 权限时的显式启动祖先、CPU affinity 合同与联合验收计划 |
+| [student-compatibility.md](student-compatibility.md) | 无 cpuset/BPF 权限时的显式启动祖先、CPU affinity 合同与已通过的联合验收范围 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |

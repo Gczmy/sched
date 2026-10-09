@@ -33,6 +33,10 @@ affinity 漂移、未知原容量或已确认失效时暂停新派发。没有 j
 显式启动祖先兼容模式可验证冻结的原租约来源，未知仍暂停；旧 observe/unknown allow
 则是有告警的降级策略。两者均不证明 cgroup 硬隔离，见 [租约策略](daemon-lease.md)。
 
+0.6.0 候选修复了启动祖先模式下 claim 选择漏读原 anchor 的阻塞；每次选择 CPU
+前对冻结的原 anchor 做新鲜观察，不能只依赖监测缓存中的 valid。
+v0.5.0 原始来源未完成此组合的联合验收；已通过范围见[兼容路线](student-compatibility.md)。
+
 `cpus_total=0` 仍是不启用总声明预算，不静默变成 auto。启用 affinity 后，独立的
 CPU-ID 池仍是有限的；固定/auto 预算、CPU-only 并发和 GPU 等其他 gate 同时生效。
 每任务最多 8192 个 CPU，池最多 65536 个编号，编号范围 0..1048575；未知或超界拒绝。
