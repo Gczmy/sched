@@ -82,6 +82,31 @@ worker/daemon SIGKILL、GPU 禁用、drain/resume/stop。节点、路径和完�
 源码逐文件与已提交源码核对一致。私有配置、状态、路径和原始日志不进入公开仓库。
 该源码构建证据不扩大正式 CPython 3.10/3.14 二进制资产矩阵，也不证明任意训练框架的科学正确性。
 
+## 2026-10-09 schema 25 候选真实 GPU 结果
+
+固定来源 `aaddb1ed0abc8832786189fbb7621524e74d5b87` 在隔离的 RTX A5000 /
+Python 3.12.3 / Linux x86_64 环境通过手动入口的全部 8 项。实际空闲显存为
+11.898/12.148 GiB；20 GiB 恢复门槛、普通组优先/FIFO、预留、真实 daemon/worker
+SIGKILL、原 owner wait、GPU 禁用及 drain/resume/stop 均符合断言。结束后测试
+daemon 为 stopped，测试 GPU compute 进程为空，显存恢复测试前水平。
+
+验收运行默认 CPU/device isolation off，不执行 BPF attach；无 Slurm 来源的
+standalone 兼容路径不证明原 Slurm 租约失效处理。实际 v2 设备/MIG 查询为只读，
+不授予派发或 wait 权威，也不替代设备硬隔离正向验收。真实 cpuset/BPF/设备 scope
+故障矩阵和原租约真实结束仍未完成。
+
+验收前核对固定源码归档 SHA256；验收中及结束后，256 个归档文件与固定提交
+逐文件核对一致。native 从相同来源显式编译，不复用其他 Python ABI 的 wheel。
+schema 10→25 的历史身份/未知
+尝试保留与迁移失败原子回滚两项合成检查通过，不替代生产恢复点验证。
+该提交的 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37904677020) 14/14
+成功；四份原始 CI ZIP 的 GitHub digest 与包内源码、wheel、独立安装证据均已
+核验并私有保存。节点、配置、状态和原始日志不进入公开仓库。
+
+包版本仍为候选 0.4.0，writer 为 schema 25；未发布、未安装到生产，不扩大正式
+CPython 3.10/3.14 二进制资产矩阵。正式新版本须另定版本号、重新固定来源/CI，
+不能覆盖已发布的 v0.4.0；schema 10 writer 不能回接新写库。
+
 ## 发布边界
 
 四组分支按 A → B → C → D 审查/合并。本次 PR 完成不等于已发布新版本或已升级生产。

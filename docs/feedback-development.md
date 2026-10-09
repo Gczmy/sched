@@ -488,6 +488,16 @@ installed/launch binding 和精确 removed→released 引用。默认拒绝脚�
 入口明确退出 1，发生在创建私有 fixture 或任何设备效果之前。没有运行正向 BPF
 路径，没有 CUDA/真实 GPU 计算，也没有更改生产或准备 Slurm 父级。
 
+后续固定来源 `aaddb1ed0abc8832786189fbb7621524e74d5b87` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37904677020) 14/14 成功；四份
+原始候选包的 GitHub digest、固定源码/wheel 与独立安装证据已核验保存。
+该来源另在非生产 GPU、独立 state 下通过全部 8 项真实 CUDA 恢复验收及两项
+schema 10→25 合成迁移/失败回滚检查，见 [真实 GPU 结果](recovery-acceptance.md)。
+这轮使用默认 CPU/device isolation off 和无 Slurm 来源的 standalone 路径；
+不计正向 cpuset/BPF/设备 scope 故障或原租约真实失效证据。测试 daemon 已停止、
+测试显存已释放；未发布或切换生产。包版本仍为候选 0.4.0，不能覆盖官方 v0.4.0；
+新正式来源/版本号、恢复点验证与授权生产切换仍须独立完成。
+
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
 | 2 | 已提交修复验收 | 候选 CI/CPU/两主机验收通过 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
@@ -500,7 +510,7 @@ installed/launch binding 和精确 removed→released 引用。默认拒绝脚�
 | 9 | admission explain/装箱解释 | 候选 CI/计算节点 CPU 通过 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
 | 10 | allocation 身份/分层失败 | 候选 CI/计算节点 CPU 通过 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
 | 11 | 磁盘/inode/quota 准入 | 候选 CI/计算节点 CPU 通过 | 控制面余量；unknown 明确；容量不足不删科学产物 |
-| 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
+| 12 | 独立发布与生产切换 | 当前候选 CI/原始包/hash 已核验；未发布或切换 | 新正式版本固定来源/CI/包；验证迁移恢复点；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
 | 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结/schema 23 显式接入/schema 24 MIG 区分与 schema 25 被动根健康候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
