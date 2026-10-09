@@ -19,8 +19,8 @@ python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <succ
 
 `GH_TOKEN` 可通过现有环境提供，下载和草稿上传仅在内存使用；脚本不保存 token、
 认证 header 或临时存储 URL。匿名公开读取可能受到 GitHub API 限制。
-版本号须与该来源的候选包一致，且不能覆盖已发布版本；当前源码为 0.5.0 候选。
-须先核对该候选最终来源的完整成功 CI，不能以已发布的 0.4.0 准备或替换旧资产。
+版本号须与该来源的候选包一致，且不能覆盖已发布版本；当前源码为 0.6.0 候选。
+0.5.0 已发布；须先核对新候选最终来源的完整成功 CI，不能替换旧资产。
 默认 repository 为 `Gczmy/sched`；其他正式仓库须显式传 `--repository owner/name`。
 
 脚本核对 repository、当前 main、完整 commit、workflow、run/attempt、全部 job、

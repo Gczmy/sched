@@ -301,6 +301,45 @@ class LaunchIntentExecutorTests(unittest.TestCase):
         finally:
             os.close(intent.fd)
 
+    def publication_with_raced_identity_read(self, *, foreign=False, repeat=False):
+        intent = _create_launch_intent(self.marker)
+        real_open = os.open
+        token = executor_module.process_start_token(os.getpid())
+        expected = f"{os.getpid()} {token}\n".encode()
+        races = []
+
+        def open_then_replace(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if path == self.marker and os.pread(fd, 4096, 0) == expected and (not races or repeat):
+                peer = self.marker + ".peer"
+                with open(peer, "wb") as stream:
+                    stream.write(b"999999 proc:123\n" if foreign else expected)
+                os.replace(peer, self.marker)
+                self.assertEqual(0, os.fstat(fd).st_nlink)
+                races.append(fd)
+            return fd
+
+        try:
+            with mock.patch.object(executor_module.os, "open", side_effect=open_then_replace):
+                if foreign or repeat:
+                    with self.assertRaisesRegex(OSError, "publication could not be verified"):
+                        _publish_launch_identity(self.marker, os.getpid(), intent.fd, intent.nonce)
+                else:
+                    self.assertEqual((os.getpid(), token),
+                        _publish_launch_identity(self.marker, os.getpid(), intent.fd, intent.nonce))
+            self.assertEqual(2 if repeat else 1, len(races))
+        finally:
+            os.close(intent.fd)
+
+    def test_same_identity_peer_replacement_during_verification_reopens_once(self):
+        self.publication_with_raced_identity_read()
+
+    def test_foreign_identity_peer_replacement_during_verification_is_rejected(self):
+        self.publication_with_raced_identity_read(foreign=True)
+
+    def test_repeated_unlink_race_is_bounded_and_rejected(self):
+        self.publication_with_raced_identity_read(repeat=True)
+
     def test_executor_publishes_intent_before_popen_and_passes_locked_fd(self) -> None:
         fake_proc = mock.Mock(pid=4242)
         fake_proc.poll.return_value = None

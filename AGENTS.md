@@ -52,6 +52,8 @@
 | `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
 | `docs/upgrade-snapshot.md` | 候选持久升级维护窗口、恢复点校验、未启动任务受控回退与故障续接 |
 | `docs/releases/0.4.0.md` | 已发布 0.4.0 的固定来源、集成合同、CI 与 schema 10 边界 |
+| `docs/releases/0.5.0.md` | 已发布 0.5.0 的固定来源、schema 25、兼容模式与独立生产切换边界 |
+| `docs/student-compatibility.md` | 无 cpuset/BPF 权限的显式启动祖先、120 声明预算、CPU affinity 联合验收与剩余交付 |
 | `docs/releases/0.2.2.md` | 已发布 0.2.2 的固定来源、验收证据、ABI/libc 范围与安装约束 |
 | `docs/releases/0.3.0.md` | 恢复能力、真实 CUDA 验收、正式 ABI 范围与 schema 9 回退 |
 | `docs/releases/0.3.1.md` | SQLite 锁修复、版本查询与 schema 9 升级边界 |
@@ -181,6 +183,8 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched daemon-lease --json`、`sched daemon status --json --include-lease` | 候选私有快照读取已记录出生/租约检查/退出；只在显式 opt-in 时扩展健康 JSON，不探测网关 Slurm |
 | `sched cpu-capacity --json`、`sched status --json --include-cpu-capacity` | 候选只读配置/已记录计算容量与原租约；默认 status.cpu 保持两整数，auto 未知时省略 |
 | `sched daemon drain [--stop-when-idle]`、`sched daemon resume` | 暂停新派发／解除暂停；running 自然结束、pending 保留；排空状态跨重启保留 |
+| `sched snapshot list --json` | 后续独立管理合同的有界只读恢复点目录；实时分页不构成一致全量态 |
+| `sched snapshot prune <id> --retention-days N --keep-last N --dry-run --json` | 后续已关闭点保留期预览；执行须在计算节点沿用 as-of/expect-plan 并带 --yes，保留关闭/必要审计，不修改当前 state |
 | `sched request <request-id> --expect-revision N ... -- <mutation>` | 计算节点持久化幂等写操作，前置条件见下文 |
 | `sched markers`、`sched notify-inbox --json`、`sched notify-ack <file>`、`sched notify-test` | 批次终态／通知查询／确认／渠道验证 |
 

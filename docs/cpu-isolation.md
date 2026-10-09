@@ -1,6 +1,6 @@
-# 候选 per-job CPU 亲和
+# per-job CPU 亲和
 
-此功能在 schema 18 引入，当前候选 writer 为 schema 25、完整只读 1–25，未发布、未部署。实际 CLI 需报告命名合同
+此功能在 schema 18 引入，已随 [v0.5.0](releases/0.5.0.md) 发布；writer 为 schema 25、完整只读 1–25，生产尚未切换。实际 CLI 需报告命名合同
 `sched-cpu-isolation-v1`；包版本相同不表示旧安装已支持。只通过 sched CLI 操作 state。
 
 ## 显式启用与边界
@@ -32,6 +32,10 @@ CPU 池来自原 daemon 的精确 affinity，容量按可验证原 Slurm 声明/
 affinity 漂移、未知原容量或已确认失效时暂停新派发。没有 job cgroup 归属证明时，
 显式启动祖先兼容模式可验证冻结的原租约来源，未知仍暂停；旧 observe/unknown allow
 则是有告警的降级策略。两者均不证明 cgroup 硬隔离，见 [租约策略](daemon-lease.md)。
+
+0.6.0 候选修复了启动祖先模式下 claim 选择漏读原 anchor 的阻塞；每次选择 CPU
+前对冻结的原 anchor 做新鲜观察，不能只依赖监测缓存中的 valid。
+v0.5.0 原始来源未完成此组合的联合验收；已通过范围见[兼容路线](student-compatibility.md)。
 
 `cpus_total=0` 仍是不启用总声明预算，不静默变成 auto。启用 affinity 后，独立的
 CPU-ID 池仍是有限的；固定/auto 预算、CPU-only 并发和 GPU 等其他 gate 同时生效。

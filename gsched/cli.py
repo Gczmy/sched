@@ -5285,10 +5285,11 @@ def cmd_integration_query(args) -> int:
 
 
 def cmd_snapshot(args) -> int:
-    from . import snapshot
+    from . import snapshot, snapshot_management
     action = args.snapshot_action
+    management = action in {"list", "prune"}
     try:
-        if action not in {"verify", "status"}:
+        if action not in {"verify", "status", "list"} and not (action == "prune" and args.dry_run):
             cfg = load_config()
             if _is_foreign_host(cfg) and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1":
                 raise state.StateError("snapshot maintenance must execute on config.node, not on a gateway")
@@ -5301,14 +5302,19 @@ def cmd_snapshot(args) -> int:
             result = snapshot.status()
         elif action == "verify":
             result = snapshot.verify(args.snapshot_id)
+        elif action == "list":
+            result = snapshot_management.catalog(limit=args.limit, cursor=args.cursor)
+        elif action == "prune":
+            result = snapshot_management.prune(args.snapshot_id, retention_days=args.retention_days,
+                keep_last=args.keep_last, as_of=args.as_of, dry_run=args.dry_run, expect_plan=args.expect_plan)
         else:
             result = getattr(snapshot, action)(args.snapshot_id)
-        print(json.dumps(result, ensure_ascii=False) if args.json else
+        print(json.dumps(result, ensure_ascii=False) if args.json or management else
               f"snapshot {result.get('snapshot_id', '-')} {result.get('phase', 'verified' if result.get('verified') else 'closed')}; daemon not started")
         return 0
     except (state.StateError, OSError, sqlite3.Error, ConfigError) as error:
         if args.json:
-            print(json.dumps({"schema_version": 1, "contract": snapshot.FORMAT,
+            print(json.dumps({"schema_version": 1, "contract": snapshot_management.FORMAT if management else snapshot.FORMAT,
                               "ok": False, "error": str(error), "daemon_started": False}, ensure_ascii=False))
         else:
             print(f"错误: {error}", file=sys.stderr)
@@ -5589,14 +5595,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("snapshot", help="升级窗口恢复点；不支持历史执行回滚，不自动启动 daemon")
     snapshots = p.add_subparsers(dest="snapshot_action", required=True)
-    for action in ("create", "verify", "migrate", "rollback", "close", "status"):
+    for action in ("create", "verify", "migrate", "rollback", "close", "status", "list", "prune"):
         parser = snapshots.add_parser(action)
-        if action not in {"create", "status"}:
+        if action not in {"create", "status", "list"}:
             parser.add_argument("snapshot_id")
-        if action not in {"verify", "status"}:
+        if action not in {"verify", "status", "list"}:
             parser.add_argument("--yes", action="store_true")
         if action == "create":
             parser.add_argument("--writers-quiesced", action="store_true", help="确认已停用不认识维护门禁的旧版写入端")
+        if action == "list":
+            parser.add_argument("--limit", type=int, default=20)
+            parser.add_argument("--cursor")
+        if action == "prune":
+            parser.add_argument("--retention-days", type=int, default=30)
+            parser.add_argument("--keep-last", type=int, default=2)
+            parser.add_argument("--as-of", type=int, help="沿用预览返回的 Unix 时间，不接受未来时间")
+            parser.add_argument("--dry-run", action="store_true")
+            parser.add_argument("--expect-plan", help="沿用预览返回的 plan_sha256；执行必须提供")
         parser.add_argument("--json", action="store_true")
         parser.set_defaults(fn=cmd_snapshot)
 

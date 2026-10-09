@@ -131,7 +131,11 @@ def select(dispatcher, conn, count, *, job_id=None):
     monitor = getattr(dispatcher, "_cluster_lease", None)
     if sys.platform != "linux" or monitor is None or not hasattr(os, "memfd_create"):
         return {"allowed": False, "reason": "cpu_affinity_primitives_unavailable"}
-    pool = pool_from_facts(dispatcher.cfg, monitor.origin, cluster_lease.kernel_context(),
+    current = dict(cluster_lease.kernel_context())
+    if monitor.origin["policy"].get("membership") == "launch_ancestry":
+        from .lease_ancestry import observe
+        current["launch_anchor"] = observe(monitor.origin.get("launch_ancestry", {}))
+    pool = pool_from_facts(dispatcher.cfg, monitor.origin, current,
                           monitor.sample, monitor.frozen_binding, monitor.decision)
     if not pool["allowed"]:
         return pool

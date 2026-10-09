@@ -3,8 +3,12 @@
 本文只记录通用调度器工作。配置和 CLI 以 [reference.md](reference.md) 为准，
 execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
 候选代码、验证、正式发布和生产部署分别记录，不能互相替代。
-当前源码为 0.5.0 候选，写 schema 25、完整只读 1–25；下文各阶段的 schema 是引入边界，
+[v0.5.0](releases/0.5.0.md) 已从 `7471c1c` 正式发布，写 schema 25、完整只读 1–25；下文各阶段的 schema 是引入边界，
 不是当前兼容上限。实际接收端使用 `sched version --json` 核对 named contracts/schema。
+
+0.6.0 候选已按[学生账号兼容路线](student-compatibility.md) 完成联合实机验收与恢复点管理；
+最终 main 来源、完整 CI 与发布准备另行核对。
+缺少 cpuset/BPF 权限的环境暂停正向硬隔离专项；生产切换独立安排。
 
 ## 历史版本 0.2.1
 
@@ -120,7 +124,7 @@ OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策�
 
 ## ND-02：持久化并校验 daemon 的集群租约来源
 
-**状态：源码候选已实现，完整 CI/计算节点隔离 CPU/CLI 验收通过，未部署生产。**
+**状态：已随 v0.5.0 发布，完整 CI/计算节点隔离 CPU/CLI 验收通过，未部署生产。**
 schema 17 保存白名单 Slurm/job/step、UID、affinity/cgroup 与启动/检查/退出事实；
 auto 模式有 Slurm 来源时持续验证，unknown 默认停新派发，确认 invalid 后锁存，
 不杀 running、不自动绑定新租约。默认健康 JSON 不变，显式 include-lease 与
@@ -163,7 +167,7 @@ daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 
 
 ## ND-03：CPU 容量自动解析与可执行约束
 
-**状态：源码候选已实现，完整 CI/计算节点 CPU/CLI 通过；尚未发布或部署。** 具体合同、查询和兼容边界见
+**状态：已随 v0.5.0 发布，完整 CI/计算节点 CPU/CLI 通过；尚未部署生产。** 具体合同、查询和兼容边界见
 [CPU 自动容量](cpu-capacity.md)。per-job 硬隔离的正向验收和交付仍未完成。`cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
 任务上回退到 `max_cpu_jobs` 并发计数；正整数仅做声明值求和，不会设置 affinity 或
 子 cgroup。
@@ -229,8 +233,8 @@ CPU/BPF/真实 GPU/owner 故障矩阵及发布仍待完成。后续 schema 25
 
 ## ND-05：升级恢复点的 CLI 接口
 
-**状态：受控升级窗口 CLI 源码候选及计算节点私有 CPU/CLI 验收已完成，完整新来源 CI、
-正式发布与生产恢复点仍待确认。**
+**状态：受控升级窗口 CLI 已随 v0.5.0 发布，最终完整 CI 和计算节点私有 CPU/CLI 验收通过；
+生产恢复点仍未创建或验证。**
 命令为 `snapshot create/verify/migrate/rollback/close/status`；私有查询临时快照仍不能
 当作持久恢复点。合同与拒绝条件见 [升级恢复点](upgrade-snapshot.md)。
 
@@ -238,4 +242,6 @@ CPU/BPF/真实 GPU/owner 故障矩阵及发布仍待完成。后续 schema 25
 并在独立位置验证旧安装可读及失败恢复行为。任何恢复都不得丢弃未知投递/执行结果、
 重建 instance 或授权重放原尝试；仅有合成迁移通过不构成生产恢复点已验证的证据。
 不支持任意历史回滚；旧版写入端须实际停用，关闭窗口后不能恢复旧点回退权。
-恢复点受管清理/保留期接口和更广的灾难恢复仍未实现，不手工删除原始受管镜像。
+后续源码已有独立 `snapshot list/prune` 受管保留期扩展，未随原 v0.5.0 发布；
+命名合同、预览 CAS、永久关闭/必要审计及旧时间未知拒绝见[升级恢复点](upgrade-snapshot.md)。
+更广的灾难恢复仍未实现，不手工删除原始受管镜像。

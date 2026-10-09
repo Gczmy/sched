@@ -1,6 +1,6 @@
-# 候选 CPU 自动容量与声明预留
+# CPU 自动容量与声明预留
 
-这是最初引入于 schema 17 的源码候选，尚未部署到生产。实际接收端须通过 `version --json`
+此功能最初引入于 schema 17，已随 [v0.5.0](releases/0.5.0.md) 发布，尚未部署到生产。实际接收端须通过 `version --json`
 协商 `sched-cpu-capacity-v1`，再用 `identity --json` 绑定实例；包版本不代替能力检查。
 当前兼容范围见 [reference](reference.md)。auto 本身不实现 per-job affinity/cgroup；
 后续 schema 18 的 [显式 CPU 亲和](cpu-isolation.md) 独立启用，也不是 cgroup 硬隔离。

@@ -1,7 +1,7 @@
 # sched 使用参考（权威版）
 
 > 面向 AI 代理与用户的**功能与命令权威查阅文档**。改调度器行为时同步更新本文件。
-> 版本基准：本次提交的 source/tests。新增诊断接口属于当前源码候选，不表示已发布或部署；使用前核对目标 CLI 的命名合同。
+> 版本基准：本次提交的 source/tests。v0.5.0 发布事实见[版本说明](releases/0.5.0.md)；后续扩展单独记录。发布不表示目标已部署，使用前核对目标 CLI 的命名合同。
 
 ---
 
@@ -15,11 +15,18 @@
 
 ## 集成身份、回执与幂等提交
 
-源码候选增加 `snapshot create/verify/migrate/rollback/close/status`，命名合同
+v0.5.0 提供 `snapshot create/verify/migrate/rollback/close/status`，命名合同
 `sched-upgrade-snapshot/v1`。创建前无损排空并停用旧版写入端；create 使用
 `--writers-quiesced --yes`，migrate/rollback/close 使用 `--yes`，各子命令支持 `--json`。
 创建和验证不初始化数据库，维护窗口内只有显式 migrate 可升级；关闭永久消费旧 ID
 回退权，不自动启动 daemon。完整文件/并发/失败续接边界见 [升级恢复点](upgrade-snapshot.md)。
+
+后续源码扩展独立合同 `sched-upgrade-snapshot-management/v1`：
+`snapshot list --limit N --cursor ID --json` 只读有界实时分页；
+`snapshot prune ID --retention-days 30 --keep-last 2 --dry-run --json` 预览已关闭点。
+执行使用同参数加 `--as-of <preview-as-of> --expect-plan <preview-sha256> --yes`，
+须在计算节点，保留永久关闭/manifest/回退 journal，不触碰当前 DB 或恢复执行。
+旧关闭时间未知、活动窗口、绑定/镜像漂移均拒绝。该扩展未随原 v0.5.0 发布。
 
 公开 JSON 保持 `schema_version:1`；命名合同见 [integration-contract.md](integration-contract.md)。
 `sched identity --json` 只读查询持久 `instance_id`、配置节点和查询主机。

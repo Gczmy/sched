@@ -397,7 +397,7 @@ def close(identifier):
             raise facts.SnapshotConflict("unknown upgrade window phase")
         # Retain the binding permanently. Old points cannot be reused after close.
         record = os.path.join(maintenance.directory(), "closed-" + identifier + ".json")
-        _publish(record, {**window, "phase": "closed", "closed_at": state.now()})
+        _publish(record, {**window, "phase": "closed", "closed_at": state.now(), "closed_at_epoch": time.time()})
         os.unlink(maintenance.window_path())
         _sync(maintenance.directory())
         return {"schema_version": 1, "contract": FORMAT, "snapshot_id": identifier,

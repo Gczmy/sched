@@ -335,17 +335,25 @@ def _read_published_launch_identity(path: str) -> tuple[int, str] | None:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        entry = os.fstat(fd)
-        if not _secure_marker_stat(entry):
+    for _ in range(2):
+        try:
+            fd = os.open(path, flags)
+        except OSError:
             return None
-        raw = _pread_bounded(fd)
-    finally:
-        os.close(fd)
+        try:
+            entry = os.fstat(fd)
+            if entry.st_nlink == 0:
+                # Parent and wrapper may replace the same published identity.
+                # Reopen once after racing the unlink; never accept this inode.
+                continue
+            if not _secure_marker_stat(entry):
+                return None
+            raw = _pread_bounded(fd)
+            break
+        finally:
+            os.close(fd)
+    else:
+        return None
     if raw is None:
         return None
     try:

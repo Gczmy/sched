@@ -1,9 +1,13 @@
 # sched execution 发布与部署清单
 
 本清单用于交付准备，不提供生产状态快照；每次切换前须现场查询版本、配置和运行状态，
-并取得对应部署授权。当前源码为 0.5.0 候选，写 schema 25、完整只读 1–25，
+并取得对应部署授权。[0.5.0](releases/0.5.0.md) 已从 `7471c1c` 正式发布，写 schema 25、完整只读 1–25，
 与已发布 v0.4.0 的 schema 上限 10 不同。下文逐阶段范围是引入时的兼容边界，
 实际接收端以 `sched version --json` 为准。
+
+生产切换仍未执行；无 cpuset/BPF 委派的环境按
+[学生账号兼容路线](student-compatibility.md) 使用显式启动祖先和可选 affinity。
+默认严格检查不放宽，硬隔离专项需另具权限和真实内核验收。
 
 已发布 0.2.2 的历史记录为 [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2)，
 发布来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`；
