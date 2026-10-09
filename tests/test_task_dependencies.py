@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from unittest import mock
 
-from gsched import cli, state, task_dependencies as dag
+from gsched import allocation, cli, state, task_dependencies as dag
 from gsched.dispatcher import Dispatcher
 from gsched.integration import instance_id
 from gsched.schema import SchemaError, validate_batch
@@ -133,6 +133,40 @@ class TaskDependencyTests(TempStateCase):
             conn.execute("DELETE FROM task_dependency_events")
         with state.connect() as conn, self.assertRaises(sqlite3.IntegrityError):
             conn.execute("UPDATE task_dependency_events SET bindings='[]'")
+
+    def test_completed_older_allocation_does_not_block_unstarted_new_version(self):
+        self.seed({"c": ["a"]})
+        dispatcher = self.dispatcher()
+        dispatcher.fake = True
+        with state.connect() as conn:
+            conn.execute("UPDATE batches SET status='active' WHERE id='dag'")
+            spec = json.loads(conn.execute("SELECT spec FROM tasks WHERE batch_id='dag' AND id='c'").fetchone()[0])
+            state.update_job(conn, "dag-c-v1", status="running", started_at=state.now(), pgid=None, rc=None)
+            identifier = allocation.reserve(conn, "dag-c-v1", spec, dispatcher)
+            state.update_job(conn, "dag-c-v1", status="done", rc=0, finished_at=state.now())
+            state.insert_task(conn, "dag", "c", 2, spec, 2, "p")
+            state.insert_job(conn, "dag-c-v2", "dag", "c", 2, "fp-c", None, "p")
+            dag.inherit(conn, state.get_job(conn, "dag-c-v1"), state.get_job(conn, "dag-c-v2"))
+            previous = tuple(conn.execute("SELECT * FROM allocations WHERE allocation_id=?", (identifier,)).fetchone())
+        code, _, err = self.capture(cli.main, self.update("new-version-with-old-allocation", "c", self.selectors("b")))
+        self.assertEqual(0, code, err)
+        with state.connect() as conn:
+            self.assertEqual(previous, tuple(conn.execute("SELECT * FROM allocations WHERE allocation_id=?", (identifier,)).fetchone()))
+            self.assertIsNone(state.get_job(conn, "dag-c-v2")["allocation_id"])
+
+    def test_retry_cleared_current_fields_cannot_hide_same_version_allocation(self):
+        self.seed({"c": ["a"]})
+        dispatcher = self.dispatcher()
+        dispatcher.fake = True
+        with state.connect() as conn:
+            conn.execute("UPDATE batches SET status='active' WHERE id='dag'")
+            spec = json.loads(conn.execute("SELECT spec FROM tasks WHERE batch_id='dag' AND id='c'").fetchone()[0])
+            state.update_job(conn, "dag-c-v1", status="running", started_at=state.now(), pgid=None, rc=None)
+            allocation.reserve(conn, "dag-c-v1", spec, dispatcher)
+            state.update_job(conn, "dag-c-v1", status="pending", started_at=None, pgid=None, rc=None, retries=0)
+        code, _, err = self.capture(cli.main, self.update("retry-cleared-allocation", "c", self.selectors("b")))
+        self.assertEqual(65, code, err)
+        self.assertIn("当前版本存在不可变 allocation 历史", err)
 
     def test_cycle_update_rolls_back_event_revision_and_command_effect(self):
         self.seed({"c": ["a"]})

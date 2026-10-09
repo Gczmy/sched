@@ -163,7 +163,13 @@ pid/start-token 内存保留，不改变兼容 poll_rc 或从历史日志/文件
 执行与恢复；本地 109 条 mock/私有只读回归通过。
 owner service/直接 child 区分、真正旧 schema 15 迁移不回填、同秒 retry、事务回滚
 及历史 pending cancel 守卫纳入回归。未测试真实 CUDA、未修改生产 daemon/config。
-固定来源与完整 CI 仍须提交后核实；完整合同见 [allocation-evidence](allocation-evidence.md)。
+固定来源 `067c458d73acee80c0629e5d14725bc3b7f78e00` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37865886944) 未通过：
+Python 3.10 任务 DAG 验收发现旧已完成 allocation 误阻止未启动新版本更新依赖；
+其余仓库/普通回归/native 项通过，candidate 被阻断，不能记录为完整绿色。
+后续单独修复仅限定当前版本的 allocation 守卫，保留跨代际运行/未知/marker/进程组
+守卫及不可变旧记录；增加旧版本已完成允许新版本更新、同版本 retry 清空仍拒绝的回归。
+修复提交的完整 CI 仍待核实；完整合同见 [allocation-evidence](allocation-evidence.md)。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |

@@ -107,6 +107,8 @@ sched request <request-id> --json --expect-kind task --expect-id <batch-id>:c \
 使用完整 batch ID 和精确来源 version；`[]` 显式解除任务自身依赖，但不解除批次门槛。
 只更新当前未启动的 pending 版本：拒绝已有 start/pgid/retries/rc、当前 attempt、
 任一代际运行/未知 attempt/旧 session/marker、活跃或不可知进程组、当前分配或待处理控制请求，以及旧执行元数据。
+当前版本即使 retry 清空启动字段，已有 allocation 仍拒绝更新；已结束的旧版本
+allocation 保留为历史，不单独阻止未启动新版本的更新，其他跨代际守卫仍生效。
 CAS、来源冻结、环检查、事件、revision 与 request 回执同事务；失败回滚事件/变更，
 保留拒绝回执。新事件链接旧事件，原 spec 和原始批次 exact 列不被覆盖。不训练、
 不删产物、不创建新任务版本、不终止任务；同 RID replay 不增加事件，unknown 仍为 75。

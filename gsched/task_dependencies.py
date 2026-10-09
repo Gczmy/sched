@@ -249,9 +249,8 @@ def update(conn, job, selectors, *, reopen=False):
             raise ValueError("同任务进程组仍活跃或不可知")
     if conn.execute("SELECT 1 FROM execution_attempts WHERE job_id=?", (job["id"],)).fetchone():
         raise ValueError("当前版本存在 execution attempt")
-    if conn.execute("SELECT 1 FROM allocations a JOIN jobs j ON j.id=a.job_id WHERE j.batch_id=? AND j.task_id=? LIMIT 1",
-                    (job["batch_id"], job["task_id"])).fetchone():
-        raise ValueError("同任务存在不可变 allocation 历史")
+    if conn.execute("SELECT 1 FROM allocations WHERE job_id=? LIMIT 1", (job["id"],)).fetchone():
+        raise ValueError("当前版本存在不可变 allocation 历史")
     for row in conn.execute("SELECT id FROM jobs WHERE batch_id=? AND task_id=?", (job["batch_id"], job["task_id"])):
         prefix = hashlib.sha256(row["id"].encode()).hexdigest()[:24]
         try:
