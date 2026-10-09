@@ -54,7 +54,7 @@ limit 默认 20、范围 1–100，使用实时 keyset，不是完整快照。�
 均 false；recorded_phase、程序绑定和 release_recorded_ready 均不是实时 kernel health。
 策略字节码解析核对两种有界端序并保留原摘要，不依赖查询主机 ABI；异端序不授予安装权。
 旧完整 schema 1–20 返回 migration_required，不猜设备绑定或升级；当前完整只读范围
-为 1–24（原映射绑定写 schema 22、显式接入写 23、MIG 能力证据写 24）。schema 20 及更旧 writer 不得回接 schema 21，
+为 1–25（原映射绑定写 schema 22、显式接入写 23、MIG 能力证据写 24、原根健康写 25）。schema 20 及更旧 writer 不得回接 schema 21，
 schema 21 及更旧 writer 不得回接 schema 22，writer 23 及更旧不得回接 24；只能使用升级前验证恢复点回退，
 不能删表/事件、降低 user_version 或手改 state。包版本尚未更改、未发布或部署。
 
@@ -68,6 +68,6 @@ schema 20 只读与无回填迁移、查询字节边界；均为 synthetic 证�
 不改变这里的被动查询或实际安装状态；后续 schema 22 候选冻结原 allocation/intent/
 inventory 并提供纯新鲜重验，schema 23 的显式安装/原 handle 启动与恢复仅观察见
 [设备 controller](device-controller.md)，schema 24 的原 MIG 能力区分见
-[MIG 能力](mig-capability.md)。尚未完成：MIG 精确权限、持久 owner
-设备故障矩阵、授权正向 CPU/BPF/真实 GPU 验收、被动新鲜根健康观察、原租约实际结束
+[MIG 能力](mig-capability.md)，schema 25 的被动前置记录见 [原根健康](scope-health.md)。尚未完成：MIG 精确权限、持久 owner
+设备故障矩阵、授权正向 CPU/BPF/真实 GPU 验收、实际委派的新鲜根健康验收、原租约实际结束
 及授权发布／生产切换。此记录层不缩小或替代这些交付。

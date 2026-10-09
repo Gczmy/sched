@@ -120,9 +120,10 @@ linux_fd_owner 仍认证重连原 owner/child，不重新 start。配置匹配�
 完整事件链，列表提供有界实时分页，不探测内核或改变 revision。命名合同
 sched-cpu-scope-state-v1 与通用原语合同独立；所有 admission/wait/physical boundary
 标记为 false。完整 schema 1–18 查询明确 migration_required，不做初始化或回填；
-当前后续 MIG 能力候选的完整只读范围为 1–24；旧 writer 不得回接更高写库，回退只用升级前验证
-恢复点，不能手改 user_version。admission-explain 的 cgroup fit 明确 unknown，
-因为当前没有新鲜原委派观察供被动解释，不能把租约检查当作根目录可用性。
+当前后续原根健康候选的完整只读范围为 1–25；旧 writer 不得回接更高写库，回退只用升级前验证
+恢复点，不能手改 user_version。独立 [scope-health](scope-health.md) 读取原委派观察；
+admission-explain 的 cgroup fit 只有新鲜原根/租约/claims 均匹配才解释，不授予启动权，
+缺观察明确 unknown，不能把租约检查或配置路径当作根目录可用性。
 
 ## 验收与剩余工作
 
@@ -150,7 +151,8 @@ scope、FD 关闭和序列化边界；普通目录拒绝在 Linux 计算节点�
 后续 schema 23 的[设备 controller](device-controller.md) 接入显式安装、原 handle 启动与
 恢复仅观察，默认 off 不安装；单独 CPU cgroup 不限制 GPU。
 尚未完成：授权正向 cpuset/原 owner 故障恢复验收、真实设备 BPF/GPU 权限验收、原租约
-真实终止矩阵、被动新鲜委派健康观察和授权生产 rollout。现有模型/拒绝测试及
+真实终止矩阵、实际委派下的新鲜健康验收和授权生产 rollout。后续 schema 25
+[原根健康](scope-health.md) 已实现被动记录与解释，模型不算实际委派成功。现有模型/拒绝测试及
 [CPU 亲和](cpu-isolation.md) 不能代替这些交付。
 
 另有独立 [设备策略原语](device-policy.md) 源码候选，提供原 scope 的有界白名单

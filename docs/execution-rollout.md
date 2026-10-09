@@ -278,3 +278,11 @@ GetMigMode 原返回、版本与双采样一致证据，writer 23 及更旧不�
 分开；身份/版本/CSV 冲突、权限/driver/接口错误不授予整卡规则或新启动 handle。
 只读实际观察不是特权 BPF/CUDA 正向证据；MIG 权限与正式发布/生产切换未完成。
 回退仍只用升级前验证恢复点，完整合同见 [原 MIG 能力](mig-capability.md)。
+
+## 后续候选原根健康 schema 25
+
+当前 writer 25、完整只读范围 1–25；25 在原 daemon lease 事件链记录 scope_origin/
+scope_check，不新增表或回填旧 root/lease/MIG。只读 scope-health 使用 30 秒诊断
+窗口，实际启动仍重新采样原 root/handle 并使用 5 秒守卫，不从健康查询制造执行权。
+writer 24 及更旧不能回接 25，回退只使用升级前验证恢复点。该候选不替代授权正向
+cpuset/BPF/GPU 故障矩阵，未部署生产，合同见 [原根健康](scope-health.md)。

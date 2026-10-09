@@ -46,7 +46,7 @@ v1 历史映射保留原语义：只有明确 Disabled/Disabled 可选，N/A 一
 不凭 NVML 重新 mint 启动 handle；设备恢复合同不变。
 
 writer schema 24 是新持久证据版本守卫，不增加 SQL 表，不回填/改写 v1 原记录或
-旧 allocation/instance。v2 冻结要求 marker>=24，完整只读范围 1–24；writer 23 及更旧
+旧 allocation/instance。v2 冻结要求 marker>=24；后续原根健康候选完整只读范围 1–25；writer 23 及更旧
 不能回接 24，回退只使用升级前验证恢复点，不降低 user_version 或手改 state。
 被动 device-inventory-bindings 查询仍使用原协商协议及摘要/精确 ID 分页，不执行
 NVML；完整原 inventory 自带 v1/v2 标识。包版本不变，尚未发布或部署。
@@ -63,5 +63,7 @@ vendor getter 用模型；真实 helper 边界用独立 CPU 子进程，不算�
 私有 UUID/节点/路径/驱动版本不写入公开仓库。
 
 仍未实现 MIG GI/CI 权限映射；真实 enabled MIG、专用 cpuset/BPF 逐卡权限、后代/
-owner/daemon 故障矩阵、被动新鲜根健康、原租约真实结束与授权发布/生产切换仍须
+owner/daemon 故障矩阵、实际委派下的新鲜根健康、原租约真实结束与授权发布/生产切换仍须
 独立完成。只读明确“不支持 MIG”不证明 CUDA 可运行或设备隔离已生效。
+被动根前置记录与解释已在后续 schema 25 [原根健康候选](scope-health.md) 实现，
+不以模型或旧安装记录推断实际委派/GPU 健康。

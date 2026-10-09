@@ -111,6 +111,11 @@ class ScopeModelTests(unittest.TestCase):
         (self.root / scope.binding.intent.name / "cpuset.cpus").write_text("0-1")
         self.assertTrue(scope.observe()["scope_configured"])
 
+    def test_revoked_parent_write_permission_refuses_even_retained_manager(self):
+        with mock.patch.object(scopes.os, "access", return_value=False), self.assertRaises(ScopeUnavailable) as result:
+            self.manager._verify()
+        self.assertEqual("scope_parent_not_writable", result.exception.reason)
+
     def test_requested_memory_drift_cannot_hide_behind_current_effective_subset(self):
         scope = self.make()
         self.configure(scope)

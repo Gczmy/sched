@@ -24,6 +24,11 @@ def preflight(manager):
     """Only native/query prerequisites on the retained parent; never load/attach."""
     from .execution.devices import _native
     result = _native().device_program_query(manager._fd)
+    validate_parent_query(result)
+    return result
+
+
+def validate_parent_query(result):
     if (type(result) is not dict or set(result) != {"program_ids", "attach_flags"}
             or type(result["program_ids"]) is not list or len(result["program_ids"]) > 64
             or any(type(n) is not int or not 0 < n <= 0xffffffff for n in result["program_ids"])

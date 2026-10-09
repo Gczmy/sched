@@ -1235,6 +1235,9 @@ class Dispatcher:
         self._recover_launch_markers()
         from .cpu_scope_controller import maintain as maintain_scopes
         maintain_scopes(self)
+        controller = getattr(self, "_cpu_scopes", None)
+        if controller is not None:
+            controller.refresh_health()
         # Revisit every running row that still lacks a pgid on every tick, not
         # only when a marker was claimed in this tick.  This also converges
         # safely after "claim succeeded, DB settlement failed": on the next

@@ -220,6 +220,20 @@ Default status/task/history, FD4 and wait_reason remain unchanged. Read-only
 hardware capability is not GPU permission/CUDA acceptance; see
 [MIG capability](mig-capability.md).
 
+### Candidate original scope health
+
+The separate `scope-health --json` query negotiates `sched-scope-health-state-v1`.
+It reads immutable scope_origin/scope_check events bound to the original daemon
+lease/instance, cold policies, root inode/context/CPU/NUMA and optional parent BPF
+query. No gateway kernel/Slurm/BPF probes or execution authority. Diagnostic
+freshness is 30 seconds; actual launch freshness remains five seconds and original
+retained handles/CAS remain mandatory. Changed, expired, exited/replaced or unknown
+bindings cannot explain ready. Resource explanation can use these recorded facts
+and the same pool/claim decisions without reserving or joining. Writer schema 25,
+complete read support 1–25, no table additions/backfill; older writers cannot reopen
+25. Default health/status/task/history and FD4 stay unchanged; see
+[scope health](scope-health.md).
+
 ### Candidate resource explanation
 
 The source resource-explanation candidate advertises `sched-admission-explain-v1`

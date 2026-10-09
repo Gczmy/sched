@@ -40,6 +40,9 @@ class CgroupAcceptance(ExactAcceptance):
         assert self.job(batch, "task") == before
         assert self.data("cpu-isolation", "--json")["claims"] == []
         assert self.data("cpu-scopes", "--json")["scopes"] == []
+        root_health = self.data("scope-health", "--json")
+        assert root_health["status"] == "unknown" and root_health["recorded_origin"] is None
+        assert not root_health["runtime_probed"] and not root_health["admission_granted"]
         assert self.data("allocations", f"{batch}:task", "--json")["allocations"] == []
         assert not (self.root / "worker/runs.txt").exists() and list(parent.iterdir()) == []
         print("PASS: ordinary-directory delegation rejected before daemon/allocation/worker; no affinity fallback or parent writes", flush=True)
@@ -81,6 +84,9 @@ class CgroupAcceptance(ExactAcceptance):
         assert any(c["id"] == "cpu_cgroup_delegation" and c["level"] == "ok" for c in check["checks"])
         self.cli("daemon", "resume")
         self.cli("daemon", "start", "--fake")
+        root_health = self.wait(lambda: self.data("scope-health", "--json"), lambda r: r["status"] == "ready")
+        assert root_health["recorded_origin"]["data"]["facts"]["parent"]["path"] == delegated_root
+        assert not root_health["admission_granted"] and not root_health["physical_boundary_verified"]
         snapshots = {}
         for task in ("ordinary", "fd", "owner"):
             output = self.root / task / "mask.json"

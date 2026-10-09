@@ -1976,6 +1976,26 @@ def cmd_device_scopes(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def cmd_scope_health(args: argparse.Namespace) -> int:
+    from . import scope_health
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            result = {"schema_version": 1, "query": "scope_health", "contract": CONTRACTS["scope_health"],
+                      "instance_id": instance_id(conn), "node": str(cfg["node"]), "effect": "none",
+                      **scope_health.query(conn, cfg)}
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0
+    except (ValueError, ConfigError, state.StateError, TypeError, KeyError, sqlite3.Error, RecursionError) as error:
+        print(f"错误: scope-health 查询失败: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_cpu_scopes(args: argparse.Namespace) -> int:
     from . import cpu_scope_state
     from .integration import CONTRACTS, instance_id
@@ -5651,6 +5671,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cursor")
     p.set_defaults(fn=cmd_cpu_scopes)
 
+    p = sub.add_parser("scope-health", help="只读已记录原委派根健康；过期/替代/未知不授予执行权")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_scope_health)
+
     p = sub.add_parser("daemon-lease", help="只读已记录 daemon 启动/租约事实，不探测 Slurm 或授予执行权")
     p.add_argument("--lease-id")
     p.add_argument("--limit", type=int, default=20)
@@ -5702,7 +5726,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "device-scopes", "device-inventory", "device-inventory-bindings"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "scope-health", "device-scopes", "device-inventory", "device-inventory-bindings"}:
         return args.fn(args)
     if command == "request":
         try:

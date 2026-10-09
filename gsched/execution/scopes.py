@@ -219,6 +219,8 @@ class DelegatedCpuScopes:
             _refuse("scope_parent_not_empty_domain")
         if "cpuset" not in _read(self._fd, "cgroup.subtree_control").split():
             _refuse("scope_cpuset_not_delegated")
+        if not os.access(".", os.W_OK, dir_fd=self._fd, effective_ids=True):
+            _refuse("scope_parent_not_writable")
         return (_indices(_read(self._fd, "cpuset.cpus.effective"), maximum=65536),
                 _indices(_read(self._fd, "cpuset.mems.effective"), maximum=MAX_MEMS))
 

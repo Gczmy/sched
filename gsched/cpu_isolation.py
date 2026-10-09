@@ -180,12 +180,8 @@ def recorded_selection(conn, cfg, count, *, job_id=None):
         if not pool["allowed"]:
             return {**base, **pool, "allowed": None}
         if base["mode"] == "cgroup":
-            # A lease observation is not a current observation of the delegated
-            # parent, original inode, cpuset configuration or unresolved scopes.
-            # Never probe from this read-only query or promise cgroup admission.
-            return {**base, "allowed": None, "reason": "original_cgroup_observation_unavailable",
-                    "lease_id": owner["lease_id"], "observation_age_s": age,
-                    "expires_after_s": cluster_lease.MAX_AGE}
+            from .scope_health import fit
+            return {**base, **fit(conn, cfg, count, job_id=job_id)}
         return {**base, **choose(conn, count, pool["pool"], job_id=job_id),
                 "lease_id": owner["lease_id"], "observation_age_s": age,
                 "expires_after_s": cluster_lease.MAX_AGE}

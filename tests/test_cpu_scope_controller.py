@@ -1,5 +1,8 @@
 """Synthetic controller/SQLite integration; never create a kernel scope here."""
 import errno
+import copy
+import secrets
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -62,6 +65,7 @@ class CpuScopeFixture(affinity.CpuIsolationFixture):
         self.dispatcher._cluster_lease.update = lambda: True
         self.cfg["cpu_isolation"] = {"mode": "cgroup", "delegated_root": "/sys/fs/cgroup/example"}
         self.dispatcher._read_gpu_policy = lambda: self.cfg
+        self.register_lease()
         self.messages = []
         self.dispatcher.log_line = self.messages.append
         self.parent = ScopeParent(self.cfg["cpu_isolation"]["delegated_root"], 1, 10, "a" * 36, "mnt:[123]", 1000)
@@ -132,6 +136,18 @@ class CpuScopeFixture(affinity.CpuIsolationFixture):
         self.controller = effects.Controller(self.dispatcher)
         self.dispatcher._cpu_scopes = self.controller
         self.addCleanup(self.controller.close)
+
+    def register_lease(self):
+        """Synthetic new daemon birth, never repurpose the previous lease."""
+        from gsched import cluster_lease
+        monitor = self.dispatcher._cluster_lease
+        owner = {"lease_id": secrets.token_hex(16), **{k: self.context[k] for k in ("pid", "start_token", "physical_host")}}
+        monitor.owner = owner
+        monitor.origin = {**copy.deepcopy(monitor.origin), "lease_id": owner["lease_id"], "started_at": time.time()}
+        with state.connect() as conn:
+            conn.execute("INSERT INTO daemon_leases VALUES(?,?,?,?)", (owner["lease_id"], monitor.origin["instance_id"], cluster_lease.encode(monitor.origin), cluster_lease.digest(monitor.origin)))
+            cluster_lease.event(conn, owner["lease_id"], "check", {**monitor.decision, "current_context": self.context,
+                "slurm_observation": monitor.sample, "slurm_binding": monitor.frozen_binding})
 
     def assert_phase(self, binding, phase):
         with state.connect() as conn:

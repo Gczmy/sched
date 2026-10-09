@@ -190,7 +190,9 @@ scheduler 实际安装、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改�
 完整映射并提供纯新鲜重验。后续 schema 23 [显式设备 controller](device-controller.md)
 接入安装、原 handle 启动与恢复仅观察；后续 schema 24 [原 UUID MIG 能力](mig-capability.md)
 区分 GetMigMode 明确不支持/未知，不回填 v1。MIG 精确权限、授权正向
-CPU/BPF/真实 GPU/owner 故障矩阵、被动新鲜根健康及发布仍待完成。
+CPU/BPF/真实 GPU/owner 故障矩阵及发布仍待完成。后续 schema 25
+[原根健康](scope-health.md) 持久化原委派/可选父 BPF 前置观察，独立被动查询和
+准入解释不探测网关、不授予执行权；实际委派下的新鲜健康验收仍待完成。
 
 ### 已确认的设计方向
 

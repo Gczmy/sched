@@ -57,8 +57,10 @@ context 见 [Linux v6.8 UAPI](https://github.com/torvalds/linux/blob/v6.8/includ
 由 [设备 controller](device-controller.md) 接入，尚未取得真实正向验收。
 后续[设备映射候选](device-inventory.md)提供 control/UVM/整卡 UUID/driver minor 的显式
 只读核对与纯规则选择；后续 schema 22 候选冻结到原 allocation 并提供新鲜核对，
-原映射接入显式 controller；仍需可靠 MIG 映射/能力区分、持久 owner 正向故障矩阵和
-被动健康观察。单独 cpu_isolation.mode=cgroup 不限制 GPU，不能从 CUDA_VISIBLE_DEVICES 或 GPU claim 推断
+原映射接入显式 controller。后续 [MIG 能力](mig-capability.md) 区分原 GetMigMode
+明确不支持/未知；[原根健康](scope-health.md) 持久化被动前置观察，不探测查询主机
+或授予执行权。仍需 MIG 精确权限、持久 owner 正向故障矩阵和实际委派健康验收。
+单独 cpu_isolation.mode=cgroup 不限制 GPU，不能从 CUDA_VISIBLE_DEVICES 或 GPU claim 推断
 设备隔离。正式 GPU 验收与生产切换需要另行授权。
 
 [回归](../tests/test_device_policy.py) 的解释器/故障模型验证有界策略、unsigned

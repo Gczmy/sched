@@ -77,8 +77,12 @@ class IsolationAcceptance(LeaseAcceptance):
         actual = self.wait(self.snapshot, bool)[-1]
         assert actual["origin"]["affinity"] == sorted(os.sched_getaffinity(0))
         assert not self.claims()["claims"]
+        root_health = self.data("scope-health", "--json")
+        assert root_health["status"] == "disabled" and root_health["recorded_origin"] is None, root_health
+        assert root_health["contract"] == "sched-scope-health-state-v1"
+        assert not root_health["runtime_probed"] and not root_health["physical_boundary_verified"]
         self.private_drain()
-        print("PASS: actual lease/affinity recorded separately with private dispatch drained", flush=True)
+        print("PASS: actual lease/affinity recorded separately with private dispatch drained; passive root health reports disabled, never invents delegation", flush=True)
 
         binary = self.root / "bin"
         binary.mkdir()

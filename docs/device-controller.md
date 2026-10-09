@@ -15,7 +15,7 @@ allocation/default status/task/history/FD4。单独 CPU cgroup 不启用设备�
 源码 writer schema 23 在原不可变 allocation.cpu_binding 中仅为明确启用的任务
 加入 `device_isolation:"nvidia"`，先于 CPU mkdir 和设备 intent。因此在 CPU 配置完成、
 设备记录尚未创建的崩溃窗口也不能 CPU-only 启动。迁移只提高语义版本，不回填或重写
-旧记录；后续 MIG 能力候选的完整只读范围 1–24，writer 23 及更旧不能打开 24。回退只用升级前验证恢复点，
+旧记录；后续原根健康候选的完整只读范围 1–25，writer 24 及更旧不能打开 25。回退只用升级前验证恢复点，
 不可删表、降 user_version 或手改 state；包版本仍未变更。
 
 ## 安装和启动顺序
@@ -59,6 +59,8 @@ CPU removed，再释放资源。不 detach、不推断程序垃圾回收，也�
 
 后续 [schema 24 MIG 能力](mig-capability.md) 接入 v2 原 UUID NVML GetMigMode，区分
 明确不支持/未知；新安装必须 v2，旧 v1 不补写，未知不降级。
+后续 schema 25 [原根健康](scope-health.md) 记录原 root/CPU/NUMA 与可选父 BPF 前置
+观察供被动新鲜解释，不安装或从查询获得执行权，原 BPF 漂移拒绝新派发。
 尚需：授权专用委派的 cpuset 与 BPF 正向矩阵、真实
-逐卡权限及后代继承、取消/owner 断连/daemon 崩溃恢复、被动新鲜根健康、原租约实际
+逐卡权限及后代继承、取消/owner 断连/daemon 崩溃恢复、实际委派下的新鲜根健康、原租约实际
 结束和授权独立发布/生产切换。不能把此源码接入或拒绝路径当作完整硬隔离交付。

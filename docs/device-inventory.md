@@ -79,7 +79,7 @@ limit 默认 20、范围 1–100，精确 ID 与 cursor 互斥。单记录 256 K
 allocation 链的总查询预算 4 MiB；超限拒绝，实时 keyset 分页不是完整当前快照。
 查询只走私有 DB/WAL 快照，不采样硬件、迁移旧库或改变 revision；所有 runtime/
 admission/wait/physical 标志均 false。原记录过期仍可以查询，不解释为当前健康。
-完整 schema 1–21 返回 migration_required；当前完整只读范围 1–24。schema 21 及更旧
+完整 schema 1–21 返回 migration_required；当前完整只读范围 1–25。schema 21 及更旧
 writer 不可回接新库，回退只使用升级前验证恢复点，不能手改 state 或降低 schema。
 
 ## 验收与未完成项

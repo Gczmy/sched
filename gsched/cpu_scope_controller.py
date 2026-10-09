@@ -19,6 +19,10 @@ from .execution_policy import digest
 MAX_ACTIVE = 256
 
 
+class _RecordedRootChanged(ValueError):
+    pass
+
+
 def _path(value):
     if (type(value) is not str or not value.startswith("/") or value.startswith("//")
             or len(value) > 4096 or "\0" in value or str(PurePosixPath(value)) != value
@@ -138,6 +142,21 @@ class Controller:
             raise
 
     def preflight(self):
+        from . import scope_health
+        observed_at = time.time()
+        started = time.monotonic()
+        try:
+            return self._preflight(observed_at, started)
+        except _RecordedRootChanged:
+            self.sampled_at = None
+            raise
+        except (OSError, ValueError, RuntimeError, state.StateError):
+            self.sampled_at = None
+            scope_health.record(self, reason="root_preflight_unavailable", observed_at=time.time())
+            raise
+
+    def _preflight(self, observed_at, started):
+        from . import scope_health
         monitor = self.dispatcher._cluster_lease
         current = cluster_lease.kernel_context()
         authority = authority_from_facts(self.manager.parent.path, monitor.origin, current, monitor.decision, _mounts())
@@ -148,11 +167,47 @@ class Controller:
             raise ValueError("original delegated CPU/NUMA parent capacity changed")
         if not set(current["affinity"]) & set(cpus):
             raise ValueError("delegated CPU parent has no CPU in original pool")
-        if self.device_policy["mode"] != "off":
-            devices.preflight(self.manager)
+        device_query = devices.preflight(self.manager) if self.device_policy["mode"] != "off" else None
+        after = cluster_lease.kernel_context()
+        if (self.manager._verify() != (cpus, mems)
+                or authority_from_facts(self.manager.parent.path, monitor.origin, after, monitor.decision, _mounts()) != authority
+                or (self.device_policy["mode"] != "off" and devices.preflight(self.manager) != device_query)):
+            raise ValueError("delegated root observation changed during sampling")
+        facts = {"policies": {"cpu": self.policy, "device": self.device_policy},
+                 "parent": asdict(self.manager.parent), "authority": authority,
+                 "cpus": list(cpus), "mems": list(mems), "device_query": device_query}
+        if not 0 <= time.monotonic() - started <= 5:
+            raise state.StateError("original root observation exceeded launch freshness")
+        if not scope_health.record(self, facts=facts, reason=None if self.healthy else "active_scopes_unresolved", observed_at=observed_at):
+            raise _RecordedRootChanged("original delegated root evidence changed")
+        if not 0 <= time.monotonic() - started <= 5:
+            raise state.StateError("original root observation expired during publication")
         self.authority, self.mems, self.cpus = authority, mems, cpus
-        self.sampled_at = time.monotonic()
-        return self.healthy
+        self.sampled_at = started
+        return self.admission_current()
+
+    def refresh_health(self):
+        """Tick observation also runs while drained; no scope/BPF mutations."""
+        from .cpu_isolation import policy
+        from . import scope_health
+        probing = False
+        try:
+            current = self.dispatcher._read_gpu_policy()
+            if policy(current) != self.policy or devices.policy(current) != self.device_policy:
+                self.sampled_at = None
+                scope_health.record(self, reason="cold_policy_changed", observed_at=time.time())
+                return False
+            probing = True
+            return self.preflight()
+        except (OSError, ValueError, RuntimeError, state.StateError) as error:
+            self.sampled_at = None
+            if not probing:
+                try:
+                    scope_health.record(self, reason="root_preflight_unavailable", observed_at=time.time())
+                except (OSError, ValueError, RuntimeError, state.StateError):
+                    pass  # Failed publication never mints a fresh positive result.
+            self.dispatcher.log_line(f"CPU root health unavailable: {error}")
+            return False
 
     def admission_current(self):
         return self.healthy and self.sampled_at is not None and 0 <= time.monotonic() - self.sampled_at <= 5

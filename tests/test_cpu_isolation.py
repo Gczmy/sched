@@ -143,14 +143,14 @@ class CpuIsolationTests(CpuIsolationFixture):
         self.cfg["cpu_isolation"] = {"mode": "cgroup", "delegated_root": "/sys/fs/cgroup/example"}
         owner = self.dispatcher._cluster_lease.owner
         item = {"origin": self.dispatcher._cluster_lease.origin, "recorded_exit": None,
-                "current_owner_binding": True, "observation_age_s": 1,
+                "current_owner_binding": True, "observation_age_s": 1, "allocation_state": "unknown",
                 "recorded_check": {"data": {**self.dispatcher._cluster_lease.decision,
                     "current_context": self.context, "slurm_observation": self.dispatcher._cluster_lease.sample,
                     "slurm_binding": None}}}
         with state.connect() as conn, mock.patch("gsched.daemon._read_lease_owner", return_value=owner), mock.patch.object(cpu_isolation.cluster_lease, "query", return_value={"leases": [item]}), mock.patch.object(cpu_isolation.cluster_lease, "kernel_context", side_effect=AssertionError("query probe")):
             result = cpu_isolation.recorded_selection(conn, self.cfg, 1)
             self.assertIsNone(result["allowed"])
-            self.assertEqual("original_cgroup_observation_unavailable", result["reason"])
+            self.assertEqual("root_observation_missing_or_stale", result["reason"])
 
     def test_claim_selection_and_kernel_resolution_are_separate_pure_decisions(self):
         with state.connect() as conn:

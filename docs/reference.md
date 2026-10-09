@@ -41,9 +41,9 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前 MIG 能力证据候选写 schema 24，完整只读范围为 1–24；
-已发布 0.4.0 写 schema 10；候选 writer 11–23 均不能回接 schema 24。原映射绑定表于 22 引入，
-23 记录设备必需标志，24 守卫新 v2 MIG 能力证据，均不回填旧事实。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前原根健康候选写 schema 25，完整只读范围为 1–25；
+已发布 0.4.0 写 schema 10；候选 writer 11–24 均不能回接 schema 25。原映射绑定表于 22 引入，
+23 记录设备必需标志，24 守卫新 v2 MIG 能力证据，25 守卫原根健康事件，均不回填旧事实。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -214,6 +214,12 @@ CPU/GPU；原 CPU removed 引用和设备 released 记录均满足后才放行�
 返回 v2 完整原 NVML 证据及外层 mig_support；仅原 GetMigMode 明确不支持才区分
 N/A，其他错误仍 unknown。默认 v1 不增加字段或 NVML 探测；原证据/有限采样与
 schema 24 兼容边界见 [MIG 能力](mig-capability.md)。
+
+`sched scope-health --json` 协商独立 `sched-scope-health-state-v1`，被动读取原 daemon/
+lease 的 root/CPU/NUMA/可选父 BPF 前置观察。30 秒诊断窗口、绑定/配置/租约变化或
+过期明确 unknown，ready 也不证明实际 scope join/BPF/GPU 权限。admission-explain
+可复用已记录 pool/claim 判断；不探测查询主机、不预占或授予启动权，默认健康 JSON
+不变。schema 25 不增加表或回填，旧库返回 migration_required；详见 [原根健康](scope-health.md)。
 
 `sched device-inventory-bindings [--scope-id ID] [--limit N] [--cursor ID] --json`
 协商独立 `sched-device-inventory-binding-v1`。schema 22 冻结原完整映射、allocation/

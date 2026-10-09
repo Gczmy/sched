@@ -445,6 +445,30 @@ unknown，没有创建 state 或更改配置。203 文件 runtime/native/fixture
 本地与计算节点前后核对一致。未执行 BPF attach、真实 GPU 计算、Slurm 父级准备
 或生产修改；特权正向矩阵、被动新鲜根健康及原租约真实结束仍未完成。
 
+固定 MIG 提交 `9ba96ec6dfb9690296e4437dcc91e867a26d7c51` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37899239052) 已完成 success，
+14/14 作业通过；未发布或部署。
+
+后续 schema 25 [原根健康候选](scope-health.md) 将原 parent/CPU/NUMA/authority/冷策略
+与可选父 BPF IDs/flags 持久化到原 daemon lease 的不可变事件链，新鲜被动查询不
+探测网关、预占资源或 mint 启动权。ready 只指原前置观察，未知/漂移/过期/配置改变/
+owner 替代或退出不能当可派发；admission-explain 复用原 pool/claim 纯判断。
+默认健康 JSON 不变，不回填旧根，writer 24 不可回接 25。持久诊断有效期 30 秒，
+实际启动仍从原采样开始计 5 秒，不因获取 DB writer 或发布记录而重新计时。
+
+最终固定来源在指定计算租约内系统 Python 3.12.3 显式 native 构建后运行
+1072 条完整回归：1067 通过、5 跳过，171.068 秒、退出码 0。跳过仍为三条无明确
+委派的正向 scope、native 缺失和 Darwin 专项，不算实际隔离成功。原根健康专项
+20 条通过；205 文件 runtime/native/fixture/构建脚本清单 SHA256 为
+`545bfa270d2d02b7cf0c193b35d173cb2288f2ed0344214ff4b408987efb1ff5`。
+早期来源全量回归曾通过，但随后补充原单调采样时限与严格分类绑定，最终依据仅取
+上述修正来源；不会用早期结果代替最终验收。新鲜根/BPF positive 是纯模型，
+实际委派/特权设备访问、原 owner 故障矩阵和原租约结束仍待独立授权验收。
+同一最终来源的六组 CPU/CLI 和普通目录 CPU/设备拒绝路径全部通过，实际 private
+daemon 的 scope-health 在未启用 cgroup 时明确 disabled，未生成根绑定；原 owner
+实际崩溃/认证重连仍不重放，cold off 不改旧历史。生产仅用已部署 CLI 读取健康，
+没有修改安装/config/daemon、Slurm 父级或执行 BPF attach/真实 GPU 计算。
+
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
 | 2 | 已提交修复验收 | 候选 CI/CPU/两主机验收通过 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
@@ -460,7 +484,7 @@ unknown，没有创建 state 或更改配置。203 文件 runtime/native/fixture
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结/schema 23 显式接入与 schema 24 MIG 区分候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结/schema 23 显式接入/schema 24 MIG 区分与 schema 25 被动根健康候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

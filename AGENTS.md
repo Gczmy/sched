@@ -71,6 +71,7 @@
 | `docs/device-inventory.md` | 候选只读 UUID/driver minor/设备节点映射、原 allocation 冻结绑定与纯新鲜重验；非 GPU 验收 |
 | `docs/device-controller.md` | 候选 schema 23 显式设备安装/原 retained handle 启动/恢复仅观察；未知不重装，正向验收未完成 |
 | `docs/mig-capability.md` | 候选 schema 24/v2 原 UUID NVML MIG 能力与 N/A 区分；旧 v1 不补写，非 GPU 权限验收 |
+| `docs/scope-health.md` | 候选 schema 25 原委派根/BPF 前置观察与被动新鲜解释；不授予执行权 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -161,6 +162,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；check 另按 backend ID 检查文件摘要与项目 root，通过不替代启动校验 |
 | `sched cpu-isolation --json` | 候选已记录活动 CPU claim；不探测、迁移或授予启动权；支持有界实时分页 |
 | `sched cpu-scopes --json` | 候选持久 scope intent/inode/生命周期；--scope-id 查询精确有界链；不探测或授予 cgroup/wait 权限 |
+| `sched scope-health --json` | 候选已记录原委派根/CPU/NUMA/可选 BPF 前置健康；30 秒诊断有效期，不探测查询主机或授予执行权 |
 | `sched device-scopes --json` | 候选 schema 21 设备意图/程序绑定与有界原事件链；--scope-id 精确查询；不探测 BPF 或授予执行权 |
 | `sched device-inventory --json` | 候选计算节点显式只读 NVIDIA 设备映射；不读 DB、安装或授予执行权；网关禁止探测 |
 | `sched device-inventory-bindings --json` | 候选 schema 22 原映射绑定私有只读摘要；`--scope-id` 查完整映射；不采样硬件或授予启动权 |

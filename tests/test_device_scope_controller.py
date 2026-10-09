@@ -34,13 +34,14 @@ class DevicePolicyTests(unittest.TestCase):
                     effects.preflight(SimpleNamespace(_fd=99))
 
 
-class DeviceControllerTests(fixture.CpuScopeFixture):
+class DeviceControllerFixture(fixture.CpuScopeFixture):
     def setUp(self):
         super().setUp()
         self.controller.close()
         self.parent = ScopeParent(self.parent.path, self.parent.device, self.parent.inode,
                                   mapping.CONTEXT["boot_id"], mapping.CONTEXT["mount_namespace"], self.parent.uid)
         self.cfg["device_isolation"] = {"mode": "nvidia"}
+        self.register_lease()  # Cold policy/parent changes require a new birth.
         self.sampled = mapping.captured_mig()
         self.installed, self.query_ok = [], True
         outer = self
@@ -71,7 +72,7 @@ class DeviceControllerTests(fixture.CpuScopeFixture):
                 self._phase = "launch_capability_issued"
                 return self.scope.constraints()
 
-        for target, kwargs in (("gsched.device_scope_controller.preflight", {}),
+        for target, kwargs in (("gsched.device_scope_controller.preflight", {"return_value": {"program_ids": [], "attach_flags": 0}}),
                               ("gsched.device_scope_controller.DeviceScope", {"side_effect": ModelDevice}),
                               ("gsched.device_scope_controller.inventory.capture", {"side_effect": lambda **kwargs: copy.deepcopy(self.sampled)}),
                               ("gsched.device_scope_controller.time.time", {"return_value": 100})):
@@ -101,6 +102,7 @@ class DeviceControllerTests(fixture.CpuScopeFixture):
             self.controller.launch_intent(conn, checked)
         self.controller.finish_launch(job)
 
+class DeviceControllerTests(DeviceControllerFixture):
     def test_original_requirement_is_frozen_before_effects_and_both_launch_cas_commit(self):
         job, identifier, intent = self.prepare()
         with state.connect() as conn:
