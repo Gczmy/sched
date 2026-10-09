@@ -119,7 +119,7 @@ linux_fd_owner 仍认证重连原 owner/child，不重新 start。配置匹配�
 完整事件链，列表提供有界实时分页，不探测内核或改变 revision。命名合同
 sched-cpu-scope-state-v1 与通用原语合同独立；所有 admission/wait/physical boundary
 标记为 false。完整 schema 1–18 查询明确 migration_required，不做初始化或回填；
-当前后续设备记录候选的完整只读范围为 1–21；旧 writer 不得回接更高写库，回退只用升级前验证
+当前后续设备映射冻结绑定候选的完整只读范围为 1–22；旧 writer 不得回接更高写库，回退只用升级前验证
 恢复点，不能手改 user_version。admission-explain 的 cgroup fit 明确 unknown，
 因为当前没有新鲜原委派观察供被动解释，不能把租约检查当作根目录可用性。
 

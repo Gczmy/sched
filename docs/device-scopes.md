@@ -53,7 +53,8 @@ limit 默认 20、范围 1–100，使用实时 keyset，不是完整快照。�
 均 false；recorded_phase、程序绑定和 release_recorded_ready 均不是实时 kernel health。
 策略字节码解析核对两种有界端序并保留原摘要，不依赖查询主机 ABI；异端序不授予安装权。
 旧完整 schema 1–20 返回 migration_required，不猜设备绑定或升级；当前完整只读范围
-为 1–21。schema 20 及更旧 writer 不得回接 schema 21，只能使用升级前验证恢复点回退，
+为 1–22（后续原映射绑定写 schema 22）。schema 20 及更旧 writer 不得回接 schema 21，
+schema 21 及更旧 writer 不得回接 schema 22；只能使用升级前验证恢复点回退，
 不能删表/事件、降低 user_version 或手改 state。包版本尚未更改、未发布或部署。
 
 ## 验收与剩余工作
@@ -63,7 +64,8 @@ limit 默认 20、范围 1–100，使用实时 keyset，不是完整快照。�
 schema 20 只读与无回填迁移、查询字节边界；均为 synthetic 证据，不算 BPF 验收。
 
 后续[设备映射候选](device-inventory.md)提供 control/UVM/整卡原 UUID/minor/节点核对，
-不改变这里的被动查询或实际安装状态。尚未完成：scheduler 实际设备安装、原 inventory
-冻结/MIG/能力区分、持久 owner
+不改变这里的被动查询或实际安装状态；后续 schema 22 候选冻结原 allocation/intent/
+inventory 并提供纯新鲜重验，仍未接通实际安装。尚未完成：scheduler 实际设备安装、
+MIG/能力区分、持久 owner
 设备故障矩阵、授权正向 CPU/BPF/真实 GPU 验收、被动新鲜根健康观察、原租约实际结束
 及授权发布／生产切换。此记录层不缩小或替代这些交付。

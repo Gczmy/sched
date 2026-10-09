@@ -240,3 +240,13 @@ schema 1–20 查询不迁移，schema 19 及更旧 writer 不可回接新库。
 完整只读范围 1–21。schema 20 及更旧 writer 不可回接新库，回退只用升级前验证恢复点。
 正向 CPU/BPF/GPU 故障矩阵与授权安装/生产切换仍未完成，不能将记录层当作硬隔离部署。
 合同见 [设备生命周期](device-scopes.md)。
+
+## 后续候选原设备映射绑定 schema 22
+
+原子新增空 device_inventory_bindings、唯一 allocation 和不可变/保留触发器，不回填
+原映射，不改变旧 instance/allocation/CPU/device intent/回执。冻结必须在安装意图前
+核对原完整 claims 与策略；新鲜重验不换卡、不刷新旧 topology、不授予启动权。
+独立 device-inventory-bindings 只读查询不采样硬件，完整 schema 1–21 返回
+migration_required，当前完整只读范围为 1–22。schema 21 及更旧 writer 不可回接新库；
+回退只使用升级前验证恢复点。实际安装/恢复、授权正向设备与生产切换仍未完成。
+完整边界见 [设备映射与绑定](device-inventory.md)。

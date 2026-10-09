@@ -166,8 +166,20 @@ fresh non-simulated allocation UUID/index, excluding NVIDIA nodes for CPU-only.
 MIG enabled/unknown cannot grant a full-GPU rule. `runtime_probed` is true only
 for this opt-in query; admission/wait/physical-boundary authority remains false.
 It does not alter default status/task/history, schema 21 or passive device-scopes.
-No actual device installation or frozen allocation inventory exists yet; see
+No actual device installation exists yet; see
 [device inventory](device-inventory.md).
+
+The subsequent schema 22 candidate freezes complete inventory and its original
+allocation/CPU inode/device-intent/lease binding before installation intent.
+`device-inventory-bindings --json` negotiates `sched-device-inventory-binding-v1`:
+passive bounded summaries or exact original inventory, never a hardware probe,
+health assertion or launch permission. Complete schemas 1–21 report migration_required,
+and migration adds an empty retained table without rewriting older facts.
+The pure pre-effect revalidation requires the same fresh complete mapping and
+original claims; a new sample cannot refresh old topology or replace a GPU.
+Unknown/consumed effects cannot acquire new authority. Actual scheduler device
+handle/installation integration and privileged positive acceptance remain outstanding.
+Writer 21 and older cannot reopen schema 22; default JSON/FD4 shapes are unchanged.
 
 ### Candidate resource explanation
 

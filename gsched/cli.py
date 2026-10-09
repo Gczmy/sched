@@ -1929,6 +1929,27 @@ def cmd_device_inventory(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_device_inventory_bindings(args: argparse.Namespace) -> int:
+    from . import device_inventory_state
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            result = {"schema_version": 1, "query": "device_inventory_bindings",
+                      "contract": CONTRACTS["device_inventory_bindings"], "instance_id": instance_id(conn),
+                      "node": str(cfg["node"]), "effect": "none",
+                      **device_inventory_state.query(conn, scope_id=args.scope_id, limit=args.limit, cursor=args.cursor)}
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0
+    except (ValueError, ConfigError, state.StateError, TypeError, KeyError, sqlite3.Error, RecursionError) as error:
+        print(f"错误: device-inventory-bindings 查询失败: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
 def cmd_device_scopes(args: argparse.Namespace) -> int:
     from . import device_scope_state
     from .integration import CONTRACTS, instance_id
@@ -5602,6 +5623,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_device_inventory)
 
+    p = sub.add_parser("device-inventory-bindings", help="只读原 allocation 冻结设备映射；不探测硬件或授予执行权")
+    p.add_argument("--scope-id")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor")
+    p.set_defaults(fn=cmd_device_inventory_bindings)
+
     p = sub.add_parser("device-scopes", help="只读原设备策略 intent/程序绑定/未决生命周期；不探测 BPF 或授予执行权")
     p.add_argument("--scope-id")
     p.add_argument("--json", action="store_true")
@@ -5667,7 +5695,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "device-scopes", "device-inventory"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "device-scopes", "device-inventory", "device-inventory-bindings"}:
         return args.fn(args)
     if command == "request":
         try:

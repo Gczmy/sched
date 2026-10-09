@@ -68,7 +68,7 @@
 | `docs/cpu-scopes.md` | 候选委派 cpuset、原 intent/inode/CAS、schema 20 显式派发/清理；不是完整硬隔离交付 |
 | `docs/device-policy.md` | 候选原 scope 设备 BPF 原语；尚未接入 scheduler 或完成特权正向/真实 GPU 验收 |
 | `docs/device-scopes.md` | 候选 schema 21 原设备意图/程序绑定/CAS、无重放与资源释放守卫；尚未接入安装 |
-| `docs/device-inventory.md` | 候选只读 UUID/driver minor/设备节点映射与原 allocation 规则选择；非实际安装或 GPU 验收 |
+| `docs/device-inventory.md` | 候选只读 UUID/driver minor/设备节点映射、原 allocation 冻结绑定与纯新鲜重验；非实际安装或 GPU 验收 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -161,6 +161,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched cpu-scopes --json` | 候选持久 scope intent/inode/生命周期；--scope-id 查询精确有界链；不探测或授予 cgroup/wait 权限 |
 | `sched device-scopes --json` | 候选 schema 21 设备意图/程序绑定与有界原事件链；--scope-id 精确查询；不探测 BPF 或授予执行权 |
 | `sched device-inventory --json` | 候选计算节点显式只读 NVIDIA 设备映射；不读 DB、安装或授予执行权；网关禁止探测 |
+| `sched device-inventory-bindings --json` | 候选 schema 22 原映射绑定私有只读摘要；`--scope-id` 查完整映射；不采样硬件或授予启动权 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |

@@ -1,7 +1,8 @@
 # NVIDIA 设备映射（源码候选）
 
 这是实际设备安装接入的前置项，不是已启用的 GPU 隔离。它生成精确原设备规则，
-没有安装配置、BPF attach、schema 迁移或 daemon 调度改动。原策略与持久生命周期见
+只读映射本身没有安装配置、BPF attach 或 daemon 调度改动；后续冻结绑定候选另写
+schema 22。原策略与持久生命周期见
 [设备原语](device-policy.md)和[设备记录](device-scopes.md)。
 
 ## 原映射与有限采样
@@ -51,8 +52,32 @@ mknod/modprobe、sudo、设备策略安装或 Slurm 父级配置接口。utility
 
 成功报告完整 inventory 和摘要、`runtime_probed:true`；admission/wait/physical boundary
 均 false。失败返回 1 和 stderr，不返回空清单或成功字段。报告是当次有限观察，
-不是持久 claim 或可跨时间复用的执行许可；未来 controller 必须冻结原记录并在安装/
-启动前核对新鲜相同绑定。MIG 未知可以被诊断记录，但不能由纯选择函数授予整卡策略。
+不是持久 claim 或可跨时间复用的执行许可。MIG 未知可以被诊断记录，但不能由纯
+选择函数授予整卡策略。
+
+## 原 allocation 冻结绑定（后续源码候选）
+
+schema 22 新增空 `device_inventory_bindings` 表与不可变/保留触发器，不回填历史。
+在设备 reserved 阶段的显式 writer 中、消耗 install_intent 前，冻结完整映射、原采样/
+冻结时间、映射摘要，以及 instance/job/version/allocation/lease、原设备 intent 和
+CPU scope inode 绑定摘要。纯规则选择必须等于原 DeviceIntent，boot/mount namespace
+必须与原 CPU parent 相同；声明 GPU 数量与原预留不符、完整原 CPU/GPU claims 缺失、
+取消、非当前代际、fake/未知拓扑、过期采样或未知 MIG 均拒绝。CPU-only 仍只授予固定基线设备。
+
+未来 controller 的 `verify_current` 接口要求 writer 外提供新的有界采样，核对完整
+原映射/节点 inode/driver/context 与原预留；新采样不能刷新不可变原 GPU topology
+时间或换卡。installed 不代表可以重建启动权，unknown、launch_intent、取消/清理
+或原 claims 丢失均拒绝新效果。此接口不自行采样、安装 BPF、重启客户进程或授予
+admission/wait；实际保留 handle 与一次性 CAS 接入仍是后续工作。
+
+`sched device-inventory-bindings [--scope-id ID] [--limit N] [--cursor ID] --json`
+协商独立 `sched-device-inventory-binding-v1`。默认返回摘要，精确 ID 返回完整原映射；
+limit 默认 20、范围 1–100，精确 ID 与 cursor 互斥。单记录 256 KiB、包括原设备/CPU/
+allocation 链的总查询预算 4 MiB；超限拒绝，实时 keyset 分页不是完整当前快照。
+查询只走私有 DB/WAL 快照，不采样硬件、迁移旧库或改变 revision；所有 runtime/
+admission/wait/physical 标志均 false。原记录过期仍可以查询，不解释为当前健康。
+完整 schema 1–21 返回 migration_required；当前完整只读范围 1–22。schema 21 及更旧
+writer 不可回接新库，回退只使用升级前验证恢复点，不能手改 state 或降低 schema。
 
 ## 验收与未完成项
 
@@ -63,6 +88,8 @@ mknod/modprobe、sudo、设备策略安装或 Slurm 父级配置接口。utility
 配置执行 CLI，不启动 daemon；实际不可用与拒绝路径通过分别报告，不把不可用算映射成功。
 输出可能含私有 UUID、节点与路径，只保存到仓库外。
 
-尚未接通 scheduler 的实际安装/启动/恢复，未冻结 inventory 到原 allocation，未实现
+冻结绑定的[纯事务回归](../tests/test_device_inventory_state.py)检查原身份/策略/时效、
+不变历史、故障拒绝、分页/字节边界、旧库不迁移与 21→22 无回填；不是内核验收。
+尚未接通 scheduler 的实际安装/启动/恢复，未实现
 N/A 的可靠能力区分、MIG 精确权限或完成正向 BPF/真实 GPU 验收。原设备 intent/CAS、
 未知不重装、原 scope 删除后释放资源等守卫仍须由后续 controller 接入；未发布或部署。

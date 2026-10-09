@@ -305,7 +305,7 @@ class DeviceScopeStateTests(affinity.CpuIsolationFixture):
         self.assertEqual("migration_required", json.loads(out)["reason"])
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(21, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM device_scopes").fetchone()[0])
             after = {name: [tuple(row) for row in conn.execute("SELECT * FROM " + name)] for name in retained}
             self.assertEqual(before, after)

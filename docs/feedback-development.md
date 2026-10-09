@@ -367,7 +367,8 @@ Device Minor 并核对原 UUID；最终实际 CLI 已取得完整映射，MIG N/
 communicate 绕过缓冲导致空输出；实际两个 CPU child 确定性复现 buffered 丢失与
 unbuffered 保留。独立提交 `ffc8af66c3a10b4cba6805fabc2330f257337143` 只改该测试，
 同时到达的两行输出与原 1 秒检查界限均保留，计算节点 25 次检查全部通过；没有
-放宽 runtime FIFO/身份守卫。其 CI 结果另行查询，不把首次失败或源码推送计作完整绿色。
+放宽 runtime FIFO/身份守卫。其 [CI](https://github.com/Gczmy/sched/actions/runs/37891718883)
+已取消，仅 5 个作业通过，不记为完整绿色；后续设备映射来源包含该测试修复。
 
 包含 FIFO 修复的最终设备映射来源在计算节点运行 995 条 native 回归：990 通过、
 5 跳过，157.223 秒、退出码 0；其中 3 条正向 scope 仍因没有明确委派而跳过，
@@ -378,6 +379,27 @@ unbuffered 保留。独立提交 `ffc8af66c3a10b4cba6805fabc2330f257337143` 只�
 本地与计算节点前后核对一致。生产健康只通过已部署 CLI 查询，未替换安装或配置。
 设备策略实际安装、原 allocation 冻结关联、可靠 MIG 不支持/未知区分与特权
 正向 CPU/GPU 故障矩阵仍未完成；不把只读硬件映射记为这些项目的验收。
+固定设备映射提交 `fc73c3d6bf8cb916277247c13787ea651e746e04` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37892355647) 14 项均通过，
+包括包含 FIFO 修复的各 Python/native 矩阵、独立安装与固定候选构建；未发布或部署。
+
+后续 schema 22 原映射冻结候选新增空不可变绑定表与独立
+device-inventory-bindings 被动查询，旧库不迁移、不回填原映射。原 allocation/lease/
+CPU inode/device intent/完整 mapping/time 必须一致；在 install_intent 前冻结，
+缺 claims/取消/非当前代际/未知 MIG/过期采样拒绝。writer 外纯新鲜重验不换卡、
+不刷新旧 GPU topology、不从 installed/unknown 记录重建启动权；所有执行/内核
+权威标志仍 false，未接通实际安装或持久 owner 的设备恢复。
+
+该最终候选在计算节点系统 Python 3.12.3 显式 native 构建后运行 1015 条完整回归：
+1010 通过、5 跳过，168.208 秒、退出码 0。3 条正向 scope 因没有明确委派跳过，
+另两条为 native 缺失与 Darwin 专项，不算实际隔离成功。20 条冻结绑定专项通过，
+包括缺失 GPU 预留不误判 CPU-only、未知/取消/新代际拒绝和 21→22 原记录不变。
+同一最终来源的六组 CPU/CLI 和普通目录委派拒绝均通过；私有 daemon 原 owner
+崩溃重连不重放，冷配置/default off 不绕过旧绑定。198 文件 runtime/native/fixture/
+构建脚本清单 SHA256 为
+`c3c38b65018189bb43bbfacc88dfdc489f576eb89432d0ef89c41f9dcd5a8b99`，
+本地与计算节点前后核对一致。不执行 BPF attach、不使用真实 GPU 计算，不更改生产
+安装/config/daemon 或 Slurm 父级；这是记录与拒绝/兼容证据，不是设备隔离部署。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -394,7 +416,7 @@ unbuffered 保留。独立提交 `ffc8af66c3a10b4cba6805fabc2330f257337143` 只�
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语、schema 21 记录与原设备映射候选；实际设备接入/正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语、schema 21 记录与 schema 22 原映射冻结候选；实际设备接入/正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

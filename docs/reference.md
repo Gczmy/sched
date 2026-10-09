@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前设备 scope 记录候选写 schema 21，完整只读范围为 1–21；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim/scope 记录与 cgroup 接入候选写 11/12/13/14/15/16/17/18/19/20，都不能回接 schema 21。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前设备映射冻结绑定候选写 schema 22，完整只读范围为 1–22；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim/scope 记录、cgroup 接入与设备记录候选写 11/12/13/14/15/16/17/18/19/20/21，都不能回接 schema 22。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -210,6 +210,13 @@ CPU/GPU；原 CPU removed 引用和设备 released 记录均满足后才放行�
 报告完整映射，runtime_probed=true 但 admission/wait/physical boundary=false。返回
 失败不等于空映射；MIG 未知不能用于整卡放行。未接实际安装，见[设备映射](device-inventory.md)。
 
+`sched device-inventory-bindings [--scope-id ID] [--limit N] [--cursor ID] --json`
+协商独立 `sched-device-inventory-binding-v1`。schema 22 冻结原完整映射、allocation/
+CPU inode/device intent/lease 与时间摘要，不回填历史。默认摘要、精确 ID 完整映射；
+单记录 256 KiB、包括关联原链的查询总预算 4 MiB，limit 1–100、默认 20，实时 keyset
+不是完整快照。查询不采样硬件、迁移旧库或授予启动权；schema 1–21 明确 migration_required。
+纯新鲜重验不换卡、不刷新旧 topology、不补造 BPF 安装；实际接入尚未完成。
+
 精确原 owner 的租约检查最多有效 45 秒，缺失/过期/配置滞后为 unknown，不探测网关。
 GPU quota=0 仍是无限制。
 旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。
@@ -219,7 +226,8 @@ GPU quota=0 仍是无限制。
 缺失/配置或运行集合变化明确 unknown。默认关闭的 `storage_admission` 可热更新，
 检查输出与 state 文件系统的字节/inode、可知当前 UID quota，容量不足不清理科学文件。
 严格 status/task/history 和 wait_reason 不变；全部配置/范围见 [storage-admission](storage-admission.md)。
-持续租约验证和硬隔离仍未实现，不能把这些查询当成上述能力。
+持续租约验证已有独立候选；硬隔离的设备安装与正向验收仍未完成，不能把这些查询
+当成租约有效或物理隔离的证明。
 
 ## 1. 心智模型
 
