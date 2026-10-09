@@ -260,7 +260,9 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     # CPU 配额制 (可选): cpus_total 节点总核数 (0=不限制), gpu_job_cpus GPU 任务默认 CPU 占用
     from .resources import finite_number
     from .storage import policy as storage_policy
+    from .cluster_lease import policy as lease_policy
     try:
+        lease_policy(cfg)
         storage_policy(cfg)
     except ValueError as error:
         raise ConfigError(f"{p}: {error}") from error
@@ -287,10 +289,10 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
         on = nf.get("on")
         if on is not None and (
             not isinstance(on, list)
-            or not all(e in ("batch_done", "batch_blocked", "recovery_no_progress") for e in on)
+            or not all(e in ("batch_done", "batch_blocked", "recovery_no_progress", "lease_invalid") for e in on)
         ):
             raise ConfigError(
-                f"{p}: notify.on 必须是 batch_done/batch_blocked/recovery_no_progress 子集数组"
+                f"{p}: notify.on 必须是 batch_done/batch_blocked/recovery_no_progress/lease_invalid 子集数组"
             )
         em = nf.get("email")
         if em is not None:

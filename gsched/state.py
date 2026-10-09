@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
 # state schema.  Bump this whenever SCHEMA or one of the migrate_* functions
 # gains a new persistent change.  The marker is written last in init_db(), so a
 # reader may trust it only after the whole migration transaction committed.
-DB_SCHEMA_VERSION = 16
+DB_SCHEMA_VERSION = 17
 
 _REQUIRED_SCHEMA_OBJECTS = {
     "table": {
@@ -242,8 +242,9 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "artifact_revalidations",
         "task_dependency_events",
         "allocations", "allocation_events",
+        "daemon_leases", "daemon_lease_events",
     },
-    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job", "allocation_job", "allocation_event_order", "allocation_event_job"},
+    "index": {"idx_batches_name_created", "idx_gpu_jobs_gpu", "execution_owner_cleanup_due", "idx_jobs_status", "recovery_queue_predecessor", "artifact_validation_job", "artifact_revalidation_job", "task_dependency_job", "allocation_job", "allocation_event_order", "allocation_event_job", "daemon_lease_kind"},
     "trigger": {
         "scheduler_identity_immutable", "scheduler_identity_retained",
         "submission_request_immutable", "submission_request_retained",
@@ -252,6 +253,7 @@ _REQUIRED_SCHEMA_OBJECTS = {
         "batch_exact_dependencies_immutable",
         "task_dependency_immutable", "task_dependency_retained", "revision_task_dependency",
         "allocation_immutable", "allocation_retained", "allocation_event_immutable", "allocation_event_retained", "revision_job_allocation", "allocation_clear_pending",
+        "daemon_lease_immutable", "daemon_lease_retained", "daemon_lease_event_immutable", "daemon_lease_event_retained",
         "artifact_validation_immutable", "artifact_validation_retained",
         "artifact_revalidation_immutable", "artifact_revalidation_retained",
         "revision_task_insert",
@@ -278,6 +280,8 @@ _REQUIRED_SCHEMA_OBJECTS = {
 # Columns added outside the base CREATE TABLE statements.  Checking these
 # protects the fast path against a falsely stamped or partially copied DB.
 _REQUIRED_MIGRATED_COLUMNS = {
+    "daemon_leases": {"lease_id", "instance_id", "payload", "sha256"},
+    "daemon_lease_events": {"lease_id", "seq", "kind", "payload", "sha256"},
     "allocations": {"allocation_id", "job_id", "ordinal", "payload", "payload_sha256"},
     "allocation_events": {"event_id", "allocation_id", "job_id", "seq", "layer", "payload"},
     "task_dependency_events": {"seq", "event_id", "request_id", "job_id", "job_version", "instance_id", "target_sha256", "previous_event_id", "bindings", "observed_at"},
@@ -560,6 +564,11 @@ def _schema_is_complete(conn: sqlite3.Connection, version: int) -> bool:
     required_columns = {
         table: set(names) for table, names in _REQUIRED_MIGRATED_COLUMNS.items()
     }
+    if version < 17:
+        required_objects["table"].difference_update({"daemon_leases", "daemon_lease_events"})
+        required_objects["index"].discard("daemon_lease_kind")
+        required_objects["trigger"].difference_update({"daemon_lease_immutable", "daemon_lease_retained", "daemon_lease_event_immutable", "daemon_lease_event_retained"})
+        del required_columns["daemon_leases"], required_columns["daemon_lease_events"]
     if version < 16:
         required_objects["table"].difference_update({"allocations", "allocation_events"})
         required_objects["index"].difference_update({"allocation_job", "allocation_event_order", "allocation_event_job"})
@@ -1098,6 +1107,7 @@ def _initialize_database() -> None:
     from .artifact_revalidation import SCHEMA as ARTIFACT_REVALIDATION_SCHEMA
     from .task_dependencies import SCHEMA as TASK_DEPENDENCY_SCHEMA
     from .allocation import SCHEMA as ALLOCATION_SCHEMA, migrate as migrate_allocations
+    from .cluster_lease import SCHEMA as DAEMON_LEASE_SCHEMA
     with connect() as conn:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= 10:
             from .integration import instance_id
@@ -1105,7 +1115,7 @@ def _initialize_database() -> None:
         previous_schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
         needs_owner_backfill = (previous_schema_version < 7 or
             conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_owner_operations'").fetchone() is None)
-        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA + ALLOCATION_SCHEMA)
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + EXECUTION_SCHEMA + OWNER_SCHEMA + OWNER_OPERATIONS_SCHEMA + RECOVERY_SCHEMA + RECOVERY_WATCH_SCHEMA + ARTIFACT_VALIDATION_SCHEMA + ARTIFACT_REVALIDATION_SCHEMA + TASK_DEPENDENCY_SCHEMA + ALLOCATION_SCHEMA + DAEMON_LEASE_SCHEMA)
         migrate_allocations(conn)
         migrate_gpu_jobs(conn)
         migrate_project_columns(conn)

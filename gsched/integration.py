@@ -30,6 +30,7 @@ CONTRACTS = {
     "admission_explain": "sched-admission-explain-v1",
     "allocations": "sched-allocations-v1",
     "storage_explain": "sched-storage-explain-v1",
+    "daemon_lease": "sched-daemon-lease-v1",
     "artifact_validations": "sched-artifact-validations-v1",
     "artifact_revalidations": "sched-artifact-revalidations-v1",
 }

@@ -155,12 +155,22 @@ are reservations, not hard isolation or physical ownership. See [storage admissi
 
 ### Candidate batch failure policy
 
+The schema 17 candidate also advertises `sched-daemon-lease-v1`: immutable
+whitelisted daemon birth, recorded controller/kernel checks and exit facts.
+Default health/status/task/history field sets are unchanged; only explicit
+`daemon status --json --include-lease` adds the nested private-snapshot query.
+`daemon-lease --json` never probes Slurm or grants execution authority. Auto mode
+validates Slurm origins, pauses unknown by default and latches confirmed invalid
+without cancelling running jobs or migrating to another lease. See
+[daemon lease](daemon-lease.md) for bounds, policy, notification and schema rollback.
+
 The source candidate additionally advertises `sched-batch-policy-v1`. Its writer
 introduced schema 11; the later artifact-validation candidate writes 12 (read
 range 1–12); the subsequent revalidation candidate writes 13 (reads 1–13).
 The later exact-dependency candidate writes 14 (reads 1–14); the subsequent task
 DAG candidate writes 15 (reads 1–15). The later allocation candidate writes 16
-(complete reads 1–16); earlier writers cannot reopen that state.
+(complete reads 1–16); the subsequent daemon-lease candidate writes 17 (complete
+reads 1–17); earlier writers cannot reopen that state.
 Released 0.4.0 cannot open these new writer states.
 Migration adds `batches.failure_policy` with default `freeze` and a monotonic
 revision trigger, without rewriting status, job versions, execution identity,

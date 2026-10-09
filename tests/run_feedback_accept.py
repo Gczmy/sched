@@ -35,6 +35,9 @@ class Acceptance:
             "host_mem_default_gib": 0.125, "host_mem_reserve_gib": 0,
             "projects": {"example": {"root": str(root), "git": False}},
             "venvs": {"python": sys.executable},
+            # These unrelated CPU/fake-GPU fixtures do not validate their
+            # enclosing real lease. The dedicated lease acceptance enforces it.
+            "lease_validation": {"mode": "observe"},
         }
         self.config = root / "config.json"
         self.config.write_text(json.dumps(self.cfg))

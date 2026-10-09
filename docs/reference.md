@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前 allocation 源码候选写 schema 16，完整只读范围为 1–16；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG 候选写 11/12/13/14/15，都不能回接 schema 16。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前 daemon 租约来源源码候选写 schema 17，完整只读范围为 1–17；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation 候选写 11/12/13/14/15/16，都不能回接 schema 17。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -382,6 +382,7 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 | `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 配额；默认 `0 / 8 / 2`。`cpus_total=0` 时仅以 `max_cpu_jobs` 限 CPU-only 并发 |
 | `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
 | `storage_admission` | 候选 opt-in 磁盘/inode/可知用户 quota 准入；默认 enabled=false，其余余量/unknown 策略见 [存储合同](storage-admission.md)，支持热更新 |
+| `lease_validation` | 候选冷配置；默认 mode=auto、unknown_policy=pause、interval_sec=30；有 Slurm 来源时失效/未知停新派发，详见 [租约合同](daemon-lease.md) |
 | `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
 | `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|
@@ -615,12 +616,18 @@ dispatcher；加 `--supervise` 可在满足所有权条件时自动重启，不�
 因此必须从目标计算租约内启动。重连既有持久 owner 不会改变它及其任务的资源上下文，
 不能视为迁移到新 daemon 的租约。screen/tmux 只是进入既有租约的操作通道，
 并不是资源边界。`cpus_total` 与 `resources.cpus` 仅用于 sched 内部
-并发记账；当前实现不创建子 cgroup，也不设置 CPU affinity。资源继承只发生在启动时：
-当前版本不持久记录 Slurm job/cgroup 启动来源，也不持续验证外部租约是否仍有效。若旧
-screen/租约被删除但 daemon 仍存活，它不会自动绑定后续新租约；进程退出后也无法可靠
-追溯当时来源。后续开发项见 [`next-development.md`](next-development.md)。
+并发记账；当前实现不创建子 cgroup，也不设置 CPU affinity。资源继承只发生在启动时。
+候选 schema 17 保存白名单 Slurm/job/step、affinity/cgroup 启动来源与检查/退出事实；
+默认 auto 对有 Slurm 来源的 daemon 持续校验，未知默认暂停、已确认失效锁存停止新派发，
+不杀 running、不自动迁移新租约。通用 system cgroup 不能宣称 valid；旧 daemon 不补造来源，
+硬杀/DB 不可写可能缺失退出记录。显式查询、策略和恢复边界见 [daemon-lease](daemon-lease.md)。
 
 ### 稳定 JSON 与跨主机读取
+
+候选 `daemon-lease --json` 与显式 `daemon status --json --include-lease` 另协商
+`sched-daemon-lease-v1`，通过私有 DB/WAL 快照查询已记录来源/检查/退出，不探测
+Slurm、不迁移旧库、不授予派发权；默认 daemon status 仍不打开 DB，默认
+status/task/history/wait_reason 不变。字段、分页与容量见 [租约合同](daemon-lease.md)。
 
 - `project list --json` 输出 `{"schema_version":1,"projects":[...]}`；每项含 `name`、有效布尔值 `gpu_enabled`、整数 `gpu_quota`（省略或 null 归一为 0）、`gpu_access:"disabled"|"unlimited"|"limited"`、`gpu_used`、`priority`、`colocate`、`max_jobs`、`gpu_affinity`、`root`。禁用不清空原配额，`gpu_used` 仍显示运行中的 GPU job 数。
 - `project_gpu_disabled` 仅用于排队 GPU 任务，优先于 quota/dependency 等待原因；任务状态仍为 `pending`。这扩展了 schema 1 的等待原因枚举，启用此功能前应同步更新 `dsh-node-sched`，旧插件的严格校验会拒绝新值。

@@ -378,6 +378,7 @@ CONFIG_COLD_KEYS = (
     "user",
     "schema_version",
     "native_exec_profiles", "execution_backends",
+    "lease_validation",
 )
 
 
@@ -573,8 +574,12 @@ class Dispatcher:
                 "physical_host": physical_host,
             }
             self._lease_id = self._lease_owner["lease_id"]
+            created_monitor = None
             try:
                 self._publish_lock_owner()
+                from .cluster_lease import Monitor
+                self._cluster_lease = Monitor(self.cfg, self._lease_owner)
+                created_monitor = self._cluster_lease
                 self._atomic_write(self.pid_file, str(pid))
                 # H2: sample the old heartbeat before publishing the new heartbeat.
                 try:
@@ -582,7 +587,12 @@ class Dispatcher:
                 except OSError:
                     self._prev_hb_ts = None
                 self._touch_heartbeat()
-            except OSError:
+            except (OSError, ValueError, state.StateError, sqlite3.Error):
+                if created_monitor is not None:
+                    try:
+                        created_monitor.finish("startup_publication_failed_not_worker_wait")
+                    except (OSError, ValueError, state.StateError, sqlite3.Error):
+                        self.log_line("startup lease exit evidence unavailable")
                 self._remove_exact_lock(self._lease_owner)
                 self._lease_owner = None
                 self._lease_id = None
@@ -804,8 +814,14 @@ class Dispatcher:
         # Keep replacement serialized until all shared lease sidecars are gone;
         # otherwise an exiting owner could unlink its successor's PID/heartbeat.
         with self._serialized_lock_update():
+            monitor = getattr(self, "_cluster_lease", None)
             if not self._remove_exact_lock(owner):
                 return
+            if monitor is not None:
+                try:
+                    monitor.finish("requested_stop" if self._stop_requested else "graceful_lease_release")
+                except (OSError, ValueError, state.StateError, sqlite3.Error) as error:
+                    self.log_line(f"lease exit evidence unavailable: {error}")
             try:
                 os.unlink(self.pid_file)
             except OSError:
@@ -1019,6 +1035,12 @@ class Dispatcher:
         while True:
             if not self._owns_current_lease():
                 self.log_line("dispatcher lease 已丢失，停止旧实例")
+                monitor = getattr(self, "_cluster_lease", None)
+                if monitor is not None:
+                    try:
+                        monitor.finish("dispatcher_lease_lost_not_worker_wait")
+                    except (OSError, ValueError, state.StateError, sqlite3.Error):
+                        self.log_line("lost lease exit evidence unavailable")
                 break
             try:
                 self._heartbeat()
@@ -1170,6 +1192,10 @@ class Dispatcher:
 
     def _tick(self) -> None:
         self._maybe_reload_config()  # B12-a: 配置热更新 (mtime 变化时)
+        monitor = getattr(self, "_cluster_lease", None)
+        if monitor is not None:
+            monitor.update()
+            self._notify_invalid_lease(monitor)
         self._drain_submit_inbox()  # C2: 单写者 inbox 文件补插请求行
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
         self._prune_control_requests()  # L11: 有界保留已完成控制请求
@@ -1230,6 +1256,31 @@ class Dispatcher:
             thread = threading.Thread(target=recovery_watch.deliver, args=(self.cfg, self.log_line), name="recovery-notify", daemon=True)
             thread.start()
             self._notify_threads.append(thread)
+
+    def _notify_invalid_lease(self, monitor):
+        if not monitor.invalid_latched or monitor.notice_started or "lease_invalid" not in (self.cfg.get("notify") or {}).get("on", []):
+            return
+        monitor.notice_started = True
+        event = {"event": "lease_invalid", "event_id": "lease-invalid-" + monitor.owner["lease_id"],
+                 "batch": "daemon", "batch_id": None, "project": None, "node": state.hostname(),
+                 "lease_id": monitor.owner["lease_id"], "allocation_state": "invalid", **monitor.decision}
+        cfg = self.cfg
+        def deliver():
+            from .cluster_lease import event as lease_event
+            try:
+                results = notify.send(event, cfg)
+                with state.connect() as conn:
+                    lease_event(conn, monitor.owner["lease_id"], "notification", {
+                        "event_id": event["event_id"], "channel_count": len(results),
+                        "success_count": sum(result.startswith("ok:") for result in results),
+                        "semantics": "best_effort_notification_not_execution_wait"})
+            except Exception:
+                # Do not include channel errors: they may contain destinations
+                # or credentials. Notification failure never authorizes work.
+                self.log_line("lease notification delivery/evidence unavailable")
+        thread = threading.Thread(target=deliver, name="lease-notify", daemon=True)
+        thread.start()
+        self._notify_threads.append(thread)
 
     def _gpu_ignored(self, idx: int) -> bool:
         """gpu-ignore 人工确认标记 (C2 修复): ignore_until 非 NULL = 静默告警.
@@ -4351,6 +4402,9 @@ class Dispatcher:
         from . import resources as admission
         if admission.drain_state() is not None:
             return
+        monitor = getattr(self, "_cluster_lease", None)
+        if monitor is not None and not monitor.update():
+            return
         try:
             gpu_policy = self._read_gpu_policy()
         except RuntimeError as error:
@@ -4743,6 +4797,14 @@ class Dispatcher:
         未启动的正常返回路径: M1 竞态 (已非 pending) 与产物指纹 skip ——
         二者都不该占用 CPU 配额 (skip 密集批次会人为压低并发)。
         """
+        monitor = getattr(self, "_cluster_lease", None)
+        if monitor is not None:
+            if conn.in_transaction:
+                conn.commit()
+            if not monitor.update():
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                return False
         if self._task_has_unresolved_launch_marker(
             conn,
             j["batch_id"],
@@ -4874,6 +4936,16 @@ class Dispatcher:
                         self._release_in_tx(conn, j["id"])
                     return False
                 self._storage_launch_observation = checked
+
+        # Fingerprint/recovery/storage work can outlast a lease observation.
+        # Recheck outside the writer transaction before claiming/cleaning.
+        if monitor is not None:
+            if conn.in_transaction:
+                conn.commit()
+            if not monitor.update():
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                return False
 
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
         # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验

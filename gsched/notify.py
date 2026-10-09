@@ -99,6 +99,8 @@ def build_event(conn, batch, host_dir: str) -> dict[str, Any]:
 
 
 def render_subject(event: dict[str, Any]) -> str:
+    if event["event"] == "lease_invalid":
+        return f"[sched] daemon allocation invalid: {event['lease_id']}"
     if event["event"] == "recovery_no_progress":
         return f"[sched] recovery stalled: {event['job_id']} (round {event['round']})"
     mark = "✅" if event["event"] == "batch_done" else "❌"
@@ -112,7 +114,7 @@ def render_subject(event: dict[str, Any]) -> str:
 
 def render_text(event: dict[str, Any]) -> str:
     """纯文本正文 (email body; inbox JSON 里同字段, 供人读)."""
-    if event["event"] == "recovery_no_progress":
+    if event["event"] in ("recovery_no_progress", "lease_invalid"):
         return json.dumps(event, ensure_ascii=False, indent=2)
     lines = [
         f"批次: {event['batch']} ({event['batch_id']})"
@@ -169,7 +171,7 @@ def _send_file(event: dict[str, Any], _ncfg: dict[str, Any]) -> str:
     safe = re.sub(r"[^0-9A-Za-z_一-鿿-]", "_", event["batch"])
     kind = "done" if event["event"] == "batch_done" else "blocked"
     p = os.path.join(d, f"{ts}-{safe}.{kind}.json")
-    if event["event"] == "recovery_no_progress":
+    if event["event"] in ("recovery_no_progress", "lease_invalid"):
         safe_id = re.sub(r"[^0-9A-Za-z_.-]", "_", event["event_id"])
         p = os.path.join(d, f"{safe_id}.json")
         if os.path.exists(p + ".acked"):

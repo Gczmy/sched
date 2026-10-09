@@ -1698,12 +1698,22 @@ class ReviewProgressRegexTests(DispatcherStateCase):
 
 
 class ReviewDispatcherLockTests(DispatcherStateCase):
+    def setUp(self):
+        super().setUp()
+        # Ownership race fixtures intentionally invent PID/start tokens and do
+        # not exercise cluster provenance; that has dedicated real/pure tests.
+        patcher = mock.patch("gsched.cluster_lease.Monitor")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def lock_dispatcher(self, name: str) -> Dispatcher:
         dispatcher = Dispatcher.__new__(Dispatcher)
         dispatcher.lock_dir = os.path.join(self.tmp.name, f"{name}.lock")
         dispatcher.pid_file = os.path.join(self.tmp.name, f"{name}.pid")
         dispatcher.heartbeat_file = os.path.join(self.tmp.name, f"{name}.heartbeat")
         dispatcher._notify_threads = []
+        dispatcher.cfg = self.cfg
+        dispatcher._stop_requested = False
         dispatcher.log_line = mock.Mock()
         return dispatcher
 

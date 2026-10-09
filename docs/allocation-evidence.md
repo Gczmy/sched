@@ -1,6 +1,6 @@
 # 候选 allocation 与分层执行证据
 
-源码候选合同为 `sched-allocations-v1`，写 schema 16，完整只读 1–16；
+源码候选合同为 `sched-allocations-v1`，引入 schema 16；后续租约候选写 schema 17，当前完整只读 1–17；
 包版本仍为 0.4.0，不代表正式发布或生产已升级。
 
 ## 分配身份

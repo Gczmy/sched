@@ -92,6 +92,7 @@ jobs:
           python tests/run_admission_accept.py
           python tests/run_allocation_accept.py
           python tests/run_storage_accept.py
+          python tests/run_cluster_lease_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh

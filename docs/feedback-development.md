@@ -188,7 +188,25 @@ mock/只读回归通过。源码/脚本摘要已核对一致，测试 daemon 停
 fixture；不填满磁盘、不改 kernel quota、不 mount、不占真实 GPU、不改生产。
 配置读取失败暂停而非把任务误判执行失败；超时 helper 不重复创建，tick 探测预算
 耗尽明确未知。旧库不迁移/补证，strict status/task/history/wait_reason 不变，配套
-插件已只读核对。固定提交完整 CI 尚待确认；完整合同见 [storage-admission](storage-admission.md)。
+插件已只读核对。固定提交 `4363c66233be6b69ce11b70e997f6a8210a0a7ab` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37868471261) 14 项全部成功；
+完整合同见 [storage-admission](storage-admission.md)。
+
+ND-02 候选新增 schema 17 不可变出生/校验/退出历史与独立 daemon-lease；默认
+健康 JSON 不变，嵌套扩展仅显式 include-lease。auto 有 Slurm 来源时校验，
+unknown 默认暂停，确认失效后锁存、不杀 running、不迁移同节点新租约。
+计算节点 [CPU/CLI 验收](../tests/run_cluster_lease_accept.py) 通过：真实来源观察
+明确 unknown 且默认 pause 不创建 allocation/worker；测试夹具改变控制器回答后
+停新派发、运行中 CPU child 自然完成、
+allocation 关联精确 daemon lease、通知 CLI 确认、后续 RUNNING 不能恢复；仅显式
+私有重启后排队任务运行一次，历史保持不变。不取消真实租约，不占真实 GPU，
+不改生产。最终验收脚本 SHA256 为
+`f215d65b7f0d0966f0826a9d3872b2c23557631d5d124d1f747106d87f61cb87`；
+计算节点系统 Python 3.12.3 回归运行 810 条，801 通过、9 条 native 不可用跳过；
+本地相关 mock/只读回归 76 条通过（其中租约专项 24 条）。初次 Conda 解释器缺少
+memfd_create 导致 3 条既有执行 backend 回归报错，切换支持该能力的系统解释器后
+最终全部通过；没有用兼容降级掩盖该环境差异。源码/脚本摘要核对一致。
+完整 CI 尚待本项固定提交确认；合同与仍未覆盖的真实租约结束/硬隔离边界见 [daemon-lease](daemon-lease.md)。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -201,9 +219,9 @@ fixture；不填满磁盘、不改 kernel quota、不 mount、不占真实 GPU�
 | 8 | bounded 精确事实/成组 pending-only cancel | 候选 CI/计算节点 CPU 通过 | 单次源批次 CAS；核对所有代际启动记录；中断/竞争/同 RID 恢复 |
 | 9 | admission explain/装箱解释 | 候选 CI/计算节点 CPU 通过 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
 | 10 | allocation 身份/分层失败 | 候选 CI/计算节点 CPU 通过 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
-| 11 | 磁盘/inode/quota 准入 | 候选计算节点 CPU 通过，CI 待确认 | 控制面余量；unknown 明确；容量不足不删科学产物 |
+| 11 | 磁盘/inode/quota 准入 | 候选 CI/计算节点 CPU 通过 | 控制面余量；unknown 明确；容量不足不删科学产物 |
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
-| ND-02 | 租约来源持久化/持续验证 | 未实现 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
+| ND-02 | 租约来源持久化/持续验证 | 候选计算节点 CPU 通过，CI 待确认 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 未实现 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
 | 硬隔离 | per-job affinity/cgroup | 未实现 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 

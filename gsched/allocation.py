@@ -133,6 +133,10 @@ def reserve(conn, job_id, spec, dispatcher):
                "semantics": "launch_intent_not_process_birth", "hard_isolation": False,
                "lease_identity": None, "worker_identity": None, "observed_at": state.now()}
     storage = getattr(dispatcher, "_storage_launch_observation", None)
+    lease = getattr(dispatcher, "_cluster_lease", None)
+    if lease is not None:
+        payload["lease_identity"] = {"lease_id": lease.owner["lease_id"], "instance_id": lease.origin["instance_id"],
+                                     "recorded_allocation_state": lease.decision["allocation_state"]}
     if (isinstance(storage, dict) and storage.get("allowed") is True and storage.get("job_id") == job_id
             and storage.get("spec_sha256") == digest(spec)):
         payload["storage_filesystems"] = [item["filesystem_id"] for item in storage["filesystems"] if "task" in item["roles"]]

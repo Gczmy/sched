@@ -56,6 +56,12 @@ def main() -> int:
         d.run()
     except Exception as e:
         print(f"[daemon] 异常退出: {e}", file=sys.stderr)
+        monitor = getattr(d, "_cluster_lease", None)
+        if monitor is not None:
+            try:
+                monitor.finish("exception_exit_no_worker_wait")
+            except Exception:
+                print("[daemon] 租约退出证据不可写，保留最后观察", file=sys.stderr)
         return 1
     return 0
 

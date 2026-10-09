@@ -149,7 +149,7 @@ class ReviewLifecycleRaceTests(TempStateCase):
     def test_dispatcher_publishes_and_daemon_parses_physical_host(self) -> None:
         dispatcher = Dispatcher(self.cfg, fake=True)
         self.addCleanup(dispatcher.log.close)
-        with mock.patch("socket.gethostname", return_value=" compute-a "), mock.patch.object(
+        with mock.patch("gsched.cluster_lease.Monitor"), mock.patch("socket.gethostname", return_value=" compute-a "), mock.patch.object(
             dispatcher,
             "_proc_start_time",
             return_value="proc:lease",

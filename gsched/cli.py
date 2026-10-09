@@ -1907,6 +1907,40 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         state.set_read_only(False)
 
 
+def _daemon_lease_snapshot(*, lease_id=None, limit=20, cursor=None, after_seq=0, current=False):
+    from .cluster_lease import query
+    from .integration import CONTRACTS, instance_id
+    from .daemon import _read_lease_owner
+    state.set_read_only(True)
+    try:
+        load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            if current and conn.execute("PRAGMA user_version").fetchone()[0] >= 17:
+                owner = _read_lease_owner()
+                latest = conn.execute("SELECT lease_id FROM daemon_leases ORDER BY rowid DESC LIMIT 1").fetchone()
+                lease_id = owner["lease_id"] if owner else latest[0] if latest else None
+                # An older owner can lack provenance; do not fabricate birth.
+                if lease_id and conn.execute("SELECT 1 FROM daemon_leases WHERE lease_id=?", (lease_id,)).fetchone() is None:
+                    return {"schema_version": 1, "contract": CONTRACTS["daemon_lease"], "available": False,
+                            "reason": "origin_not_recorded", "leases": [], "effect": "none", "admission_granted": False}
+            return {"schema_version": 1, "query": "daemon_lease", "contract": CONTRACTS["daemon_lease"],
+                    "instance_id": instance_id(conn), "effect": "none", "admission_granted": False,
+                    **query(conn, lease_id=lease_id, limit=limit, cursor=cursor, after_seq=after_seq)}
+    finally:
+        state.set_read_only(False)
+
+
+def cmd_daemon_lease(args: argparse.Namespace) -> int:
+    try:
+        result = _daemon_lease_snapshot(lease_id=args.lease_id, limit=args.limit, cursor=args.cursor, after_seq=args.after_seq)
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0
+    except (ValueError, ConfigError, state.StateError, TypeError, KeyError, RecursionError, sqlite3.Error) as error:
+        print(f"错误: daemon-lease 查询失败: {error}", file=sys.stderr)
+        return 1
+
+
 def cmd_storage_explain(args: argparse.Namespace) -> int:
     from .storage import explain
     from .integration import CONTRACTS, instance_id
@@ -4226,6 +4260,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon
 
     try:
+        if getattr(args, "include_lease", False) and (args.action != "status" or not getattr(args, "json", False)):
+            raise ValueError("--include-lease 仅用于 daemon status --json")
         if getattr(args, "json", False) and args.action not in ("status", "check"):
             raise ValueError("--json 仅用于 daemon status/check")
         if getattr(args, "stop_when_idle", False) and args.action != "drain":
@@ -4268,7 +4304,10 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             ) else 0
         if args.action == "status":
             if getattr(args, "json", False):
-                print(json.dumps({"schema_version": 1, **daemon.health_snapshot()}, ensure_ascii=False))
+                result = {"schema_version": 1, **daemon.health_snapshot()}
+                if getattr(args, "include_lease", False):
+                    result["lease"] = _daemon_lease_snapshot(current=True, limit=1)
+                print(json.dumps(result, ensure_ascii=False))
             else:
                 print(daemon.status_str())
             return 0
@@ -5440,9 +5479,18 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("command", nargs="+")
         p.set_defaults(fn=cmd_request if request_command == "request" else cmd_request_validate)
 
+    p = sub.add_parser("daemon-lease", help="只读已记录 daemon 启动/租约事实，不探测 Slurm 或授予执行权")
+    p.add_argument("--lease-id")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor")
+    p.add_argument("--after-seq", type=int, default=0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_daemon_lease)
+
     p = sub.add_parser("daemon", help="daemon 生命周期")
     p.add_argument("action", choices=["start", "stop", "status", "check", "drain", "resume", "foreground"])
     p.add_argument("--json", action="store_true", help="status/check: 结构化健康状态或前置检查")
+    p.add_argument("--include-lease", action="store_true", help="status --json: 显式增加已记录租约扩展；默认契约不变")
     p.add_argument("--supervise", action="store_true", help="foreground: restart only after unexpected owned-child exit")
     p.add_argument("--restart-delay-sec", type=float, default=None)
     p.add_argument("--max-restarts", type=int, default=None, help="foreground: 0 means unlimited restarts")
@@ -5482,7 +5530,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease"}:
         return args.fn(args)
     if command == "request":
         try:

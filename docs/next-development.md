@@ -56,7 +56,7 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
   这是已提交的源码候选，不代表新版本发布、Linux 全矩阵或生产部署通过。DB schema 仍为 10，
   默认批次失败策略、名称依赖、真实 wait、资源结算及未知请求守卫未改变。
 - 后续失败隔离源码候选加入 opt-in `failure_policy` 和 `batch-policy` 独立合同。
-  该阶段引入 schema 11；后续首次验证/复验/精确依赖/任务 DAG/allocation 候选写 12/13/14/15/16（当前完整只读 1–16）；默认 freeze 保留，旧 blocked 不自动重开。
+  该阶段引入 schema 11；后续首次验证/复验/精确依赖/任务 DAG/allocation/租约候选写 12/13/14/15/16/17（当前完整只读 1–17）；默认 freeze 保留，旧 blocked 不自动重开。
   策略写操作通过 batch CAS request，显式 --reopen 不重试失败任务。该阶段本身没有任务 DAG，
   不包含不可变复验/结算。CI/计算节点验收与发布状态分别见交付清单。
 - 后续候选追加不可变首次 dispatcher 产物验证和 `artifact-validations` 只读查询。
@@ -118,27 +118,31 @@ OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策�
 
 ## ND-02：持久化并校验 daemon 的集群租约来源
 
-**状态：待设计、未实现。** 当前 daemon lease 只用于确认进程身份，没有持久记录
-Slurm job、step、cgroup、cpuset 或启动 shell 的资源上下文，`daemon status` 也不展示
-这些信息。
+**状态：源码候选已实现，计算节点隔离 CPU/CLI 验收通过；完整 CI 待确认，未部署生产。**
+schema 17 保存白名单 Slurm/job/step、UID、affinity/cgroup 与启动/检查/退出事实；
+auto 模式有 Slurm 来源时持续验证，unknown 默认停新派发，确认 invalid 后锁存，
+不杀 running、不自动绑定新租约。默认健康 JSON 不变，显式 include-lease 与
+独立 daemon-lease 私有快照查询见 [合同](daemon-lease.md)。
+通用 system cgroup 明确 unknown，不能仅凭 RUNNING 或环境断言归属。
+旧 daemon 不补造来源，硬杀/DB 不可写时可能缺失退出事件；保留最后观察而非补造 wait。
 
 ### 匿名化历史场景
 
 daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 被删除、旧租约
 关闭，但脱离 TTY 的 daemon 在该环境下继续运行。后来同节点创建了新租约，
 旧 daemon 不会自动感知或绑定新租约，直至按 idle timeout 自动退出。进程退出后，现有
-sidecar 与日志不足以百分之百还原它当时属于哪个 Slurm job/cgroup。
+当时的 sidecar 与日志不足以百分之百还原它属于哪个 Slurm job/cgroup。
 
 这说明“启动时继承 allocation/cgroup”与“租约生命周期持续有效”是两个独立条件；
 `start_new_session=True` 本身既不会申请新租约，也不会完成租约迁移或有效性验证。
 
-### 目标行为
+### 原目标与候选实现边界
 
 1. daemon 发布 lease 时原子持久化最小、白名单化的启动来源：`started_at`、
    `physical_host`、PID/start token、`SLURM_JOB_ID`、`SLURM_STEP_ID`、Slurm 声明的 CPU
    数量、`sched_getaffinity(0)`/`Cpus_allowed_list` 结果及 cgroup 标识。禁止保存完整环境，
    避免把令牌或其他秘密写入 state。
-2. 扩展现有 `sched daemon status --json`，兼容已有身份与健康字段，展示持久化来源、当前可见来源和
+2. 通过显式 `sched daemon status --json --include-lease` 扩展查询，默认已有字段不变，展示持久化来源、已记录当前来源和
    `allocation_state=valid|invalid|unknown`；daemon 已退出后仍保留最后一次启动与退出
    上下文供审计，而不是只剩无法归属的历史日志。现有 lease 已记录 `physical_host`、
    PID/start token 与 lease ID，缺口是 Slurm/资源上下文及退出后的来源保留。

@@ -189,3 +189,14 @@ NULL 指针及 revision/回队清空触发器。迁移不生成历史分配/退�
 新 validation key 按 allocation 区分同版本 retry，旧 key/证据不改写。
 独立查询、上限和真实 wait/监控/产物边界见 [allocation-evidence](allocation-evidence.md)；
 生产排空、安装和切换须另行授权，CPU/fake-GPU 验收不证明真实 CUDA/worker 归属。
+
+## 后续候选 daemon 租约 schema 17
+
+新增空 daemon_leases/daemon_lease_events、查询索引与不可变/保留触发器；旧库不
+补造出生/租约事实，不改变任务/原 wait/执行身份、allocation、请求或 instance。
+首次就绪前原子持久化最小来源与首次校验；默认 auto 有 Slurm 来源时执行验证，
+未知默认暂停。部署前须检查目标租约实际 job/step cgroup，不能只凭 RUNNING 或环境
+宣称有效；显式 observe/unknown allow 是降低保护，不是修复隔离。
+完整 schema 1–17 只读不迁移，schema 10–16 writer 不能回接新写库；回退只能使用
+升级前恢复点，禁止删来源/事件或降低 user_version。新查询与告警/退出保留合同见
+[daemon-lease](daemon-lease.md)。真实 lease 结束测试、真实 CUDA 与生产切换另行授权。
