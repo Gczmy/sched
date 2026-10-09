@@ -161,10 +161,12 @@ daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 
 任务上回退到 `max_cpu_jobs` 并发计数；正整数仅做声明值求和，不会设置 affinity 或
 子 cgroup。
 
-通用执行层另提供 [候选启动约束原语](execution-constraints.md)：三个 backend 在用户
-exec 前应用显式 CPU 集合和保留 cgroup FD，失败不降级。它尚未接入 scheduler
-配置、allocation CPU 分配、scope 持久绑定/清理/恢复或设备策略，不代表 per-job
-硬隔离已经完成；当前计算环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
+通用执行层提供 [候选启动约束原语](execution-constraints.md)：三个 backend 在用户
+exec 前应用显式 CPU 集合和保留 cgroup FD，失败不降级。后续
+[scheduler CPU 亲和候选](cpu-isolation.md) 接入显式冷配置、schema 18 的不可变
+allocation CPU 绑定/活动 claim、原清理事实释放与持久 owner 重连；应用可主动扩大
+affinity，不能称为硬隔离。scope 持久绑定/清理/恢复和设备策略仍未实现；当前计算
+环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
 
 ### 已确认的设计方向
 

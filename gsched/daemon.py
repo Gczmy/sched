@@ -627,6 +627,23 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
         from .execution.preflight import deployment_checks
         issues.extend(deployment_checks(cfg))
 
+    from .cpu_isolation import policy as cpu_isolation_policy
+    if cpu_isolation_policy(cfg)["mode"] == "affinity":
+        try:
+            from .execution import LaunchConstraints, LinuxFdBackend, CONSTRAINTS_VERSION
+            from .execution_policy import sealed_bytes
+            cpus = tuple(sorted(os.sched_getaffinity(0)))
+            LaunchConstraints(cpu_affinity=cpus[:1]).validate()
+            descriptor = sealed_bytes(b"{}", "sched-cpu-affinity-preflight")
+            os.close(descriptor)
+            if cfg.get("execution_backends") and getattr(LinuxFdBackend()._module, "constraints_interface_version", None) != CONSTRAINTS_VERSION:
+                raise ValueError("native launch constraints interface absent")
+        except Exception as error:
+            add("CPU affinity", str(error), "fail", check_id="cpu_affinity_primitives")
+        else:
+            add("CPU affinity", "kernel affinity and sealed bootstrap available; lease/claims still rechecked at launch",
+                check_id="cpu_affinity_primitives")
+
     # 用户身份 (H2)
     import getpass
 

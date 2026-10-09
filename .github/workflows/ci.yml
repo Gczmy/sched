@@ -55,9 +55,9 @@ jobs:
   python:
     name: Python ${{ matrix.python }}
     runs-on: ubuntu-24.04
-    # The compute-only CLI sequence now includes bounded storage admission;
-    # the previous sequence already takes about 13 minutes on Python 3.10.
-    timeout-minutes: 20
+    # Bounded CPU affinity adds an independent CLI lifecycle to the existing
+    # lease/storage sequence; fault-injected native reconnect runs separately.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +94,7 @@ jobs:
           python tests/run_storage_accept.py
           python tests/run_cluster_lease_accept.py
           python tests/run_cpu_capacity_accept.py
+          python tests/run_cpu_isolation_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh
@@ -101,7 +102,7 @@ jobs:
   native:
     name: Native Python ${{ matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -133,6 +134,8 @@ jobs:
         run: python tests/run_capability_denial_accept.py
       - name: Public execution CLI lifecycle
         run: python tests/run_execution_accept.py
+      - name: CPU affinity claims and persistent-owner crash/reconnect
+        run: python tests/run_cpu_isolation_accept.py
 
   candidate:
     name: Candidate Python ${{ matrix.python }} / ${{ matrix.os }}

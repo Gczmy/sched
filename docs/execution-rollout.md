@@ -200,3 +200,13 @@ NULL 指针及 revision/回队清空触发器。迁移不生成历史分配/退�
 完整 schema 1–17 只读不迁移，schema 10–16 writer 不能回接新写库；回退只能使用
 升级前恢复点，禁止删来源/事件或降低 user_version。新查询与告警/退出保留合同见
 [daemon-lease](daemon-lease.md)。真实 lease 结束测试、真实 CUDA 与生产切换另行授权。
+
+## 后续候选 CPU 亲和 schema 18
+
+默认关闭的 cpu_isolation.mode=affinity 是冷配置，以原子迁移新增空 CPU claim 表、
+索引和更新禁止触发器；不补造旧任务绑定，不改 instance、wait 或历史 allocation。
+只读完整 schema 1–18 不迁移，旧 writer 不能回接 schema 18。回退只能使用已验证
+的升级前恢复点，禁止删 claim/事件、降低 user_version 或重新 start 旧 owner。
+持久重连保留旧 claim/mask，不能视作迁移租约。当前亲和不是 cgroup 硬限制；
+安装前核对实际合同/native 约束接口，启用前在授权租约内 drain/显式重启并验收。
+详见 [CPU 亲和](cpu-isolation.md)；真实 cgroup/设备、CUDA 和生产切换仍另行授权。

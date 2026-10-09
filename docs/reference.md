@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前 daemon 租约来源源码候选写 schema 17，完整只读范围为 1–17；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation 候选写 11/12/13/14/15/16，都不能回接 schema 17。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前 CPU 亲和源码候选写 schema 18，完整只读范围为 1–18；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约候选写 11/12/13/14/15/16/17，都不能回接 schema 18。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -184,8 +184,12 @@ daemon 观测最多有效 90 秒，fresh VRAM 仍只有效 5 秒；未来时间�
 最终 CAS/内核权限仍需派发时核验，unchecked_dispatch_gates 明确列出；旧失败/等待的
 科学原因也不能由此补判成功。retry 退避、批次状态、当前代际和 drain 单独显示。
 
-CPU/内存/显存都是调度器声明预留，不是 per-job affinity/cgroup 硬限制。cpus_total=0
-仍只回退 CPU-only 并发，不限制 GPU 任务的 CPU 总量；GPU quota=0 仍是无限制。
+CPU/内存/显存预算是调度器声明预留，不是不可越界的 per-job cgroup 硬限制。
+默认 off 时 cpus_total=0 仍只回退 CPU-only 并发，不限制 GPU 任务的 CPU 总量；
+显式启用候选 [CPU 亲和](cpu-isolation.md) 后，有限 CPU-ID 池是独立 gate，
+admission-explain 增加 cpu_isolation 并复用池/claim 判断，池满仍报告 CPU 拒绝。
+精确原 owner 的租约检查最多有效 45 秒，缺失/过期/配置滞后为 unknown，不探测网关。
+GPU quota=0 仍是无限制。
 旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。
 后续存储源码候选在该查询嵌套独立 storage 报告，复用存储派发决策；相关必需证据
 未知时 resource_fit 为 null。`sched storage-explain <batch>:<task> [--version N] --json`
@@ -381,6 +385,7 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 | `co_locate / co_locate_safety / co_locate_max_jobs / co_locate_freeze_pct` | 共享总开关与阈值；默认 `false / 0.7 / 3 / 85` |
 | `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 预留预算；默认 `0 / 8 / 2`。零值只限 CPU-only 并发；显式 `"auto"` 使用原租约/affinity 的保守容量；固定正值超已知边界告警 |
 | `cpus_auto_max` | 候选 auto 的可选正整数上限 1..1048576，默认 null；非 auto 必须省略/null；可热更 |
+| `cpu_isolation` | 候选 schema 18 显式冷配置，mode=off（默认）或 affinity；按原 allocation 预留独立 CPU 集合，不是 cgroup 硬隔离，详见 [CPU 亲和](cpu-isolation.md) |
 | `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
 | `storage_admission` | 候选 opt-in 磁盘/inode/可知用户 quota 准入；默认 enabled=false，其余余量/unknown 策略见 [存储合同](storage-admission.md)，支持热更新 |
 | `lease_validation` | 候选冷配置；默认 mode=auto、unknown_policy=pause、interval_sec=30；有 Slurm 来源时失效/未知停新派发，详见 [租约合同](daemon-lease.md) |
@@ -621,7 +626,10 @@ dispatcher；加 `--supervise` 可在满足所有权条件时自动重启，不�
 因此必须从目标计算租约内启动。重连既有持久 owner 不会改变它及其任务的资源上下文，
 不能视为迁移到新 daemon 的租约。screen/tmux 只是进入既有租约的操作通道，
 并不是资源边界。`cpus_total` 与 `resources.cpus` 仅用于 sched 内部
-并发记账；当前实现不创建子 cgroup，也不设置 CPU affinity。资源继承只发生在启动时。
+并发记账；默认不创建子 cgroup、不设置 CPU affinity。候选显式 cpu_isolation.mode=affinity
+在用户 exec 前设置并核对原 claim 的 CPU mask，应用仍可扩大 affinity，不是硬 cpuset。
+资源继承只发生在启动时；只读 `sched cpu-isolation --json` 查询原活动 claim，完整合同见
+[CPU 亲和](cpu-isolation.md)。不会创建子 cgroup 或修改父 Slurm 资源。
 候选 schema 17 保存白名单 Slurm/job/step、affinity/cgroup 启动来源与检查/退出事实；
 默认 auto 对有 Slurm 来源的 daemon 持续校验，未知默认暂停、已确认失效锁存停止新派发，
 不杀 running、不自动迁移新租约。通用 system cgroup 不能宣称 valid；旧 daemon 不补造来源，

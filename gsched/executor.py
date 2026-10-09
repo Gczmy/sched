@@ -761,7 +761,7 @@ class Executor:
         self._execution_owners: dict[str, Any] = {}
 
     def prepare_configured_execution(self, job_id: str, spec: dict, profile: dict,
-                                     identity: dict, gpu: int | None, log_path: str):
+                                     identity: dict, gpu: int | None, log_path: str, *, constraints=None):
         if job_id in self._execution_prepared or job_id in self._execution_owners:
             raise ValueError("execution attempt is already retained")
         if profile["kind"] == "linux_fd_owner":
@@ -801,7 +801,8 @@ class Executor:
                                "prepare_timeout": retention["prepare_timeout_sec"],
                                "terminal_retention": retention["terminal_retention_sec"]}
                 prepared = backend.prepare(ExecutionEnvelope(tuple(profile["argv"]), env),
-                                           executable_fd=executable, cwd_fd=root, fd_bindings=bindings, **options)
+                                           executable_fd=executable, cwd_fd=root, fd_bindings=bindings,
+                                           **options, **({"constraints": constraints} if constraints is not None else {}))
             self._execution_prepared[job_id] = prepared
             self._execution_owners[job_id] = prepared.owner
             return prepared
@@ -917,6 +918,7 @@ class Executor:
         native_exec_profile_id: str | None = None,
         native_exec_profile_sha256: str | None = None,
         native_exec_submitted_argv: list[str] | None = None,
+        constraints=None,
     ) -> int:
         """启动任务. 返回 wrapper 进程 PID (pgid 锚点).
 
@@ -1115,6 +1117,7 @@ class Executor:
                 ExecutionEnvelope(tuple(wrapper_cmd), merged_env, cwd),
                 stdout_fd=log_f.fileno(), stderr_fd=log_f.fileno(),
                 pass_fds=tuple(popen_kwargs.get("pass_fds", ())), start_new_session=True,
+                **({"constraints": constraints} if constraints is not None else {}),
             )
             proc = prepared.launch().process
             self._supervisor_waits.pop(proc.pid, None)

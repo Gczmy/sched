@@ -46,6 +46,7 @@
 | `docs/recovery-policy.md` | 候选 checkpoint/smoke、新版本 FIFO、显存准入与前台守护 |
 | `docs/recovery-acceptance.md` | 候选恢复故障/兼容矩阵与非生产 GPU 验收 |
 | `docs/execution-api.md` | 公开 execution backend 注册、输入 FD 与可选 native 构建 |
+| `docs/cpu-isolation.md` | 候选显式 per-job CPU affinity、原 allocation claim、释放/恢复与非 cgroup 边界 |
 | `docs/persistent-execution-owner.md` | 可选持久 owner 的身份、认证重连、冷配置保留期与已记录健康 |
 | `docs/execution-rollout.md` | 独立发布、安装与 schema 回退边界 |
 | `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
@@ -86,6 +87,7 @@
 | `gsched/state.py` | SQLite WAL、私有只读快照、事务、revision 与请求记录 |
 | `gsched/daemon.py`、`gsched/dispatcher.py` | 生命周期、inbox 消费、恢复、依赖解锁与派发 |
 | `gsched/allocator.py`、`gsched/executor.py` | GPU 探测与分配、任务启动和进程组管理 |
+| `gsched/cpu_isolation.py` | 显式冷配置 CPU claim、启动亲和与共用被动解释决策；不是 cgroup 硬隔离 |
 | `gsched/execution/`、`gsched/execution_policy.py` | 自包含通用执行实现、backend 冷注册与任务文件绑定 |
 | `gsched/_legacy_execution.py` | 历史持久态识别与禁止重放的兼容守卫 |
 | `gsched/schema.py`、`gsched/config.py`、`gsched/templates.py` | 批次与配置校验、runtime 解析、模板展开 |
@@ -151,6 +153,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched artifact-validations <batch>:<task> --json` | 候选首次验证摘要；--validation-id 读取一条完整证据，不检查当前文件或重新结算 |
 | `sched artifact-revalidations <batch>:<task> --json` | 候选复验事件摘要；--event-id 读取一条完整证据；写操作 artifact-revalidate 只能经 task CAS/instance request |
 | `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；check 另按 backend ID 检查文件摘要与项目 root，通过不替代启动校验 |
+| `sched cpu-isolation --json` | 候选已记录活动 CPU claim；不探测、迁移或授予启动权；支持有界实时分页 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |

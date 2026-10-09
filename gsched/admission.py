@@ -35,6 +35,8 @@ def policy_context(cfg):
                 "co_locate_safety": 0.7, "co_locate_max_jobs": 3, "host_mem_total_gib": 0,
                 "host_mem_reserve_gib": 16, "host_mem_default_gib": 8, "gpus": []}
     result = {key: cfg.get(key, default) for key, default in defaults.items()}
+    from .cpu_isolation import policy as isolation_policy
+    result["cpu_isolation"] = isolation_policy(cfg)
     fields = {"gpu_quota": 0, "priority": 0, "gpu_affinity": [], "gpu_affinity_hard": False,
               "gpu_enabled": True, "colocate": True}
     result["projects"] = {name: {**{key: item.get(key, default) for key, default in fields.items()},
@@ -202,6 +204,16 @@ def explain(conn, cfg, batch, job, spec):
     gpu = gpu_plan(conn, adapter, job["id"], spec, project) if not cpu_only else None
     reasons = list(budget["reasons"])
     unknown = list(budget["unknown"])
+    from .cpu_isolation import policy as isolation_policy, recorded_selection
+    isolation = None
+    if isolation_policy(cfg)["mode"] == "affinity":
+        isolation = recorded_selection(conn, cfg, adapter._task_cpus(spec), job_id=job["id"])
+        if isolation["allowed"] is None:
+            unknown.append(isolation["reason"])
+        elif not isolation["allowed"]:
+            reasons.append("cpu")
+        if error:
+            unknown.append(error)
     from . import storage
     storage_check = storage.explain(conn, cfg, job, spec)
     reasons.extend(storage_check["reasons"])
@@ -252,12 +264,13 @@ def explain(conn, cfg, batch, job, spec):
             "budget": budget, "gpu": gpu, "reasons": list(dict.fromkeys(reasons)), "unknown": sorted(set(unknown)),
             "order": {"rank_before_gates": rank, "truncated": order_truncated, "limit": MAX_READY,
                       "policy": "project_priority_desc_batch_priority_desc_fifo", "preemption": False, "smaller_jobs_may_backfill": True},
-            "resource_fit": None if unknown else budget["allowed"] and (gpu is None or gpu["allowed"]) and storage_check["allowed"] is True,
+            "resource_fit": None if unknown else budget["allowed"] and (gpu is None or gpu["allowed"]) and storage_check["allowed"] is True and (isolation is None or isolation["allowed"] is True),
             "unchecked_dispatch_gates": external, "admission_granted": False, "effect": "none",
             "source": "private_database_snapshot_and_separately_recorded_daemon_observations",
             "hard_isolation": False, "storage": storage_check,
             "disk_inode_quota_admission": "enabled" if storage_check["enabled"] else "disabled",
             "cpu_capacity": cpu_capacity,
+            **({"cpu_isolation": isolation} if isolation is not None else {}),
             "continuous_lease_validation": "daemon_lease_validation_separate_contract"}
 
 

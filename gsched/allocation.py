@@ -91,7 +91,7 @@ def record(conn, job_id, layer, data, *, allocation_id=None):
     return {"event_id": event_id, **payload}
 
 
-def reserve(conn, job_id, spec, dispatcher):
+def reserve(conn, job_id, spec, dispatcher, *, cpu_binding=None):
     from .resources import host_mem_gib
     if not conn.in_transaction:
         raise state.StateError("allocation reservation requires launch transaction")
@@ -138,6 +138,8 @@ def reserve(conn, job_id, spec, dispatcher):
         payload["lease_identity"] = {"lease_id": lease.owner["lease_id"], "instance_id": lease.origin["instance_id"],
                                      "recorded_allocation_state": lease.decision["allocation_state"]}
     capacity = getattr(dispatcher, "_cpu_capacity", None)
+    if cpu_binding is not None:
+        payload["cpu_binding"] = cpu_binding
     if isinstance(capacity, dict):
         payload["cpu_capacity"] = capacity
     if (isinstance(storage, dict) and storage.get("allowed") is True and storage.get("job_id") == job_id
@@ -148,6 +150,9 @@ def reserve(conn, job_id, spec, dispatcher):
     encoded = _bounded(payload)
     conn.execute("INSERT INTO allocations VALUES(?,?,?,?,?)", (identifier, job_id, ordinal, encoded, digest(payload)))
     conn.execute("UPDATE jobs SET allocation_id=? WHERE id=?", (identifier, job_id))
+    if cpu_binding is not None:
+        from .cpu_isolation import reserve as reserve_cpu
+        reserve_cpu(conn, identifier, job_id, cpu_binding)
     record(conn, job_id, "resource", {"event": "reservation_committed", "hard_isolation": False,
                                     "physical_ownership_verified": False})
     return identifier

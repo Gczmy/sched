@@ -1,7 +1,8 @@
 # 候选 CPU 自动容量与声明预留
 
-这是 schema 17 源码候选，尚未部署到生产。实际接收端须通过 `identity --json`
-协商 `sched-cpu-capacity-v1`；包版本不代替能力检查。它不实现 per-job affinity/cgroup。
+这是最初引入于 schema 17 的源码候选，尚未部署到生产。实际接收端须通过 `identity --json`
+协商 `sched-cpu-capacity-v1`；包版本不代替能力检查。auto 本身不实现 per-job affinity/cgroup；
+后续 schema 18 的 [显式 CPU 亲和](cpu-isolation.md) 独立启用，也不是 cgroup 硬隔离。
 
 ## 配置和计账
 
@@ -68,7 +69,7 @@ used=null 表示旧运行预留不可确认，不是零使用量。allocation �
 网关 affinity/Slurm。观察最多 64 KiB，hash、instance/node、配置摘要、当前精确 owner
 及 PID/start token 按已有健康规则绑定；过期 45 秒、未来时间、配置落后、owner
 不匹配或观察损坏均为 unavailable。未运行 daemon 的固定/零值只展示配置声明，
-observation.error 明确缺少观察；不伪造当前物理容量。数据库仍为 schema 17。
+observation.error 明确缺少观察；不伪造当前物理容量。auto 本身未新增 schema 17 之外的迁移。
 
 ## 验收边界
 

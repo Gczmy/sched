@@ -293,7 +293,7 @@ class LeaseEvidenceTests(TempStateCase):
             state.set_read_only(False)
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(17, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(expected, instance_id(conn))
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM daemon_leases").fetchone()[0])
 

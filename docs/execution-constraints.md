@@ -1,9 +1,10 @@
 # 候选启动约束原语
 
-这是 per-job affinity/cgroup 工作的第一层，不是已完成的 scheduler 硬隔离功能。
-源码提供通用 `LaunchConstraints` 和 `sched-execution-constraints/v1`；没有新增可用的
-任务 JSON/config 字段、CLI 控制面或数据库迁移。Agent 仍只通过 sched CLI 操作。
-scheduler 的 CPU 分配、scope 创建/持久绑定/清理/恢复与设备策略尚需后续实现。
+这是 per-job affinity/cgroup 工作的通用第一层，不是已完成的 cgroup 硬隔离功能。
+源码提供通用 `LaunchConstraints` 和 `sched-execution-constraints/v1`；该原语本身不
+新增任务字段或迁移。后续 [scheduler 亲和层](cpu-isolation.md) 显式冷配置启用、
+以 schema 18 持久化 CPU 分配/释放，并提供独立 CLI；Agent 仍只通过 sched CLI 操作。
+scope 创建/持久绑定/清理/恢复与设备策略尚需后续实现。
 
 ## 通用 backend 接口
 
@@ -67,8 +68,9 @@ FD 生命周期及 native/持久 owner 重连证据，不能宣称取得真实 c
 
 ## 后续交付，仍属原目标
 
-1. scheduler 显式冷配置与能力检查；未知委派/CPU 边界停止新派发，默认关闭兼容。
-2. 事务前准备最小 scope，持久化 allocation/CPU 集合/inode/job 绑定后才能启动；
+1. scheduler 显式冷配置、能力检查及 CPU claim 已有亲和候选；未知 CPU 边界停新
+   派发，默认关闭兼容。cgroup 委派可用性/控制面仍待实现。
+2. cgroup 模式仍需事务前准备最小 scope，持久化 allocation/CPU 集合/inode/job 绑定后才能启动；
    预约不可冒充生效，真实 child/资源事件独立记录。
 3. 运行、取消、timeout、失效租约、启动失败和 owner 重连共享精确 scope；有进程或
    cleanup 未知就保留资源，不凭 PID/日志补 wait，不迁移旧 scope、不自动重放。

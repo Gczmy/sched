@@ -379,6 +379,7 @@ CONFIG_COLD_KEYS = (
     "schema_version",
     "native_exec_profiles", "execution_backends",
     "lease_validation",
+    "cpu_isolation",
 )
 
 
@@ -969,6 +970,8 @@ class Dispatcher:
                             rc=137 if current["rc"] is None else current["rc"],
                             finished_at=state.now(),
                         )
+                        from .cpu_isolation import release as release_cpu
+                        release_cpu(conn, current, cleanup_source="stop_group_gone")
                         if current["gpu"] is not None:
                             self._release_in_tx(conn, current["id"])
                         settled_rows.append(current)
@@ -2182,6 +2185,8 @@ class Dispatcher:
                 # writer wins, a later cancel observes the published terminal.
                 if not conn.in_transaction:
                     conn.execute("BEGIN IMMEDIATE")
+                from .cpu_isolation import release as release_cpu
+                release_cpu(conn, j, cleanup_source="adoption_group_gone")
                 rc = None if native_exec else self._read_job_rc(j)
                 if rc is not None:
                     # Preserve the wrapper's durable exit evidence even when a
@@ -3406,6 +3411,8 @@ class Dispatcher:
                     })
                     state.update_job(conn, job["id"], status="interrupted",
                                      failure="execution_not_started", finished_at=state.now())
+                    from .cpu_isolation import release as release_cpu
+                    release_cpu(conn, job, cleanup_source="configured_not_started")
                     self._release_gpu_for_job(conn, job)
                     cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
                     self._recover_clean_interruption(conn, job, authority="not_started")
@@ -3429,6 +3436,8 @@ class Dispatcher:
                     execution_state.observe(conn, job["id"], observation, phase="unresolved")
                     if clean:
                         state.update_job(conn, job["id"], status="interrupted", failure="execution_authority_lost", finished_at=state.now())
+                        from .cpu_isolation import release as release_cpu
+                        release_cpu(conn, job, cleanup_source="configured_group_clean")
                         self._release_gpu_for_job(conn, job)
                         cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
                         self._recover_clean_interruption(conn, job)
@@ -3454,6 +3463,8 @@ class Dispatcher:
                 current = state.get_job(conn, job["id"])
                 state.update_job(conn, job["id"], status="cancelled" if current["kill_reason"] == "cancelled" else "interrupted",
                                  failure="execution_not_started", finished_at=state.now())
+                from .cpu_isolation import release as release_cpu
+                release_cpu(conn, job, cleanup_source="configured_not_started")
                 self._release_gpu_for_job(conn, job)
                 cleanup.extend((("launch", dict(job)), ("profile", dict(job))))
                 self._recover_clean_interruption(conn, job, authority="not_started")
@@ -3530,6 +3541,8 @@ class Dispatcher:
             return []
         if ordinary_wait is not None or not process_exit_authoritative:
             record_allocation_wait(conn, current_wait_job, ordinary_wait, rc if rc is not None else j["rc"])
+        from .cpu_isolation import release as release_cpu
+        release_cpu(conn, current_wait_job, cleanup_source="configured_group_clean" if process_exit_authoritative else "ordinary_group_gone")
 
         job_snapshot = dict(j)
         cleanup_paths = [
@@ -4427,6 +4440,10 @@ class Dispatcher:
             for key, default in (("host_mem_total_gib", 0), ("host_mem_reserve_gib", 16),
                                  ("host_mem_default_gib", 8)):
                 admission_cfg[key] = gpu_policy.get(key, default)
+        from .cpu_isolation import policy as cpu_isolation_policy
+        if cpu_isolation_policy(gpu_policy) != cpu_isolation_policy(self.cfg):
+            self.log_line("CPU isolation cold configuration changed/unreadable; new dispatch paused until explicit restart")
+            return
         from . import gpu_admission
         self._gpu_admission_samples = gpu_admission.sample(self.allocator) if any("gpu_admission" in item for item in self.cfg.get("projects", {}).values()) else {}
         with self._dispatch_connection() as conn:
@@ -4627,6 +4644,12 @@ class Dispatcher:
                     if first in admission.WAIT_REASONS:
                         resource_waits[j["id"]] = first
                     continue
+                from .cpu_isolation import select as select_cpus
+                cpu_selection = select_cpus(self, conn, task_cpus, job_id=j["id"])
+                if cpu_selection is not None and not cpu_selection["allowed"]:
+                    resource_waits[j["id"]] = "cpu"
+                    self.log_line(f"job {j['id']} CPU affinity waits: {cpu_selection['reason']}")
+                    continue
                 if storage.policy(storage_cfg)["enabled"]:
                     if conn.in_transaction:
                         conn.commit()
@@ -4703,6 +4726,9 @@ class Dispatcher:
                         failure="launch",
                         finished_at=state.now(),
                     )
+                    if not current["pgid"] or self._job_process_state(current) in ("dead", "mismatch"):
+                        from .cpu_isolation import release as release_cpu
+                        release_cpu(conn, current, cleanup_source="launch_not_started")
                     self._maybe_retry(conn, j)
 
             admission.publish_admission(memory_sample, resource_waits)
@@ -4796,6 +4822,12 @@ class Dispatcher:
         from . import cpu_capacity
         try:
             current_cfg = self._read_gpu_policy()
+            from .cpu_isolation import policy as isolation_policy, select as select_cpus
+            if isolation_policy(current_cfg) != isolation_policy(self.cfg):
+                return False
+            selection = select_cpus(self, conn, self._task_cpus(spec))
+            if selection is not None and not selection["allowed"]:
+                return False
             cfg = {**self.cfg, **{key: current_cfg.get(key, default) for key, default in
                 (("cpus_total", 0), ("cpus_auto_max", None), ("max_cpu_jobs", 2))}}
             if getattr(self, "_cluster_lease", None) is not None:
@@ -4990,6 +5022,13 @@ class Dispatcher:
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
             return False
+        from .cpu_isolation import select as select_cpus
+        cpu_selection = select_cpus(self, conn, self._task_cpus(spec), job_id=j["id"])
+        if cpu_selection is not None and not cpu_selection["allowed"]:
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
+        cpu_binding = cpu_selection["binding"] if cpu_selection is not None else None
         cur = conn.execute(
             "UPDATE jobs SET status='running', started_at=?"
             " WHERE id=? AND status='pending'"
@@ -5041,7 +5080,7 @@ class Dispatcher:
             kill_reason=None,
         )
         from .allocation import reserve as reserve_allocation
-        reserve_allocation(conn, j["id"], spec, self)
+        reserve_allocation(conn, j["id"], spec, self, **({"cpu_binding": cpu_binding} if cpu_binding is not None else {}))
         conn.commit()
         prior_inflight = getattr(self, "_launch_inflight", None)
         if isinstance(prior_inflight, dict):
@@ -5103,6 +5142,9 @@ class Dispatcher:
             ),
             "force_rerun": bool(spec.get("_force_rerun")),
         }
+        if cpu_binding is not None:
+            from .execution import LaunchConstraints
+            launch_kwargs["constraints"] = LaunchConstraints(cpu_affinity=tuple(cpu_binding["cpus"]))
         if native_binding is not None:
             launch_kwargs.update(
                 {
@@ -5180,7 +5222,10 @@ class Dispatcher:
         try:
             launch_spec = dict(spec)
             launch_spec["_recovery_context"] = recovery.context(self.host_dir, job, spec)
-            prepared = self.executor.prepare_configured_execution(job["id"], launch_spec, profile, identity, gpu, log_path)
+            from .cpu_isolation import launch_constraints
+            constraints = launch_constraints(conn, state.get_job(conn, job["id"]))
+            prepared = self.executor.prepare_configured_execution(job["id"], launch_spec, profile, identity, gpu, log_path,
+                **({"constraints": constraints} if constraints is not None else {}))
             conn.execute("BEGIN IMMEDIATE")
             if hasattr(prepared.owner, "binding"):
                 execution_state.bind_owner(conn, job["id"], prepared.owner.binding)
@@ -5217,6 +5262,8 @@ class Dispatcher:
                 current = state.get_job(conn, job["id"])
                 state.update_job(conn, job["id"], status="cancelled" if current["kill_reason"] == "cancelled" else "failed",
                                  failure="execution_admission", finished_at=state.now())
+                from .cpu_isolation import release as release_cpu
+                release_cpu(conn, current, cleanup_source="configured_not_started")
                 self._release_gpu_for_job(conn, job)
                 conn.commit()
                 if owner is not None:
