@@ -1,9 +1,10 @@
 # 候选委派 CPU scope 原语
 
 这是 scheduler cgroup 工作的生命周期底层，不是已可用的 cgroup 配置/CLI 功能。
-公开通用接口 `sched-cpu-scope/v1` 位于 gsched.execution.scopes；不新增数据库迁移，
-当前 writer 仍为 schema 18。Agent 的运维入口仍只有 sched CLI，不自行调用原语
-修改生产 cgroup。scheduler 的持久 intent/inode/claim、恢复与设备策略尚需接入。
+公开通用接口 `sched-cpu-scope/v1` 位于 gsched.execution.scopes。后续记录层候选
+gsched.cpu_scope_state 原子新增 schema 19，不自动创建或启用 cgroup。Agent 的运维
+入口仍只有 sched CLI，不自行调用原语修改生产 cgroup。真实派发、恢复、持续漂移
+检查与设备策略尚需接入，不能把可查询持久记录当作完整隔离能力。
 
 ## 严格委派与不可变绑定
 
@@ -19,7 +20,7 @@ CPU scope intent 固定唯一 32 位 hex scope_id、调用方不可变 attempt/a
 往返。名字只从唯一 ID 派生，不接受应用路径。每 scope 最多 8192 CPU、4096 NUMA
 节点，父 CPU 集合最多 65536，控制文本最多 64 KiB；重复/越界/歧义输入拒绝。
 
-调用方必须按以下顺序持久化，后续 scheduler 集成将负责这些事务：
+调用方必须按以下顺序持久化，记录层提供事务守卫，后续派发集成负责外部效果：
 
 1. 在创建前保存不可变 CpuScopeIntent 及 CPU claim，失败不能自动换 ID 重试。
 2. create 只独占创建一个新 scope，并返回 CpuScopeBinding（原 dev/inode）。
@@ -54,6 +55,40 @@ observe 读取原 scope 的有效 CPU/NUMA、cgroup.events 的 populated（含�
 控制权限。cpuset 限制已加入该 scope 的 CPU，GPU 权限还需要单独设备 BPF，未实现。
 内核规则见 [cgroup-v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)。
 
+## 持久记录层与释放守卫
+
+schema 19 的 cpu_scopes/cpu_scope_events 以空表原子迁移，原 intent 和事件均禁止
+UPDATE/DELETE；每 allocation 至多一个 scope，全局 scope_id 唯一，不补造旧任务。
+reservation 绑定原 allocation 全文摘要、instance/job/version/lease 和完整 CPU claim，
+不能把新租约、同名任务或 retry 后当前指针替代原绑定。调用方在同一个 allocation/
+claim writer 中 reserve，再提交后执行外部操作；记录层不自行 commit 或操作文件。
+
+每次外部效果先用 last_event_id CAS 消耗独立 intent，并提交：
+reserved → create_intent → inode_bound → configure_intent → configured → launch_intent。
+inode 必须精确包含原 intent；configured 只接受精确 CPU/NUMA、空 scope 的已记录
+观察，不制造 worker 加入/wait 事实。取消、非最新/非 active 代际和已启动任务不能
+消耗新的 create/configure/launch intent；重启不能重复消耗或重新绑定 inode。
+
+unknown 保留原事件链和 CPU claim。mkdir 后但 inode 未持久化时，不允许猜 inode/
+按名字接管、abandon 或重建。已保存原 inode 的未知配置可转入 cleanup_intent，但
+必须由后续控制器重新核对原 inode 和 scope 含后代为空；原 execution 清理守卫仍
+必须通过。remove 的真实成功结果另写 removed，不能从目录缺失推断删除成功；
+清理效果已经消耗但结果未知时不重新删除。reserved 尚未消耗 create 的意图才可
+abandoned。只有 removed/abandoned 允许原 CPU release；状态终止、retry 清当前
+指针、进程组已空或 scope 未知均不能绕过。空 scope 仍不提供原 returncode。
+
+现有 release 已接记录守卫，launch_constraints 对有 scope 的 allocation 拒绝仅
+affinity 降级；冷切换 off 时仍有未决 scope 会暂停新派发，不能用配置关闭绕过它。
+当前 mode=off|affinity 不会生成 scope，cgroup 冷配置尚未开放；后续
+派发须持有原 scope FD，所有 GPU/CPU 释放、timeout/租约失效与恢复也须接完整守卫。
+记录函数只接受内部来源，不是 Agent 的新写入口。
+
+只读 `sched cpu-scopes --json` 使用私有 DB/WAL 快照；`--scope-id ID` 读取精确
+完整事件链，列表提供有界实时分页，不探测内核或改变 revision。命名合同
+sched-cpu-scope-state-v1 与通用原语合同独立；所有 admission/wait/physical boundary
+标记为 false。完整 schema 1–18 查询明确 migration_required，不做初始化或回填；
+旧 writer 不得回接 schema 19，回退只用升级前验证恢复点，不能手改 user_version。
+
 ## 验收与剩余工作
 
 [回归](../tests/test_cpu_scopes.py) 将 synthetic 模型与实际内核验收分开。模型验证
@@ -66,7 +101,11 @@ scope、FD 关闭和序列化边界；普通目录拒绝在 Linux 计算节点�
 不再启动和空 scope 删除；不自动准备或改写父级。无委派时明确 skip，不计内核
 隔离验收成功。native 另须明确构建，SCHED_REQUIRE_NATIVE=1 时不可用为失败。
 
-尚未完成：scheduler 冷配置/能力协商、创建前持久 intent 和 CPU claim 的原子绑定、
-inode/configuration/child/resource 事件、崩溃窗口与丢失 scope 的 fail-closed 恢复、
+记录层的 [纯事务回归](../tests/test_cpu_scope_state.py) 覆盖原绑定、CAS、不可变历史、
+创建/配置/清理未知窗口、禁止 affinity 降级、释放保留、旧库和被动 CLI。模型事件
+不是实际 cgroup 崩溃注入证据，不将它计入正向 kernel 验收。
+
+尚未完成：scheduler cgroup 冷配置/实际创建与子进程 join、记录层接通外部效果、
+原 lease 委派目录验证、child/resource 事件、丢失 scope 的 fail-closed 执行恢复、
 取消/timeout/租约失效下的清理、持续 cpuset 漂移监测、设备隔离与授权生产 rollout。
 本原语及已有 [CPU 亲和](cpu-isolation.md) 不能代替这些交付。

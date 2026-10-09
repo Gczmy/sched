@@ -11,7 +11,7 @@ from gsched.dispatcher import Dispatcher
 from test_review_cli_state import TempStateCase
 
 
-class CpuIsolationTests(TempStateCase):
+class CpuIsolationFixture(TempStateCase):
     def setUp(self):
         super().setUp()
         self.cfg["cpu_isolation"] = {"mode": "affinity"}
@@ -56,6 +56,8 @@ class CpuIsolationTests(TempStateCase):
             identifier = allocation.reserve(conn, job, spec, self.dispatcher, cpu_binding=result["binding"])
             return job, identifier, result["binding"]
 
+
+class CpuIsolationTests(CpuIsolationFixture):
     def test_policy_explicit_and_default_off(self):
         self.assertEqual({"mode": "off"}, cpu_isolation.policy({}))
         for value in (None, True, {"mode": "cgroup"}, {"mode": True}, {"mode": "affinity", "extra": 1}):
@@ -190,5 +192,5 @@ class CpuIsolationTests(TempStateCase):
             self.assertTrue(state._schema_is_complete(conn, 17))
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(18, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM cpu_assignments").fetchone()[0])

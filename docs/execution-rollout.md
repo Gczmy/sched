@@ -210,3 +210,12 @@ NULL 指针及 revision/回队清空触发器。迁移不生成历史分配/退�
 持久重连保留旧 claim/mask，不能视作迁移租约。当前亲和不是 cgroup 硬限制；
 安装前核对实际合同/native 约束接口，启用前在授权租约内 drain/显式重启并验收。
 详见 [CPU 亲和](cpu-isolation.md)；真实 cgroup/设备、CUDA 和生产切换仍另行授权。
+
+## 后续候选 scope 生命周期 schema 19
+
+原子新增空 cpu_scopes/cpu_scope_events、原 allocation 唯一索引及不可变/保留触发器；
+不补造旧绑定、inode、wait 或执行历史。完整 schema 1–19 查询不迁移，旧 writer
+不能回接 schema 19，回退须用升级前验证恢复点，不得删事件或降低 user_version。
+cpu-scopes 的独立只读合同只报告已记录事实，不是可用 cgroup 派发/健康证明。
+default off/affinity 不创建子 cgroup；后续接入实际外部效果、持续验证、设备边界
+和授权正向实机验收前，不能将它作为完整硬隔离发布。见 [scope 生命周期](cpu-scopes.md)。

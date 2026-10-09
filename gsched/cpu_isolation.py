@@ -102,6 +102,10 @@ def choose(conn, count, pool, *, job_id=None):
 def select(dispatcher, conn, count, *, job_id=None):
     """Fresh kernel facts, cached original Slurm evidence; never migrate claims."""
     if policy(dispatcher.cfg)["mode"] == "off":
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 19:
+            from .cpu_scope_state import unresolved
+            if unresolved(conn):
+                return {"allowed": False, "reason": "unresolved_cpu_scope_retained"}
         return None
     monitor = getattr(dispatcher, "_cluster_lease", None)
     if sys.platform != "linux" or monitor is None or not hasattr(os, "memfd_create"):
@@ -165,6 +169,9 @@ def launch_constraints(conn, job):
         raise state.StateError("launch allocation missing")
     if "cpu_binding" not in _allocation(row):
         return None
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 19:
+        if conn.execute("SELECT 1 FROM cpu_scopes WHERE allocation_id=?", (identifier,)).fetchone() is not None:
+            raise state.StateError("CPU scope launch requires its original retained cgroup FD; affinity fallback refused")
     rows = conn.execute("SELECT cpu FROM cpu_assignments WHERE allocation_id=? AND job_id=? ORDER BY cpu", (identifier, job["id"])).fetchall()
     _, binding = allocation_binding(conn, identifier, job["id"])
     if [row["cpu"] for row in rows] != binding["cpus"]:
@@ -189,6 +196,10 @@ def release(conn, job, *, cleanup_source):
     rows = conn.execute("SELECT cpu FROM cpu_assignments WHERE allocation_id=? AND job_id=? ORDER BY cpu", (identifier, job["id"])).fetchall()
     if not rows:
         return
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 19:
+        from .cpu_scope_state import release_allowed
+        if not release_allowed(conn, identifier, job["id"]):
+            return  # Scope uncertainty survives job terminal/retry pointer changes.
     _, binding = allocation_binding(conn, identifier, job["id"])
     if [row["cpu"] for row in rows] != binding["cpus"]:
         raise state.StateError("CPU release binding differs")

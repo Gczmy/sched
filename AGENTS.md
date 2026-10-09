@@ -65,7 +65,7 @@
 | `docs/daemon-lease.md` | 候选持久 daemon 启动来源、只读租约查询与持续校验；未知不冒充有效 |
 | `docs/cpu-capacity.md` | 候选 CPU auto 保守容量、冻结运行预留与零值兼容；不等于 per-job 硬隔离 |
 | `docs/execution-constraints.md` | 候选公开 backend 启动约束；scope 持久事务/设备策略与 scheduler 集成尚待实现 |
-| `docs/cpu-scopes.md` | 候选委派 cpuset scope 原语；明确委派、原 inode 恢复只观察与空 scope 清理，不是可用 cgroup CLI |
+| `docs/cpu-scopes.md` | 候选委派 cpuset 原语、schema 19 原 intent/inode/CAS/未决 CPU claim 与只读 CLI；不是已接通 cgroup 派发 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -155,6 +155,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched artifact-revalidations <batch>:<task> --json` | 候选复验事件摘要；--event-id 读取一条完整证据；写操作 artifact-revalidate 只能经 task CAS/instance request |
 | `sched capabilities --json`、`sched daemon check --json` | 本机能力／计算节点前置检查；check 另按 backend ID 检查文件摘要与项目 root，通过不替代启动校验 |
 | `sched cpu-isolation --json` | 候选已记录活动 CPU claim；不探测、迁移或授予启动权；支持有界实时分页 |
+| `sched cpu-scopes --json` | 候选持久 scope intent/inode/生命周期；--scope-id 查询精确有界链；不探测或授予 cgroup/wait 权限 |
 | `sched diag <batch>[:task]`、`sched log <batch>:<task>` | 失败诊断优先用 `diag`；日志支持 `-n N`、`-f` |
 | `sched retry <batch>[:task]` | 同 spec 解锁失败终态重跑；省略任务为批次级 |
 | `sched resubmit <batch>:<task>` | 同 spec 新版本入队；批次级使用 `--failed` 或 `--all`，可先 `--dry-run` |

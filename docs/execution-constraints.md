@@ -5,7 +5,8 @@
 新增任务字段或迁移。后续 [scheduler 亲和层](cpu-isolation.md) 显式冷配置启用、
 以 schema 18 持久化 CPU 分配/释放，并提供独立 CLI；Agent 仍只通过 sched CLI 操作。
 另有 [委派 CPU scope 原语](cpu-scopes.md) 管理唯一 intent/inode、配置、被动恢复和
-空 scope 清理；scheduler 持久事务/恢复接入与设备策略尚需后续实现。
+空 scope 清理。schema 19 的后续持久记录层提供原 allocation/intent/inode/CAS
+和 CPU 释放守卫；实际创建/派发/执行恢复与设备策略尚需接入，不是已开放 cgroup 模式。
 
 ## 通用 backend 接口
 

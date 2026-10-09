@@ -124,6 +124,18 @@ Truncation, byte bounds, compatibility and CPU/fake-GPU acceptance are specified
 in [allocation evidence](allocation-evidence.md). Strict status/task/history
 fields and wait_reason remain unchanged; consumers must negotiate this contract.
 
+### Candidate CPU scope lifecycle
+
+The later schema 19 scope-lifecycle candidate advertises `sched-cpu-scope-state-v1`.
+`cpu-scopes --json` lists bounded recorded intents; `--scope-id ID` reads an exact
+immutable allocation/lease/CPU/inode-bound event chain. It never probes cgroups,
+creates a scope, replays a start, invents a wait, or grants kernel-health/launch
+authority. Unknown lifecycle effects retain CPU claims, including after a terminal
+job or retry pointer change. Complete old schemas are queried without migration;
+schema <19 reports migration_required, with no historical backfill. Strict default
+status/task/history fields and FD4 identities remain unchanged. There is no enabled
+scheduler cgroup mode yet; see [scope lifecycle](cpu-scopes.md).
+
 ### Candidate resource explanation
 
 The source resource-explanation candidate advertises `sched-admission-explain-v1`

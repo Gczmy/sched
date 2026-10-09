@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前 CPU 亲和源码候选写 schema 18，完整只读范围为 1–18；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约候选写 11/12/13/14/15/16/17，都不能回接 schema 18。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前 CPU scope 持久记录源码候选写 schema 19，完整只读范围为 1–19；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim 候选写 11/12/13/14/15/16/17/18，都不能回接 schema 19。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -188,6 +188,16 @@ CPU/内存/显存预算是调度器声明预留，不是不可越界的 per-job 
 默认 off 时 cpus_total=0 仍只回退 CPU-only 并发，不限制 GPU 任务的 CPU 总量；
 显式启用候选 [CPU 亲和](cpu-isolation.md) 后，有限 CPU-ID 池是独立 gate，
 admission-explain 增加 cpu_isolation 并复用池/claim 判断，池满仍报告 CPU 拒绝。
+
+`sched cpu-scopes [--scope-id ID] [--limit N] [--cursor ID] --json` 提供独立命名合同
+`sched-cpu-scope-state-v1`。默认读取已记录 scope 摘要；精确 ID 返回完整有界事件链，
+与 cursor 互斥。limit 默认 20、范围 1–100，每个 scope 至多 256 事件/单项 1 MiB。
+记录绑定原 instance/job/version/allocation/lease/CPU 集合、唯一创建 intent 和原 inode；
+查询不探测 cgroup/Slurm/进程、不修改 DB 或授予启动/wait 权限。`recorded_phase` 不是
+当前内核健康，`cpu_release_recorded_ready` 也不替代实际清理和原执行守卫。
+旧完整 schema 1–18 返回 migration_required，不迁移或回填；分页是实时 keyset，不是
+完整快照。当前没有启用 cgroup 的配置或 scope 写 CLI，默认查询为空；此记录层不是
+已接通的硬隔离派发。详见 [scope 生命周期](cpu-scopes.md)。
 精确原 owner 的租约检查最多有效 45 秒，缺失/过期/配置滞后为 unknown，不探测网关。
 GPU quota=0 仍是无限制。
 旧 free 卡容量未知时的兼容放行和共享降级独占明确警告，不因解释接口隐式改变策略。

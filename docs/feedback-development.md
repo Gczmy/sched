@@ -280,7 +280,24 @@ wait；同 UID 委派不当作恶意程序沙箱。16 条纯模型检查通过�
 本地与计算节点一致。同一最终来源的 CPU 亲和 CLI 六组全部通过：普通/fake-GPU/
 native mask、释放/取消、原 owner 崩溃重连和冷配置/默认 off 没有回归，未创建实际
 cgroup 或动生产。scheduler 持久 intent/claim/资源事件、scope 漂移和取消/
-timeout/失效租约恢复接入仍待实现，设备与授权生产切换也未完成；本项 CI 待确认。
+timeout/失效租约恢复接入仍待实现，设备与授权生产切换也未完成。固定提交
+`0aa7dc856fcee862744ccda38989b7e394ddd023` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37879967943) 14 项均通过；
+未发布或部署。
+
+后续候选新增 schema 19 的 scope 持久记录层，绑定原 allocation 全文摘要、
+instance/job/version/lease/CPU claim、唯一创建 intent 和原 inode。所有外部效果先
+消耗独立 CAS intent；unknown 不按名字猜 inode，不重建或重复 start，也不借任务
+终态/retry 释放原 CPU。原 scope removed、或尚未创建的 reserved abandoned 才放行
+原 CPU release；cold off 不能绕过旧未决 scope。有 scope 的 launch_constraints
+拒绝仅 affinity 降级。独立 cpu-scopes CLI 只查询私有快照，不探测或授予 wait。
+19 条纯事务模型通过；指定计算租约内最终来源完整 native 回归运行 915 条，911
+通过、4 跳过，其中正向 scope 两条因无委派明确跳过。171 文件 runtime/fixture
+SHA256 为 `d0717d398d9f7fe9b8dec2570e40767729b331b3df92014bc3cfc633fa4a0bef`，
+本地与计算节点一致。同一最终来源 CPU 亲和 CLI 六组全部通过，涵盖普通/fake-GPU/
+native mask、取消/释放、原 owner 崩溃重连与冷配置/默认 off，生产 daemon/config
+未改。此记录层不自动启用 cgroup，没有实际 scope mkdir/join/恢复/设备验收，
+不能当作完整硬隔离；本项 CI 待确认，未发布或部署。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -297,7 +314,7 @@ timeout/失效租约恢复接入仍待实现，设备与授权生产切换也未
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 通用原语与 scheduler 亲和/CPU claim 候选；实际 cgroup/设备边界未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 原语、亲和/CPU claim 和 schema 19 scope 持久记录候选；实际 cgroup/设备边界未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。
