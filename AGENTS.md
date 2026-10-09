@@ -53,6 +53,7 @@
 | `docs/upgrade-snapshot.md` | 候选持久升级维护窗口、恢复点校验、未启动任务受控回退与故障续接 |
 | `docs/releases/0.4.0.md` | 已发布 0.4.0 的固定来源、集成合同、CI 与 schema 10 边界 |
 | `docs/releases/0.5.0.md` | 已发布 0.5.0 的固定来源、schema 25、兼容模式与独立生产切换边界 |
+| `docs/releases/0.6.0.md` | 已发布 0.6.0 的固定来源、最终联合验收、完整 CI 与七项原始资产；生产切换独立安排 |
 | `docs/student-compatibility.md` | 无 cpuset/BPF 权限的显式启动祖先、120 声明预算、CPU affinity 联合验收与剩余交付 |
 | `docs/releases/0.2.2.md` | 已发布 0.2.2 的固定来源、验收证据、ABI/libc 范围与安装约束 |
 | `docs/releases/0.3.0.md` | 恢复能力、真实 CUDA 验收、正式 ABI 范围与 schema 9 回退 |

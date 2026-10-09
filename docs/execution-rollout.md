@@ -9,6 +9,10 @@
 [学生账号兼容路线](student-compatibility.md) 使用显式启动祖先和可选 affinity。
 默认严格检查不放宽，硬隔离专项需另具权限和真实内核验收。
 
+[0.6.0](releases/0.6.0.md) 已从 `8f412cc` 正式发布，完整 main CI 14/14 和
+七项原始公开下载资产均核对通过；与最终实机验收来源 `a85435e` 的 tree 相同。
+本次发布增加已关闭恢复点管理，schema 上限仍为 25，安装 ABI 与生产切换仍独立核验。
+
 已发布 0.2.2 的历史记录为 [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2)，
 发布来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`；
 [最终来源 CI](https://github.com/Gczmy/sched/actions/runs/36881160410) 的 14 项检查全部通过。

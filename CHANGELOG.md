@@ -1,9 +1,26 @@
 # Changelog
 
-## 0.5.0 (candidate)
+## 0.6.0 (2026-10-09)
 
-Not published or deployed. Source and immutable CI artifacts must be selected
-independently before release preparation; published v0.4.0 remains unchanged.
+Published as [v0.6.0](https://github.com/Gczmy/sched/releases/tag/v0.6.0) from
+`8f412cc2c2d4828d97dd370df61e0cb72a210c02`; complete main CI passed 14/14.
+All seven original assets were downloaded publicly and compared byte for byte.
+Production deployment and real Slurm lease-end acceptance remain separate.
+
+- Add bounded passive closed-snapshot browsing and fenced retention pruning,
+  preserving permanent close records and audit without reviving rollback authority.
+- Complete existing-lease launch-ancestry and affinity acceptance with a fixed
+  120-CPU accounting budget, private faults and original owner crash reconnection.
+  Affinity still does not provide cpuset/BPF hard isolation.
+- Refresh the original launch anchor before CPU claim selection; reopen an unlinked
+  same-identity publication inode once without accepting foreign or insecure records.
+- Keep writer schema 25, complete read range 1–25 and existing default query JSON.
+
+## 0.5.0 (2026-10-09)
+
+Published as [v0.5.0](https://github.com/Gczmy/sched/releases/tag/v0.5.0) from
+`7471c1cfdff5b8290799fceecabf20c8d230bf6f`; complete CI and seven original assets
+were verified independently. Production deployment is separate from publication.
 
 - Add explicit GPU pool/hard-affinity validation, structured artifact diagnostics
   and `json_equals`, immutable initial validation and audited artifact-only

@@ -81,4 +81,14 @@ fixture CANCELLED 不算真实结束证据。原 owner 重连必须保留 attemp
 实机验收发现并修复了 claim 启动前漏读原 anchor 的问题：现在每次选择 CPU 前
 重新观察冻结的原 anchor，缺失或漂移仍拒绝，即使缓存决策为 valid。
 原始内核上下文不带该观察；合成回归另覆盖真实调用路径，不能预填 anchor 掩盖缺口。
-当前候选已完成联合验收和恢复点管理；最终 main CI/发布准备独立核对，生产切换另行安排。
+之后修复普通任务父进程与 wrapper 同身份发布竞争时的已解除链接 inode 读取：
+仅重开路径一次，仍拒绝外来身份、硬链接和连续竞争。最终源码
+`a85435e42de35717a74a152cf86db5e10c984989` 已在同一指定既有租约中重新完成
+七组完整联合验收，退出码 0；20 项启动身份回归和 17 项 native 恢复队列回归均通过。
+私有 daemon stopped、活动 claim 与 pending/running 均为零，273 个来源文件核对一致。
+
+[PR #22](https://github.com/Gczmy/sched/pull/22) 已合并至
+`8f412cc2c2d4828d97dd370df61e0cb72a210c02`，与最终验收来源的 Git tree 完全一致。
+[main CI](https://github.com/Gczmy/sched/actions/runs/37981724339) 14/14 通过，
+0.6.0 的七项原始发布产物已完成准备和离线复核；正式发布事实见
+[0.6.0 说明](releases/0.6.0.md)。生产切换与真实租约结束测试仍另行安排。
