@@ -1,7 +1,7 @@
 # 仅产物复验与重新结算（源码候选）
 
-候选合同为 `sched-artifact-revalidations-v1`，引入时写 schema 13；后续精确依赖候选
-写 14、完整只读范围 1–14，复验合同本身不变。
+候选合同为 `sched-artifact-revalidations-v1`，引入时写 schema 13；当前候选写 25、
+完整只读范围 1–25，见 [reference](reference.md)，复验合同本身不变。
 包版本仍为 0.4.0，须协商实际部署的合同/schema；源码推送不是新发布或生产部署。
 首次记录见 [artifact-validation](artifact-validation.md)，本接口不替代科学验收。
 
@@ -85,4 +85,5 @@ available=false/reason=migration_required；写迁移仅追加空表/索引/不�
 旧失败、日志或当前文件回填。schema 12/11 候选和已发布 0.4.0 不能直接回接新写库，
 回退使用升级前验证的恢复点；不得降低 user_version 或删除审计记录。
 
-本阶段没有精确依赖或任务 DAG；那些能力按 [完整清单](feedback-development.md) 独立开发。
+复验接口本身不定义精确依赖或任务 DAG；当前候选的独立依赖接口见
+[reference](reference.md)，各阶段验收/交付状态见 [完整清单](feedback-development.md)。

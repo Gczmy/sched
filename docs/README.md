@@ -3,6 +3,11 @@
 当前行为以代码和下列契约文档为准。文档中的示例使用通用名称；真实账户、
 节点、租约、会话、批次和部署目录保留在仓库外的私有运行记录中。
 
+当前源码候选写库 schema 25，完整只读范围 1–25；包版本仍为 0.4.0，
+不等于已发布的 v0.4.0（schema 上限 10）或生产已升级。各页的“引入 schema”
+表示功能加入时的边界，不是当前兼容上限。接收端以 `sched version --json`
+协商实际代码的 named contracts/schema；`sched identity --json` 只用于实例绑定。
+
 | 文档 | 用途 |
 | --- | --- |
 | [开发与提交检查](../CONTRIBUTING.md) | 公共 CI、隐私检查与本地提交钩子 |
@@ -11,7 +16,7 @@
 | [sqlite-lock-safety.md](sqlite-lock-safety.md) | SQLite 锁修复、事务诊断与旧 schema 回补边界 |
 | [project-gpu-access.md](project-gpu-access.md) | 项目 GPU 开关的行为与验收依据 |
 | [execution-boundary.md](execution-boundary.md) | 通用执行层、项目 adapter 和独立发布边界 |
-| [recovery-policy.md](recovery-policy.md) | 候选恢复协议、smoke、FIFO、显存准入与守护 |
+| [recovery-policy.md](recovery-policy.md) | 自 0.3.0 发布的恢复协议、smoke、FIFO、显存准入与守护 |
 | [recovery-acceptance.md](recovery-acceptance.md) | 候选恢复完整故障/兼容矩阵与非生产 GPU 验收 |
 | [execution-api.md](execution-api.md) | backend 冷注册、输入 FD 和自包含可选 native |
 | [persistent-execution-owner.md](persistent-execution-owner.md) | 持久 owner、认证重连、运维确认与崩溃恢复证据 |
@@ -20,7 +25,7 @@
 | [0.2.1 Release 说明](releases/0.2.1.md) | 功能、兼容性与安装/回退约束；发布事实以 GitHub Release 为准 |
 | [0.2.2 Release 说明](releases/0.2.2.md) | 逐 backend 预检、Linux 矩阵与发布准备；正式来源和资产以 Release/tag 为准 |
 | [0.3.0 Release 说明](releases/0.3.0.md) | 恢复协议、显存准入、前台守护与 schema 9；发布事实以 Release/tag 为准 |
-| [0.4.0 Release 说明](releases/0.4.0.md) | 集成候选、schema 10 与独立消费端兼容边界 |
+| [0.4.0 Release 说明](releases/0.4.0.md) | 已发布集成合同、schema 10 与独立消费端兼容边界 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |
@@ -30,7 +35,7 @@
 | [artifact-revalidation.md](artifact-revalidation.md) | 候选仅产物复验、CAS/幂等结算与独立验证计数 |
 | [allocation-evidence.md](allocation-evidence.md) | 候选不可变分配、分层失败与 owner/worker 身份边界 |
 | [storage-admission.md](storage-admission.md) | 候选 opt-in 磁盘/inode/可知用户 quota、控制面余量与只读解释 |
-| [daemon-lease.md](daemon-lease.md) | 候选不可变启动来源、Slurm 持续验证与失效锁存；默认健康 JSON 不变 |
+| [daemon-lease.md](daemon-lease.md) | 候选不可变启动来源、Slurm 持续验证与失效锁存；显式启动祖先兼容不是硬隔离 |
 | [cpu-capacity.md](cpu-capacity.md) | 候选显式 CPU auto、保守容量/冻结预留、零值兼容与 opt-in 只读查询 |
 | [cpu-isolation.md](cpu-isolation.md) | 候选 schema 18 显式 per-job 亲和、不可变 CPU claim、释放/重连与被动解释；不是 cgroup 硬隔离 |
 | [cpu-scopes.md](cpu-scopes.md) | 候选委派 cpuset 原语、持久 intent/inode/CAS 和 schema 20 显式派发/清理；正向内核/设备验收未完成 |

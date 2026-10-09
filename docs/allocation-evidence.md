@@ -1,7 +1,8 @@
 # 候选 allocation 与分层执行证据
 
-源码候选合同为 `sched-allocations-v1`，引入 schema 16；后续租约候选写 schema 17，当前完整只读 1–17；
-包版本仍为 0.4.0，不代表正式发布或生产已升级。
+源码候选合同为 `sched-allocations-v1`，引入 schema 16。当前候选写 schema 25、
+完整只读 1–25，兼容范围见 [reference](reference.md)；包版本仍为 0.4.0，
+不代表正式发布或生产已升级。
 
 ## 分配身份
 
@@ -16,7 +17,11 @@ allocation 是启动意图，不证明已经出生进程；启动失败/未知�
 GPU UUID 只使用计算节点已记录、五秒以内的完整拓扑样本；缺失/过期为 unknown，
 fake GPU 明确 simulated。索引/UUID/预留均不证明物理进程占用。
 不保存 env、命令或 backend 认证 token/endpoint；不推断 worker 身份。
-`hard_isolation:false`、`lease_identity:null`：租约持续验证与 per-job 硬隔离仍是独立待开发项。
+运行中的租约 monitor 为新分配保存 `lease_identity`，绑定原 lease/instance ID 和当时
+记录的 allocation_state；没有 monitor 时为 null，历史记录不回填。租约持续验证见
+[daemon lease](daemon-lease.md)。显式 CPU 模式还保存 `cpu_binding`，容量/存储准入
+可保存各自观察；这些记录本身不证明 worker 的物理占用或硬隔离，仍保留
+`hard_isolation:false`。正向内核隔离验收与生产切换独立记录。
 
 jobs 的当前 allocation 指针参与 revision；回到 pending 时清空，历史记录不删。
 重新启动前再分配。成组取消/依赖更新检查不可变历史，不把 retry 清空当前字段

@@ -3,6 +3,8 @@
 本文只记录通用调度器工作。配置和 CLI 以 [reference.md](reference.md) 为准，
 execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
 候选代码、验证、正式发布和生产部署分别记录，不能互相替代。
+当前源码候选写 schema 25、完整只读 1–25；下文各阶段的 schema 是引入边界，
+不是当前兼容上限。实际接收端使用 `sched version --json` 核对 named contracts/schema。
 
 ## 历史版本 0.2.1
 
@@ -53,10 +55,10 @@ native 资产覆盖 CPython 3.10/3.14 × glibc 2.35/2.39 / Linux x86_64。
   只读 `artifact-check`、完整请求格式校验/可选 JSON 错误、同 RID 有界回执等待与
   多 RID 查询，以及显式 GPU 池/硬亲和交叉校验。使用契约见
   [integration-contract.md](integration-contract.md) 和 [reference.md](reference.md)。
-  这是已提交的源码候选，不代表新版本发布、Linux 全矩阵或生产部署通过。DB schema 仍为 10，
+  该第一阶段是源码候选，不代表新版本发布、Linux 全矩阵或生产部署通过。该阶段 DB schema 为 10，
   默认批次失败策略、名称依赖、真实 wait、资源结算及未知请求守卫未改变。
 - 后续失败隔离源码候选加入 opt-in `failure_policy` 和 `batch-policy` 独立合同。
-  该阶段引入 schema 11；后续首次验证/复验/精确依赖/任务 DAG/allocation/租约候选写 12/13/14/15/16/17（当前完整只读 1–17）；默认 freeze 保留，旧 blocked 不自动重开。
+  该阶段引入 schema 11；后续首次验证/复验/精确依赖/任务 DAG/allocation/租约分别引入 12/13/14/15/16/17；默认 freeze 保留，旧 blocked 不自动重开。
   策略写操作通过 batch CAS request，显式 --reopen 不重试失败任务。该阶段本身没有任务 DAG，
   不包含不可变复验/结算。CI/计算节点验收与发布状态分别见交付清单。
 - 后续候选追加不可变首次 dispatcher 产物验证和 `artifact-validations` 只读查询。
@@ -123,7 +125,10 @@ schema 17 保存白名单 Slurm/job/step、UID、affinity/cgroup 与启动/检�
 auto 模式有 Slurm 来源时持续验证，unknown 默认停新派发，确认 invalid 后锁存，
 不杀 running、不自动绑定新租约。默认健康 JSON 不变，显式 include-lease 与
 独立 daemon-lease 私有快照查询见 [合同](daemon-lease.md)。
-通用 system cgroup 明确 unknown，不能仅凭 RUNNING 或环境断言归属。
+默认 cgroup membership 遇通用 system cgroup 明确 unknown，不能仅凭 RUNNING 或环境断言归属。
+显式 `launch_ancestry` 兼容模式另外验证冻结的真实启动链、原 shell/stepd、控制器和
+step 进程跟踪，未知仍暂停；不证明 daemon 当前 Slurm membership 或硬隔离。
+该新增模式的独立来源/CI/真机证据见 [交付清单](feedback-development.md)。
 旧 daemon 不补造来源，硬杀/DB 不可写时可能缺失退出事件；保留最后观察而非补造 wait。
 
 ### 匿名化历史场景
@@ -145,19 +150,21 @@ daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 
 2. 通过显式 `sched daemon status --json --include-lease` 扩展查询，默认已有字段不变，展示持久化来源、已记录当前来源和
    `allocation_state=valid|invalid|unknown`；daemon 已退出后仍保留最后一次启动与退出
    上下文供审计，而不是只剩无法归属的历史日志。现有 lease 已记录 `physical_host`、
-   PID/start token 与 lease ID，缺口是 Slurm/资源上下文及退出后的来源保留。
+   PID/start token 与 lease ID；schema 17 已补充 Slurm/资源上下文及退出后的来源保留。
 3. daemon 周期性验证已记录 Slurm job 是否仍为目标节点上的 RUNNING allocation，并
    检查自身 affinity/cgroup 是否与启动快照一致。`scontrol` 不可用或集群未启用可靠
-   cgroup 时必须报告 `unknown`，不能伪装成 valid。
+   cgroup 时，默认 membership 必须报告 `unknown`，不能伪装成 valid。显式启动祖先
+   兼容模式只按其独立冻结证据验证来源，不冒充 cgroup 归属。
 4. 已确认租约失效时停止派发新任务、留下可诊断事件并通知；默认不暗中迁移到后来创建
-   的租约，也不直接杀死已经运行的任务。恢复必须在目标新租约内显式 stop/start。
+   的租约，也不直接杀死已经运行的任务。恢复必须在目标新租约内显式重启；需要保留
+   running 时先 drain --stop-when-idle 等原任务自然结束，不用 stop 模拟无损排空。
 5. 增加旧租约关闭但 daemon 存活、新租约同节点建立、Slurm 查询失败、PID 复用、daemon
    正常退出后追溯，以及状态 JSON 兼容性的验收测试。
 
 ## ND-03：CPU 容量自动解析与可执行约束
 
 **状态：源码候选已实现，完整 CI/计算节点 CPU/CLI 通过；尚未发布或部署。** 具体合同、查询和兼容边界见
-[CPU 自动容量](cpu-capacity.md)。per-job 硬隔离仍未实现。`cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
+[CPU 自动容量](cpu-capacity.md)。per-job 硬隔离的正向验收和交付仍未完成。`cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
 任务上回退到 `max_cpu_jobs` 并发计数；正整数仅做声明值求和，不会设置 affinity 或
 子 cgroup。
 
@@ -167,8 +174,8 @@ exec 前应用显式 CPU 集合和保留 cgroup FD，失败不降级。后续
 allocation CPU 绑定/活动 claim、原清理事实释放与持久 owner 重连；应用可主动扩大
 affinity，不能称为硬隔离。后续 scope 持久记录与 CPU 释放守卫已在源码候选实现，
 后续 schema 20 候选接通显式委派 cgroup 创建/派发/原 inode 清理与恢复守卫，设备
-策略和正向 kernel/故障恢复验收仍未完成；当前计算
-环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
+controller 也已有独立源码候选；正向 cpuset/BPF/设备 scope 故障恢复验收仍未完成。
+已验收计算环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
 
 后续 [委派 CPU scope 原语](cpu-scopes.md) 提供唯一 intent/原 inode 绑定、子 cpuset
 配置与有效集合核对、恢复仅观察和确认空 scope 清理；不修改父 controller，不因
@@ -179,11 +186,11 @@ CPU claim 绑定的 intent、原 inode、配置/启动/清理的一次 CAS，未
 缺少明确测试委派时不宣称正向内核验收通过，仍不是完整 cgroup/设备交付。
 
 独立 [设备策略原语](device-policy.md) 源码候选新增有界精确白名单、原 CPU scope
-与程序摘要/ID/tag 绑定、一次安装和恢复只观察；无替换/卸载/失败降级。尚未接入
-scheduler 实际安装、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改变当前 GPU 权限。
+与程序摘要/ID/tag 绑定、一次安装和恢复只观察；无替换/卸载/失败降级。该原语自身不
+接通 scheduler 安装或 NVIDIA 映射；后续接入见下文，正向 BPF/CUDA 权限验收仍未完成。
 后续 [schema 21 设备记录](device-scopes.md) 冻结原 inode/策略/代际并 CAS 消耗安装/
-启动意图，unknown 保留原预留，原 CPU removed 后另记设备 released；只有独立
-只读查询，没有实际设备安装接入。正式设备故障矩阵/正向验收与发布仍未完成。
+启动意图，unknown 保留原预留，原 CPU removed 后另记设备 released；该阶段只有独立
+只读查询，实际设备安装在 schema 23 接入。正式设备故障矩阵/正向验收与发布仍未完成。
 后续[设备映射候选](device-inventory.md)核对 UUID/driver minor/节点，纯选择只放行
 原 allocation 的明确未分区整卡或 CPU-only 基线；显式 device-inventory 仅在计算节点
 只读探测，不读 DB。后续 schema 22 候选冻结原 allocation/CPU scope/device intent 的
@@ -205,10 +212,11 @@ CPU/BPF/真实 GPU/owner 故障矩阵及发布仍待完成。后续 schema 25
    RUNNING allocation，并复核自身 affinity/cgroup；启动时解析一次容量不足以覆盖租约
    后续被删除而 daemon 继续存活的场景。
 4. 旧租约确认失效时停止派发新任务、记录事件并通知，不自动迁移或绑定同节点后来创建
-   的新租约。已经运行的任务默认不被暗中杀死；恢复要求在目标新租约内显式 stop/start。
-5. per-job affinity/cgroup 作为独立的硬隔离能力后续实现。在它完成前，
-   `resources.cpus` 与解析后的 `cpus_total` 仍只是 admission control/调度记账，不能描述
-   成对单个任务的物理 CPU 限制。
+   的新租约。已经运行的任务默认不被暗中杀死；恢复要求在目标新租约内显式重启，
+   需要保留 running 时先 drain --stop-when-idle，不能用 stop 模拟无损排空。
+5. per-job affinity 与显式委派 cgroup 已有独立源码候选，affinity 本身不是硬隔离，
+   cgroup/BPF 仍须正向内核验收。未启用已验收的执行约束时，`resources.cpus` 与
+   解析后的 `cpus_total` 只是 admission control/调度记账，不是单任务物理 CPU 限制。
 
 ### 可观测性与验收
 
@@ -218,3 +226,14 @@ CPU/BPF/真实 GPU/owner 故障矩阵及发布仍待完成。后续 schema 25
   用于明确部署，但若大于当前 affinity/Slurm 容量必须告警或拒绝派发。
 - 覆盖 auto、固定值、零值兼容、Slurm/affinity 一致与冲突、租约运行中失效、新租约
   同节点建立但禁止自动迁移，以及未启用硬隔离时的机器可读语义测试。
+
+## ND-05：升级恢复点的 CLI 接口
+
+**状态：接口需求，尚未实现。** 当前 CLI 没有持久备份/恢复子命令；私有只读查询
+快照会自动清理，不能当作已保存、可恢复的升级恢复点。生产升级前需先确定正式接口，
+不能用手写 SQL、复制共享源库或手改 state 绕过操作契约。
+
+恢复点需绑定原实例、schema、配置、数据库与相关 inbox/请求/启动记录的同一维护边界，
+并在独立位置验证旧安装可读及失败恢复行为。任何恢复都不得丢弃未知投递/执行结果、
+重建 instance 或授权重放原尝试；仅有合成迁移通过不构成生产恢复点已验证的证据。
+具体命令、持久文件范围和并发协议须在实现前定案，不把本节当作可用 CLI。

@@ -16,6 +16,7 @@ context 为 `exit_zero`、`exit_nonzero` 或 `probe_ready`。取消、超时、�
 
 记录冻结 instance、batch/task/job/version、retry/start、指纹、批次 revision、完整
 spec 摘要、task/stage 规则、逐项文件证据、原始返回码及已证明的 wait/cleanup。
+新 allocation 的 ID 同时参与完成绑定，避免同秒、同版本 retry 的证据碰撞；旧记录不改写。
 原始 cmd/env 不包含在查询证据中，只通过 spec 摘要绑定。原始 backend identity
 也只保存摘要；不复制 owner 的重连凭据。记录 ID 为规范有限 JSON payload 的 SHA-256，
 规则、wait 和 checks 各自还有摘要。完整记录读取验证这些摘要与索引字段的绑定。
@@ -29,7 +30,7 @@ daemon 仍持有该 supervisor 的 Popen、实际 poll 取得退出码、强启�
 若原始 wait 在落盘前因崩溃丢失，之后检查不能重新产生这份原始事实。
 
 首次失败不可 UPDATE/DELETE，也不能因文件后来通过而覆盖。相同完成绑定重复进入
-结算路径读取原记录，不重查文件；普通 retry 即使复用 version，也按 retry/start 保留
+结算路径读取原记录，不重查文件；普通 retry 即使复用 version，也按原完成绑定保留
 独立原始记录。这不意味着 retry 是科学上相同的尝试，客户仍自行管理科学 lineage。
 
 内容规则最多读取 1 MiB，并记录读取字节的 SHA-256；纯存在/min_bytes 规则不读取
@@ -68,13 +69,13 @@ next_cursor、evidence_included，以及 `effect:none`、`historical_failure_rec
 
 ## schema 与后续开发
 
-本阶段引入 schema 12；后续任务 DAG 候选写 15，完整 schema 1–15 支持只读。旧库没有表时返回
+本阶段引入 schema 12；当前候选写 25、完整只读 1–25，见 [reference](reference.md)。旧库没有表时返回
 `available:false,reason:migration_required`，不迁移、不从历史状态回填。写初始化原子
 添加空表/索引/不可变触发器，不改已有任务、版本、状态、revision、身份、wait 或未知回执。
 schema 11 候选及已发布 0.4.0 不能直接启动新写库；回退使用升级前已验证的恢复点，
 不能删表或回改 user_version。
 
-阶段 5 独立复验/结算接口需要新追加观察、CAS/幂等与原始执行权威、规则和文件来源
+阶段 5 的独立复验/结算接口使用新追加观察、CAS/幂等与原始执行权威、规则和文件来源
 校验；不能把本页查询的 passed=true 或 wait_verified=true 单独当作重新结算许可。
-精确依赖、DAG、allocation 身份和分层 worker/validator 失败同样按
-[完整清单](feedback-development.md) 独立开发。
+精确依赖、DAG、allocation 身份和分层执行证据已有独立源码候选，验收/交付状态见
+[完整清单](feedback-development.md)。这些接口不替代客户 worker/validator 的原始失败权威。

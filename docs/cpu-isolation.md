@@ -1,6 +1,6 @@
 # 候选 per-job CPU 亲和
 
-此功能在 schema 18 引入，当前后续设备记录候选 writer 为 schema 21，未发布、未部署。实际 CLI 需报告命名合同
+此功能在 schema 18 引入，当前候选 writer 为 schema 25、完整只读 1–25，未发布、未部署。实际 CLI 需报告命名合同
 `sched-cpu-isolation-v1`；包版本相同不表示旧安装已支持。只通过 sched CLI 操作 state。
 
 ## 显式启用与边界
@@ -30,7 +30,8 @@ CPU/GPU 任务、linux_fd 和 linux_fd_owner 均在用户 exec 前应用同一�
 CPU 池来自原 daemon 的精确 affinity，容量按可验证原 Slurm 声明/affinity 的保守
 最小值解析；不会使用查询网关的 CPU 编号或后来创建的租约。kernel owner/cgroup/
 affinity 漂移、未知原容量或已确认失效时暂停新派发。没有 job cgroup 归属证明时，
-只有原租约策略显式 observe/unknown allow 才可能容许已验证 CPU 来源；这不是硬隔离。
+显式启动祖先兼容模式可验证冻结的原租约来源，未知仍暂停；旧 observe/unknown allow
+则是有告警的降级策略。两者均不证明 cgroup 硬隔离，见 [租约策略](daemon-lease.md)。
 
 `cpus_total=0` 仍是不启用总声明预算，不静默变成 auto。启用 affinity 后，独立的
 CPU-ID 池仍是有限的；固定/auto 预算、CPU-only 并发和 GPU 等其他 gate 同时生效。
@@ -75,8 +76,10 @@ schema 18 原子新增空 cpu_assignments 表/索引/更新禁止触发器，不
 [scope 生命周期记录](cpu-scopes.md)，默认 affinity 不创建 scope；有 scope 记录时
 原 CPU claim 要等 recorded removed/未创建 abandoned，未知不能借终态释放，也不能
 仅 affinity 启动降级。schema 20 接通独立委派 cpuset 与 cleanup_ready，不改变
-默认 affinity。后续 schema 21 新增 [设备记录与资源守卫](device-scopes.md)，尚无设备
-安装接入；完整 schema 1–21 只读查询不迁移，旧 writer 不得回接更高写库，回退只能使用已验证的升级前恢复点，不能删
+默认 affinity。schema 21 引入 [设备记录与资源守卫](device-scopes.md)，该阶段仅记录；
+后续 schema 23 接入 [显式设备 controller](device-controller.md)，24/25 增加 MIG 能力和
+原委派根健康记录。当前完整 schema 1–25 只读查询不迁移；默认 off/affinity 不启用
+cgroup 或设备隔离。旧 writer 不得回接更高写库，回退只能使用已验证的升级前恢复点，不能删
 claim、降低 user_version 或手改 state。发布与生产切换仍按
 [独立 rollout](execution-rollout.md) 另行授权。
 

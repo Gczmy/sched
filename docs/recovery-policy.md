@@ -1,8 +1,9 @@
 # 断点恢复与 smoke 门禁
 
-本页描述候选版本中显式启用的通用恢复接口；0.2.2 不提供这些字段。
-当前包含 checkpoint、smoke 门禁和显式新版本恢复 FIFO。剩余显存阈值、分级与
-supervisor 仍是后续开发项，不能将协议视为已支持与外部任务共卡。
+本页描述自 0.3.0 发布、当前源码继续维护的显式通用恢复接口；0.2.2 不提供这些字段。
+包含 checkpoint、smoke 门禁、显式新版本恢复 FIFO、剩余显存阈值、分级、持久无进展
+策略和前台 daemon/supervisor。正式来源与验收见 [0.3.0 说明](releases/0.3.0.md)；
+这些能力不授权与外部任务共卡，后文仍保留外部占用拒绝和原执行权威守卫。
 
 ## 任务声明
 
@@ -137,8 +138,9 @@ queue lineage 与结算证据有保留/不可改写守卫。取消意图、状�
 queue 的 seq、predecessor_job_id、root_job_id、round、queued_at、not_before 和摘要，
 不暴露私有路径或应用 payload。既有 status/task/history schema 和 wait_reason 枚举不变。
 
-候选写库 schema 9，读取完整 schema 1–9；旧 schema 的 recovery 队列/结算返回 null，
-只读查询不迁移。0.2.2 不识别 schema 9，不能将旧二进制接回新写库。
+该恢复功能集在 schema 9 完成引入；当前候选写 25、完整只读 1–25，见
+[reference](reference.md)。旧 schema 的 recovery 队列/结算返回 null，只读查询不迁移。
+0.2.2 不识别 schema 9，不能将旧二进制接回新写库。
 
 验收见 [test_recovery_queue.py](../tests/test_recovery_queue.py)：真实普通 subprocess、
 linux_fd 和 linux_fd_owner 均验证 A OOM → B/C 完成 → A 新版本恢复；持久 owner

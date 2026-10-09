@@ -1,6 +1,9 @@
 # sched execution 发布与部署清单
 
-本清单用于交付准备。当前生产版本、配置和运行状态尚未查询；执行本清单前须取得对应部署授权。
+本清单用于交付准备，不提供生产状态快照；每次切换前须现场查询版本、配置和运行状态，
+并取得对应部署授权。当前源码候选写 schema 25、完整只读 1–25，包版本仍为 0.4.0，
+与已发布 v0.4.0 的 schema 上限 10 不同。下文逐阶段范围是引入时的兼容边界，
+实际接收端以 `sched version --json` 为准。
 
 已发布 0.2.2 的历史记录为 [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2)，
 发布来源为 `8aa2559dc64e74acd2cec6bcb2f5481d1d9fbc1d`；
@@ -103,6 +106,9 @@ close_range、memfd 和 UNIX socket 权限拒绝。尚未通过的矩阵不扩�
 ## 回退边界
 
 切换前保留旧安装、原配置和经正式备份流程取得的恢复点。
+当前 CLI 尚无持久备份/恢复接口，私有查询快照不等于已保存的恢复点；接口需求见
+[ND-05](next-development.md#nd-05升级恢复点的-cli-接口)。未确定并验证正式流程前，
+不通过手写 SQL、复制共享源库或手改 state 安排生产回退。
 0.2.0 将写库 schema 升至 6，新增不可变 owner binding；0.2.1 升至 7，
 新增确认队列与已记录健康，0.2.2 保持 schema 7。对应只读范围分别为 1–6 和 1–7。
 旧版本不能被假定为兼容新写库。回退须在 daemon 排空后，
@@ -131,7 +137,7 @@ schema 8 可读恢复 queue/settlement，但 watch 为 null；0.2.2 无法打开
 
 ## 候选失败隔离 schema 11
 
-当前失败隔离源码候选增加批次 `failure_policy` 和 revision trigger；旧批次全部
+失败隔离阶段源码候选增加批次 `failure_policy` 和 revision trigger；旧批次全部
 默认 freeze，不迁移状态、任务代际、原始 wait/身份、未知尝试或回执，不自动重开 blocked。
 完整 schema 1–11 可私有快照只读查询。包版本仍为 0.4.0，不代表正式新版本或部署完成。
 已发布 0.4.0 的 schema 上限为 10，升级后不能直接启动旧 writer；回退必须使用升级前
@@ -195,8 +201,10 @@ NULL 指针及 revision/回队清空触发器。迁移不生成历史分配/退�
 新增空 daemon_leases/daemon_lease_events、查询索引与不可变/保留触发器；旧库不
 补造出生/租约事实，不改变任务/原 wait/执行身份、allocation、请求或 instance。
 首次就绪前原子持久化最小来源与首次校验；默认 auto 有 Slurm 来源时执行验证，
-未知默认暂停。部署前须检查目标租约实际 job/step cgroup，不能只凭 RUNNING 或环境
-宣称有效；显式 observe/unknown allow 是降低保护，不是修复隔离。
+未知默认暂停。默认 membership 须检查目标租约实际 job/step cgroup，不能只凭 RUNNING
+或环境宣称有效；显式启动祖先兼容模式须验证冻结的真实启动链、原 shell/stepd 和精确
+step 跟踪，不证明当前 daemon Slurm membership 或硬隔离。显式 observe/unknown allow
+是降低保护，不是修复隔离。
 完整 schema 1–17 只读不迁移，schema 10–16 writer 不能回接新写库；回退只能使用
 升级前恢复点，禁止删来源/事件或降低 user_version。新查询与告警/退出保留合同见
 [daemon-lease](daemon-lease.md)。真实 lease 结束测试、真实 CUDA 与生产切换另行授权。
@@ -235,23 +243,23 @@ schema 1–20 查询不迁移，schema 19 及更旧 writer 不可回接新库。
 原子新增空 device_scopes/device_scope_events、唯一 allocation 和不可变/保留触发器，
 不回填旧设备事实。安装/启动 CAS 与原 scope/program binding 保持一次性，unknown
 不重装/卸载；CPU removed 尚未完成设备 released 时仍保留预留，cold off/终态不绕过。
-现有 CPU controller 对设备记录拒绝 CPU-only 启动，尚未接通真实 BPF 安装。
-独立 device-scopes 查询不探测 kernel，不授予执行/wait；schema 1–20 不迁移，当前
+该阶段 CPU controller 对设备记录拒绝 CPU-only 启动，尚未接通真实 BPF 安装；后续接入见 schema 23。
+独立 device-scopes 查询不探测 kernel，不授予执行/wait；schema 1–20 不迁移，该阶段
 完整只读范围 1–21。schema 20 及更旧 writer 不可回接新库，回退只用升级前验证恢复点。
 正向 CPU/BPF/GPU 故障矩阵与授权安装/生产切换仍未完成，不能将记录层当作硬隔离部署。
 合同见 [设备生命周期](device-scopes.md)。
 
 ## 后续候选原设备映射绑定 schema 22
 
-当前后续显式设备接入写 schema 23，完整只读 1–23；以下为 22 引入原映射绑定的
-历史边界，23 的语义升级与回退约束见本文后续章节。
+以下为 schema 22 引入原映射绑定的历史边界，23–25 的语义升级与回退约束见后续章节；
+当前候选完整范围见本页开头。
 
 原子新增空 device_inventory_bindings、唯一 allocation 和不可变/保留触发器，不回填
 原映射，不改变旧 instance/allocation/CPU/device intent/回执。冻结必须在安装意图前
 核对原完整 claims 与策略；新鲜重验不换卡、不刷新旧 topology、不授予启动权。
 独立 device-inventory-bindings 只读查询不采样硬件，完整 schema 1–21 返回
-migration_required，当前完整只读范围为 1–22。schema 21 及更旧 writer 不可回接新库；
-回退只使用升级前验证恢复点。实际安装/恢复、授权正向设备与生产切换仍未完成。
+migration_required，该阶段完整只读范围为 1–22。schema 21 及更旧 writer 不可回接新库；
+回退只使用升级前验证恢复点。该阶段尚未接通实际安装/恢复；后续接入不代替授权正向设备验收与生产切换。
 完整边界见 [设备映射与绑定](device-inventory.md)。
 
 ## 后续候选显式设备接入 schema 23
@@ -273,7 +281,7 @@ attachment/完整映射/lease 新鲜检查后，CPU 与设备 launch_intent 同�
 
 不新增 SQL 表或补写旧事实；新显式设备安装要求 inventory v2 的原 UUID/NVML
 GetMigMode 原返回、版本与双采样一致证据，writer 23 及更旧不能回接 24。
-当前完整只读范围 1–24，旧冻结 v1 原文/摘要保持不变，不由当前探测补判历史 N/A。
+该阶段完整只读范围 1–24，旧冻结 v1 原文/摘要保持不变，不由当前探测补判历史 N/A。
 默认诊断仍 v1，可选 --with-mig-capability 独立协商。明确不支持、supported 与 unknown
 分开；身份/版本/CSV 冲突、权限/driver/接口错误不授予整卡规则或新启动 handle。
 只读实际观察不是特权 BPF/CUDA 正向证据；MIG 权限与正式发布/生产切换未完成。

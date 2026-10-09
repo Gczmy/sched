@@ -12,6 +12,11 @@ are additive; consumers must negotiate named contracts and tolerate unknown
 fields. Legacy task replies remain readable through their existing validation.
 Database schema 10 adds persistent identity and structured operation receipts.
 Read-only identity/receipt queries never initialize or migrate a database.
+The current source candidate writes schema 25 and reads complete schemas 1–25;
+the package version is still 0.4.0, distinct from published v0.4.0 (schema maximum
+10). The phase-specific ranges below describe introduction boundaries, not the
+current reader maximum. Negotiate the installed CLI through `version --json`;
+`identity --json` binds an instance, not the set of supported capabilities.
 
 The launch-ancestry candidate also advertises `sched-daemon-launch-ancestry-v1`.
 Only explicit cold `lease_validation.membership=launch_ancestry` uses this mode;

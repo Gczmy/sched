@@ -527,7 +527,7 @@ schema 10→25 合成迁移/失败回滚检查，见 [真实 GPU 结果](recover
 | 9 | admission explain/装箱解释 | 候选 CI/计算节点 CPU 通过 | 复用真实判断，全部资源/原因/观测时效，预约不冒充硬限制 |
 | 10 | allocation 身份/分层失败 | 候选 CI/计算节点 CPU 通过 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
 | 11 | 磁盘/inode/quota 准入 | 候选 CI/计算节点 CPU 通过 | 控制面余量；unknown 明确；容量不足不删科学产物 |
-| 12 | 独立发布与生产切换 | 当前候选 CI/原始包/hash 已核验；未发布或切换 | 新正式版本固定来源/CI/包；验证迁移恢复点；获授权的计算节点排空/安装/验收 |
+| 12 | 独立发布与生产切换 | `aaddb1e` 的 CI/原始包/hash 已核验；后续来源单独核对；未发布或切换 | 新正式版本固定来源/CI/包；验证迁移恢复点；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
 | 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结/schema 23 显式接入/schema 24 MIG 区分与 schema 25 被动根健康候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |

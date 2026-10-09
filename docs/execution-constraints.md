@@ -7,7 +7,8 @@
 另有 [委派 CPU scope 原语](cpu-scopes.md) 管理唯一 intent/inode、配置、被动恢复和
 空 scope 清理。schema 19 的后续持久记录层提供原 allocation/intent/inode/CAS
 和 CPU 释放守卫；schema 20 候选接通显式委派 cgroup 模式、三种 backend 启动和
-原 inode 清理，不创建父委派。正向 kernel/故障恢复验收与设备策略仍未完成。
+原 inode 清理，不创建父委派。设备原语及 schema 23 显式 controller 也已有源码候选，
+但正向 cpuset/BPF/设备 scope 故障恢复验收仍未完成。
 
 ## 通用 backend 接口
 
@@ -64,7 +65,7 @@ BPF。这里未提供这两种资源配置或多租户安全隔离。调用方�
 规则依据见 Linux [affinity 手册](https://man7.org/linux/man-pages/man2/sched_setaffinity.2.html)
 和内核 [cgroup-v2 文档](https://docs.kernel.org/admin-guide/cgroup-v2.html)。
 
-当前计算节点缺少用户 cgroup 写委派，专项只取得实际 CPU affinity/继承/错误/取消/
+已验收的计算环境缺少用户 cgroup 写委派，专项只取得实际 CPU affinity/继承/错误/取消/
 FD 生命周期及 native/持久 owner 重连证据，不能宣称取得真实 cgroup join/创建或 GPU
 设备隔离验收。测试见 [launch constraints](../tests/test_launch_constraints.py)；执行型
 测试只在 Linux 计算节点/CI 跑，native 必须明确构建，缺失不冒充通过。
@@ -72,12 +73,15 @@ FD 生命周期及 native/持久 owner 重连证据，不能宣称取得真实 c
 ## 后续交付，仍属原目标
 
 1. scheduler 的亲和和显式 cgroup 委派冷配置/CPU claim 已有源码候选，未知边界停新
-   派发，默认关闭；不自动准备父委派。新鲜被动委派健康观察仍待实现。
+   派发，默认关闭；不自动准备父委派。schema 25 的 [被动根健康](scope-health.md)
+   已有源码候选，实际委派下的正向新鲜健康验收仍待完成。
 2. schema 20 在创建前提交 allocation/CPU claim/intent，原 inode 保存后再配置，
    启动 intent 提交后才把原 FD 交给 backend；预约不可冒充已生效或已 join。
 3. 运行、取消、timeout、启动失败和 owner 重连的原 scope 清理守卫已接入候选；
    busy/unknown 保留资源，不凭 PID/日志补 wait，不迁移旧 scope、不自动重放。
 4. 原 inode 空 scope 删除结果持久化后才释放，清理未知禁止重复分配该 CPU 集合。
-   原租约真实失效、故障恢复和 CPU 上限须取得授权内核证据；设备权限未实现。
-5. 在具备委派的隔离计算环境验证 cpuset 不可越界、资源释放/重启/失败；设备隔离与
-   真实 CUDA 仍需单独授权，最后按阶段 12 完成发布/生产切换。
+   原租约真实失效、故障恢复和 CPU 上限须取得授权内核证据；设备安装接入已在
+   [显式 controller](device-controller.md) 实现，但正向设备权限验收尚未完成。
+5. 在具备委派的隔离计算环境验证 cpuset 不可越界、资源释放/重启/失败；
+   设备隔离下的真实 CUDA 仍需单独授权。默认隔离关闭的真实 CUDA 结果见
+   [恢复验收](recovery-acceptance.md)，不替代设备权限证据；最后按阶段 12 完成发布/生产切换。

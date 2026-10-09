@@ -1,7 +1,8 @@
 # 候选 CPU 自动容量与声明预留
 
-这是最初引入于 schema 17 的源码候选，尚未部署到生产。实际接收端须通过 `identity --json`
-协商 `sched-cpu-capacity-v1`；包版本不代替能力检查。auto 本身不实现 per-job affinity/cgroup；
+这是最初引入于 schema 17 的源码候选，尚未部署到生产。实际接收端须通过 `version --json`
+协商 `sched-cpu-capacity-v1`，再用 `identity --json` 绑定实例；包版本不代替能力检查。
+当前兼容范围见 [reference](reference.md)。auto 本身不实现 per-job affinity/cgroup；
 后续 schema 18 的 [显式 CPU 亲和](cpu-isolation.md) 独立启用，也不是 cgroup 硬隔离。
 
 ## 配置和计账
@@ -29,10 +30,12 @@ per-task 声明作为保守上限，不通过 NTASKS 放大。Slurm 字段语义
 过期/不可读控制器观察、原 job 未确认、内核上下文变化或锁存 invalid，均暂停 auto
 新派发，不回退到 0 或 max_cpu_jobs。无 Slurm 的 standalone 原始上下文可用 affinity。
 
-[租约策略](daemon-lease.md) 默认 unknown=pause；只有 cgroup membership 无法核对，
-而原 job/内核身份和 CPU 声明均可确认时，显式 allow/observe 才可能允许 auto。
-这仍是有诊断告警的未知 cgroup，不是有效物理租约证明。即便 observe/allow，auto
-也不会容忍已确认 invalid、未知控制器或未知内核身份。固定/零值仍沿租约策略控制，
+[租约策略](daemon-lease.md) 默认 cgroup membership、unknown=pause。缺少 job cgroup
+时，可显式启用 `membership:launch_ancestry`，通过冻结的真实启动链、原 shell/stepd
+身份、控制器和精确 step 进程跟踪验证兼容来源；未知仍暂停。它不证明 daemon 当前
+属于 Slurm proctrack 或获得硬隔离。旧显式 allow/observe 仅在原 job/内核身份和 CPU
+声明均确认、只有 cgroup membership 未知时可能允许 auto，属于有告警的保护降级。
+无论哪种策略，auto 都不容忍已确认 invalid、未知控制器或未知内核身份。固定/零值仍沿租约策略控制，
 不可用 auto 规则静默改变它们的兼容语义。
 
 CPU/GPU 任务共享总预算；显式 resources.cpus 优先，CPU-only 默认 1，GPU 默认
@@ -79,3 +82,5 @@ observation.error 明确缺少观察；不伪造当前物理容量。auto 本身
 真实租约来源，再用 state 外的 fixture scontrol 改变回答，验证热缩容、CPU/GPU
 共同预算、查询失败、失效锁存及零值回退。fake GPU 不占真实 GPU，不修改真实
 Slurm job、生产 daemon 或配置；这些证据不替代真实 CUDA/生产部署验收。
+[启动祖先 CPU/CLI 验收](../tests/run_launch_ancestry_accept.py) 另检查真实原租约来源、
+CPU auto 上限、控制器回答未知后恢复以及失效锁存；不结束真实租约，不证明硬隔离。

@@ -14,11 +14,13 @@
 
 ```bash
 python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <successful-ci-run-id> \
-  --version 0.3.0 --output dist/release-prepared
+  --version <new-package-version> --output dist/release-prepared
 ```
 
 `GH_TOKEN` 可通过现有环境提供，下载和草稿上传仅在内存使用；脚本不保存 token、
 认证 header 或临时存储 URL。匿名公开读取可能受到 GitHub API 限制。
+版本号须与该来源的候选包一致，且不能覆盖已发布版本；当前源码包版本与已发布
+0.4.0 相同，须先确定新的正式来源/版本，不能直接以 0.4.0 准备或替换旧资产。
 默认 repository 为 `Gczmy/sched`；其他正式仓库须显式传 `--repository owner/name`。
 
 脚本核对 repository、当前 main、完整 commit、workflow、run/attempt、全部 job、
