@@ -219,3 +219,13 @@ NULL 指针及 revision/回队清空触发器。迁移不生成历史分配/退�
 cpu-scopes 的独立只读合同只报告已记录事实，不是可用 cgroup 派发/健康证明。
 default off/affinity 不创建子 cgroup；后续接入实际外部效果、持续验证、设备边界
 和授权正向实机验收前，不能将它作为完整硬隔离发布。见 [scope 生命周期](cpu-scopes.md)。
+
+## 后续候选 cgroup 接入 schema 20
+
+显式 mode=cgroup/delegated_root 冷配置接通原 lease/parent/inode 的创建、配置与
+三种 backend 启动，新增 cleanup_ready 事件，将 execution 清理与外部 scope
+含后代清空/原目录删除分开。迁移保留原 scope/CPU 历史，不重放旧 start；完整
+schema 1–20 查询不迁移，schema 19 及更旧 writer 不可回接新库。即使 mode=off，
+未决旧 scope 也保留资源并阻止排空完成。不能通过删事件或降 user_version 回退。
+当前只具源码、模型与拒绝路径证据，正向 cpuset/故障恢复/设备和生产切换尚未完成；
+外部明确委派、授权验证和升级前恢复点是启用前提，不自动修改父 cgroup。

@@ -628,7 +628,7 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
         issues.extend(deployment_checks(cfg))
 
     from .cpu_isolation import policy as cpu_isolation_policy
-    if cpu_isolation_policy(cfg)["mode"] == "affinity":
+    if cpu_isolation_policy(cfg)["mode"] != "off":
         try:
             from .execution import LaunchConstraints, LinuxFdBackend, CONSTRAINTS_VERSION
             from .execution_policy import sealed_bytes
@@ -643,6 +643,14 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
         else:
             add("CPU affinity", "kernel affinity and sealed bootstrap available; lease/claims still rechecked at launch",
                 check_id="cpu_affinity_primitives")
+    if cpu_isolation_policy(cfg)["mode"] == "cgroup":
+        try:
+            from .cpu_scope_controller import preflight_check
+            preflight_check(cfg)
+        except Exception as error:
+            add("CPU cgroup delegation", str(error), "fail", check_id="cpu_cgroup_delegation")
+        else:
+            add("CPU cgroup delegation", "original hierarchy/private cpuset verified without creating a scope; launch rechecks required", check_id="cpu_cgroup_delegation")
 
     # 用户身份 (H2)
     import getpass

@@ -41,8 +41,8 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前 CPU scope 持久记录源码候选写 schema 19，完整只读范围为 1–19；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim 候选写 11/12/13/14/15/16/17/18，都不能回接 schema 19。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前 cgroup 接入源码候选写 schema 20，完整只读范围为 1–20；
+已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim/scope 记录候选写 11/12/13/14/15/16/17/18/19，都不能回接 schema 20。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -395,7 +395,7 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 | `co_locate / co_locate_safety / co_locate_max_jobs / co_locate_freeze_pct` | 共享总开关与阈值；默认 `false / 0.7 / 3 / 85` |
 | `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 预留预算；默认 `0 / 8 / 2`。零值只限 CPU-only 并发；显式 `"auto"` 使用原租约/affinity 的保守容量；固定正值超已知边界告警 |
 | `cpus_auto_max` | 候选 auto 的可选正整数上限 1..1048576，默认 null；非 auto 必须省略/null；可热更 |
-| `cpu_isolation` | 候选 schema 18 显式冷配置，mode=off（默认）或 affinity；按原 allocation 预留独立 CPU 集合，不是 cgroup 硬隔离，详见 [CPU 亲和](cpu-isolation.md) |
+| `cpu_isolation` | 候选显式冷配置，mode=off（默认）、affinity，或 schema 20 的 cgroup + 规范绝对 delegated_root；只用外部已委派原 lease cpuset，失败不降级。亲和与待完成内核/设备验收见 [CPU 亲和](cpu-isolation.md)、[CPU scope](cpu-scopes.md) |
 | `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
 | `storage_admission` | 候选 opt-in 磁盘/inode/可知用户 quota 准入；默认 enabled=false，其余余量/unknown 策略见 [存储合同](storage-admission.md)，支持热更新 |
 | `lease_validation` | 候选冷配置；默认 mode=auto、unknown_policy=pause、interval_sec=30；有 Slurm 来源时失效/未知停新派发，详见 [租约合同](daemon-lease.md) |
@@ -639,7 +639,9 @@ dispatcher；加 `--supervise` 可在满足所有权条件时自动重启，不�
 并发记账；默认不创建子 cgroup、不设置 CPU affinity。候选显式 cpu_isolation.mode=affinity
 在用户 exec 前设置并核对原 claim 的 CPU mask，应用仍可扩大 affinity，不是硬 cpuset。
 资源继承只发生在启动时；只读 `sched cpu-isolation --json` 查询原活动 claim，完整合同见
-[CPU 亲和](cpu-isolation.md)。不会创建子 cgroup 或修改父 Slurm 资源。
+[CPU 亲和](cpu-isolation.md)。该模式不创建子 cgroup。候选显式 cgroup 模式仅在
+外部已授权委派内创建唯一子 cpuset，三种 backend 在 exec 前 join，原 inode/lease
+绑定、清理与未完成正向/设备验收见 [CPU scope](cpu-scopes.md)；不修改父 Slurm 资源。
 候选 schema 17 保存白名单 Slurm/job/step、affinity/cgroup 启动来源与检查/退出事实；
 默认 auto 对有 Slurm 来源的 daemon 持续校验，未知默认暂停、已确认失效锁存停止新派发，
 不杀 running、不自动迁移新租约。通用 system cgroup 不能宣称 valid；旧 daemon 不补造来源，

@@ -206,7 +206,7 @@ def explain(conn, cfg, batch, job, spec):
     unknown = list(budget["unknown"])
     from .cpu_isolation import policy as isolation_policy, recorded_selection
     isolation = None
-    if isolation_policy(cfg)["mode"] == "affinity":
+    if isolation_policy(cfg)["mode"] != "off":
         isolation = recorded_selection(conn, cfg, adapter._task_cpus(spec), job_id=job["id"])
         if isolation["allowed"] is None:
             unknown.append(isolation["reason"])

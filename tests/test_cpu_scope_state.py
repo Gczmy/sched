@@ -247,7 +247,7 @@ class CpuScopeStateTests(affinity.CpuIsolationFixture):
         self.assertEqual("migration_required", json.loads(out)["reason"])
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(19, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertTrue(state._schema_is_complete(conn, 19))
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM cpu_scopes").fetchone()[0])
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM cpu_scope_events").fetchone()[0])

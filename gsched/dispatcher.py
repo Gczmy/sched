@@ -581,6 +581,10 @@ class Dispatcher:
                 from .cluster_lease import Monitor
                 self._cluster_lease = Monitor(self.cfg, self._lease_owner)
                 created_monitor = self._cluster_lease
+                from .cpu_isolation import policy as isolation_policy
+                if isolation_policy(self.cfg)["mode"] == "cgroup":
+                    from .cpu_scope_controller import Controller
+                    self._cpu_scopes = Controller(self)
                 self._atomic_write(self.pid_file, str(pid))
                 # H2: sample the old heartbeat before publishing the new heartbeat.
                 try:
@@ -588,7 +592,10 @@ class Dispatcher:
                 except OSError:
                     self._prev_hb_ts = None
                 self._touch_heartbeat()
-            except (OSError, ValueError, state.StateError, sqlite3.Error):
+            except (OSError, ValueError, RuntimeError, state.StateError, sqlite3.Error):
+                controller = getattr(self, "_cpu_scopes", None)
+                if controller is not None:
+                    controller.close()
                 if created_monitor is not None:
                     try:
                         created_monitor.finish("startup_publication_failed_not_worker_wait")
@@ -804,6 +811,9 @@ class Dispatcher:
             pass
 
     def _cleanup_lock(self) -> None:
+        controller = getattr(self, "_cpu_scopes", None)
+        if controller is not None:
+            controller.close()
         # 通知线程收尾: 退出前等在途通知发完 (超时则放弃, 记 log)
         for thread in getattr(self, "_notify_threads", ()):
             thread.join(timeout=10)
@@ -867,6 +877,8 @@ class Dispatcher:
 
     def _stop_locked(self) -> bool:
         """Terminate exact owned groups, settling state only after proven exit."""
+        from .cpu_scope_controller import maintain as maintain_scopes
+        maintain_scopes(self)
         self._recover_launch_markers()
         try:
             with state.connect() as conn:
@@ -962,6 +974,9 @@ class Dispatcher:
                                 f"process identity={process_state}"
                             )
                             continue
+                        from .cpu_scope_state import request_cleanup
+                        if not request_cleanup(conn, current, cleanup_source="stop_group_gone"):
+                            continue
                         state.update_job(
                             conn,
                             current["id"],
@@ -1009,6 +1024,10 @@ class Dispatcher:
             and unresolved_native == 0
             and not self._unresolved_launch_markers()
         )
+        if completed:
+            from .cpu_scope_state import unresolved
+            with state.connect() as conn:
+                completed = not unresolved(conn)
         if completed:
             self._cleanup_lock()
         else:
@@ -1127,6 +1146,10 @@ class Dispatcher:
         with state.submission_lock():
             with state.connect() as conn:
                 n = conn.execute(activity_query).fetchone()[0]
+                from .cpu_scope_state import unresolved
+                if unresolved(conn):
+                    self.last_activity = time.time()
+                    return False
                 pending_control = conn.execute(
                     "SELECT COUNT(*) FROM control_requests WHERE status='pending'"
                 ).fetchone()[0]
@@ -1144,6 +1167,7 @@ class Dispatcher:
                     conn.execute("BEGIN IMMEDIATE")
                     if (
                         conn.execute(activity_query).fetchone()[0] > 0
+                        or unresolved(conn)
                         or conn.execute(
                             "SELECT 1 FROM control_requests"
                             " WHERE status='pending' LIMIT 1"
@@ -1208,6 +1232,8 @@ class Dispatcher:
         self._check_timeouts()  # H6: duration_min 超时看门狗, kill 后交 reap 收尾
         self._check_probes()  # L6: 日志门控 (fail_on_log/ready_on_log), kill 后交 reap 收尾
         self._recover_launch_markers()
+        from .cpu_scope_controller import maintain as maintain_scopes
+        maintain_scopes(self)
         # Revisit every running row that still lacks a pgid on every tick, not
         # only when a marker was claimed in this tick.  This also converges
         # safely after "claim succeeded, DB settlement failed": on the next
@@ -2185,8 +2211,24 @@ class Dispatcher:
                 # writer wins, a later cancel observes the published terminal.
                 if not conn.in_transaction:
                     conn.execute("BEGIN IMMEDIATE")
+                from .cpu_scope_state import request_cleanup
+                if not request_cleanup(conn, j, cleanup_source="adoption_group_gone"):
+                    continue
                 from .cpu_isolation import release as release_cpu
                 release_cpu(conn, j, cleanup_source="adoption_group_gone")
+                scoped = bool(dict(j).get("allocation_id") and conn.execute("SELECT 1 FROM cpu_scopes WHERE allocation_id=?", (j["allocation_id"],)).fetchone())
+                if scoped:
+                    # A restarted ordinary owner cannot recreate a wait from
+                    # Bash sidecars, empty cgroup or application artifacts.
+                    from .allocation import ordinary_wait as record_wait
+                    record_wait(conn, j, None, j["rc"])
+                    current = state.get_job(conn, j["id"])
+                    reason = current["kill_reason"]
+                    state.update_job(conn, j["id"], status="cancelled" if reason == "cancelled" else "timed_out" if reason == "timed_out" else "interrupted",
+                                     failure="cpu_scope_wait_authority_lost", finished_at=state.now())
+                    self._release_gpu_for_job(conn, j)
+                    cleanup_jobs.extend((("launch", dict(j)), ("profile", dict(j))))
+                    continue
                 rc = None if native_exec else self._read_job_rc(j)
                 if rc is not None:
                     # Preserve the wrapper's durable exit evidence even when a
@@ -3254,6 +3296,12 @@ class Dispatcher:
                     continue
                 if self._has_native_session(conn, j["id"]):
                     continue
+                retained_scope = getattr(self, "_cpu_scope_settlements", {}).get(dict(j).get("allocation_id"))
+                if retained_scope is not None:
+                    cleanup_jobs.extend(self._handle_job_done(conn, j, retained_scope["rc"],
+                        process_exit_authoritative=retained_scope["authoritative"],
+                        ordinary_wait=retained_scope["wait"]))
+                    continue
                 native_exec = self._job_uses_native_exec(conn, j)
                 known_proc = self.executor.has_process(j["pgid"])
                 waited_rc = None
@@ -3409,6 +3457,9 @@ class Dispatcher:
                         "status": "not_started", "pid": None, "returncode": None,
                         "rusage": None, "group_clean": True, "launch_error": None,
                     })
+                    from .cpu_scope_state import request_cleanup
+                    if not request_cleanup(conn, job, cleanup_source="configured_not_started"):
+                        continue
                     state.update_job(conn, job["id"], status="interrupted",
                                      failure="execution_not_started", finished_at=state.now())
                     from .cpu_isolation import release as release_cpu
@@ -3435,6 +3486,9 @@ class Dispatcher:
                                    "launch_error": None}
                     execution_state.observe(conn, job["id"], observation, phase="unresolved")
                     if clean:
+                        from .cpu_scope_state import request_cleanup
+                        if not request_cleanup(conn, job, cleanup_source="configured_group_clean"):
+                            continue
                         state.update_job(conn, job["id"], status="interrupted", failure="execution_authority_lost", finished_at=state.now())
                         from .cpu_isolation import release as release_cpu
                         release_cpu(conn, job, cleanup_source="configured_group_clean")
@@ -3461,6 +3515,9 @@ class Dispatcher:
                         pass  # Keep the durable intent and retry the original owner.
             if observation["status"] == "not_started" and observation.get("group_clean") is True:
                 current = state.get_job(conn, job["id"])
+                from .cpu_scope_state import request_cleanup
+                if not request_cleanup(conn, current, cleanup_source="configured_not_started"):
+                    continue
                 state.update_job(conn, job["id"], status="cancelled" if current["kill_reason"] == "cancelled" else "interrupted",
                                  failure="execution_not_started", finished_at=state.now())
                 from .cpu_isolation import release as release_cpu
@@ -3503,6 +3560,11 @@ class Dispatcher:
         return boot_id()
 
     def _ack_configured_owner(self, conn, job_id):
+        current = state.get_job(conn, job_id)
+        if current is not None and current["status"] == "running":
+            # Original execution exit may precede scope cleanup. Keep the
+            # original owner available until resource/job settlement commits.
+            return
         error_code = None
         try:
             outcome = self.executor.retire_configured_execution(job_id)
@@ -3541,8 +3603,38 @@ class Dispatcher:
             return []
         if ordinary_wait is not None or not process_exit_authoritative:
             record_allocation_wait(conn, current_wait_job, ordinary_wait, rc if rc is not None else j["rc"])
+        from .cpu_scope_state import request_cleanup
+        if not request_cleanup(conn, current_wait_job, cleanup_source="configured_group_clean" if process_exit_authoritative else "ordinary_group_gone"):
+            if ordinary_wait is not None or process_exit_authoritative:
+                # Scope removal may need later ticks. Popen/retained wait is
+                # consumed once; keep this original result in this daemon only.
+                # A restart cannot recreate this authority from an RC sidecar.
+                settlements = getattr(self, "_cpu_scope_settlements", None)
+                if settlements is None:
+                    settlements = self._cpu_scope_settlements = {}
+                from .cpu_scope_controller import MAX_ACTIVE
+                identifier = current_wait_job["allocation_id"]
+                if identifier not in settlements and len(settlements) >= MAX_ACTIVE:
+                    raise state.StateError("CPU scope settlement bound reached; original claims retained")
+                settlements[identifier] = {"rc": rc, "wait": ordinary_wait, "authoritative": process_exit_authoritative}
+            return []
+        getattr(self, "_cpu_scope_settlements", {}).pop(current_wait_job["allocation_id"], None)
         from .cpu_isolation import release as release_cpu
         release_cpu(conn, current_wait_job, cleanup_source="configured_group_clean" if process_exit_authoritative else "ordinary_group_gone")
+
+        scoped = bool(current_wait_job["allocation_id"] and conn.execute("SELECT 1 FROM cpu_scopes WHERE allocation_id=?", (current_wait_job["allocation_id"],)).fetchone())
+        if scoped and not process_exit_authoritative:
+            from .artifact_validation import wait_snapshot
+            raw_rc = ordinary_wait.get("returncode") if isinstance(ordinary_wait, dict) else None
+            if not wait_snapshot(conn, current_wait_job, raw_rc, ordinary_wait)["verified"]:
+                # Scope emptiness is cleanup evidence, not original wait. In
+                # particular an ordinary child outliving a daemon restart must
+                # not settle success from its RC file or application artifacts.
+                reason = current_wait_job["kill_reason"]
+                state.update_job(conn, j["id"], status="cancelled" if reason == "cancelled" else "timed_out" if reason == "timed_out" else "interrupted",
+                                 failure="cpu_scope_wait_authority_lost", finished_at=state.now())
+                self._release_gpu_for_job(conn, j)
+                return [("launch", dict(j)), ("profile", dict(j))]
 
         job_snapshot = dict(j)
         cleanup_paths = [
@@ -4444,6 +4536,14 @@ class Dispatcher:
         if cpu_isolation_policy(gpu_policy) != cpu_isolation_policy(self.cfg):
             self.log_line("CPU isolation cold configuration changed/unreadable; new dispatch paused until explicit restart")
             return
+        controller = getattr(self, "_cpu_scopes", None)
+        if controller is not None:
+            try:
+                if not controller.preflight():
+                    return
+            except (OSError, ValueError, RuntimeError, state.StateError) as error:
+                self.log_line(f"CPU scope dispatch paused: original delegation unavailable: {error}")
+                return
         from . import gpu_admission
         self._gpu_admission_samples = gpu_admission.sample(self.allocator) if any("gpu_admission" in item for item in self.cfg.get("projects", {}).values()) else {}
         with self._dispatch_connection() as conn:
@@ -4717,6 +4817,12 @@ class Dispatcher:
                             "保留 running/resource/marker"
                         )
                         continue
+                    from .cpu_scope_state import request_cleanup
+                    scoped = bool(dict(current).get("allocation_id") and conn.execute("SELECT 1 FROM cpu_scopes WHERE allocation_id=?", (current["allocation_id"],)).fetchone())
+                    if scoped and (current["pgid"] and self._job_process_state(current) not in ("dead", "mismatch")):
+                        continue
+                    if not request_cleanup(conn, current, cleanup_source="launch_not_started"):
+                        continue
                     if gpu is not None:
                         self._release_in_tx(conn, j["id"])
                     state.update_job(
@@ -4748,7 +4854,8 @@ class Dispatcher:
                 # the marker after its own running CAS and rolls back.
                 conn.execute("BEGIN IMMEDIATE")
                 running = conn.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone()
-                if running:
+                from .cpu_scope_state import unresolved
+                if running or unresolved(conn):
                     return False
                 state.mark_idle_shutdown()
             self.log_line("排空完成，停止 daemon；保留 pending 与排空请求，resume 后恢复派发")
@@ -4844,6 +4951,14 @@ class Dispatcher:
             return False
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
+        try:
+            return self._launch_job_scoped(conn, j, gpu)
+        finally:
+            controller = getattr(self, "_cpu_scopes", None)
+            if controller is not None:
+                controller.finish_launch(j["id"])
+
+    def _launch_job_scoped(self, conn, j, gpu: int | None) -> bool:
         """启动任务; 返回是否真正启动 (调用方据此计 CPU/并发配额, D1)。
 
         未启动的正常返回路径: M1 竞态 (已非 pending) 与产物指纹 skip ——
@@ -5006,6 +5121,14 @@ class Dispatcher:
 
         # Final CPU admission uses current hot configuration and immutable
         # running reservations, after all potentially slow launch preparation.
+        controller = getattr(self, "_cpu_scopes", None)
+        if controller is not None:
+            if conn.in_transaction:
+                conn.commit()
+            if not controller.preflight():
+                if gpu is not None:
+                    self._release_in_tx(conn, j["id"])
+                return False
         if not self._cpu_launch_allowed(conn, spec):
             if gpu is not None:
                 self._release_in_tx(conn, j["id"])
@@ -5081,7 +5204,11 @@ class Dispatcher:
         )
         from .allocation import reserve as reserve_allocation
         reserve_allocation(conn, j["id"], spec, self, **({"cpu_binding": cpu_binding} if cpu_binding is not None else {}))
+        if controller is not None:
+            controller.reserve(conn, state.get_job(conn, j["id"]))
         conn.commit()
+        scope_job = state.get_job(conn, j["id"])
+        scope_constraints = controller.prepare(conn, scope_job) if controller is not None else None
         prior_inflight = getattr(self, "_launch_inflight", None)
         if isinstance(prior_inflight, dict):
             # This commit also made any earlier launch pgid writebacks durable.
@@ -5098,7 +5225,8 @@ class Dispatcher:
         )
 
         if spec.get("execution") is not None:
-            return self._launch_configured_job(conn, j, b, spec, gpu, log_path)
+            return self._launch_configured_job(conn, j, b, spec, gpu, log_path,
+                **({"scope_constraints": scope_constraints} if scope_constraints is not None else {}))
 
         # The scheduler-owned profile path is a reserved control channel.
         # Batch, task, and deployment defaults may not redirect it.
@@ -5142,7 +5270,9 @@ class Dispatcher:
             ),
             "force_rerun": bool(spec.get("_force_rerun")),
         }
-        if cpu_binding is not None:
+        if scope_constraints is not None:
+            launch_kwargs["constraints"] = scope_constraints
+        elif cpu_binding is not None:
             from .execution import LaunchConstraints
             launch_kwargs["constraints"] = LaunchConstraints(cpu_affinity=tuple(cpu_binding["cpus"]))
         if native_binding is not None:
@@ -5157,6 +5287,13 @@ class Dispatcher:
                     ),
                 }
             )
+        if controller is not None:
+            if conn.in_transaction:
+                conn.commit()
+            checked = controller.launch_check(conn, scope_job)
+            conn.execute("BEGIN IMMEDIATE")
+            controller.launch_intent(conn, checked)
+            conn.commit()
         pgid = self.executor.launch(**launch_kwargs)
         inflight = getattr(self, "_launch_inflight", None)
         if isinstance(inflight, dict):
@@ -5203,7 +5340,7 @@ class Dispatcher:
             pass
         return True
 
-    def _launch_configured_job(self, conn, job, batch, spec, gpu, log_path) -> bool:
+    def _launch_configured_job(self, conn, job, batch, spec, gpu, log_path, *, scope_constraints=None) -> bool:
         profile = revalidate_binding(spec, self.cfg, str(batch["project"]), json.loads(batch["env"] or "{}"))
         root_stat = os.stat(spec["cwd_abs"])
         frozen = getattr(self, "_native_exec_project_root_identities", {}).get(batch["project"])
@@ -5223,13 +5360,17 @@ class Dispatcher:
             launch_spec = dict(spec)
             launch_spec["_recovery_context"] = recovery.context(self.host_dir, job, spec)
             from .cpu_isolation import launch_constraints
-            constraints = launch_constraints(conn, state.get_job(conn, job["id"]))
+            constraints = scope_constraints if scope_constraints is not None else launch_constraints(conn, state.get_job(conn, job["id"]))
             prepared = self.executor.prepare_configured_execution(job["id"], launch_spec, profile, identity, gpu, log_path,
                 **({"constraints": constraints} if constraints is not None else {}))
+            controller = getattr(self, "_cpu_scopes", None)
+            checked = controller.launch_check(conn, state.get_job(conn, job["id"])) if scope_constraints is not None else None
             conn.execute("BEGIN IMMEDIATE")
             if hasattr(prepared.owner, "binding"):
                 execution_state.bind_owner(conn, job["id"], prepared.owner.binding)
             execution_state.launch_intent(conn, job["id"])
+            if checked is not None:
+                controller.launch_intent(conn, checked)
             conn.commit()
             owner = prepared.launch()
             observation = asdict(owner.poll())
@@ -5260,6 +5401,11 @@ class Dispatcher:
             if observation["status"] == "not_started":
                 execution_state.observe(conn, job["id"], observation, phase="not_started")
                 current = state.get_job(conn, job["id"])
+                from .cpu_scope_state import request_cleanup
+                if not request_cleanup(conn, current, cleanup_source="configured_not_started"):
+                    conn.commit()
+                    self.log_line(f"execution {job['id']} not started; original CPU scope cleanup pending")
+                    return False
                 state.update_job(conn, job["id"], status="cancelled" if current["kill_reason"] == "cancelled" else "failed",
                                  failure="execution_admission", finished_at=state.now())
                 from .cpu_isolation import release as release_cpu

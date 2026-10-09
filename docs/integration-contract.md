@@ -133,8 +133,12 @@ creates a scope, replays a start, invents a wait, or grants kernel-health/launch
 authority. Unknown lifecycle effects retain CPU claims, including after a terminal
 job or retry pointer change. Complete old schemas are queried without migration;
 schema <19 reports migration_required, with no historical backfill. Strict default
-status/task/history fields and FD4 identities remain unchanged. There is no enabled
-scheduler cgroup mode yet; see [scope lifecycle](cpu-scopes.md).
+status/task/history fields and FD4 identities remain unchanged. The later schema
+20 candidate advertises `sched-cpu-cgroup-v1`, enabling only an explicitly supplied
+delegated root, original lease/parent identity, committed effect boundaries and
+cleanup_ready before external removal. Passive cgroup fit remains unknown, not
+a root-availability claim. Positive kernel/device acceptance is still outstanding;
+see [scope lifecycle](cpu-scopes.md).
 
 ### Candidate resource explanation
 

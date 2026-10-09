@@ -306,6 +306,10 @@ class ScopeLinuxAcceptanceTests(unittest.TestCase):
     def test_native_scope_join_caps_affinity_and_descendants(self):
         self.execute(native=True)
 
+    def test_scheduler_scope_cli_join_and_cleanup(self):
+        from run_cpu_cgroup_accept import run
+        run(positive=True)
+
 
 if __name__ == "__main__":
     unittest.main()

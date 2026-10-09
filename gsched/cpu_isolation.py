@@ -1,4 +1,4 @@
-"""Opt-in scheduler CPU claims and launch affinity, not a cgroup boundary."""
+"""Opt-in original CPU claims, affinity and explicitly delegated cpuset launch."""
 from __future__ import annotations
 
 import os
@@ -25,8 +25,17 @@ MAX_POOL = 65536
 
 def policy(cfg):
     raw = cfg.get("cpu_isolation", {})
-    if type(raw) is not dict or set(raw) - {"mode"} or raw.get("mode", "off") not in ("off", "affinity"):
-        raise ValueError("cpu_isolation 仅接受 mode=off|affinity；cgroup 模式尚未实现")
+    if type(raw) is not dict or set(raw) - {"mode", "delegated_root"} or raw.get("mode", "off") not in ("off", "affinity", "cgroup"):
+        raise ValueError("cpu_isolation 仅接受 mode=off|affinity|cgroup 和显式 delegated_root")
+    if raw.get("mode") == "cgroup":
+        from pathlib import PurePosixPath
+        path = raw.get("delegated_root")
+        if (type(path) is not str or not path.startswith("/") or path.startswith("//") or path == "/"
+                or "\0" in path or len(path) > 4096 or str(PurePosixPath(path)) != path or ".." in PurePosixPath(path).parts):
+            raise ValueError("cgroup 模式必须显式配置规范绝对 delegated_root")
+        return {"mode": "cgroup", "delegated_root": path}
+    if "delegated_root" in raw:
+        raise ValueError("delegated_root 只用于显式 cgroup 模式")
     return {"mode": raw.get("mode", "off")}
 
 
@@ -44,10 +53,20 @@ def allocation_binding(conn, identifier, job_id):
         raise state.StateError("CPU allocation binding missing")
     value = _allocation(row)
     binding = value.get("cpu_binding")
-    if (type(binding) is not dict or binding.get("mode") != "affinity"
+    if (type(binding) is not dict or binding.get("mode") not in ("affinity", "cgroup")
             or binding.get("hard_isolation") is not False or binding.get("schema_version") != 1
             or len(_cpus(binding["cpus"])) != value["cpu_reservation"]):
         raise state.StateError("CPU allocation binding invalid")
+    if binding["mode"] == "cgroup":
+        from .execution.scopes import ScopeParent
+        try:
+            ScopeParent(**binding["scope_parent"])
+            _cpus(binding["scope_mems"], maximum=4096)
+            pool = _cpus(binding["scope_pool"], maximum=MAX_POOL)
+            if type(binding.get("scope_authority")) is not dict or not set(binding["cpus"]) <= set(pool):
+                raise ValueError("CPU scope authority/pool binding missing")
+        except (KeyError, TypeError, ValueError) as error:
+            raise state.StateError("CPU scope authority binding invalid") from error
     return value, binding
 
 
@@ -114,18 +133,34 @@ def select(dispatcher, conn, count, *, job_id=None):
                           monitor.sample, monitor.frozen_binding, monitor.decision)
     if not pool["allowed"]:
         return pool
+    controller = None
+    if policy(dispatcher.cfg)["mode"] == "cgroup":
+        controller = getattr(dispatcher, "_cpu_scopes", None)
+        if controller is None or not controller.admission_current():
+            return {"allowed": False, "reason": "original_cgroup_admission_unavailable"}
+        available = set(controller.cpus)
+        pool["pool"] = [cpu for cpu in monitor.origin["affinity"] if cpu in available][:len(pool["pool"])]
+        if not pool["pool"]:
+            return {"allowed": False, "reason": "original_cgroup_cpu_pool_empty"}
     selected = choose(conn, count, pool["pool"], job_id=job_id)
     if not selected["allowed"]:
         return selected
-    return {"allowed": True, "binding": {"schema_version": 1, "mode": "affinity", "cpus": selected["cpus"],
+    value = {"schema_version": 1, "mode": policy(dispatcher.cfg)["mode"], "cpus": selected["cpus"],
         "lease_id": monitor.owner["lease_id"], "kernel_context_sha256": pool["kernel_context_sha256"],
-        "hard_isolation": False, "semantics": "launch_affinity_not_nonwidenable_cpuset"}}
+        "hard_isolation": False, "semantics": "launch_affinity_not_nonwidenable_cpuset"}
+    if value["mode"] == "cgroup":
+        from .cpu_scope_controller import active, MAX_ACTIVE
+        if len(active(conn)) >= MAX_ACTIVE:
+            return {"allowed": False, "reason": "cpu_scope_bound_exhausted"}
+        value.update(controller.binding_fields())
+        value["semantics"] = "cpuset_launch_intent_not_join_proof"
+    return {"allowed": True, "binding": value}
 
 
 def recorded_selection(conn, cfg, count, *, job_id=None):
     """Exact live owner's recorded origin; no query-host kernel/Slurm probes."""
     from .daemon import _read_lease_owner
-    base = {"mode": "affinity", "hard_isolation": False, "runtime_probed": False, "admission_granted": False}
+    base = {"mode": policy(cfg)["mode"], "hard_isolation": False, "runtime_probed": False, "admission_granted": False}
     try:
         if conn.execute("PRAGMA user_version").fetchone()[0] < 18:
             return {**base, "allowed": None, "reason": "cpu_claims_migration_required"}
@@ -142,6 +177,13 @@ def recorded_selection(conn, cfg, count, *, job_id=None):
                                check["slurm_binding"], check)
         if not pool["allowed"]:
             return {**base, **pool, "allowed": None}
+        if base["mode"] == "cgroup":
+            # A lease observation is not a current observation of the delegated
+            # parent, original inode, cpuset configuration or unresolved scopes.
+            # Never probe from this read-only query or promise cgroup admission.
+            return {**base, "allowed": None, "reason": "original_cgroup_observation_unavailable",
+                    "lease_id": owner["lease_id"], "observation_age_s": age,
+                    "expires_after_s": cluster_lease.MAX_AGE}
         return {**base, **choose(conn, count, pool["pool"], job_id=job_id),
                 "lease_id": owner["lease_id"], "observation_age_s": age,
                 "expires_after_s": cluster_lease.MAX_AGE}
@@ -174,6 +216,8 @@ def launch_constraints(conn, job):
             raise state.StateError("CPU scope launch requires its original retained cgroup FD; affinity fallback refused")
     rows = conn.execute("SELECT cpu FROM cpu_assignments WHERE allocation_id=? AND job_id=? ORDER BY cpu", (identifier, job["id"])).fetchall()
     _, binding = allocation_binding(conn, identifier, job["id"])
+    if binding["mode"] == "cgroup":
+        raise state.StateError("cgroup allocation cannot use affinity-only launch even if scope intent is missing")
     if [row["cpu"] for row in rows] != binding["cpus"]:
         raise state.StateError("launch CPU claims differ from immutable allocation")
     return LaunchConstraints(cpu_affinity=tuple(binding["cpus"]))

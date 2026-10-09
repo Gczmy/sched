@@ -2,7 +2,7 @@
 
 Each external effect requires a separately committed intent. An uncertain
 effect is never retried by name, and an absent scope is not proof of removal.
-This ledger is scheduler infrastructure, not an enabled cgroup dispatch mode.
+This ledger never performs filesystem effects or grants execution authority.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ CREATE TRIGGER IF NOT EXISTS cpu_scope_event_retained BEFORE DELETE ON cpu_scope
 MAX_EVENTS = 256
 MAX_BYTES = 1024 * 1024
 KINDS = {"reserved", "create_intent", "inode_bound", "configure_intent", "configured",
-         "launch_intent", "cleanup_intent", "removed", "abandoned", "unknown"}
+         "launch_intent", "cleanup_ready", "cleanup_intent", "removed", "abandoned", "unknown"}
 TERMINAL = {"removed", "abandoned"}
 OBSERVATION_KEYS = {"scope_configured", "populated", "direct_process_count", "effective_cpus",
                     "effective_mems", "admission_granted", "wait_authority_granted", "device_isolation"}
@@ -146,9 +146,11 @@ def _validate_transition(value, events, kind, data):
     allowed = {"reserved": {None}, "create_intent": {"reserved"}, "inode_bound": {"create_intent"},
                "configure_intent": {"inode_bound"}, "configured": {"configure_intent"},
                "launch_intent": {"configured"}, "cleanup_intent": {"inode_bound", "configure_intent", "configured", "launch_intent", "unknown"},
+               "cleanup_ready": {"inode_bound", "configure_intent", "configured", "launch_intent", "unknown"},
                "removed": {"cleanup_intent"}, "abandoned": {"reserved"}, "unknown": KINDS - TERMINAL - {"unknown"}}
     if phase not in allowed[kind]:
-        raise state.StateError("CPU scope effect consumed or recovery cannot replay it")
+        if not (kind == "cleanup_intent" and phase == "cleanup_ready"):
+            raise state.StateError("CPU scope effect consumed or recovery cannot replay it")
     if kind == "inode_bound":
         if set(data) != {"binding"}:
             raise state.StateError("CPU scope inode data invalid")
@@ -159,6 +161,11 @@ def _validate_transition(value, events, kind, data):
         if set(data) != {"observation"} or bound is None:
             raise state.StateError("CPU scope configuration requires its original inode")
         _observation(data["observation"], intent, configured=True)
+    elif kind == "cleanup_ready":
+        if (set(data) != {"cleanup_source"} or bound is None
+                or data["cleanup_source"] not in ("ordinary_group_gone", "adoption_group_gone", "stop_group_gone", "configured_group_clean", "configured_not_started", "launch_not_started")
+                or any(event["kind"] in ("cleanup_ready", "cleanup_intent") for event in events)):
+            raise state.StateError("CPU scope cleanup request requires original binding and unconsumed effect")
     elif kind == "cleanup_intent":
         if set(data) != {"observation", "cleanup_source"} or bound is None:
             raise state.StateError("CPU scope cleanup requires its original inode")
@@ -237,6 +244,10 @@ def release_allowed(conn, allocation_id, job_id):
     """Unknown or nonterminal scope retains claims even after terminal job CAS."""
     row = conn.execute("SELECT scope_id FROM cpu_scopes WHERE allocation_id=? AND job_id=?", (allocation_id, job_id)).fetchone()
     if row is None:
+        from .allocation import _allocation as decode_allocation
+        original = conn.execute("SELECT * FROM allocations WHERE allocation_id=? AND job_id=?", (allocation_id, job_id)).fetchone()
+        if original is not None and decode_allocation(original).get("cpu_binding", {}).get("mode") == "cgroup":
+            raise state.StateError("original cgroup allocation scope intent missing; retain resources")
         return True  # No retroactive scope binding for legacy affinity jobs.
     _, events = load(conn, row[0])
     return events[-1]["kind"] in TERMINAL
@@ -249,6 +260,35 @@ def unresolved(conn):
         return False
     load(conn, row[0])  # Missing/corrupt evidence is an error, not an empty pool.
     return True
+
+
+def request_cleanup(conn, job, *, cleanup_source):
+    """Execution guard has proved no child/clean group; never probe in writer."""
+    identifier = dict(job).get("allocation_id")
+    if not identifier or conn.execute("PRAGMA user_version").fetchone()[0] < 19:
+        return True
+    row = conn.execute("SELECT scope_id FROM cpu_scopes WHERE allocation_id=? AND job_id=?", (identifier, job["id"])).fetchone()
+    if row is None:
+        release_allowed(conn, identifier, job["id"])
+        return True
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    _, events = load(conn, row[0])
+    last = events[-1]
+    if last["kind"] in TERMINAL:
+        return True
+    if last["kind"] == "reserved":
+        advance(conn, row[0], last["event_id"], "abandoned")
+        return True
+    if last["kind"] == "create_intent":
+        advance(conn, row[0], last["event_id"], "unknown", {"reason": "creation_result_unknown"})
+        return False
+    if (last["kind"] in ("cleanup_ready", "cleanup_intent")
+            or any(e["kind"] in ("cleanup_ready", "cleanup_intent") for e in events)
+            or not any(e["kind"] == "inode_bound" for e in events)):
+        return False
+    advance(conn, row[0], last["event_id"], "cleanup_ready", {"cleanup_source": cleanup_source})
+    return False
 
 
 def query(conn, *, scope_id=None, limit=20, cursor=None):

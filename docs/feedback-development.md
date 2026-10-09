@@ -297,7 +297,26 @@ SHA256 为 `d0717d398d9f7fe9b8dec2570e40767729b331b3df92014bc3cfc633fa4a0bef`，
 本地与计算节点一致。同一最终来源 CPU 亲和 CLI 六组全部通过，涵盖普通/fake-GPU/
 native mask、取消/释放、原 owner 崩溃重连与冷配置/默认 off，生产 daemon/config
 未改。此记录层不自动启用 cgroup，没有实际 scope mkdir/join/恢复/设备验收，
-不能当作完整硬隔离；本项 CI 待确认，未发布或部署。
+不能当作完整硬隔离。固定来源 `6d17aab65e5c4b428cc2c6b11e3fe21aa92d8e7d` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37881749346) 14 项均通过；未发布或部署。
+
+后续 schema 20 源码候选接通显式 cgroup/delegated_root、原 lease/parent/inode
+验证与创建/配置/启动/清理的独立提交边界；不自动准备父委派。execution 已清理
+与原 scope 含后代为空分开，cleanup_ready 后仅在 writer 外删除原目录，真实
+removed 落库后才释放。普通 wait 在同 daemon 内按原 allocation 保留跨 tick；
+丢失原 wait 不从 sidecar/产物补判成功。原 owner 亦保留至清理/结算完成，缺少
+原 cgroup intent 不允许 affinity 降级或释放。18 条 controller 模型、19 条记录模型
+与 15 条亲和纯决策/事务回归通过，模型不计 kernel 验收。
+指定计算租约内最终固定来源完整 native 回归运行 936 条：931 通过、5 跳过；
+其中两条底层 scope 和一条 scheduler 正向项均因缺少明确委派跳过。174 文件
+runtime/fixture 清单 SHA256 为
+`c2401eaaaa2713cdc0b96d41abf4a8fde1bba7e6bf810d1c198a1cedb4058c13`，
+本地与计算节点核对一致；同来源普通目录 cgroup 委派拒绝 CLI 通过，无 daemon/
+allocation/CPU claim/worker，无父级写入。兼容 CPU 亲和 CLI 六组在此前固定来源
+`1f9d7baa4241dd5801c18dab933180784c7aab6432b59ff2e9395cd6d81dd14e` 全部通过，
+之后仅补缺失 cgroup intent 的拒绝守卫并取得最终全量/拒绝路径证据。
+未使用真实 GPU、修改生产 daemon/config 或 Slurm 父级；尚未取得正向 cpuset/
+故障恢复/设备证据，未发布或部署。合同与授权正向脚本见 [CPU scope](cpu-scopes.md)。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -314,7 +333,7 @@ native mask、取消/释放、原 owner 崩溃重连与冷配置/默认 off，�
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 原语、亲和/CPU claim 和 schema 19 scope 持久记录候选；实际 cgroup/设备边界未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 原语、亲和/CPU claim、持久 scope 与 schema 20 显式 cgroup 派发/清理源码候选；正向内核/设备验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

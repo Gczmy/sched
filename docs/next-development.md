@@ -166,14 +166,16 @@ exec 前应用显式 CPU 集合和保留 cgroup FD，失败不降级。后续
 [scheduler CPU 亲和候选](cpu-isolation.md) 接入显式冷配置、schema 18 的不可变
 allocation CPU 绑定/活动 claim、原清理事实释放与持久 owner 重连；应用可主动扩大
 affinity，不能称为硬隔离。后续 scope 持久记录与 CPU 释放守卫已在源码候选实现，
-实际 cgroup 创建/派发/清理/恢复和设备策略仍未接通；当前计算
+后续 schema 20 候选接通显式委派 cgroup 创建/派发/原 inode 清理与恢复守卫，设备
+策略和正向 kernel/故障恢复验收仍未完成；当前计算
 环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
 
 后续 [委派 CPU scope 原语](cpu-scopes.md) 提供唯一 intent/原 inode 绑定、子 cpuset
 配置与有效集合核对、恢复仅观察和确认空 scope 清理；不修改父 controller，不因
 配置失败降级或重建旧名字。后续 schema 19 候选以空表持久记录原 allocation/lease/
 CPU claim 绑定的 intent、原 inode、配置/启动/清理的一次 CAS，未知保留原 CPU claim，
-可通过独立只读 cpu-scopes 查询。尚未把记录层接通实际创建、派发和执行恢复；
+可通过独立只读 cpu-scopes 查询。schema 20 将已提交效果与外部创建/配置/启动/
+清理分开，新增 cleanup_ready，原 wait 跨 tick 保留，重启失去普通 wait 不补判成功；
 缺少明确测试委派时不宣称正向内核验收通过，仍不是完整 cgroup/设备交付。
 
 ### 已确认的设计方向
