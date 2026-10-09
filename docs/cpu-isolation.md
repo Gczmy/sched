@@ -1,6 +1,6 @@
-# 候选 per-job CPU 亲和
+# per-job CPU 亲和
 
-此功能在 schema 18 引入，当前候选 writer 为 schema 25、完整只读 1–25，未发布、未部署。实际 CLI 需报告命名合同
+此功能在 schema 18 引入，已随 [v0.5.0](releases/0.5.0.md) 发布；writer 为 schema 25、完整只读 1–25，生产尚未切换。实际 CLI 需报告命名合同
 `sched-cpu-isolation-v1`；包版本相同不表示旧安装已支持。只通过 sched CLI 操作 state。
 
 ## 显式启用与边界

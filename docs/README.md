@@ -3,8 +3,8 @@
 当前行为以代码和下列契约文档为准。文档中的示例使用通用名称；真实账户、
 节点、租约、会话、批次和部署目录保留在仓库外的私有运行记录中。
 
-当前源码为 0.5.0 候选，写库 schema 25，完整只读范围 1–25；
-不等于已发布的 v0.4.0（schema 上限 10）或生产已升级。各页的“引入 schema”
+已发布 [v0.5.0](releases/0.5.0.md)，固定来源 `7471c1c`，写库 schema 25，完整只读范围 1–25；
+生产切换和正向硬隔离验收仍未完成。各页的“引入 schema”
 表示功能加入时的边界，不是当前兼容上限。接收端以 `sched version --json`
 协商实际代码的 named contracts/schema；`sched identity --json` 只用于实例绑定。
 
@@ -27,7 +27,8 @@
 | [0.2.2 Release 说明](releases/0.2.2.md) | 逐 backend 预检、Linux 矩阵与发布准备；正式来源和资产以 Release/tag 为准 |
 | [0.3.0 Release 说明](releases/0.3.0.md) | 恢复协议、显存准入、前台守护与 schema 9；发布事实以 Release/tag 为准 |
 | [0.4.0 Release 说明](releases/0.4.0.md) | 已发布集成合同、schema 10 与独立消费端兼容边界 |
-| [0.5.0 候选说明](releases/0.5.0.md) | 通用反馈修复、租约/CPU 能力与 schema 25；尚未发布或部署 |
+| [0.5.0 Release 说明](releases/0.5.0.md) | 固定来源、完整 CI、原始资产、租约/CPU 能力与 schema 25；生产切换另行安排 |
+| [student-compatibility.md](student-compatibility.md) | 无 cpuset/BPF 权限时的显式启动祖先、CPU affinity 合同与联合验收计划 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |

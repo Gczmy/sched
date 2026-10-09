@@ -1,7 +1,7 @@
 # sched 使用参考（权威版）
 
 > 面向 AI 代理与用户的**功能与命令权威查阅文档**。改调度器行为时同步更新本文件。
-> 版本基准：本次提交的 source/tests。新增诊断接口属于当前源码候选，不表示已发布或部署；使用前核对目标 CLI 的命名合同。
+> 版本基准：本次提交的 source/tests。v0.5.0 发布事实见[版本说明](releases/0.5.0.md)；后续扩展单独记录。发布不表示目标已部署，使用前核对目标 CLI 的命名合同。
 
 ---
 
@@ -15,7 +15,7 @@
 
 ## 集成身份、回执与幂等提交
 
-源码候选增加 `snapshot create/verify/migrate/rollback/close/status`，命名合同
+v0.5.0 提供 `snapshot create/verify/migrate/rollback/close/status`，命名合同
 `sched-upgrade-snapshot/v1`。创建前无损排空并停用旧版写入端；create 使用
 `--writers-quiesced --yes`，migrate/rollback/close 使用 `--yes`，各子命令支持 `--json`。
 创建和验证不初始化数据库，维护窗口内只有显式 migrate 可升级；关闭永久消费旧 ID

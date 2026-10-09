@@ -1,9 +1,10 @@
-# 候选 daemon 租约来源与持续校验
+# daemon 租约来源与持续校验
 
-来源记录于 schema 17 引入；当前完整候选写 schema 25、只读 schema 1–25。包版本不代表部署能力，使用
+来源记录于 schema 17 引入；[v0.5.0](releases/0.5.0.md) 写 schema 25、只读 schema 1–25。包版本不代表部署能力，使用
 `version --json` 协商 `sched-daemon-lease-v1`，`identity --json` 确认实例。未部署到生产，不能把 CPU/fake-GPU
 验收当作真实 Slurm 失效或 CUDA 验收。后续候选的 [CPU 自动容量](cpu-capacity.md)
-复用此来源和校验；per-job 硬隔离仍另行开发。
+复用此来源和校验；per-job 硬隔离仍须授权正向验收。
+无委派权限时的部署合同与联合验收见[学生账号兼容路线](student-compatibility.md)。
 
 ## 配置与派发边界
 

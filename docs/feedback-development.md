@@ -6,6 +6,12 @@
 
 ## 当前交付边界
 
+2026-10-09：最终来源 `7471c1cfdff5b8290799fceecabf20c8d230bf6f` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37929921531) 14/14 成功，
+[v0.5.0](releases/0.5.0.md) 已正式发布七份原始资产。下文逐阶段的候选状态保留为
+当时记录；生产切换、正向 cpuset/BPF 和原 Slurm 租约真实结束仍未完成。
+当前无特权路线的后续工作见[学生账号兼容路线](student-compatibility.md)。
+
 第一阶段源码提交 `5c9a170` 加入产物逐项诊断、`json_equals`、只读
 `artifact-check`、请求格式/JSON 拒绝、同 RID 有界等待/多 RID 查询与
 GPU 池/硬亲和交叉校验。该阶段使用 DB schema 10；阶段 3/4/5/6 引入 11/12/13/14，阶段 7 后续候选写 15。
