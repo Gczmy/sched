@@ -18,6 +18,11 @@ from run_exact_dependencies_accept import ExactAcceptance
 
 
 class CgroupAcceptance(ExactAcceptance):
+    daemon_flags = ("--fake",)
+
+    def verify_scoped_worker(self, batch, task, scope, *, released):
+        """Optional extra evidence for the independently gated device lane."""
+
     def save_config(self, delegated_root):
         self.cfg.update(cpu_isolation={"mode": "cgroup", "delegated_root": delegated_root},
                         cpus_total=2, max_cpu_jobs=2,
@@ -80,10 +85,10 @@ class CgroupAcceptance(ExactAcceptance):
         self.config.write_text(json.dumps(self.cfg))
         self.cli("daemon", "drain")
         batch = self.submit("scoped", tasks, failure_policy="continue_independent")
-        check = self.data("daemon", "check", "--fake", "--json")
+        check = self.data("daemon", "check", *self.daemon_flags, "--json")
         assert any(c["id"] == "cpu_cgroup_delegation" and c["level"] == "ok" for c in check["checks"])
         self.cli("daemon", "resume")
-        self.cli("daemon", "start", "--fake")
+        self.cli("daemon", "start", *self.daemon_flags)
         root_health = self.wait(lambda: self.data("scope-health", "--json"), lambda r: r["status"] == "ready")
         assert root_health["recorded_origin"]["data"]["facts"]["parent"]["path"] == delegated_root
         assert not root_health["admission_granted"] and not root_health["physical_boundary_verified"]
@@ -98,6 +103,7 @@ class CgroupAcceptance(ExactAcceptance):
             assert "/sched-cpu-" + scope["scope_id"] in mask[3]
             assert scope["recorded_phase"] == "launch_intent" and scope["launch_consumed"]
             assert not scope["cpu_release_recorded_ready"]
+            self.verify_scoped_worker(batch, task, scope, released=False)
             if task == "ordinary":
                 other_output = self.root / "fd/mask.json"
                 other = self.wait(lambda: json.loads(other_output.read_text()) if other_output.exists() else None, bool)
@@ -113,6 +119,7 @@ class CgroupAcceptance(ExactAcceptance):
             frozen = self.data("cpu-scopes", "--scope-id", scope["scope_id"], "--json")
             assert frozen["scopes"][0]["recorded_phase"] == "removed"
             assert not Path(delegated_root, "sched-cpu-" + scope["scope_id"]).exists()
+            self.verify_scoped_worker(batch, task, frozen["scopes"][0], released=True)
             assert (self.root / task / "runs.txt").read_text() == "run\n"
             if task != "ordinary":
                 attempt = self.data("execution", f"{batch}:{task}", "--json")["attempts"][0]
@@ -121,7 +128,7 @@ class CgroupAcceptance(ExactAcceptance):
         assert self.data("cpu-isolation", "--json")["claims"] == []
         self.cli("daemon", "drain", "--stop-when-idle")
         self.wait(lambda: self.data("daemon", "status", "--json"), lambda r: r["health_state"] == "stopped")
-        self.cli("daemon", "start", "--fake")
+        self.cli("daemon", "start", *self.daemon_flags)
         self.cli("daemon", "drain", "--stop-when-idle")
         self.wait(lambda: self.data("daemon", "status", "--json"), lambda r: r["health_state"] == "stopped")
         for identifier, frozen in snapshots.items():

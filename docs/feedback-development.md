@@ -469,6 +469,25 @@ daemon 的 scope-health 在未启用 cgroup 时明确 disabled，未生成根绑
 实际崩溃/认证重连仍不重放，cold off 不改旧历史。生产仅用已部署 CLI 读取健康，
 没有修改安装/config/daemon、Slurm 父级或执行 BPF attach/真实 GPU 计算。
 
+固定原根健康提交 `ca171a414919185f8ff5e5173d68fbb3a65e5809` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37902420532) 已完成 success，
+14/14 作业通过，含默认/native 回归、CPU/CLI 和独立候选构建；未发布或部署。
+
+设备正向验收准备另提供显式授权的 CPU-only/BPF 入口，复用三种 backend 的原
+cpuset/取消/清理检查并增加标准设备允许、精确 NVIDIA 节点 EPERM、后代继承、原
+installed/launch binding 和精确 removed→released 引用。默认拒绝脚本与自动 CI
+不会执行它；变量不准备委派或授予 BPF 权限。此入口尚未执行，不计正向内核证据，
+逐卡 GPU 允许/CUDA 与实际设备 scope 故障矩阵仍待完成，见
+[设备 controller](device-controller.md)。
+
+该脚本来源在指定既有计算租约内显式 native 构建后通过 83 条专项检查中的 80 条，
+3 条正向 scope 项因无外部明确委派跳过；新增纯授权/程序/结果检查 7 条均通过。
+207 文件 runtime/native/fixture/构建脚本清单 SHA256 为
+`62b9406e4d8936c506d974c9a618c35a825a6855a640dded357848f150c97375`，
+计算节点前后与本地一致。默认 CPU/设备普通目录拒绝验收均退出 0；未授权调用正向
+入口明确退出 1，发生在创建私有 fixture 或任何设备效果之前。没有运行正向 BPF
+路径，没有 CUDA/真实 GPU 计算，也没有更改生产或准备 Slurm 父级。
+
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
 | 2 | 已提交修复验收 | 候选 CI/CPU/两主机验收通过 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |

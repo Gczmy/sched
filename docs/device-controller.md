@@ -57,6 +57,27 @@ CPU removed，再释放资源。不 detach、不推断程序垃圾回收，也�
 [计算节点拒绝验收](../tests/run_device_cgroup_accept.py) 只用私有 ordinary directory
 与 fake topology，明确拒绝 daemon/allocation/worker，不附加 BPF 或探测真实 GPU。
 
+[CPU-only 正向入口](../tests/run_device_positive_accept.py) 不纳入自动 CI，只有在计算节点、
+明确授权 BPF load/attach、外部已准备专用委派和 native 构建后才运行：
+
+```bash
+SCHED_TEST_CPU_SCOPE_ROOT=/sys/fs/cgroup/private-example \
+SCHED_TEST_DEVICE_ATTACH_AUTHORIZED=1 \
+PYTHONPATH=. python3 tests/run_device_positive_accept.py --positive-cpu
+```
+
+示例路径不是可用委派；变量不授予内核权限。脚本不创建父委派、不改父 controller、
+不 sudo、不新申请租约。所有 sched 操作走 CLI，state/配置与 worker 是新建私有 fixture。
+真实只读 v2 inventory 确定精确节点；先要求同 UID 在外层能新开这些 NVIDIA 节点，
+否则拒绝将外部策略/DAC 的拒绝当作子策略证据。三个 backend 的 CPU-only worker
+及新后代分别新开设备：null/zero 成功，原整卡/control/UVM 必须 EPERM；无 CUDA、
+ioctl 或 GPU 作业。同时检查原 installed/launch binding、取消、原 CPU removed 引用
+和设备 released、停止后重启不改旧链。出错保留私有 state/证据，不删除未知 scope。
+
+当前仅提供脚本及纯 guard/program 检查，**尚未运行这条正向入口**。它即使通过也只
+证明 CPU-only 排除 NVIDIA 的边界，不能代替 GPU 作业允许指定卡/拒绝其他卡、真实
+CUDA、持久 owner 在设备 scope 中崩溃重连、权限/映射漂移或原租约结束的故障矩阵。
+
 后续 [schema 24 MIG 能力](mig-capability.md) 接入 v2 原 UUID NVML GetMigMode，区分
 明确不支持/未知；新安装必须 v2，旧 v1 不补写，未知不降级。
 后续 schema 25 [原根健康](scope-health.md) 记录原 root/CPU/NUMA 与可选父 BPF 前置
