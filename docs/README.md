@@ -21,6 +21,7 @@
 | [execution-api.md](execution-api.md) | backend 冷注册、输入 FD 和自包含可选 native |
 | [persistent-execution-owner.md](persistent-execution-owner.md) | 持久 owner、认证重连、运维确认与崩溃恢复证据 |
 | [execution-rollout.md](execution-rollout.md) | 独立发布、安装与 schema 回退边界 |
+| [upgrade-snapshot.md](upgrade-snapshot.md) | 候选持久维护窗口、恢复点校验与未启动任务的受控回退 |
 | [release-preparation.md](release-preparation.md) | 完整 CI 原始产物校验、Release 草稿准备与中断续传 |
 | [0.2.1 Release 说明](releases/0.2.1.md) | 功能、兼容性与安装/回退约束；发布事实以 GitHub Release 为准 |
 | [0.2.2 Release 说明](releases/0.2.2.md) | 逐 backend 预检、Linux 矩阵与发布准备；正式来源和资产以 Release/tag 为准 |

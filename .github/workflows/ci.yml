@@ -96,6 +96,7 @@ jobs:
           python tests/run_cpu_capacity_accept.py
           python tests/run_cpu_isolation_accept.py
           python tests/run_cpu_cgroup_accept.py
+          python tests/run_snapshot_accept.py
           bash tests/run_mode_consistency_accept.sh
           bash tests/run_project_gpu_enabled_accept.sh
           bash tests/run_docs_refs_accept.sh

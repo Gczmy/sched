@@ -76,6 +76,7 @@ def _explicit_stop(session):
         return False  # Indeterminate controls cannot cancel a running child.
 
 
+@state.maintenance.writer
 def foreground(*, fake=False, supervise=False, restart_delay_sec=3, max_restarts=0):
     """Own one daemon child at a time. Never steal a live/stale/unknown lease."""
     if type(restart_delay_sec) not in (int, float) or not 1 <= restart_delay_sec <= 300:

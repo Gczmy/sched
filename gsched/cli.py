@@ -5284,6 +5284,37 @@ def cmd_integration_query(args) -> int:
         state.set_read_only(False)
 
 
+def cmd_snapshot(args) -> int:
+    from . import snapshot
+    action = args.snapshot_action
+    try:
+        if action not in {"verify", "status"}:
+            cfg = load_config()
+            if _is_foreign_host(cfg) and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1":
+                raise state.StateError("snapshot maintenance must execute on config.node, not on a gateway")
+            if not args.yes:
+                print("未确认：snapshot 写操作需要 --yes", file=sys.stderr)
+                return 1
+        if action == "create":
+            result = snapshot.create(writers_quiesced=args.writers_quiesced)
+        elif action == "status":
+            result = snapshot.status()
+        elif action == "verify":
+            result = snapshot.verify(args.snapshot_id)
+        else:
+            result = getattr(snapshot, action)(args.snapshot_id)
+        print(json.dumps(result, ensure_ascii=False) if args.json else
+              f"snapshot {result.get('snapshot_id', '-')} {result.get('phase', 'verified' if result.get('verified') else 'closed')}; daemon not started")
+        return 0
+    except (state.StateError, OSError, sqlite3.Error, ConfigError) as error:
+        if args.json:
+            print(json.dumps({"schema_version": 1, "contract": snapshot.FORMAT,
+                              "ok": False, "error": str(error), "daemon_started": False}, ensure_ascii=False))
+        else:
+            print(f"错误: {error}", file=sys.stderr)
+        return 1
+
+
 def cmd_version(args) -> int:
     """Report installed code compatibility without consulting configured state."""
     from .integration import CONTRACTS
@@ -5556,6 +5587,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="确认执行")
     p.set_defaults(fn=cmd_clean)
 
+    p = sub.add_parser("snapshot", help="升级窗口恢复点；不支持历史执行回滚，不自动启动 daemon")
+    snapshots = p.add_subparsers(dest="snapshot_action", required=True)
+    for action in ("create", "verify", "migrate", "rollback", "close", "status"):
+        parser = snapshots.add_parser(action)
+        if action not in {"create", "status"}:
+            parser.add_argument("snapshot_id")
+        if action not in {"verify", "status"}:
+            parser.add_argument("--yes", action="store_true")
+        if action == "create":
+            parser.add_argument("--writers-quiesced", action="store_true", help="确认已停用不认识维护门禁的旧版写入端")
+        parser.add_argument("--json", action="store_true")
+        parser.set_defaults(fn=cmd_snapshot)
+
     p = sub.add_parser("config", help="配置管理 (B12-a 热更新)")
     sub_cfg = p.add_subparsers(dest="config_cmd", required=True)
     p_reload = sub_cfg.add_parser("reload", help="请求 daemon 热更新 config.json")
@@ -5726,7 +5770,52 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "scope-health", "device-scopes", "device-inventory", "device-inventory-bindings"}:
+    if command == "request":
+        try:
+            _request_envelope(args)
+        except RequestValidationError as error:
+            return _request_rejection(args, error)
+    passive = {
+        "capabilities", "version", "identity", "request-status", "request-status-many",
+        "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations",
+        "batch-policy", "batch-dependencies", "task-dependencies", "task-facts",
+        "admission-explain", "allocations", "storage-explain", "daemon-lease",
+        "cpu-capacity", "cpu-isolation", "cpu-scopes", "scope-health", "device-scopes",
+        "device-inventory", "device-inventory-bindings", "verify", "status", "task",
+        "execution", "recovery", "history", "markers", "incidents", "diag", "log",
+        "list-gpus", "notify-inbox", "project", "snapshot",
+    }
+    read = (command in passive or bool(getattr(args, "dry_run", False))
+            or (command == "config" and getattr(args, "config_cmd", None) == "get")
+            or (command == "daemon" and getattr(args, "action", None) == "status"))
+    try:
+        if read:
+            return _main_args(args)
+        if command != "init":
+            try:
+                cfg = load_config()
+            except ConfigError:
+                return _main_args(args)
+            if (_is_foreign_host(cfg) and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1"
+                    and command != "submit"):
+                return _main_args(args)  # existing host guard, before any fence file
+        with state.maintenance.gate():
+            return _main_args(args)
+    except state.SubmissionBlocked as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 2
+    except state.StateError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    except ConfigError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+
+
+def _main_args(args) -> int:
+
+    command = getattr(args, "_subcommand", None)
+    if command in {"snapshot", "capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity", "cpu-isolation", "cpu-scopes", "scope-health", "device-scopes", "device-inventory", "device-inventory-bindings"}:
         return args.fn(args)
     if command == "request":
         try:
@@ -5848,6 +5937,7 @@ def main(argv: list[str] | None = None) -> int:
         and not foreign_submit
         and not foreign_read
         and not dry_run
+        and not (command == "daemon" and daemon_action == "check")
         and (not local_read or local_db_read)
     )
     if should_init:

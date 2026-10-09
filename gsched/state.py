@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .config import default_state_dir
+from . import maintenance
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
@@ -894,6 +895,13 @@ def submission_shutdown_marker() -> str:
 
 @contextmanager
 def submission_lock() -> Iterator[None]:
+    with maintenance.gate():
+        with _submission_lock() as value:
+            yield value
+
+
+@contextmanager
+def _submission_lock() -> Iterator[None]:
     """Serialize submissions with one re-entrant process-local lock order."""
     depth = _submission_lock_depth.get()
     if depth:
@@ -1207,6 +1215,7 @@ def ensure_db_initialized() -> str:
     return init_db()
 
 
+@maintenance.writer
 def init_db() -> str:
     """建目录 + 建表 + 迁移, 返回 db 路径. 幂等且当前 schema 只读快返."""
     if _read_only or _query_only:
@@ -1590,7 +1599,7 @@ def _snapshot_signature(path: str) -> tuple:
 
 
 
-def _copy_sqlite_snapshot(path: str, destination: str, include_wal: bool) -> None:
+def _copy_sqlite_snapshot(path: str, destination: str, include_wal: bool, *, timeout=None) -> None:
     """Copy source bytes in another process to preserve local SQLite locks.
 
     A query can run while this process has a writer (including in another
@@ -1604,10 +1613,14 @@ def _copy_sqlite_snapshot(path: str, destination: str, include_wal: bool) -> Non
         " if sys.argv[3]=='1': shutil.copyfile(sys.argv[1]+'-wal',sys.argv[2]+'-wal')\n"
         "except FileNotFoundError: sys.exit(2)\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-I", "-c", code, path, destination, "1" if include_wal else "0"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", code, path, destination, "1" if include_wal else "0"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            **({"timeout": timeout} if timeout is not None else {}),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise StateError("private SQLite snapshot copy time bound exceeded") from error
     if result.returncode == 2:
         raise FileNotFoundError(path)
     if result.returncode:
@@ -1615,7 +1628,7 @@ def _copy_sqlite_snapshot(path: str, destination: str, include_wal: bool) -> Non
 
 
 @contextmanager
-def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
+def _read_only_database(path: str, *, copy_timeout=None) -> Iterator[tuple[str, bool]]:
     """Yield a stable private copy without opening SQLite state on the source."""
     snapshot_dir = tempfile.mkdtemp(prefix="sched-state-ro-")
     snapshot_db = os.path.join(snapshot_dir, os.path.basename(path))
@@ -1628,7 +1641,8 @@ def _read_only_database(path: str) -> Iterator[tuple[str, bool]]:
             if before[0] is None:
                 raise StateError(f"state database does not exist: {path}")
             try:
-                _copy_sqlite_snapshot(path, snapshot_db, before[1] is not None)
+                _copy_sqlite_snapshot(path, snapshot_db, before[1] is not None,
+                                      **({"timeout": copy_timeout} if copy_timeout is not None else {}))
             except FileNotFoundError:
                 continue
             if before[1] is None:
@@ -1679,6 +1693,16 @@ def _commit_transaction(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
+    if _read_only or _query_only:
+        with _connect() as conn:
+            yield conn
+    else:
+        with maintenance.gate(), _connect() as conn:
+            yield conn
+
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     """Open the state database in invocation-selected read or writer mode."""
     bound = _bound_connection.get()
     if bound is not None:

@@ -352,6 +352,7 @@ def _terminate_unready_child(
     return "已 exact SIGKILL 并确认退出"
 
 
+@state.maintenance.writer
 def start(fake: bool = False, force: bool = False) -> str:
     if not force and is_running():
         return f"daemon 已在运行 ({status_str()})"

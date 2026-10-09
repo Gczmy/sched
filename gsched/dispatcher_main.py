@@ -12,8 +12,10 @@ import signal
 import sys
 
 from .config import load_config
+from .maintenance import writer
 
 
+@writer
 def main() -> int:
     ap = argparse.ArgumentParser(prog="sched-daemon")
     ap.add_argument("--daemon", action="store_true")
