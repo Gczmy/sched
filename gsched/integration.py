@@ -31,6 +31,7 @@ CONTRACTS = {
     "allocations": "sched-allocations-v1",
     "storage_explain": "sched-storage-explain-v1",
     "daemon_lease": "sched-daemon-lease-v1",
+    "daemon_lease_launch_ancestry": "sched-daemon-launch-ancestry-v1",
     "cpu_capacity": "sched-cpu-capacity-v1",
     "cpu_isolation": "sched-cpu-isolation-v1",
     "cpu_scopes": "sched-cpu-scope-state-v1",

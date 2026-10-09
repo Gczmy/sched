@@ -13,6 +13,14 @@ fields. Legacy task replies remain readable through their existing validation.
 Database schema 10 adds persistent identity and structured operation receipts.
 Read-only identity/receipt queries never initialize or migrate a database.
 
+The launch-ancestry candidate also advertises `sched-daemon-launch-ancestry-v1`.
+Only explicit cold `lease_validation.membership=launch_ancestry` uses this mode;
+the default cgroup policy and default health/status/task/history replies remain
+unchanged. Exact lease queries can contain frozen launch lineage and tracking
+observations. A compatible valid lease is not current daemon Slurm membership or
+hard isolation; see [daemon lease](daemon-lease.md). This optional evidence uses
+existing append-only lease records, without a new database schema migration.
+
 ## Identity and task ownership
 
 `identity --json` returns instance_id, configured node and query_host.

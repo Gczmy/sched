@@ -34,13 +34,17 @@ _pending_probe = None
 
 def policy(cfg):
     supplied = cfg.get("lease_validation", {})
-    if not isinstance(supplied, dict) or set(supplied) - {"mode", "unknown_policy", "interval_sec"}:
+    if not isinstance(supplied, dict) or set(supplied) - {"mode", "unknown_policy", "interval_sec", "membership"}:
         raise ValueError("lease_validation 必须为受支持字段的对象")
-    value = {"mode": "auto", "unknown_policy": "pause", "interval_sec": 30, **supplied}
+    value = {"mode": "auto", "unknown_policy": "pause", "interval_sec": 30, "membership": "cgroup", **supplied}
     if value["mode"] not in ("auto", "enforce", "observe") or value["unknown_policy"] not in ("pause", "allow"):
         raise ValueError("lease_validation mode/unknown_policy 非法")
     if type(value["interval_sec"]) is not int or not 1 <= value["interval_sec"] <= 30:
         raise ValueError("lease_validation.interval_sec 必须为 1..30 整数")
+    if value["membership"] not in ("cgroup", "launch_ancestry"):
+        raise ValueError("lease_validation.membership 必须为 cgroup 或 launch_ancestry")
+    if value["membership"] == "launch_ancestry" and (value["unknown_policy"] != "pause" or value["mode"] == "observe"):
+        raise ValueError("launch_ancestry 要求 unknown_policy=pause 和 auto/enforce")
     return value
 
 
@@ -90,7 +94,7 @@ def slurm_environment():
     return values
 
 
-def probe(job_id):
+def probe(job_id, *, step_id=None, anchor_pid=None):
     global _pending_probe
     process = None
     try:
@@ -103,7 +107,10 @@ def probe(job_id):
             _pending_probe = None
         process = subprocess.Popen([sys.executable, "-m", "gsched.lease_probe"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        output, _ = process.communicate(json.dumps({"job_id": job_id}), timeout=5)
+        request = {"job_id": job_id}
+        if anchor_pid is not None:
+            request.update(step_id=step_id, anchor_pid=anchor_pid)
+        output, _ = process.communicate(json.dumps(request), timeout=5)
         if process.returncode or len(output.encode()) > 1024 * 1024:
             raise ValueError("Slurm helper failed or exceeded bound")
         value = json.loads(output)
@@ -127,6 +134,7 @@ def binding(job):
 
 def decide(origin, current, sample, *, frozen_binding=None, invalid_latched=False):
     reasons, unknown = [], []
+    ancestry_mode = origin["policy"].get("membership", "cgroup") == "launch_ancestry"
     job_id = origin["slurm_environment"].get("SLURM_JOB_ID")
     for key in ("pid", "start_token", "physical_host", "uid", "affinity", "cgroups", "cpus_allowed_list"):
         if origin.get(key) is None or current.get(key) is None:
@@ -157,22 +165,36 @@ def decide(origin, current, sample, *, frozen_binding=None, invalid_latched=Fals
                 reasons.append("original_slurm_allocation_replaced_or_resized")
             if job.get("end_time") and job["end_time"] <= time.time():
                 reasons.append("original_slurm_allocation_end_reached")
-            groups = current.get("cgroups") or []
-            matching = [g for g in groups if re.search(r"(?:^|/)job_" + re.escape(job_id) + r"(?:/|$)", g["path"])]
-            if not matching:
-                unknown.append("job_cgroup_membership_not_verified")
-            step = origin["slurm_environment"].get("SLURM_STEP_ID")
-            if step and matching and not any(re.search(r"(?:^|/)step_" + re.escape(step) + r"(?:/|$)", g["path"]) for g in matching):
-                unknown.append("step_cgroup_membership_not_verified")
+            if not ancestry_mode:
+                groups = current.get("cgroups") or []
+                matching = [g for g in groups if re.search(r"(?:^|/)job_" + re.escape(job_id) + r"(?:/|$)", g["path"])]
+                if not matching:
+                    unknown.append("job_cgroup_membership_not_verified")
+                step = origin["slurm_environment"].get("SLURM_STEP_ID")
+                if step and matching and not any(re.search(r"(?:^|/)step_" + re.escape(step) + r"(?:/|$)", g["path"]) for g in matching):
+                    unknown.append("step_cgroup_membership_not_verified")
+    if ancestry_mode:
+        from .lease_ancestry import decide as ancestry_decide
+        ancestry = origin.get("launch_ancestry", {})
+        if ancestry.get("known") and (ancestry.get("job_id") != job_id
+                or ancestry.get("step_id") != origin["slurm_environment"].get("SLURM_STEP_ID")):
+            unknown.append("slurm_launch_origin_binding_invalid")
+        r, u = ancestry_decide(ancestry, current.get("launch_anchor", {}), sample, current)
+        reasons.extend(r)
+        unknown.extend(u)
     if invalid_latched:
         reasons.append("allocation_invalid_latched")
     invalid = invalid_latched or bool(reasons)
     settings = origin["policy"]
-    enforced = settings["mode"] == "enforce" or (settings["mode"] == "auto" and "SLURM_JOB_ID" in origin["slurm_environment"])
+    enforced = ancestry_mode or settings["mode"] == "enforce" or (settings["mode"] == "auto" and "SLURM_JOB_ID" in origin["slurm_environment"])
     allowed = not enforced or (not invalid and (not unknown or settings["unknown_policy"] == "allow"))
-    return {"allocation_state": "invalid" if invalid else "unknown" if unknown else "valid",
+    result = {"allocation_state": "invalid" if invalid else "unknown" if unknown else "valid",
             "invalid_latched": invalid, "reasons": sorted(set(reasons)), "unknown": sorted(set(unknown)),
             "enforced": enforced, "dispatch_allowed": allowed, "hard_isolation": False}
+    if ancestry_mode:
+        result.update(protection_level="launch_ancestry_affinity", job_cgroup_verified=False,
+                      current_daemon_slurm_membership_verified=False)
+    return result
 
 
 def encode(value):
@@ -214,7 +236,11 @@ class Monitor:
                        "started_at": time.time(), "slurm_environment": env, "policy": policy(cfg)}
         if any(self.origin[k] != owner[k] for k in ("pid", "start_token", "physical_host")):
             raise ValueError("daemon origin differs from exact process owner")
-        self.sample = probe(env["SLURM_JOB_ID"]) if env.get("SLURM_JOB_ID") else {"known": False, "observed_at": time.time()}
+        if self.origin["policy"]["membership"] == "launch_ancestry":
+            from .lease_ancestry import capture, observe
+            self.origin["launch_ancestry"] = capture(context, env)
+            context["launch_anchor"] = observe(self.origin["launch_ancestry"])
+        self.sample = self._probe() if env.get("SLURM_JOB_ID") else {"known": False, "observed_at": time.time()}
         self.frozen_binding = binding(self.sample["job"]) if self.sample.get("known") and self.sample.get("job") else None
         self.origin["initial_slurm_binding"] = self.frozen_binding
         self.invalid_latched = False
@@ -233,6 +259,13 @@ class Monitor:
         self._recorded_decision = self.decision
         self._incident_recorded = self.invalid_latched
 
+    def _probe(self):
+        env = self.origin["slurm_environment"]
+        ancestry = self.origin.get("launch_ancestry", {})
+        if ancestry.get("known"):
+            return probe(env["SLURM_JOB_ID"], step_id=ancestry["step_id"], anchor_pid=ancestry["anchor"]["pid"])
+        return probe(env["SLURM_JOB_ID"])
+
     def _incident(self, conn):
         state.insert_incident(conn, ts=state.now(), kind="lease_invalid", gpu_idx=None, job_id=None, batch_id=None,
             payload_json=json.dumps({"lease_id": self.owner["lease_id"], "reasons": self.decision["reasons"],
@@ -245,10 +278,13 @@ class Monitor:
     def update(self, *, force=False):
         now = time.time()
         current = kernel_context()
+        if self.origin["policy"]["membership"] == "launch_ancestry":
+            from .lease_ancestry import observe
+            current["launch_anchor"] = observe(self.origin["launch_ancestry"])
         self.current_context = current
         job_id = self.origin["slurm_environment"].get("SLURM_JOB_ID")
         if job_id and (force or not 0 <= now - self.sample["observed_at"] < self.origin["policy"]["interval_sec"]):
-            self.sample = probe(job_id)
+            self.sample = self._probe()
         decision = decide(self.origin, current, self.sample, frozen_binding=self.frozen_binding, invalid_latched=self.invalid_latched)
         if self.frozen_binding is None and self.sample.get("job") and not decision["invalid_latched"]:
             self.frozen_binding = binding(self.sample["job"])

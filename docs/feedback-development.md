@@ -210,6 +210,23 @@ memfd_create 导致 3 条既有执行 backend 回归报错，切换支持该能�
 [完整 CI](https://github.com/Gczmy/sched/actions/runs/37871104844) 14 项全部通过；
 合同与仍未覆盖的真实租约结束/硬隔离边界见 [daemon-lease](daemon-lease.md)。
 
+2026-10-09：新增显式冷 `lease_validation.membership=launch_ancestry` 候选，默认
+cgroup 校验不变；兼容模式禁止 observe/allow。出生前核对真实 root Slurm stepd
+祖先、原 anchor/boot/start ticks/UID/affinity/cgroup，并由本机精确 job/step 的
+listpids 正向关联原 anchor；之后只观察这个冻结身份，未知暂停、确认失效锁存。
+公开能力为 `sched-daemon-launch-ancestry-v1`，沿现有 append-only 租约记录，不新增
+schema；valid 不代表当前后台 daemon 被 Slurm 跟踪或具备硬隔离。
+指定既有计算节点租约的 [隔离 CPU/CLI 验收](../tests/run_launch_ancestry_accept.py)
+已通过：真实来源/原 step 跟踪可核验、CPU auto 上限为一；控制器 fixture 不可读时
+停止新派发且 running 保留，同原绑定恢复可读后解除 unknown；模拟 CANCELLED
+锁存，原 CPU child 自然完成一次、后来 RUNNING 不恢复，只有显式私有重启后
+另一任务运行一次。没有结束真实租约、占真实 GPU、修改生产配置或重启生产 daemon。
+首次脚本误选 submit 自动启动后已退出的历史出生记录；修正为当前 owner 并清除
+私有 stop-when-idle 后最终通过，没有放宽运行代码。本提交完整 CI、真实租约结束、
+新版本发布与生产切换尚未取得；具体证据与来源摘要保存在仓库外。
+本地 mock/私有只读与计算节点相关回归各运行 124 条、全部通过；最终 runtime 和
+专项脚本的逐文件 SHA256 核对一致。
+
 2026-10-09：ND-03 的 CPU auto 源码候选通过指定既有租约内的隔离 CPU/CLI 验收。
 真实原始 affinity/Slurm 来源先单独观察；默认未知暂停没有产生 allocation/worker。
 随后只修改 state 外 fixture 控制器回答，验证来源最小值/上限、GPU 与 CPU 共用

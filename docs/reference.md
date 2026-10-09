@@ -429,7 +429,7 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 | `cpu_isolation` | 候选显式冷配置，mode=off（默认）、affinity，或 schema 20 的 cgroup + 规范绝对 delegated_root；只用外部已委派原 lease cpuset，失败不降级。亲和与待完成内核/设备验收见 [CPU 亲和](cpu-isolation.md)、[CPU scope](cpu-scopes.md) |
 | `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
 | `storage_admission` | 候选 opt-in 磁盘/inode/可知用户 quota 准入；默认 enabled=false，其余余量/unknown 策略见 [存储合同](storage-admission.md)，支持热更新 |
-| `lease_validation` | 候选冷配置；默认 mode=auto、unknown_policy=pause、interval_sec=30；有 Slurm 来源时失效/未知停新派发，详见 [租约合同](daemon-lease.md) |
+| `lease_validation` | 候选冷配置；默认 membership=cgroup、mode=auto、unknown_policy=pause、interval_sec=30；可显式 launch_ancestry 验证原 Slurm 启动祖先/affinity（非硬隔离），失效/未知停新派发，详见 [租约合同](daemon-lease.md) |
 | `idle_timeout_min` | daemon 空闲自动退出分钟数；默认 360，`0` = 禁用 |
 | `notify` | 省略时关闭；可配置 batch done/blocked 的 file/email/command 渠道 |
 | `conda_envs_dirs` | runtime.conda_env 解析目录（热更新）|

@@ -1,7 +1,7 @@
 # 候选 daemon 租约来源与持续校验
 
-源码候选写 schema 17、完整只读 schema 1–17；包版本不代表部署能力，使用
-`identity --json` 协商 `sched-daemon-lease-v1`。未部署到生产，不能把 CPU/fake-GPU
+来源记录于 schema 17 引入；当前完整候选写 schema 25、只读 schema 1–25。包版本不代表部署能力，使用
+`version --json` 协商 `sched-daemon-lease-v1`，`identity --json` 确认实例。未部署到生产，不能把 CPU/fake-GPU
 验收当作真实 Slurm 失效或 CUDA 验收。后续候选的 [CPU 自动容量](cpu-capacity.md)
 复用此来源和校验；per-job 硬隔离仍另行开发。
 
@@ -11,7 +11,7 @@
 {"lease_validation":{"mode":"auto","unknown_policy":"pause","interval_sec":30}}
 ```
 
-这是冷配置：`mode` 为 `auto|enforce|observe`，`unknown_policy` 为 `pause|allow`，
+这是冷配置：`membership` 默认为 `cgroup`；`mode` 为 `auto|enforce|observe`，`unknown_policy` 为 `pause|allow`，
 `interval_sec` 为 1..30 整数；未知字段拒绝。默认 auto 在启动环境出现
 `SLURM_JOB_ID` 时执行校验，即使该值非法；普通无 Slurm 环境保留 standalone
 派发兼容。enforce 总是执行；observe 仅记录，不限制派发，是显式放弃保护。
@@ -35,6 +35,51 @@ unknown；挂起 helper 未结束时不再创建同类 helper。不用错误展�
 cgroup 可核对时才报告 valid。通用 system cgroup、只有 Slurm 环境变量、hostname
 别名不可核对、控制器不可读或采样过期，都不冒充 valid。这些记录仍不是独占
 设备、执行 owner、真实 worker wait 或 per-job 硬隔离证明。
+
+### 显式启动祖先兼容模式
+
+不提供 job/step cgroup 的集群可显式使用：
+
+```json
+{"lease_validation":{"membership":"launch_ancestry","mode":"auto","unknown_policy":"pause","interval_sec":30}}
+```
+
+先在实际部署协商 `sched-daemon-launch-ancestry-v1`。此模式只支持 Linux 中可读的
+原启动链，要求原 job/step；禁止与 observe 或 unknown_policy=allow 组合。即使缺少
+Slurm 环境也暂停，不回退 standalone。旧配置不指定 membership 时仍要求 cgroup。
+
+后台启动仍保留独立 session：在首次就绪前、启动 CLI 尚未退出时，daemon 最多读取
+64 层真实 `/proc` 父进程链，选取 root UID 的 `slurmstepd` 直接用户子进程为原 anchor。
+读取前后核对全部父子边、PID/start ticks、UID、PGID/session 和 kernel boot ID；
+anchor 与 daemon 必须具有相同 cgroup 上下文，daemon affinity 必须是原 anchor 的子集。
+不使用进程标题、环境变量或 screen 名称单独证明来源，不保存 argv/env 或尝试
+读取 root 进程的 exe/namespace。启动链缺失时本次出生保持未知，后续不重新选择祖先。
+
+在原 job JSON、UID/节点/启动时间/重启次数/CPU 绑定验证之外，计算节点 helper
+调用 `scontrol listpids <original-job>.<original-step>`，严格接受五列 PID/JOBID/STEPID/
+LOCALID/GLOBALID 表，并要求原 anchor 在精确 job/step 下被跟踪。输出格式不支持、
+查询失败或权限不可读为 unknown；成功且原 anchor 不再被跟踪、原 anchor/stepd
+消失或身份/affinity/cgroup 变化则锁存 invalid。表只用于正向关联原 anchor，
+不能用来穷举 daemon、worker 或 GPU 进程。job/hostnames/listpids 共享既有 helper
+总截止 5 秒；没有新的 Slurm 写操作。
+
+出生记录冻结原链、anchor 和 stepd；CLI 退出导致 daemon 被 reparent 不要求重建链。
+之后每次门禁核对原 anchor/stepd，按 interval 重查原 Slurm 跟踪；不采纳另一个
+租约 shell。控制器失效/重排/resize 和租约结束仍沿原规则锁存。unknown 可在同一
+原身份恢复可读后解除，确认 invalid 必须显式重启；running 不因门禁失败被取消。
+CPU auto 复用同一证据，并取原 affinity/Slurm 声明的保守容量。
+
+兼容模式的 valid 表示该保护级别的租约与启动来源检查通过，返回
+`protection_level:launch_ancestry_affinity`、`job_cgroup_verified:false`、
+`current_daemon_slurm_membership_verified:false`、`hard_isolation:false`。
+它不使脱离 PGID 的 daemon 被 Slurm 重新接管、不保证租约结束后内核杀死所有
+后代、不提供 cpuset/设备 BPF 硬隔离。Slurm 文档也明确 pgid 跟踪不能识别所有
+关联进程，见 [listpids](https://slurm.schedmd.com/scontrol.html#OPT_listpids)。
+父链由本机内核和当前用户执行的 Slurm 客户端提供，不声称能防御同 UID 的恶意
+客户端替换或私有状态篡改。当前单次采样与派发间仍有竞态窗口。
+
+此扩展只新增可选出生/检查证据和命名能力，不新增 DB 表、不回填旧来源；默认
+status/task/history/健康 JSON 不变，只有显式租约查询展示新证据。
 
 原 job 明确不再 RUNNING、成功的精确查询明确不存在、被复用/重排/resize、到达
 租约结束时间、UID 或自身 kernel 身份/affinity/cgroup 改变时，当前 daemon
@@ -102,6 +147,13 @@ CANCELLED 时保留 running、暂停 pending、绑定 allocation、确认通知�
 不能恢复，真实子进程自然完成；只有显式私有重启后另一任务运行一次。该测试
 不取消真实 allocation、不新建租约、不占真实 GPU、不改生产 daemon/config。
 其他 CPU fixture 显式 observe，不宣称验证外层真实租约。
+
+[启动祖先回归](../tests/test_lease_ancestry.py) 使用 mock 和私有合成 DB 检查默认
+不放宽、真实父子边的采集规则、PID/boot 复用、外部 job/step、未知暂停、失效锁存、
+不可变出生与 CPU auto 同源判断。计算节点的
+[专项验收](../tests/run_launch_ancestry_accept.py) 使用实际既有租约、独立 state 和
+CPU-only worker，先验证真实启动来源，再以 state 外控制器夹具验证未知/失效/重启。
+它不结束真实租约，不占真实 GPU，不证明 cpuset/BPF 或生产升级安全。
 
 迁移仅新增空 daemon_leases/daemon_lease_events、索引与不可变/保留触发器，不
 回填历史、不改 job 状态/wait、原执行身份、allocation、请求与 instance。

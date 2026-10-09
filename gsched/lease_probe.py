@@ -83,14 +83,43 @@ def sample(job_id):
         return {"observed_at": started, "known": False, "reason": "slurm_query_unavailable_or_unsupported"}
 
 
+def launch_tracking(job_id, step_id, anchor_pid):
+    from .lease_ancestry import STEP
+    unknown = {"known": False, "reason": "slurm_launch_tracking_unavailable_or_unsupported"}
+    try:
+        if (not isinstance(job_id, str) or not re.fullmatch(r"[1-9][0-9]{0,18}", job_id)
+                or not isinstance(step_id, str) or not STEP.fullmatch(step_id)
+                or type(anchor_pid) is not int or not 1 <= anchor_pid < 2 ** 31):
+            raise ValueError("tracking binding invalid")
+        lines = command(["listpids", job_id + "." + step_id]).splitlines()
+        if not lines or len(lines) > 16385 or lines[0].split() != ["PID", "JOBID", "STEPID", "LOCALID", "GLOBALID"]:
+            raise ValueError("tracking output unsupported")
+        found, seen = False, set()
+        for line in lines[1:]:
+            fields = line.split()
+            if (len(fields) != 5 or not fields[0].isdecimal() or not 1 <= int(fields[0]) < 2 ** 31
+                    or fields[1:3] != [job_id, step_id]
+                    or any(not re.fullmatch(r"-?[0-9]{1,20}", v) for v in fields[3:])
+                    or fields[0] in seen):
+                raise ValueError("tracking row invalid")
+            seen.add(fields[0])
+            found = found or int(fields[0]) == anchor_pid
+        return {"known": True, "job_id": job_id, "step_id": step_id, "anchor_pid": anchor_pid, "present": found}
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return unknown
+
+
 def main():
     if sys.platform != "linux":
         raise SystemExit("lease helper requires Linux compute context")
     raw = sys.stdin.read(1025)
     value = json.loads(raw)
-    if len(raw) > 1024 or not isinstance(value, dict) or set(value) != {"job_id"}:
+    if len(raw) > 1024 or not isinstance(value, dict) or set(value) not in ({"job_id"}, {"job_id", "step_id", "anchor_pid"}):
         raise SystemExit("invalid lease helper input")
-    print(json.dumps(sample(value["job_id"]), allow_nan=False))
+    observed = sample(value["job_id"])
+    if "anchor_pid" in value:
+        observed["launch_tracking"] = launch_tracking(value["job_id"], value["step_id"], value["anchor_pid"])
+    print(json.dumps(observed, allow_nan=False))
 
 
 if __name__ == "__main__":
