@@ -98,6 +98,7 @@ class Owner:
         self._pass_fds: tuple[int, ...] = ()
         self._start_new_session = True
         self._launch_error: int | None = None
+        self._constraint_error_fd: int | None = None
 
     @property
     def pid(self) -> int | None:
@@ -167,9 +168,22 @@ class Owner:
                                "running" if self._proc is not None else "authority_lost")
                 raise
 
+    def _inspect_constraint_error(self):
+        if self._constraint_error_fd is not None:
+            try:
+                raw = os.read(self._constraint_error_fd, 64)
+            except BlockingIOError:
+                raw = None
+            if raw is not None:
+                if raw:
+                    self._launch_error = int(raw) if raw.strip().isdigit() and len(raw) < 16 else 5
+                os.close(self._constraint_error_fd)
+                self._constraint_error_fd = None
+
     def poll(self) -> ExecutionObservation:
         with self._lock:
             self._check()
+            self._inspect_constraint_error()
             if self._state == "prepared":
                 return ExecutionObservation("prepared", None)
             if self._native is not None:
@@ -188,6 +202,8 @@ class Owner:
                                             group_clean=True if self._state == "not_started" else None)
             assert self._proc is not None
             result = self._proc.poll()
+            if result is not None:
+                self._inspect_constraint_error()
             group_clean = None
             if os.name == "posix" and self._start_new_session and result is not None:
                 try:
@@ -200,7 +216,8 @@ class Owner:
                     self._state in ("running", "cleanup_pending")):
                 self._signal_subprocess(signal.SIGKILL)
                 self._cancel_deadline = None
-            return ExecutionObservation(self._state, self._proc.pid, result, group_clean=group_clean)
+            return ExecutionObservation(self._state, self._proc.pid, result, group_clean=group_clean,
+                                        launch_error=self._launch_error)
 
     def _signal_subprocess(self, signum: int) -> None:
         assert self._proc is not None
@@ -254,6 +271,9 @@ class Owner:
                 raise RuntimeError("cannot close active or unresolved owner")
             if self._native is not None:
                 self._native.close()
+            if self._constraint_error_fd is not None:
+                os.close(self._constraint_error_fd)
+                self._constraint_error_fd = None
             self._closed = True
             with _registry_lock:
                 _retained.pop(self.owner_id, None)
@@ -308,7 +328,7 @@ class SubprocessBackend:
 
     def prepare(self, envelope: ExecutionEnvelope, *, stdout_fd: int | None = None,
                 stderr_fd: int | None = None, pass_fds: tuple[int, ...] = (),
-                start_new_session: bool = True) -> Prepared:
+                start_new_session: bool = True, constraints=None) -> Prepared:
         if type(envelope) is not ExecutionEnvelope:
             raise TypeError("prepare requires ExecutionEnvelope")
         if type(start_new_session) is not bool:
@@ -319,7 +339,16 @@ class SubprocessBackend:
             raise BackendUnavailable("pass_fds requires POSIX")
         for descriptor in pass_fds:
             os.fstat(descriptor)
+        if constraints is not None:
+            from .constraints import LaunchConstraints
+            if type(constraints) is not LaunchConstraints:
+                raise TypeError("constraints require LaunchConstraints")
+            constraints.validate()
+            if (constraints.cgroup_procs_fd is not None
+                    and constraints.cgroup_procs_fd in (*pass_fds, stdout_fd, stderr_fd)):
+                raise ValueError("cgroup control descriptor cannot be passed to the program")
         owned: list[int] = []
+        owner = None
         try:
             descriptors = []
             for descriptor in (stdout_fd, stderr_fd):
@@ -335,10 +364,31 @@ class SubprocessBackend:
             owner = Owner()
             owner._pass_fds = pass_fds
             owner._start_new_session = start_new_session
+            if constraints is not None:
+                from .constraints import SUBPROCESS_ENTRY
+                from ..execution_policy import canonical_bytes, sealed_bytes
+                cgroup = None
+                if constraints.cgroup_procs_fd is not None:
+                    cgroup = os.dup(constraints.cgroup_procs_fd)
+                    owned.append(cgroup)
+                raw = canonical_bytes({"argv": envelope.argv, "env": dict(envelope.env),
+                    "cpu_affinity": constraints.cpu_affinity, "cgroup_procs_fd": cgroup})
+                if len(raw) > 2 * 1024 * 1024:
+                    raise ValueError("constraint bootstrap exceeds 2 MiB")
+                boot = sealed_bytes(raw, "sched-launch-constraints")
+                owned.append(boot)
+                error_read, error_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+                owner._constraint_error_fd = error_read
+                owned.append(error_write)
+                owner._pass_fds = tuple(sorted(set(pass_fds) | {boot, error_write} | ({cgroup} if cgroup is not None else set())))
+                envelope = ExecutionEnvelope((sys.executable, "-I", "-S", "-B", "-c", SUBPROCESS_ENTRY,
+                    str(boot), str(error_write)), {"PATH": os.defpath}, envelope.cwd)
             return Prepared(envelope, owner, tuple(descriptors), tuple(owned))
         except BaseException:
             for descriptor in owned:
                 os.close(descriptor)
+            if owner is not None and owner._constraint_error_fd is not None:
+                os.close(owner._constraint_error_fd)
             raise
 
 
@@ -363,7 +413,7 @@ class LinuxFdBackend:
 
     def prepare(self, envelope: ExecutionEnvelope, *, executable_fd: int,
                 cwd_fd: int | None = None,
-                fd_bindings: Mapping[int, int] | None = None) -> Prepared:
+                fd_bindings: Mapping[int, int] | None = None, constraints=None) -> Prepared:
         if type(envelope) is not ExecutionEnvelope:
             raise TypeError("prepare requires ExecutionEnvelope")
         if envelope.cwd is not None:
@@ -378,9 +428,20 @@ class LinuxFdBackend:
                 raise ValueError("descriptor bindings must map nonnegative integers")
             if target > 65535:
                 raise ValueError("descriptor target exceeds interface limit")
+        options = ()
+        if constraints is not None:
+            from .constraints import LaunchConstraints, CONSTRAINTS_VERSION
+            if type(constraints) is not LaunchConstraints:
+                raise TypeError("constraints require LaunchConstraints")
+            constraints.validate()
+            if constraints.cgroup_procs_fd in bindings.values():
+                raise ValueError("cgroup control descriptor cannot be bound to the program")
+            if getattr(self._module, "constraints_interface_version", None) != CONSTRAINTS_VERSION:
+                raise BackendUnavailable("native constraints interface absent", reason="native_constraints_unavailable")
+            options = (constraints.cpu_affinity, -1 if constraints.cgroup_procs_fd is None else constraints.cgroup_procs_fd)
         native = self._module.prepare(
             executable_fd, envelope.argv,
             tuple(f"{key}={value}" for key, value in sorted(envelope.env.items())),
-            -1 if cwd_fd is None else cwd_fd, tuple(sorted(bindings.items())),
+            -1 if cwd_fd is None else cwd_fd, tuple(sorted(bindings.items())), *options,
         )
         return Prepared(envelope, Owner(native=native))

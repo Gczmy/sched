@@ -224,8 +224,27 @@ Mock 未提供新增容量上下文；明确该窄夹具只隔离租约门禁后
 CPU 验收脚本 SHA256 为
 `c67e9236417519155b9fd764948837e65b5af15d48b9549fe169f2b2c6ea9962`；本地与
 计算节点摘要一致。临时 state 经 CLI 停止确认后清理；源码/传输文件亦已清理。
-本项固定提交的完整 CI 待确认；[CPU 容量合同](cpu-capacity.md) 仍明确非 per-job
+固定提交 `bed2c0aac6bcf5af840d0c071d74ec23baad5b8f` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37873350599) 14 项全部通过；
+[CPU 容量合同](cpu-capacity.md) 仍明确非 per-job
 硬隔离、非真实租约终止/CUDA 验收、非发布或生产切换。
+
+per-job 硬隔离的第一层候选提供通用 LaunchConstraints，不新增 scheduler 配置或
+schema：subprocess、linux_fd、linux_fd_owner 都可在用户 exec 前绑定显式 CPU mask
+与保留 cgroup.procs FD；旧调用不变、失败不降级。计算节点明确构建 native 后
+全量回归运行 864 条：862 通过，2 条平台专项跳过；16 条启动约束专项包含实际
+CPU/后代继承、native 启动失败无客户副作用、原始 wait/取消/FD 生命周期、只读
+真实 cgroup FD 拒绝以及持久 owner 认证重连。两个旧 supervisor fixture 曾因
+实际 Slurm 来源 unknown 被生产默认 pause 阻止；仅对独立执行 fixture 显式 observe
+后通过，未放宽租约守卫。固定 runtime/fixture 清单（164 文件）SHA256 为
+`2c8d8afce1e129efe8b636fec599367e388c4a8406282624c935b8e90b5966c3`，
+本地与计算节点一致；本地 7 条纯值/Mock 检查通过。当前计算环境没有用户 cgroup
+写委派，因此不宣称实际 cgroup join、controller/设备硬隔离或 CUDA 验收通过。
+同一来源的 public execution CLI 全部 12 组场景通过：普通/default 不回归，直接
+原始 wait/rusage、取消/timeout、缺失或摘要漂移拒绝、无权重建 wait 的 daemon
+重启、持久 owner 重连/丢失均保持原契约，实际故障仅注入独立 fixture。
+scheduler 的分配/scope 持久绑定/清理/恢复仍待实现；具体边界见
+[execution constraints](execution-constraints.md)。本项完整 CI 待确认，未发布/部署。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -241,8 +260,8 @@ CPU 验收脚本 SHA256 为
 | 11 | 磁盘/inode/quota 准入 | 候选 CI/计算节点 CPU 通过 | 控制面余量；unknown 明确；容量不足不删科学产物 |
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
-| ND-03 | CPU auto 容量 | 候选计算节点 CPU 通过，CI 待确认 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 未实现 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
+| 硬隔离 | per-job affinity/cgroup | 通用启动约束原语候选，scheduler/实际 cgroup/设备边界未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

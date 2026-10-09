@@ -118,7 +118,7 @@ OOM FIFO、固定 12 GiB 默认剩余显存准入、分级和持久无进展策�
 
 ## ND-02：持久化并校验 daemon 的集群租约来源
 
-**状态：源码候选已实现，计算节点隔离 CPU/CLI 验收通过；完整 CI 待确认，未部署生产。**
+**状态：源码候选已实现，完整 CI/计算节点隔离 CPU/CLI 验收通过，未部署生产。**
 schema 17 保存白名单 Slurm/job/step、UID、affinity/cgroup 与启动/检查/退出事实；
 auto 模式有 Slurm 来源时持续验证，unknown 默认停新派发，确认 invalid 后锁存，
 不杀 running、不自动绑定新租约。默认健康 JSON 不变，显式 include-lease 与
@@ -156,10 +156,15 @@ daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 
 
 ## ND-03：CPU 容量自动解析与可执行约束
 
-**状态：源码候选已实现，计算节点 CPU/CLI 通过，完整 CI 待确认；尚未发布或部署。** 具体合同、查询和兼容边界见
+**状态：源码候选已实现，完整 CI/计算节点 CPU/CLI 通过；尚未发布或部署。** 具体合同、查询和兼容边界见
 [CPU 自动容量](cpu-capacity.md)。per-job 硬隔离仍未实现。`cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
 任务上回退到 `max_cpu_jobs` 并发计数；正整数仅做声明值求和，不会设置 affinity 或
 子 cgroup。
+
+通用执行层另提供 [候选启动约束原语](execution-constraints.md)：三个 backend 在用户
+exec 前应用显式 CPU 集合和保留 cgroup FD，失败不降级。它尚未接入 scheduler
+配置、allocation CPU 分配、scope 持久绑定/清理/恢复或设备策略，不代表 per-job
+硬隔离已经完成；当前计算环境缺少用户 cgroup 写委派，真实 cgroup/设备验收仍待安排。
 
 ### 已确认的设计方向
 

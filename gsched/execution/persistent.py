@@ -215,7 +215,7 @@ class PersistentLinuxFdBackend:
         LinuxFdBackend()  # No fallback if the native kernel capability is absent.
 
     def prepare(self, envelope, *, executable_fd, cwd_fd, fd_bindings, identity,
-                duration_seconds=None, prepare_timeout=30., terminal_retention=3600.):
+                duration_seconds=None, prepare_timeout=30., terminal_retention=3600., constraints=None):
         if type(envelope) is not ExecutionEnvelope or envelope.cwd is not None:
             raise ValueError("persistent backend requires an FD envelope")
         for value in (prepare_timeout, terminal_retention):
@@ -233,10 +233,24 @@ class PersistentLinuxFdBackend:
                    "identity": identity, "owner_id": owner_id, "token": token, "endpoint": endpoint,
                    "duration": duration_seconds, "prepare_timeout": prepare_timeout,
                    "terminal_retention": terminal_retention}
+        if constraints is not None:
+            from .constraints import LaunchConstraints, CONSTRAINTS_VERSION
+            if type(constraints) is not LaunchConstraints:
+                raise TypeError("constraints require LaunchConstraints")
+            constraints.validate()
+            if getattr(LinuxFdBackend()._module, "constraints_interface_version", None) != CONSTRAINTS_VERSION:
+                from .backend import BackendUnavailable
+                raise BackendUnavailable("native constraints interface absent", reason="native_constraints_unavailable")
+            if constraints.cgroup_procs_fd in fd_bindings.values():
+                raise ValueError("cgroup control descriptor cannot be bound to the program")
+            startup["constraints"] = {"cpu_affinity": constraints.cpu_affinity,
+                "cgroup_procs_fd": constraints.cgroup_procs_fd, "interface_version": CONSTRAINTS_VERSION}
         raw = canonical_bytes(startup)
         if len(raw) > MAX_FRAME:
             raise ValueError("owner startup exceeds limit")
         descriptors = {executable_fd, cwd_fd, *fd_bindings.values()}
+        if constraints is not None and constraints.cgroup_procs_fd is not None:
+            descriptors.add(constraints.cgroup_procs_fd)
         for descriptor in descriptors:
             if type(descriptor) is not int or descriptor < 0:
                 raise ValueError("invalid owner descriptor")
@@ -285,13 +299,21 @@ def serve(startup_fd):
     validate_binding(binding)
     bindings = {int(k): v for k, v in startup["bindings"].items()}
     inherited = {startup["executable_fd"], startup["cwd_fd"], *bindings.values()}
+    constraints = None
+    if "constraints" in startup:
+        from .constraints import LaunchConstraints
+        declaration = dict(startup["constraints"])
+        declaration["cpu_affinity"] = tuple(declaration["cpu_affinity"])
+        constraints = LaunchConstraints(**declaration)
+        if constraints.cgroup_procs_fd is not None:
+            inherited.add(constraints.cgroup_procs_fd)
     wrapper = {"schema": IDENTITY_SCHEMA, "attempt": startup["identity"], "owner": public_binding(binding)}
     identity_fd = sealed_bytes(canonical_bytes(wrapper), "sched-owner-identity")
     bindings[4] = identity_fd
     inherited.add(identity_fd)
     try:
         prepared = LinuxFdBackend().prepare(ExecutionEnvelope(tuple(startup["argv"]), startup["env"]),
-            executable_fd=startup["executable_fd"], cwd_fd=startup["cwd_fd"], fd_bindings=bindings)
+            executable_fd=startup["executable_fd"], cwd_fd=startup["cwd_fd"], fd_bindings=bindings, constraints=constraints)
     finally:
         for descriptor in inherited:
             os.close(descriptor)

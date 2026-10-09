@@ -84,6 +84,8 @@ class Acceptance:
         self.cfg = {"schema_version": 1, "node": socket.gethostname(), "user": getpass.getuser(),
                     "state_dir": str(root / "state"), "gpus": [0], "cpus_total": 4,
                     "max_cpu_jobs": 4, "default_project": "text", "venvs": {"python": sys.executable},
+                    # Lease admission has its own isolated acceptance matrix.
+                    "lease_validation": {"mode": "observe"},
                     "projects": {name: {"root": str(path), "git": False} for name, path in self.projects.items()},
                     "execution_backends": {}}
         sha = hashlib.sha256(self.executable.read_bytes()).hexdigest()

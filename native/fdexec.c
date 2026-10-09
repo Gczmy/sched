@@ -13,19 +13,26 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
+#include <stdio.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define BINDING_LIMIT 128
-#define OWNED_LIMIT (BINDING_LIMIT + 5)
+#define OWNED_LIMIT (BINDING_LIMIT + 6)
+#define CPU_LIMIT 1048576
+#define AFFINITY_COUNT_LIMIT 8192
+#define CPU_MASK_BYTES (CPU_LIMIT / 8)
 
 typedef struct {
     PyObject_HEAD
     pid_t creator_pid, creator_tid, pid;
     int state, consumed, wait_status, launch_error, group_clean;
     int executable_fd, cwd_fd, error_fd;
+    int cgroup_procs_fd;
+    unsigned char *cpu_mask, *observed_cpu_mask;
     int owned[OWNED_LIMIT], owned_count;
     int source[BINDING_LIMIT + 3], target[BINDING_LIMIT + 3], binding_count;
     char **argv, **envp;
@@ -99,6 +106,8 @@ static void owner_dealloc(child_owner *o) {
     if (o->error_fd >= 0) close(o->error_fd);
     free_strings(o->argv);
     free_strings(o->envp);
+    PyMem_Free(o->cpu_mask);
+    PyMem_Free(o->observed_cpu_mask);
     Py_TYPE(o)->tp_free((PyObject *)o);
 }
 
@@ -155,6 +164,19 @@ static PyObject *owner_start(child_owner *o, PyObject *unused) {
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) child_failure(error_write, errno);
         for (int number = 1; number < NSIG; ++number)
             if (number != SIGKILL && number != SIGSTOP) sigaction(number, &action, NULL);
+        if (o->cgroup_procs_fd >= 0) {
+            ssize_t count;
+            do { count = write(o->cgroup_procs_fd, "0\n", 2); } while (count < 0 && errno == EINTR);
+            if (count != 2) child_failure(error_write, count < 0 ? errno : EIO);
+        }
+        if (o->cpu_mask) {
+            if (syscall(SYS_sched_setaffinity, 0, CPU_MASK_BYTES, o->cpu_mask) < 0)
+                child_failure(error_write, errno);
+            if (syscall(SYS_sched_getaffinity, 0, CPU_MASK_BYTES, o->observed_cpu_mask) < 0)
+                child_failure(error_write, errno);
+            if (memcmp(o->cpu_mask, o->observed_cpu_mask, CPU_MASK_BYTES) != 0)
+                child_failure(error_write, EXDEV);
+        }
         if (o->cwd_fd >= 0 && fchdir(o->cwd_fd) < 0) child_failure(error_write, errno);
         for (int i = 0; i < o->binding_count; ++i)
             if (dup2(o->source[i], o->target[i]) < 0) child_failure(error_write, errno);
@@ -312,8 +334,10 @@ static PyTypeObject owner_type = {
 static PyObject *prepare(PyObject *module, PyObject *args) {
     (void)module;
     int executable, cwd;
+    int cgroup = -1;
     PyObject *argv, *envp, *bindings;
-    if (!PyArg_ParseTuple(args, "iOOiO", &executable, &argv, &envp, &cwd, &bindings)) return NULL;
+    PyObject *cpus = NULL;
+    if (!PyArg_ParseTuple(args, "iOOiO|Oi", &executable, &argv, &envp, &cwd, &bindings, &cpus, &cgroup)) return NULL;
     if (!PyTuple_Check(bindings) || PyTuple_GET_SIZE(bindings) > BINDING_LIMIT) {
         PyErr_SetString(PyExc_ValueError, "too many or invalid descriptor bindings"); return NULL;
     }
@@ -329,7 +353,7 @@ static PyObject *prepare(PyObject *module, PyObject *args) {
     child_owner *o = (child_owner *)owner_type.tp_alloc(&owner_type, 0);
     if (!o) return NULL;
     o->creator_pid = getpid(); o->creator_tid = (pid_t)syscall(SYS_gettid);
-    o->executable_fd = o->cwd_fd = o->error_fd = -1;
+    o->executable_fd = o->cwd_fd = o->error_fd = o->cgroup_procs_fd = -1;
     o->argv = copy_strings(argv); o->envp = copy_strings(envp);
     if (!o->argv || !o->envp || !o->argv[0]) goto fail;
     int targets[BINDING_LIMIT], sources[BINDING_LIMIT], minimum = 3;
@@ -343,6 +367,52 @@ static PyObject *prepare(PyObject *module, PyObject *args) {
             PyErr_SetString(PyExc_ValueError, "duplicate target descriptor"); goto fail;
         }
         if (targets[i] >= minimum) minimum = targets[i] + 1;
+    }
+    if (cpus) {
+        if (!PyTuple_CheckExact(cpus) || PyTuple_GET_SIZE(cpus) > AFFINITY_COUNT_LIMIT) {
+            PyErr_SetString(PyExc_ValueError, "invalid CPU affinity tuple"); goto fail;
+        }
+        if (PyTuple_GET_SIZE(cpus) > 0) {
+            o->cpu_mask = PyMem_Calloc(CPU_MASK_BYTES, 1);
+            o->observed_cpu_mask = PyMem_Calloc(CPU_MASK_BYTES, 1);
+            if (!o->cpu_mask || !o->observed_cpu_mask) { PyErr_NoMemory(); goto fail; }
+            long previous = -1;
+            for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(cpus); ++i) {
+                PyObject *item = PyTuple_GET_ITEM(cpus, i);
+                if (!PyLong_CheckExact(item)) {
+                    PyErr_SetString(PyExc_ValueError, "CPU affinity requires exact integers"); goto fail;
+                }
+                long cpu = PyLong_AsLong(item);
+                if (PyErr_Occurred()) goto fail;
+                if (cpu <= previous || cpu >= CPU_LIMIT) {
+                    PyErr_SetString(PyExc_ValueError, "CPU affinity must be ordered unique and bounded"); goto fail;
+                }
+                size_t word_bits = CHAR_BIT * sizeof(unsigned long);
+                ((unsigned long *)o->cpu_mask)[cpu / word_bits] |= 1UL << (cpu % word_bits);
+                previous = cpu;
+            }
+        }
+    }
+    if (cgroup >= 0) {
+        struct statfs filesystem;
+        char descriptor_path[64], resolved[PATH_MAX];
+        if (fstatfs(cgroup, &filesystem) < 0 || fstat(cgroup, &identity) < 0) goto os_fail;
+        snprintf(descriptor_path, sizeof(descriptor_path), "/proc/self/fd/%d", cgroup);
+        ssize_t length = readlink(descriptor_path, resolved, sizeof(resolved)-1);
+        if (length < 0) goto os_fail;
+        resolved[length] = 0;
+        int access = fcntl(cgroup, F_GETFL);
+        if (access < 0) goto os_fail;
+        if (filesystem.f_type != 0x63677270 || !S_ISREG(identity.st_mode)
+                || length < 13 || strcmp(resolved + length - 13, "/cgroup.procs") != 0
+                || ((access & O_ACCMODE) != O_WRONLY && (access & O_ACCMODE) != O_RDWR)) {
+            PyErr_SetString(PyExc_ValueError, "requires writable cgroup-v2 cgroup.procs"); goto fail;
+        }
+        for (int i = 0; i < count; ++i) if (sources[i] == cgroup) {
+            PyErr_SetString(PyExc_ValueError, "cgroup control FD cannot be bound to child"); goto fail;
+        }
+        o->cgroup_procs_fd = retain_fd(o, cgroup, minimum);
+        if (o->cgroup_procs_fd < 0) goto os_fail;
     }
     o->executable_fd = retain_fd(o, executable, minimum);
     if (o->executable_fd < 0) goto os_fail;
@@ -403,6 +473,9 @@ PyMODINIT_FUNC PyInit__fdexec(void) {
     PyObject *result = PyModule_Create(&module);
     if (!result) return NULL;
     if (PyModule_AddStringConstant(result, "interface_version", "sched-execution/v1") < 0) {
+        Py_DECREF(result); return NULL;
+    }
+    if (PyModule_AddStringConstant(result, "constraints_interface_version", "sched-execution-constraints/v1") < 0) {
         Py_DECREF(result); return NULL;
     }
     return result;

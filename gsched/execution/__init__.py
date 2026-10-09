@@ -18,10 +18,12 @@ from .backend import (
     retained_owners,
 )
 from .persistent import PersistentLinuxFdBackend, PersistentOwner, OwnerUnavailable
+from .constraints import LaunchConstraints, CONSTRAINTS_VERSION
 
 __all__ = [
     "INTERFACE_VERSION", "BackendUnavailable", "ExecutionEnvelope",
     "ExecutionObservation", "LinuxFdBackend", "Owner", "Prepared",
     "SubprocessBackend", "retained_owners",
     "PersistentLinuxFdBackend", "PersistentOwner", "OwnerUnavailable",
+    "LaunchConstraints", "CONSTRAINTS_VERSION",
 ]

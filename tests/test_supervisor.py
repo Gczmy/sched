@@ -182,6 +182,9 @@ class SupervisorProcessTests(TempStateCase):
         super().setUp()
         self.cfg["user"] = getpass.getuser()
         self.cfg["max_cpu_jobs"] = 1
+        # These isolated execution fixtures do not exercise lease admission.
+        # Dedicated cluster-lease tests cover the fail-closed production guard.
+        self.cfg["lease_validation"] = {"mode": "observe"}
         Path(self.config_path).write_text(json.dumps(self.cfg))
         self.repo = str(Path(__file__).resolve().parents[1])
         self.env = dict(os.environ, PYTHONPATH=self.repo, PYTHONDONTWRITEBYTECODE="1")

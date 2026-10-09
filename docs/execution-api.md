@@ -7,6 +7,11 @@
 项目 root 不能热切换；任务不能传入 Python module 或注入 `gsched` namespace。
 调度器不加载项目 adapter 代码。
 
+源码候选新增可选 `LaunchConstraints`，对三种 backend 提供启动前 CPU/cgroup FD
+绑定原语；省略保持原行为，尚非可用任务配置或完整 scheduler 硬隔离。
+新接口、原始 wait 与仍缺少的委派/设备/生命周期边界见
+[execution constraints](execution-constraints.md)。
+
 ## 管理员配置
 
 以下配置使用虚构项目与路径，摘要必须替换为实际已审查文件的 SHA-256：
