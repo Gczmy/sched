@@ -21,6 +21,13 @@ v0.5.0 提供 `snapshot create/verify/migrate/rollback/close/status`，命名合
 创建和验证不初始化数据库，维护窗口内只有显式 migrate 可升级；关闭永久消费旧 ID
 回退权，不自动启动 daemon。完整文件/并发/失败续接边界见 [升级恢复点](upgrade-snapshot.md)。
 
+后续源码扩展独立合同 `sched-upgrade-snapshot-management/v1`：
+`snapshot list --limit N --cursor ID --json` 只读有界实时分页；
+`snapshot prune ID --retention-days 30 --keep-last 2 --dry-run --json` 预览已关闭点。
+执行使用同参数加 `--as-of <preview-as-of> --expect-plan <preview-sha256> --yes`，
+须在计算节点，保留永久关闭/manifest/回退 journal，不触碰当前 DB 或恢复执行。
+旧关闭时间未知、活动窗口、绑定/镜像漂移均拒绝。该扩展未随原 v0.5.0 发布。
+
 公开 JSON 保持 `schema_version:1`；命名合同见 [integration-contract.md](integration-contract.md)。
 `sched identity --json` 只读查询持久 `instance_id`、配置节点和查询主机。
 没有状态或未迁移旧 schema 时返回 `available:false` 和原因，查询不会初始化数据库。

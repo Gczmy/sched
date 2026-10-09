@@ -77,7 +77,49 @@ rollback 在实际替换前保存原 DB/WAL/SHM 摘要和持久 intent，将回�
 中断后窗口保持 restoring，重复同 ID rollback 只按原 journal/digest 续接，不重新提交任务。
 中断恢复须仍满足文件/实例绑定；发生漂移则保留现场并拒绝，不猜测或自动覆盖。
 restoring 时禁止 close。创建失败保持 creating 并冻结写入，可显式 close 放弃未完成点；
-不允许拿未完成点回退。恢复点清理/保留期 CLI 尚未实现，不手工删除受管恢复记录。
+不允许拿未完成点回退。后续源码提供下述恢复点管理扩展；不手工删除受管恢复记录。
+
+## 有界查询与保留期清理（后续源码）
+
+命名合同 `sched-upgrade-snapshot-management/v1` 独立协商，不改变升级窗口 v1 的回退权限。
+此扩展尚未发布；已有 v0.5.0 安装不因文档更新取得新命令。
+
+```sh
+sched snapshot list --limit 20 --json
+sched snapshot list --limit 20 --cursor <snapshot-id> --json
+sched snapshot prune <snapshot-id> --retention-days 30 --keep-last 2 --dry-run --json
+```
+
+list 与 prune --dry-run 可在网关读取现有私有控制记录，不打开当前 DB、不初始化
+目录或锁、不探测查询主机的进程/Slurm。list 默认 20、最多 100 行，ID keyset 实时
+分页，`truncated/next_cursor` 不能拼造一致全量快照。总目录项最多 10,000；记录、
+输出和扫描均有界，读取失败不返回部分成功。查询均 `effect:none/rollback_authorized:false`。
+
+prune 只预览单个完整且已关闭的恢复点，默认保留 30 天与最近 2 个未清理关闭点。
+`retention-days` 为 0..36500，`keep-last` 为 0..100；0 须显式指定。
+保留期依据关闭时持久化的 `closed_at_epoch`。旧记录只有无时区字符串时报告
+`closed_time_not_recorded` 并拒绝清理，不猜时区或补写旧事实。创建未完成、镜像/审计损坏、
+存在任何活动维护窗口或未知额外文件/目录时拒绝；不靠当前 PID 或任务终态取得清理权。
+
+预览返回 `as_of`、`plan_sha256`、候选字节数和文件数。执行必须在 config.node 计算节点，
+沿用同一保留参数、as-of 和计划摘要：
+
+```sh
+sched snapshot prune <snapshot-id> --retention-days 30 --keep-last 2 \
+  --as-of <preview-as-of> --expect-plan <preview-plan-sha256> --yes --json
+```
+
+执行取得稳定独占维护锁，重新核对原关闭记录、配置/state/物理主机绑定、manifest、
+目录 inode 和每个文件摘要；预览变化拒绝，不另选恢复点。删除前持久化原 pruning
+意图，按原目录 FD 删除精确副本，逐步 fsync；故障保留现场，同一参数/摘要才可续接。
+不接受符号链接、硬链接、目录替换或未知文件。每阶段最多 30 秒，单文件 128 MiB、
+总量 1 GiB/10,000 项；忙或超限保留原记录。
+
+仅移除该关闭点的 DB/config/节点文件副本与已完成回退的 before-rollback 副本。
+原 point inode、manifest.json、rollback.json、永久 closed 记录和 prune 审计保留，
+不修改当前 state/config、unknown 请求、execution、scope、任务、revision 或实例。
+清理后 phase=pruned；重复同一操作重核对审计并返回原结果，不复活回退权。
+verify 因镜像已清理而失败是预期行为，不能据 manifest 摘要推断仍可恢复。
 
 ## 验收范围
 

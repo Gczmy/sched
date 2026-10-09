@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 from run_cluster_lease_accept import LeaseAcceptance
 
@@ -57,6 +58,34 @@ class SnapshotAcceptance(LeaseAcceptance):
         self.data("snapshot", "close", later, "--yes", "--json")
         print("PASS: a later maintenance window cannot revive a historical recovery point; private daemon remains stopped", flush=True)
 
+        first = self.data("snapshot", "list", "--limit", "1", "--json")
+        assert first["contract"] == "sched-upgrade-snapshot-management/v1" and first["effect"] == "none"
+        assert first["truncated"] and first["next_cursor"]
+        second = self.data("snapshot", "list", "--limit", "1", "--cursor", first["next_cursor"], "--json")
+        assert not second["truncated"]
+        assert {first["snapshots"][0]["snapshot_id"], second["snapshots"][0]["snapshot_id"]} == {identifier, later}
+        retained = self.data("snapshot", "prune", identifier, "--dry-run", "--json")
+        assert not retained["eligible"] and "retention_period_not_elapsed" in retained["reasons"]
+        time.sleep(1.1)  # Move beyond the recorded fractional close epoch without changing a clock.
+        preview = self.data("snapshot", "prune", identifier, "--retention-days", "0", "--keep-last", "0",
+                            "--dry-run", "--json")
+        assert preview["eligible"] and preview["effect"] == "none"
+        command = ("snapshot", "prune", identifier, "--retention-days", "0", "--keep-last", "0",
+                   "--as-of", preview["as_of"], "--expect-plan", preview["plan_sha256"], "--json")
+        self.cli(*command, expect=1)  # Missing --yes never deletes.
+        result = self.data(*command, "--yes")
+        assert result["phase"] == "pruned" and result["audit_retained"] and not result["current_state_modified"]
+        assert self.data(*command, "--yes") == result
+        rows = self.data("snapshot", "list", "--json")["snapshots"]
+        assert next(r for r in rows if r["snapshot_id"] == identifier)["phase"] == "pruned"
+        assert next(r for r in rows if r["snapshot_id"] == later)["phase"] == "closed"
+        self.data("snapshot", "verify", identifier, "--json", expect=1)
+        self.data("snapshot", "rollback", identifier, "--yes", "--json", expect=1)
+        assert self.data("identity", "--json")["instance_id"] == instance
+        assert self.job(batch, "once")["jobs"][0]["status"] == "done"
+        assert (self.root / "once" / "runs.txt").read_text() == "run\n"
+        print("PASS: passive bounded catalog, retention preview, explicit original-plan prune/replay and permanent audit preserve current instance/task/wait and later point", flush=True)
+
 
 def main():
     if sys.platform != "linux" or (os.environ.get("GITHUB_ACTIONS") != "true" and not os.environ.get("SLURM_JOB_ID")):
@@ -74,8 +103,8 @@ def main():
         acceptance.cli("daemon", "stop")
         if acceptance.data("daemon", "status", "--json")["health_state"] != "stopped":
             raise RuntimeError(f"Private daemon not stopped; retained {root}")
-    # Recovery-point/state cleanup has no CLI yet. Retain its evidence rather
-    # than deleting scheduler-managed images directly through the test harness.
+    # Only eligible closed copies were pruned through CLI. Retain current state,
+    # audit records and the remaining recovery point for inspection.
     print(f"RETAINED: stopped private recovery evidence {root}", flush=True)
 
 
