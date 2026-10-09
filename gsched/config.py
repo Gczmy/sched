@@ -261,8 +261,10 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     from .resources import finite_number
     from .storage import policy as storage_policy
     from .cluster_lease import policy as lease_policy
+    from .cpu_capacity import policy as cpu_policy
     try:
         lease_policy(cfg)
+        cpu_policy(cfg)
         storage_policy(cfg)
     except ValueError as error:
         raise ConfigError(f"{p}: {error}") from error
@@ -273,7 +275,7 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     ):
         if not finite_number(cfg.get(key, default), positive=positive):
             raise ConfigError(f"{p}: {key} 必须是有限{'正' if positive else '非负'}数")
-    for k, min_v in (("cpus_total", 0), ("gpu_job_cpus", 1), ("max_cpu_jobs", 1)):
+    for k, min_v in (("gpu_job_cpus", 1), ("max_cpu_jobs", 1)):
         v = cfg.get(k)
         if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < min_v):
             raise ConfigError(f"{p}: {k} 必须是整数且 >= {min_v}")

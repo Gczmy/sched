@@ -1172,6 +1172,9 @@ def _decode_status_job_cursor(
 def cmd_status(args: argparse.Namespace) -> int:
     """sched status [batch]: bounded, coherent latest-version current state."""
     cfg = _load_cfg()
+    if getattr(args, "include_cpu_capacity", False) and not args.json:
+        print("错误: --include-cpu-capacity 仅用于 status --json", file=sys.stderr)
+        return 1
     limit = max(1, min(1000, int(getattr(args, "limit", 200))))
     out: dict[str, Any] = {
         "schema_version": 1,
@@ -1463,20 +1466,19 @@ def cmd_status(args: argparse.Namespace) -> int:
                 }
             )
 
-        cpu_used = 0
-        running_specs = conn.execute(
-            "SELECT t.spec FROM jobs j"
-            " LEFT JOIN tasks t ON t.batch_id=j.batch_id"
-            " AND t.id=j.task_id AND t.version=j.version"
-            " WHERE j.status='running'"
-        ).fetchall()
-        for row in running_specs:
-            try:
-                task_spec = json.loads(row["spec"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                task_spec = {}
-            cpu_used += _task_cpus_of(task_spec.get("resources") or {}, cfg)
-        out["cpu"] = {"used": cpu_used, "total": cfg.get("cpus_total", 0)}
+        from . import cpu_capacity
+        try:
+            cpu_used = cpu_capacity.reserved(conn, cfg, lambda spec: _task_cpus_of(spec.get("resources") or {}, cfg))
+        except cpu_capacity.CpuReservationUnknown:
+            cpu_used = None
+        capacity = cpu_capacity.recorded(conn, cfg)
+        # Unknown auto is never represented as zero/unlimited or a string in
+        # the default strict two-integer CPU contract accepted by old clients.
+        if cpu_used is not None and (capacity["mode"] != "auto" or capacity["available"]):
+            out["cpu"] = {"used": cpu_used, "total": capacity["effective_total"]}
+        if getattr(args, "include_cpu_capacity", False):
+            from .integration import CONTRACTS
+            out["cpu_capacity"] = {"contract": CONTRACTS["cpu_capacity"], "used": cpu_used, **capacity}
 
         from . import resources as admission
         memory_used = admission.memory_usage(conn, cfg)
@@ -1508,7 +1510,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     requested_memory = admission.host_mem_gib({"resources": res}, cfg)
                 except (TypeError, ValueError, AttributeError):
                     requested_memory = limit + 1  # Legacy invalid spec awaits daemon rejection.
-                if cfg.get("cpus_total", 0) and cpu_used + _task_cpus_of(res, cfg) > cfg["cpus_total"]:
+                if cpu_used is None or (capacity["mode"] == "auto" and not capacity["available"]) or (capacity["effective_total"] and cpu_used + _task_cpus_of(res, cfg) > capacity["effective_total"]):
                     job["wait_reason"] = "cpu"
                 elif limit and memory_used + requested_memory > limit:
                     job["wait_reason"] = "host_memory"
@@ -1902,6 +1904,32 @@ def cmd_artifact_check(args: argparse.Namespace) -> int:
         return 0 if output["passed"] else 1
     except (ValueError, ConfigError, state.StateError, RecursionError) as error:
         print(f"错误: {error}", file=sys.stderr)
+        return 1
+    finally:
+        state.set_read_only(False)
+
+
+def cmd_cpu_capacity(args: argparse.Namespace) -> int:
+    from . import cpu_capacity
+    from .integration import CONTRACTS, instance_id
+    state.set_read_only(True)
+    try:
+        cfg = load_config()
+        with state.connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                used = cpu_capacity.reserved(conn, cfg, lambda spec: _task_cpus_of(spec.get("resources") or {}, cfg))
+            except cpu_capacity.CpuReservationUnknown:
+                used = None
+            result = {"schema_version": 1, "query": "cpu_capacity", "contract": CONTRACTS["cpu_capacity"],
+                      "instance_id": instance_id(conn), "node": state.hostname(), "effect": "none",
+                      "used": used,
+                      "reservation_error": "legacy_running_cpu_reservation_unknown" if used is None else None,
+                      **cpu_capacity.recorded(conn, cfg)}
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0
+    except (ValueError, ConfigError, state.StateError, TypeError, KeyError, sqlite3.Error, RecursionError) as error:
+        print(f"错误: cpu-capacity 查询失败: {error}", file=sys.stderr)
         return 1
     finally:
         state.set_read_only(False)
@@ -5312,6 +5340,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="三视图总览")
     p.add_argument("batch", nargs="?", default=None)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--include-cpu-capacity", action="store_true", help="--json: 显式增加配置/已记录容量/来源/租约扩展")
     p.add_argument("--limit", type=int, default=200, help="批次/任务最大行数 (默认 200)")
     p.add_argument(
         "--cursor",
@@ -5479,6 +5508,10 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("command", nargs="+")
         p.set_defaults(fn=cmd_request if request_command == "request" else cmd_request_validate)
 
+    p = sub.add_parser("cpu-capacity", help="只读声明/已记录计算节点 CPU 容量；不探测网关、不授予执行权")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_cpu_capacity)
+
     p = sub.add_parser("daemon-lease", help="只读已记录 daemon 启动/租约事实，不探测 Slurm 或授予执行权")
     p.add_argument("--lease-id")
     p.add_argument("--limit", type=int, default=20)
@@ -5530,7 +5563,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     command = getattr(args, "_subcommand", None)
-    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease"}:
+    if command in {"capabilities", "version", "identity", "request-status", "request-status-many", "request-validate", "artifact-check", "artifact-validations", "artifact-revalidations", "artifact-revalidate", "batch-policy", "batch-dependencies", "task-dependencies", "dependency-update", "task-facts", "cancel-pending", "admission-explain", "allocations", "storage-explain", "daemon-lease", "cpu-capacity"}:
         return args.fn(args)
     if command == "request":
         try:

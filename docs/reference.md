@@ -379,7 +379,8 @@ owner/wait 权威时不推断成功、不重放，也不因代码迁移直接删
 | `gpus[i].max_jobs` | 异构卡每卡打包上限（热更新）|
 | `gpus` | 卡号或 `{idx,mem_gib,max_jobs}` 数组；省略/空数组时由 daemon 探测 |
 | `co_locate / co_locate_safety / co_locate_max_jobs / co_locate_freeze_pct` | 共享总开关与阈值；默认 `false / 0.7 / 3 / 85` |
-| `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 配额；默认 `0 / 8 / 2`。`cpus_total=0` 时仅以 `max_cpu_jobs` 限 CPU-only 并发 |
+| `cpus_total / gpu_job_cpus / max_cpu_jobs` | CPU 预留预算；默认 `0 / 8 / 2`。零值只限 CPU-only 并发；显式 `"auto"` 使用原租约/affinity 的保守容量；固定正值超已知边界告警 |
+| `cpus_auto_max` | 候选 auto 的可选正整数上限 1..1048576，默认 null；非 auto 必须省略/null；可热更 |
 | `host_mem_total_gib / host_mem_reserve_gib / host_mem_default_gib` | 主机内存准入；默认 `0 / 16 / 8` GiB。total=0 关闭；其余有限非负，default 必须大于 0；支持热更新 |
 | `storage_admission` | 候选 opt-in 磁盘/inode/可知用户 quota 准入；默认 enabled=false，其余余量/unknown 策略见 [存储合同](storage-admission.md)，支持热更新 |
 | `lease_validation` | 候选冷配置；默认 mode=auto、unknown_policy=pause、interval_sec=30；有 Slurm 来源时失效/未知停新派发，详见 [租约合同](daemon-lease.md) |
@@ -414,6 +415,10 @@ aging/fair-share：运行中的低优任务不会被驱逐；高优候选因 quo
 保留系统余量。运行进程树采用 PSS，读取失败的部分按未使用预留保守处理，不累加 RSS。
 采样或配置读取失败时暂停派发。预留不是 cgroup 硬限制；任务仍应保留运行期内存保护。
 `status.cpu.used` 和 `host_memory.used_gib` 都是声明预留，不是实时 CPU/PSS 用量。
+候选 CPU auto 的严格 status.cpu 已知时仍是两个整数；未知时省略，不用零值表示未知。
+通过 `cpu-capacity --json` 或显式 `status --json --include-cpu-capacity` 查看配置、有效
+容量、来源、租约和观测时效。运行 CPU 预留冻结到原 allocation，热改默认值不缩小
+已启动任务的预留；详见 [CPU 自动容量](cpu-capacity.md)。这不是 per-job 硬限制。
 节点可用内存来自 daemon 最近 90 秒内的采样，未知时为 null，不在网关采样替代。
 
 安全维护使用 `sched daemon drain` 暂停新派发，已有任务自然结束，pending 保留。

@@ -137,6 +137,9 @@ def reserve(conn, job_id, spec, dispatcher):
     if lease is not None:
         payload["lease_identity"] = {"lease_id": lease.owner["lease_id"], "instance_id": lease.origin["instance_id"],
                                      "recorded_allocation_state": lease.decision["allocation_state"]}
+    capacity = getattr(dispatcher, "_cpu_capacity", None)
+    if isinstance(capacity, dict):
+        payload["cpu_capacity"] = capacity
     if (isinstance(storage, dict) and storage.get("allowed") is True and storage.get("job_id") == job_id
             and storage.get("spec_sha256") == digest(spec)):
         payload["storage_filesystems"] = [item["filesystem_id"] for item in storage["filesystems"] if "task" in item["roles"]]

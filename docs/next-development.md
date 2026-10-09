@@ -156,13 +156,14 @@ daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 
 
 ## ND-03：CPU 容量自动解析与可执行约束
 
-**状态：待设计、未实现。** 当前 `cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
+**状态：源码候选已实现，计算节点 CPU/CLI 通过，完整 CI 待确认；尚未发布或部署。** 具体合同、查询和兼容边界见
+[CPU 自动容量](cpu-capacity.md)。per-job 硬隔离仍未实现。`cpus_total=0` 表示关闭总 CPU 配额，只在 CPU-only
 任务上回退到 `max_cpu_jobs` 并发计数；正整数仅做声明值求和，不会设置 affinity 或
 子 cgroup。
 
 ### 已确认的设计方向
 
-1. 显式增加 `cpus_total: "auto"`（最终字段形式实现前定案），保留
+1. 显式增加 `cpus_total: "auto"` 与可选正整数 `cpus_auto_max`，保留
    `cpus_total=0` 当前“不启用总 CPU 配额”的兼容语义；不得把现有零值静默改成 auto。
 2. auto 模式综合 Slurm 声明、`sched_getaffinity(0)` 与可选配置上限解析有效 CPU 容量。
    多个可信来源不一致时取保守边界并明确告警，无法确认安全容量时 fail-closed 或报告
@@ -178,7 +179,9 @@ daemon 从既有 Slurm 租约 shell 启动；随后用于进入租约的 screen 
 
 ### 可观测性与验收
 
-- `status --json` 同时展示配置值、解析后容量、容量来源与租约有效性；固定正整数仍可
+- 显式 `status --json --include-cpu-capacity` 或独立 `cpu-capacity --json` 同时展示
+  配置值、解析后容量、来源与租约有效性；默认 status.cpu 保持两整数，auto 未知时
+  省略该可选字段。固定正整数仍可
   用于明确部署，但若大于当前 affinity/Slurm 容量必须告警或拒绝派发。
 - 覆盖 auto、固定值、零值兼容、Slurm/affinity 一致与冲突、租约运行中失效、新租约
   同节点建立但禁止自动迁移，以及未启用硬隔离时的机器可读语义测试。

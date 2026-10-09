@@ -2,7 +2,8 @@
 
 源码候选写 schema 17、完整只读 schema 1–17；包版本不代表部署能力，使用
 `identity --json` 协商 `sched-daemon-lease-v1`。未部署到生产，不能把 CPU/fake-GPU
-验收当作真实 Slurm 失效或 CUDA 验收。CPU 自动容量与 per-job 硬隔离另行开发。
+验收当作真实 Slurm 失效或 CUDA 验收。后续候选的 [CPU 自动容量](cpu-capacity.md)
+复用此来源和校验；per-job 硬隔离仍另行开发。
 
 ## 配置与派发边界
 

@@ -23,14 +23,15 @@ MAX_SAMPLE_AGE = 90.0
 
 
 def running_snapshot(conn):
-    rows = [dict(row) for row in conn.execute("SELECT j.id,j.version,j.pgid,j.gpu,j.project,t.spec FROM jobs j LEFT JOIN tasks t ON t.batch_id=j.batch_id AND t.id=j.task_id AND t.version=j.version WHERE j.status='running' ORDER BY j.id LIMIT ?", (MAX_RUNNING + 1,))]
+    pointer = "j.allocation_id" if conn.execute("PRAGMA user_version").fetchone()[0] >= 16 else "NULL"
+    rows = [dict(row) for row in conn.execute("SELECT j.id,j.version,j.pgid,j.gpu,j.project," + pointer + " AS allocation_id,t.spec FROM jobs j LEFT JOIN tasks t ON t.batch_id=j.batch_id AND t.id=j.task_id AND t.version=j.version WHERE j.status='running' ORDER BY j.id LIMIT ?", (MAX_RUNNING + 1,))]
     if len(rows) > MAX_RUNNING or sum(len((row["spec"] or "").encode()) for row in rows) > 4 * 1024 * 1024:
         raise ValueError("running reservation facts exceed 10000 records / 4 MiB")
     return digest(rows)
 
 
 def policy_context(cfg):
-    defaults = {"cpus_total": 0, "max_cpu_jobs": 2, "gpu_job_cpus": 8, "co_locate": False,
+    defaults = {"cpus_total": 0, "cpus_auto_max": None, "max_cpu_jobs": 2, "gpu_job_cpus": 8, "co_locate": False,
                 "co_locate_safety": 0.7, "co_locate_max_jobs": 3, "host_mem_total_gib": 0,
                 "host_mem_reserve_gib": 16, "host_mem_default_gib": 8, "gpus": []}
     result = {key: cfg.get(key, default) for key, default in defaults.items()}
@@ -180,12 +181,18 @@ def explain(conn, cfg, batch, job, spec):
         parallel = int(parallel)
         if parallel <= 0:
             raise ValueError("max_parallel 必须为正整数")
-    used_cpu = adapter._cpu_in_use(conn)
+    from .cpu_capacity import CpuReservationUnknown
+    try:
+        used_cpu = adapter._cpu_in_use(conn)
+    except CpuReservationUnknown:
+        used_cpu = None
     project = job["project"] or batch["project"]
     project_running = conn.execute("SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id=j.batch_id WHERE j.status='running' AND j.gpu IS NOT NULL AND COALESCE(j.project,b.project)=?", (project,)).fetchone()[0]
     memory_age = time.time() - float(runtime["memory_sampled_at"]) if runtime else None
     memory_sample = runtime["memory_sample"] if usage_matches and memory_age is not None and 0 <= memory_age <= MAX_SAMPLE_AGE else None
-    budget = budgets(cfg, cfg, project, cpu_only=cpu_only, cpus=adapter._task_cpus(spec),
+    from .cpu_capacity import recorded as recorded_cpu
+    cpu_capacity = recorded_cpu(conn, cfg)
+    budget = budgets(cfg, cfg, project, cpu_only=cpu_only, cpus=adapter._task_cpus(spec), cpu_capacity=cpu_capacity,
                      memory=resources.host_mem_gib(spec, cfg), parallel=parallel,
                      used_cpu=used_cpu, cpu_jobs=conn.execute("SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL").fetchone()[0],
                      used_memory=resources.memory_usage(conn, cfg), memory_sample=memory_sample,
@@ -250,15 +257,20 @@ def explain(conn, cfg, batch, job, spec):
             "source": "private_database_snapshot_and_separately_recorded_daemon_observations",
             "hard_isolation": False, "storage": storage_check,
             "disk_inode_quota_admission": "enabled" if storage_check["enabled"] else "disabled",
-            "continuous_lease_validation": "not_implemented"}
+            "cpu_capacity": cpu_capacity,
+            "continuous_lease_validation": "daemon_lease_validation_separate_contract"}
 
 
 def budgets(cfg, policy_cfg, project, *, cpu_only, cpus, memory, parallel,
             used_cpu, cpu_jobs, used_memory, memory_sample, outstanding_memory,
-            launched_memory, batch_running, project_running):
+            launched_memory, batch_running, project_running, cpu_capacity=None):
     """Return every budget rejection in the historical gate order."""
     quota = int((cfg.get("projects", {}).get(project) or {}).get("gpu_quota", 0) or 0)
-    total = int(cfg.get("cpus_total", 0) or 0)
+    from .cpu_capacity import policy, resolve, permits
+    configured = policy(cfg)["configured"]
+    cpu_capacity = cpu_capacity or resolve(cfg)
+    total = cpu_capacity["effective_total"] if configured == "auto" else configured
+    cpu_allowed = permits(cfg, cpu_capacity, cpus=cpus, used=used_cpu, cpu_only=cpu_only, cpu_jobs=cpu_jobs)
     max_cpu = int(cfg.get("max_cpu_jobs", 2))
     mem_limit = float(policy_cfg.get("host_mem_total_gib", 0))
     reserve = float(policy_cfg.get("host_mem_reserve_gib", 16))
@@ -269,7 +281,7 @@ def budgets(cfg, policy_cfg, project, *, cpu_only, cpus, memory, parallel,
                               "limit": quota, "used": project_running, "unit": "running_gpu_jobs", "zero_means": "unlimited"},
         "batch_parallel": {"applies": parallel is not None, "allowed": not parallel or batch_running < parallel,
                            "limit": parallel, "used": batch_running},
-        "cpu_reservation": {"applies": total > 0, "allowed": total <= 0 or used_cpu + cpus <= total,
+        "cpu_reservation": {"applies": configured != 0, "allowed": configured == 0 or cpu_allowed,
                             "requested": cpus, "used": used_cpu, "limit": total, "hard_isolation": False},
         "host_memory": {"applies": mem_limit > 0,
                         "allowed": resources.memory_available(policy_cfg, used_memory, memory, memory_sample, launched_memory, outstanding_memory),
@@ -279,8 +291,8 @@ def budgets(cfg, policy_cfg, project, *, cpu_only, cpus, memory, parallel,
                         "effective_budget_gib": min(mem_limit, max(0, memory_sample["MemTotal"] - reserve)) if memory_sample and mem_limit > 0 else None,
                         "physical_headroom_gib": memory_sample["MemAvailable"] - launched_memory - outstanding_memory - reserve if memory_sample else None,
                         "hard_isolation": False},
-        "cpu_only_concurrency": {"applies": cpu_only and total <= 0,
-                                 "allowed": not cpu_only or total > 0 or cpu_jobs < max_cpu,
+        "cpu_only_concurrency": {"applies": cpu_only and configured == 0,
+                                 "allowed": not cpu_only or configured != 0 or cpu_jobs < max_cpu,
                                  "limit": max_cpu, "used": cpu_jobs},
     }
     codes = {"project_gpu_enabled": "project_gpu_disabled", "project_gpu_quota": "quota",
@@ -288,6 +300,10 @@ def budgets(cfg, policy_cfg, project, *, cpu_only, cpus, memory, parallel,
              "cpu_only_concurrency": "cpu"}
     reasons = [codes[key] for key, check in checks.items() if not check["allowed"]]
     unknown = ["host_memory_sample"] if mem_limit > 0 and memory_sample is None else []
+    if configured == "auto" and not cpu_capacity["available"]:
+        unknown.extend(cpu_capacity["unknown"] or ["cpu_capacity_unavailable"])
+    if used_cpu is None:
+        unknown.append("legacy_running_cpu_reservation_unknown")
     return {"allowed": not reasons, "reasons": list(dict.fromkeys(reasons)), "unknown": unknown, "checks": checks}
 
 

@@ -62,6 +62,7 @@
 | `docs/allocation-evidence.md` | 候选不可变启动分配与进程/监控/产物/资源分层，不推断 worker 身份 |
 | `docs/storage-admission.md` | 候选 opt-in 存储准入与控制面余量；用户 quota 未知不等于无限制 |
 | `docs/daemon-lease.md` | 候选持久 daemon 启动来源、只读租约查询与持续校验；未知不冒充有效 |
+| `docs/cpu-capacity.md` | 候选 CPU auto 保守容量、冻结运行预留与零值兼容；不等于 per-job 硬隔离 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |
@@ -161,6 +162,7 @@ daemon 必须从用户指定的既有 Slurm 租约 shell 启动；多个候选�
 | `sched config get`、`sched config set -f <patch.json> --yes`、`sched config reload` | 读取配置／深合并补丁并触发热更／请求重载 |
 | `sched daemon status --json` | 只读健康查询，不打开 DB；区分调度健康、进程存活与查询节点，跨节点 PID 状态为 unknown |
 | `sched daemon-lease --json`、`sched daemon status --json --include-lease` | 候选私有快照读取已记录出生/租约检查/退出；只在显式 opt-in 时扩展健康 JSON，不探测网关 Slurm |
+| `sched cpu-capacity --json`、`sched status --json --include-cpu-capacity` | 候选只读配置/已记录计算容量与原租约；默认 status.cpu 保持两整数，auto 未知时省略 |
 | `sched daemon drain [--stop-when-idle]`、`sched daemon resume` | 暂停新派发／解除暂停；running 自然结束、pending 保留；排空状态跨重启保留 |
 | `sched request <request-id> --expect-revision N ... -- <mutation>` | 计算节点持久化幂等写操作，前置条件见下文 |
 | `sched markers`、`sched notify-inbox --json`、`sched notify-ack <file>`、`sched notify-test` | 批次终态／通知查询／确认／渠道验证 |

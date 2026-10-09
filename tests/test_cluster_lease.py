@@ -316,9 +316,13 @@ class LeaseEvidenceTests(TempStateCase):
         self.addCleanup(dispatcher.log.close)
         dispatcher._cluster_lease = mock.Mock()
         dispatcher._cluster_lease.update.side_effect = [True, False]
+        # This narrow fixture exercises the later lease fence, not CPU source
+        # resolution. The CPU gate has its own real synthetic-context tests.
+        dispatcher._cpu_launch_allowed = mock.Mock(return_value=True)
         dispatcher._ready_fingerprint_snapshots = {jid: ("new-fp", None, None)}
         with state.connect() as conn, mock.patch.object(dispatcher, "_prepare_launch_marker", return_value=False), mock.patch.object(dispatcher, "_clean_stale_artifacts") as cleanup, mock.patch.object(dispatcher.executor, "launch") as launch:
             self.assertFalse(dispatcher._launch_job(conn, state.get_job(conn, jid), None))
+            dispatcher._cpu_launch_allowed.assert_called_once()
             cleanup.assert_not_called()
             launch.assert_not_called()
             self.assertEqual("pending", state.get_job(conn, jid)["status"])

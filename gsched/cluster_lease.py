@@ -208,6 +208,7 @@ class Monitor:
     def __init__(self, cfg, owner):
         self.owner = dict(owner)
         context = kernel_context()
+        self.current_context = context
         env = slurm_environment()
         self.origin = {**context, "schema_version": 1, "lease_id": owner["lease_id"], "node": state.hostname(),
                        "started_at": time.time(), "slurm_environment": env, "policy": policy(cfg)}
@@ -244,6 +245,7 @@ class Monitor:
     def update(self, *, force=False):
         now = time.time()
         current = kernel_context()
+        self.current_context = current
         job_id = self.origin["slurm_environment"].get("SLURM_JOB_ID")
         if job_id and (force or not 0 <= now - self.sample["observed_at"] < self.origin["policy"]["interval_sec"]):
             self.sample = probe(job_id)

@@ -1196,6 +1196,8 @@ class Dispatcher:
         if monitor is not None:
             monitor.update()
             self._notify_invalid_lease(monitor)
+        from .cpu_capacity import capture as capture_cpu
+        capture_cpu(self)
         self._drain_submit_inbox()  # C2: 单写者 inbox 文件补插请求行
         self._process_control_requests()  # 事故记录 4: cancel 转发 daemon, kill 前处理
         self._prune_control_requests()  # L11: 有界保留已完成控制请求
@@ -4403,8 +4405,12 @@ class Dispatcher:
         if admission.drain_state() is not None:
             return
         monitor = getattr(self, "_cluster_lease", None)
-        if monitor is not None and not monitor.update():
-            return
+        if monitor is not None:
+            permitted = monitor.update()
+            from .cpu_capacity import capture as capture_cpu
+            capture_cpu(self)
+            if not permitted:
+                return
         try:
             gpu_policy = self._read_gpu_policy()
         except RuntimeError as error:
@@ -4514,7 +4520,12 @@ class Dispatcher:
             # GPU 任务 CPU 占用 = resources.cpus 或 config.gpu_job_cpus (NN 训练也要 CPU).
             # cpus_total 未配置(0) -> 回退 max_cpu_jobs: CPU-only 并发上限 (定案 7 旧语义),
             # GPU 任务不受 CPU 约束 (旧版行为).
-            used_cpu = self._cpu_in_use(conn)
+            from .cpu_capacity import CpuReservationUnknown
+            try:
+                used_cpu = self._cpu_in_use(conn)
+            except CpuReservationUnknown:
+                self.log_line("CPU auto pauses dispatch: legacy running CPU reservation unknown")
+                return
             used_memory = admission.memory_usage(conn, admission_cfg)
             memory_sampled_at = time.time()
             memory_sample = admission.host_memory() if admission_cfg.get("host_mem_total_gib", 0) else None
@@ -4603,6 +4614,7 @@ class Dispatcher:
                     continue
                 from .admission import budgets
                 budget = budgets(self.cfg, {**admission_cfg, "projects": gpu_policy.get("projects", {})}, project,
+                                 cpu_capacity=getattr(self, "_cpu_capacity", None),
                                  cpu_only=is_cpu_only, cpus=task_cpus, memory=task_memory, parallel=mp,
                                  used_cpu=used_cpu, cpu_jobs=cpu_only_running, used_memory=used_memory,
                                  memory_sample=memory_sample, outstanding_memory=outstanding_memory,
@@ -4732,19 +4744,8 @@ class Dispatcher:
 
     def _cpu_in_use(self, conn) -> int:
         """当前 running 任务 (GPU + CPU-only) 的 CPU 占用总和."""
-        used = 0
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE status='running'"
-        ).fetchall()
-        for j in rows:
-            try:
-                spec = self._load_task_spec(conn, j)
-                used += self._task_cpus(spec)
-            except (AttributeError, TypeError, ValueError):
-                # Fail closed for quota accounting: reserve the default GPU
-                # job CPU share until the malformed record is isolated.
-                used += int(self.cfg.get("gpu_job_cpus", DEFAULT_GPU_JOB_CPUS))
-        return used
+        from .cpu_capacity import reserved
+        return reserved(conn, self.cfg, self._task_cpus)
 
     def _gpu_dispatch_suppressed(self, idx: int) -> bool:
         """Share Allocator's util-debounce gate across every packing path."""
@@ -4790,6 +4791,25 @@ class Dispatcher:
         return current_fp, stage_fingerprints, git_rev
 
 
+
+    def _cpu_launch_allowed(self, conn, spec):
+        from . import cpu_capacity
+        try:
+            current_cfg = self._read_gpu_policy()
+            cfg = {**self.cfg, **{key: current_cfg.get(key, default) for key, default in
+                (("cpus_total", 0), ("cpus_auto_max", None), ("max_cpu_jobs", 2))}}
+            if getattr(self, "_cluster_lease", None) is not None:
+                if conn.in_transaction:
+                    conn.commit()
+                capacity = cpu_capacity.capture(self, cfg=cfg)
+            else:
+                capacity = cpu_capacity.resolve(cfg)
+            return cpu_capacity.permits(cfg, capacity, cpus=self._task_cpus(spec),
+                used=cpu_capacity.reserved(conn, cfg, self._task_cpus),
+                cpu_only=(spec.get("resources") or {}).get("gpu", 1) == 0,
+                cpu_jobs=conn.execute("SELECT COUNT(*) FROM jobs WHERE status='running' AND gpu IS NULL").fetchone()[0])
+        except (RuntimeError, cpu_capacity.CpuReservationUnknown):
+            return False
 
     def _launch_job(self, conn, j, gpu: int | None) -> bool:
         """启动任务; 返回是否真正启动 (调用方据此计 CPU/并发配额, D1)。
@@ -4874,6 +4894,11 @@ class Dispatcher:
                 return False
             self._storage_launch_observation = checked
 
+        if not self._cpu_launch_allowed(conn, spec):
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
+
         if self._prepare_launch_marker(j):
             self.log_line(
                 f"job {j['id']} 存在未决 launch marker; 本轮不派发"
@@ -4946,6 +4971,13 @@ class Dispatcher:
                 if gpu is not None:
                     self._release_in_tx(conn, j["id"])
                 return False
+
+        # Final CPU admission uses current hot configuration and immutable
+        # running reservations, after all potentially slow launch preparation.
+        if not self._cpu_launch_allowed(conn, spec):
+            if gpu is not None:
+                self._release_in_tx(conn, j["id"])
+            return False
 
         # M1 修复: 条件更新抢占 —— SELECT/指纹快照到 launch 之间可能已被
         # cancel、批次终止或 resubmit 成旧代际；最终写必须再次原子校验

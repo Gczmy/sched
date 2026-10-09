@@ -31,6 +31,7 @@
 | [allocation-evidence.md](allocation-evidence.md) | 候选不可变分配、分层失败与 owner/worker 身份边界 |
 | [storage-admission.md](storage-admission.md) | 候选 opt-in 磁盘/inode/可知用户 quota、控制面余量与只读解释 |
 | [daemon-lease.md](daemon-lease.md) | 候选不可变启动来源、Slurm 持续验证与失效锁存；默认健康 JSON 不变 |
+| [cpu-capacity.md](cpu-capacity.md) | 候选显式 CPU auto、保守容量/冻结预留、零值兼容与 opt-in 只读查询 |
 | [repository-hygiene.md](repository-hygiene.md) | 仓库中的隐私信息和运行记录边界 |
 
 [2026-09-07 联合审查](code_review_sched_dsh_2026-09-07.md) 保留为修复记录，

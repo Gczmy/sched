@@ -153,6 +153,21 @@ authority. Strict status/task/history and wait_reason remain unchanged; no schem
 migration or historical backfill is added. Optional allocation filesystem bindings
 are reservations, not hard isolation or physical ownership. See [storage admission](storage-admission.md).
 
+### Candidate CPU capacity
+
+The schema 17 candidate advertises `sched-cpu-capacity-v1`. Explicit cpus_total="auto"
+uses conservative original-lease/affinity CPU counts and optional cpus_auto_max;
+zero remains unlimited reservations with CPU-only concurrency fallback. Unknown
+original capacity blocks new auto dispatch; running allocation reservations stay
+frozen despite default changes. Passive `cpu-capacity --json` and opt-in
+`status --json --include-cpu-capacity` describe configuration, recorded capacity,
+source and lease status, without gateway probes or admission authority. Default
+optional status.cpu remains two integers; unknown auto omits it, never emits a
+string/zero to imply unlimited capacity. The companion plugin accepts this absence
+and the unchanged cpu wait_reason; it must negotiate before requesting the nested
+extension. No further schema bump or per-job isolation is implied. See
+[CPU capacity](cpu-capacity.md).
+
 ### Candidate batch failure policy
 
 The schema 17 candidate also advertises `sched-daemon-lease-v1`: immutable

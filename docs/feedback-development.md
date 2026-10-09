@@ -206,7 +206,26 @@ allocation 关联精确 daemon lease、通知 CLI 确认、后续 RUNNING 不能
 本地相关 mock/只读回归 76 条通过（其中租约专项 24 条）。初次 Conda 解释器缺少
 memfd_create 导致 3 条既有执行 backend 回归报错，切换支持该能力的系统解释器后
 最终全部通过；没有用兼容降级掩盖该环境差异。源码/脚本摘要核对一致。
-完整 CI 尚待本项固定提交确认；合同与仍未覆盖的真实租约结束/硬隔离边界见 [daemon-lease](daemon-lease.md)。
+固定提交 `ae652b3b5aa0b0076104fe762d44a6d87b265c65` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37871104844) 14 项全部通过；
+合同与仍未覆盖的真实租约结束/硬隔离边界见 [daemon-lease](daemon-lease.md)。
+
+2026-10-09：ND-03 的 CPU auto 源码候选通过指定既有租约内的隔离 CPU/CLI 验收。
+真实原始 affinity/Slurm 来源先单独观察；默认未知暂停没有产生 allocation/worker。
+随后只修改 state 外 fixture 控制器回答，验证来源最小值/上限、GPU 与 CPU 共用
+冻结预留、热缩容不杀 running、超额 pending 无启动记录、控制器 unknown 暂停、
+确认 invalid 后 RUNNING 仍锁存，以及显式重启/零值并发回退/各任务只执行一次。
+没有修改真实 Slurm job、使用真实 GPU 或变更生产 daemon/config。
+计算节点系统 Python 3.12.3 全量回归 830 条：821 通过，9 条 native 不可用跳过；
+本地相关 mock/只读回归 88 条通过（CPU 专项 20 条）。首次回归中一个旧租约门禁
+Mock 未提供新增容量上下文；明确该窄夹具只隔离租约门禁后全量通过，没有放宽
+运行代码。固定 runtime/fixture 清单摘要为
+`edd334512b5b84af4df2c34140c8b929d3296fbe940a6ee5740c5c80f04ee5a9`，
+CPU 验收脚本 SHA256 为
+`c67e9236417519155b9fd764948837e65b5af15d48b9549fe169f2b2c6ea9962`；本地与
+计算节点摘要一致。临时 state 经 CLI 停止确认后清理；源码/传输文件亦已清理。
+本项固定提交的完整 CI 待确认；[CPU 容量合同](cpu-capacity.md) 仍明确非 per-job
+硬隔离、非真实租约终止/CUDA 验收、非发布或生产切换。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
@@ -221,8 +240,8 @@ memfd_create 导致 3 条既有执行 backend 回归报错，切换支持该能�
 | 10 | allocation 身份/分层失败 | 候选 CI/计算节点 CPU 通过 | 不可变分配关联；原始退出/监控声明/产物/资源分层；owner 不冒充 worker |
 | 11 | 磁盘/inode/quota 准入 | 候选 CI/计算节点 CPU 通过 | 控制面余量；unknown 明确；容量不足不删科学产物 |
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
-| ND-02 | 租约来源持久化/持续验证 | 候选计算节点 CPU 通过，CI 待确认 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
-| ND-03 | CPU auto 容量 | 未实现 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
+| ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
+| ND-03 | CPU auto 容量 | 候选计算节点 CPU 通过，CI 待确认 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
 | 硬隔离 | per-job affinity/cgroup | 未实现 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
