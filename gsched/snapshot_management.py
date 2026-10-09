@@ -17,7 +17,7 @@ import time
 from . import maintenance, snapshot, snapshot_facts as facts, state
 
 FORMAT = "sched-upgrade-snapshot-management/v1"
-MAX_ENTRIES = 10000
+MAX_ENTRIES = 30000
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024 * 1024
 MAX_SECONDS = 30

@@ -28,6 +28,14 @@ v0.5.0 提供 `snapshot create/verify/migrate/rollback/close/status`，命名合
 须在计算节点，保留永久关闭/manifest/回退 journal，不触碰当前 DB 或恢复执行。
 旧关闭时间未知、活动窗口、绑定/镜像漂移均拒绝。该扩展未随原 v0.5.0 发布。
 
+0.6.1 候选协商 `sched-upgrade-snapshot-permissions/v1`：计算节点在 daemon 已排空、
+旧 writer 停用、窗口关闭后，先 `snapshot permissions --dry-run --json`。
+执行使用 `--writers-quiesced --expect-plan <preview-plan_sha256> --yes --json`；
+原实例/数据库事实/配置/目录身份和权限全部重核，只收紧目录的 group/other 权限。
+中断保留已收紧目录与审计，须重新预览剩余项。没有自动迁移、清理日志、启动或任务重放。
+候选节点树范围为 20,000 项，关闭点清理为 30,000 项；原 0.6.0 安装仍受 10,000 项限制。
+完整保存原文件；其余字节、metadata 和数据库事实边界见[升级恢复点](upgrade-snapshot.md)。
+
 公开 JSON 保持 `schema_version:1`；命名合同见 [integration-contract.md](integration-contract.md)。
 `sched identity --json` 只读查询持久 `instance_id`、配置节点和查询主机。
 没有状态或未迁移旧 schema 时返回 `available:false` 和原因，查询不会初始化数据库。

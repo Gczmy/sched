@@ -64,7 +64,8 @@ rollback 返回 restored 后窗口仍然开启，数据库为原 schema，配置
 节点 DB/WAL/SHM 之外的文件/目录必须保持不变，包括 inbox、回执 ticket、通知确认、marker
 和日志。配置变化、新增/删除文件、追加回执（含 unknown）、任务/版本/执行/资源事件变化、
 未经审计的新表/列均拒绝回退。只允许空新增审计表和原记录上的迁移默认列；不删除未知记录。
-限制为 10,000 文件/目录、单文件 128 MiB、节点文件总量 512 MiB、数据库事实 500,000 行/
+0.6.0 的节点树上限为 10,000 文件/目录；0.6.1 候选提高为 20,000，完整保存每一项。
+单文件 128 MiB、节点文件总量 512 MiB、数据库事实 500,000 行/
 256 MiB；扫描/备份有界。超限不返回部分成功，也不能据此降低保护条件。
 
 daemon/前台 owner 或启动文件存在、running、GPU/CPU 活动分配、未决 execution/owner cleanup、
@@ -78,6 +79,28 @@ rollback 在实际替换前保存原 DB/WAL/SHM 摘要和持久 intent，将回�
 中断恢复须仍满足文件/实例绑定；发生漂移则保留现场并拒绝，不猜测或自动覆盖。
 restoring 时禁止 close。创建失败保持 creating 并冻结写入，可显式 close 放弃未完成点；
 不允许拿未完成点回退。后续源码提供下述恢复点管理扩展；不手工删除受管恢复记录。
+
+## 旧目录权限准备（0.6.1 候选）
+
+合同 `sched-upgrade-snapshot-permissions/v1`。既有私有 state 根下的历史目录可能仍为
+0755；create 继续要求目录私有，不通过跳过这些目录创建不完整恢复点。
+新增计算节点接口，在 daemon 无损排空、旧 writer 停用且不存在升级窗口时执行：
+
+```sh
+sched snapshot permissions --dry-run --json
+sched snapshot permissions --writers-quiesced --expect-plan <plan_sha256> --yes --json
+```
+
+预览不初始化控制目录、修改权限或迁移数据库。计划绑定原实例、完整数据库事实摘要、
+配置原字节、节点目录和每项原 inode/mtime/ctime/权限；最多 20,000 项、30 秒。
+执行在独占维护锁内复核原计划，拒绝源链接、非普通文件、外来 UID、活动 owner/resource
+及漂移。沿原根 FD 逐级以 O_NOFOLLOW 打开原目录，只移除 group/other 权限；
+普通文件、原任务/unknown/wait、配置和 schema 均不修改。
+
+效果前保存独立权限准备审计；完成后再次核对全部原文件和数据库事实。
+中断可能留下已收紧的部分目录，保留审计，不自动放宽权限。重新预览剩余目录后，
+只能使用新摘要继续修复。成功不授予启动、迁移、回退或任务重放权；之后仍需正式
+snapshot create/verify/migrate。已关闭点不因权限准备复活回退权。
 
 ## 有界查询与保留期清理（0.6.0）
 
@@ -117,7 +140,8 @@ sched snapshot prune <snapshot-id> --retention-days 30 --keep-last 2 \
 拒绝摘要检查后的原 inode 内改写。预览变化拒绝，不另选恢复点。删除前持久化原 pruning
 意图，按原目录 FD 删除精确副本，逐步 fsync；故障保留现场，同一参数/摘要才可续接。
 不接受符号链接、硬链接、目录替换或未知文件。每阶段最多 30 秒，单文件 128 MiB、
-总量 1 GiB/10,000 项；忙或超限保留原记录。
+总量 1 GiB；0.6.0 最多 10,000 项，0.6.1 候选最多 30,000 项，以容纳较大镜像及元数据。
+忙或超限保留原记录。
 
 仅移除该关闭点的 DB/config/节点文件副本与已完成回退的 before-rollback 副本。
 原 point inode、manifest.json、rollback.json、永久 closed 记录和 prune 审计保留，

@@ -13,8 +13,8 @@ fields. Legacy task replies remain readable through their existing validation.
 Database schema 10 adds persistent identity and structured operation receipts.
 Read-only identity/receipt queries never initialize or migrate a database.
 The current source candidate writes schema 25 and reads complete schemas 1–25;
-the package version is a 0.5.0 candidate, distinct from published v0.4.0 (schema maximum
-10). The phase-specific ranges below describe introduction boundaries, not the
+the package version is a 0.6.1 candidate, distinct from published v0.6.0 (schema maximum
+25) and v0.4.0 (schema maximum 10). The phase-specific ranges below describe introduction boundaries, not the
 current reader maximum. Negotiate the installed CLI through `version --json`;
 `identity --json` binds an instance, not the set of supported capabilities.
 
@@ -25,6 +25,12 @@ unchanged. Exact lease queries can contain frozen launch lineage and tracking
 observations. A compatible valid lease is not current daemon Slurm membership or
 hard isolation; see [daemon lease](daemon-lease.md). This optional evidence uses
 existing append-only lease records, without a new database schema migration.
+
+The optional `sched-upgrade-snapshot-permissions/v1` contract prepares owned legacy
+directory permissions before creating an upgrade window. Compute-node preview is
+passive; mutation requires the original plan digest, quiesced unaware writers and
+explicit confirmation. It only removes group/other directory permissions and retains
+an intent/audit; it never grants database migration, execution, wait or rollback authority.
 
 ## Identity and task ownership
 

@@ -20,6 +20,19 @@ class SnapshotAcceptance(LeaseAcceptance):
         assert not self.data("snapshot", "status", "--json")["maintenance_open"]
         self.private_drain()
         assert self.job(batch, "once")["jobs"][0]["status"] == "pending"
+        # Synthetic legacy directory within this script's independent state.
+        legacy = Path(self.cfg["state_dir"]) / self.cfg["node"] / "legacy-permissions"
+        legacy.mkdir(mode=0o755)
+        legacy.chmod(0o755)
+        (legacy / "original.log").write_text("unknown wait is retained\n")
+        preview = self.data("snapshot", "permissions", "--dry-run", "--json")
+        assert preview["repair_count"] == 1 and not preview["permissions_changed"]
+        assert legacy.stat().st_mode & 0o777 == 0o755
+        repaired = self.data("snapshot", "permissions", "--writers-quiesced", "--expect-plan",
+                             preview["plan_sha256"], "--yes", "--json")
+        assert repaired["phase"] == "completed" and legacy.stat().st_mode & 0o777 == 0o700
+        assert (legacy / "original.log").read_text() == "unknown wait is retained\n"
+        print("PASS: independent CLI permission preview/CAS repair preserves pending version and original log", flush=True)
         created = self.data("snapshot", "create", "--writers-quiesced", "--yes", "--json")
         identifier = created["snapshot_id"]
         assert created["maintenance_open"] and not created["daemon_started"]

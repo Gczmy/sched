@@ -5285,11 +5285,11 @@ def cmd_integration_query(args) -> int:
 
 
 def cmd_snapshot(args) -> int:
-    from . import snapshot, snapshot_management
+    from . import snapshot, snapshot_management, snapshot_permissions
     action = args.snapshot_action
-    management = action in {"list", "prune"}
+    management = action in {"list", "prune", "permissions"}
     try:
-        if action not in {"verify", "status", "list"} and not (action == "prune" and args.dry_run):
+        if action not in {"verify", "status", "list"} and not (action in {"prune", "permissions"} and args.dry_run):
             cfg = load_config()
             if _is_foreign_host(cfg) and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1":
                 raise state.StateError("snapshot maintenance must execute on config.node, not on a gateway")
@@ -5307,6 +5307,12 @@ def cmd_snapshot(args) -> int:
         elif action == "prune":
             result = snapshot_management.prune(args.snapshot_id, retention_days=args.retention_days,
                 keep_last=args.keep_last, as_of=args.as_of, dry_run=args.dry_run, expect_plan=args.expect_plan)
+        elif action == "permissions":
+            cfg = load_config()
+            if _is_foreign_host(cfg) and os.environ.get("SCHED_ALLOW_FOREIGN_WRITE") != "1":
+                raise state.StateError("snapshot permission preparation must execute on config.node")
+            result = snapshot_permissions.prepare(dry_run=args.dry_run,
+                writers_quiesced=args.writers_quiesced, expect_plan=args.expect_plan)
         else:
             result = getattr(snapshot, action)(args.snapshot_id)
         print(json.dumps(result, ensure_ascii=False) if args.json or management else
@@ -5314,7 +5320,7 @@ def cmd_snapshot(args) -> int:
         return 0
     except (state.StateError, OSError, sqlite3.Error, ConfigError) as error:
         if args.json:
-            print(json.dumps({"schema_version": 1, "contract": snapshot_management.FORMAT if management else snapshot.FORMAT,
+            print(json.dumps({"schema_version": 1, "contract": snapshot_permissions.FORMAT if action == "permissions" else snapshot_management.FORMAT if management else snapshot.FORMAT,
                               "ok": False, "error": str(error), "daemon_started": False}, ensure_ascii=False))
         else:
             print(f"错误: {error}", file=sys.stderr)
@@ -5595,14 +5601,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("snapshot", help="升级窗口恢复点；不支持历史执行回滚，不自动启动 daemon")
     snapshots = p.add_subparsers(dest="snapshot_action", required=True)
-    for action in ("create", "verify", "migrate", "rollback", "close", "status", "list", "prune"):
+    for action in ("create", "verify", "migrate", "rollback", "close", "status", "list", "prune", "permissions"):
         parser = snapshots.add_parser(action)
-        if action not in {"create", "status", "list"}:
+        if action not in {"create", "status", "list", "permissions"}:
             parser.add_argument("snapshot_id")
         if action not in {"verify", "status", "list"}:
             parser.add_argument("--yes", action="store_true")
         if action == "create":
             parser.add_argument("--writers-quiesced", action="store_true", help="确认已停用不认识维护门禁的旧版写入端")
+        if action == "permissions":
+            parser.add_argument("--dry-run", action="store_true")
+            parser.add_argument("--writers-quiesced", action="store_true")
+            parser.add_argument("--expect-plan", help="沿用权限预览返回的 plan_sha256")
         if action == "list":
             parser.add_argument("--limit", type=int, default=20)
             parser.add_argument("--cursor")
