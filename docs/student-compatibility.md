@@ -46,13 +46,17 @@
 联合入口为[启动祖先与 affinity 验收](../tests/run_launch_affinity_accept.py)：
 
 ```sh
-PYTHONPATH=. python3 tests/run_launch_affinity_accept.py --require-native
+PYTHONPATH=. python3 tests/run_launch_affinity_accept.py --require-native --faults
 ```
 
 须从指定原租约 shell 执行，并为该解释器独立构建 native。入口仅将测试自身及其
 私有 daemon 限为两个已有 CPU；固定预算仍为 120，不改变原 Slurm anchor 的 mask。
 退出前通过 CLI 确认私有 daemon 停止，保留受管 state/logs。[联合合成回归](../tests/test_compatibility_affinity.py)
 覆盖预算/有限池、未知/过期、漂移与原 claim 保留；不是该入口已通过的实机证明。
+`--faults` 使用私有控制器故障、实际 helper 超时、私有 daemon SIGSTOP/SIGCONT 的
+过期观察、私有 daemon mask 漂移和 SIGKILL/原 owner 认证重连。fixture job 状态/身份
+变化仍不是原真实租约结束；不修改原 Slurm shell/stepd 或生产进程。
+恢复点管理的新命令和原始 v0.5.0 边界见[升级恢复点](upgrade-snapshot.md)。
 
 | 后续项目 | 完成判据 |
 | --- | --- |
