@@ -245,9 +245,22 @@ class SnapshotManagementTests(TempStateCase):
                 manager.catalog(limit=value)
         with mock.patch.object(manager, "MAX_ENTRIES", 0), self.assertRaises(state.StateError):
             manager.catalog()
+        with mock.patch.object(manager, "MAX_METADATA_BYTES", 0), self.assertRaises(state.StateError):
+            manager.catalog()
+        with mock.patch.object(manager, "MAX_METADATA_BYTES", 0), self.assertRaises(state.StateError):
+            manager.prune(identifier, dry_run=True)
         for options in ({"retention_days": -1}, {"keep_last": 101}, {"as_of": int(time.time()) + 100}):
             with self.assertRaises(state.StateError):
                 manager.prune(identifier, dry_run=True, **options)
+
+    def test_catalog_rejects_unbounded_identity_summary(self):
+        identifier = self.closed()
+        path = os.path.join(snapshot._point(identifier), "manifest.json")
+        manifest = snapshot._json(path)
+        manifest["database_facts"]["instance_id"] = "a" * 1000
+        snapshot._publish(path, manifest)
+        with self.assertRaises(state.StateError):
+            manager.catalog()
 
     def test_failed_creation_closed_without_manifest_is_not_a_cleanup_candidate(self):
         with mock.patch.object(snapshot, "_source_image", side_effect=OSError("injected creation failure")):

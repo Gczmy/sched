@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import json
 import math
 import os
 import re
@@ -18,6 +19,7 @@ from . import maintenance, snapshot, snapshot_facts as facts, state
 FORMAT = "sched-upgrade-snapshot-management/v1"
 MAX_ENTRIES = 10000
 MAX_BYTES = 1024 * 1024 * 1024
+MAX_METADATA_BYTES = 64 * 1024 * 1024
 MAX_SECONDS = 30
 KEEP_FILES = {"manifest.json", "rollback.json"}
 
@@ -88,10 +90,30 @@ def _ids():
     return sorted(found)
 
 
-def _closed(identifier):
+def _metadata_budget():
+    return {"remaining": MAX_METADATA_BYTES, "deadline": time.monotonic() + MAX_SECONDS}
+
+
+def _record(path, budget):
+    if time.monotonic() > budget["deadline"]:
+        raise facts.SnapshotConflict("snapshot catalog metadata time bound exceeded")
+    data = snapshot._read(path, limit=min(snapshot.MAX_MANIFEST_BYTES, budget["remaining"]), private=True)
+    budget["remaining"] -= len(data)
+    if time.monotonic() > budget["deadline"]:
+        raise facts.SnapshotConflict("snapshot catalog metadata time bound exceeded")
+    try:
+        value = json.loads(data)
+    except (ValueError, TypeError, RecursionError) as error:
+        raise facts.SnapshotConflict("invalid snapshot catalog record") from error
+    if type(value) is not dict:
+        raise facts.SnapshotConflict("invalid snapshot catalog record")
+    return value, hashlib.sha256(data).hexdigest()
+
+
+def _closed(identifier, budget=None):
     path = os.path.join(maintenance.directory(), "closed-" + identifier + ".json")
     try:
-        record = snapshot._json(path)
+        record = snapshot._json(path) if budget is None else _record(path, budget)[0]
     except FileNotFoundError:
         return None
     if (record.get("format") != snapshot.FORMAT or record.get("snapshot_id") != identifier
@@ -104,25 +126,30 @@ def _epoch(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
-def _summary(identifier):
+def _summary(identifier, budget):
     point = snapshot._point(identifier)
-    closed = _closed(identifier)
-    pruning = snapshot._json(_journal(identifier)) if os.path.lexists(_journal(identifier)) else None
+    closed = _closed(identifier, budget)
+    pruning = _record(_journal(identifier), budget)[0] if os.path.lexists(_journal(identifier)) else None
     if pruning is not None:
         _validate_journal(identifier, pruning)
     manifest_path = os.path.join(point, "manifest.json")
-    manifest = snapshot._json(manifest_path) if os.path.lexists(manifest_path) else None
+    manifest, manifest_digest = _record(manifest_path, budget) if os.path.lexists(manifest_path) else (None, None)
     if manifest is not None and (manifest.get("format") != snapshot.FORMAT or manifest.get("snapshot_id") != identifier):
         raise facts.SnapshotConflict("snapshot catalog manifest binding invalid")
     if manifest is not None and (type(manifest.get("database_facts")) is not dict
             or type(manifest.get("created_at")) is not str or len(manifest["created_at"]) > 64):
         raise facts.SnapshotConflict("snapshot catalog summary fields invalid")
+    if manifest is not None:
+        recorded = manifest["database_facts"]
+        identity, schema = recorded.get("instance_id"), recorded.get("database_schema")
+        if ((identity is not None and (type(identity) is not str or re.fullmatch(r"[0-9a-f]{32}", identity) is None))
+                or type(schema) is not int or not 0 <= schema <= 2147483647):
+            raise facts.SnapshotConflict("snapshot catalog identity/schema summary invalid")
     phase = pruning["phase"] if pruning else "closed" if closed else "incomplete"
     window = snapshot.status()
     if window.get("snapshot_id") == identifier:
         phase = window.get("phase", "unknown")
-    complete = bool(closed and manifest and closed.get("manifest_sha256") ==
-                    snapshot._file_fact(manifest_path, private=True)["sha256"])
+    complete = bool(closed and manifest and closed.get("manifest_sha256") == manifest_digest)
     epoch = closed.get("closed_at_epoch") if closed else None
     return {"snapshot_id": identifier, "phase": phase,
             "created_at": manifest.get("created_at") if manifest else None,
@@ -139,8 +166,9 @@ def catalog(*, limit=20, cursor=None):
     if cursor is not None:
         snapshot._identifier(cursor)
     with _reader() as present:
+        budget = _metadata_budget()
         identifiers = [i for i in _ids() if cursor is None or i > cursor] if present else []
-        rows = [_summary(i) for i in identifiers[:limit]]
+        rows = [_summary(i, budget) for i in identifiers[:limit]]
         truncated = len(identifiers) > limit
         result = _base(effect="none", query="snapshot_list", snapshots=rows, truncated=truncated,
                      next_cursor=rows[-1]["snapshot_id"] if truncated else None,
@@ -198,7 +226,8 @@ def _options(retention_days, keep_last, as_of):
 
 
 def _plan(identifier, options):
-    rows = [_summary(i) for i in _ids()]
+    budget = _metadata_budget()
+    rows = [_summary(i, budget) for i in _ids()]
     item = next((row for row in rows if row["snapshot_id"] == identifier), None)
     reasons = []
     if snapshot.status()["maintenance_open"]:

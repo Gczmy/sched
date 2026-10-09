@@ -92,8 +92,9 @@ sched snapshot prune <snapshot-id> --retention-days 30 --keep-last 2 --dry-run -
 
 list 与 prune --dry-run 可在网关读取现有私有控制记录，不打开当前 DB、不初始化
 目录或锁、不探测查询主机的进程/Slurm。list 默认 20、最多 100 行，ID keyset 实时
-分页，`truncated/next_cursor` 不能拼造一致全量快照。总目录项最多 10,000；记录、
-输出和扫描均有界，读取失败不返回部分成功。查询均 `effect:none/rollback_authorized:false`。
+分页，`truncated/next_cursor` 不能拼造一致全量快照。总目录项最多 10,000；一次查询或
+保留计划的 metadata 总读取最多 64 MiB、30 秒，list 输出最多 4 MiB。
+读取失败不返回部分成功。查询均 `effect:none/rollback_authorized:false`。
 
 prune 只预览单个完整且已关闭的恢复点，默认保留 30 天与最近 2 个未清理关闭点。
 `retention-days` 为 0..36500，`keep-last` 为 0..100；0 须显式指定。
