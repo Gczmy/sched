@@ -3,7 +3,7 @@
 本文只记录通用调度器工作。配置和 CLI 以 [reference.md](reference.md) 为准，
 execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
 候选代码、验证、正式发布和生产部署分别记录，不能互相替代。
-当前源码候选写 schema 25、完整只读 1–25；下文各阶段的 schema 是引入边界，
+当前源码为 0.5.0 候选，写 schema 25、完整只读 1–25；下文各阶段的 schema 是引入边界，
 不是当前兼容上限。实际接收端使用 `sched version --json` 核对 named contracts/schema。
 
 ## 历史版本 0.2.1

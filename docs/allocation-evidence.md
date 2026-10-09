@@ -1,7 +1,7 @@
 # 候选 allocation 与分层执行证据
 
 源码候选合同为 `sched-allocations-v1`，引入 schema 16。当前候选写 schema 25、
-完整只读 1–25，兼容范围见 [reference](reference.md)；包版本仍为 0.4.0，
+完整只读 1–25，兼容范围见 [reference](reference.md)；包版本为 0.5.0 候选，
 不代表正式发布或生产已升级。
 
 ## 分配身份

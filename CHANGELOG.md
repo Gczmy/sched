@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.0 (candidate)
+
+Not published or deployed. Source and immutable CI artifacts must be selected
+independently before release preparation; published v0.4.0 remains unchanged.
+
+- Add explicit GPU pool/hard-affinity validation, structured artifact diagnostics
+  and `json_equals`, immutable initial validation and audited artifact-only
+  revalidation/settlement without reconstructing missing original waits.
+- Add opt-in independent-task failure policy, exact dependencies and task DAGs,
+  bounded task facts, atomic pending-only cancellation, allocation event chains,
+  admission explanations and opt-in storage admission.
+- Record and continuously validate original daemon leases; explicit launch-ancestry
+  compatibility keeps unknown paused without claiming Slurm membership or isolation.
+  Add conservative CPU auto capacity while preserving zero as an unlimited budget.
+- Provide opt-in CPU affinity and explicitly delegated CPU/device scope candidates,
+  original NVIDIA/MIG bindings and passive root health. Positive cpuset/BPF/device
+  isolation acceptance and production rollout remain incomplete; defaults stay off.
+- Write schema 25 and read complete schemas 1–25 without query migration. Older
+  writers cannot reopen this database; verified pre-upgrade recovery is required.
+
 ## 0.2.2 (2026-10-01)
 
 Published as [v0.2.2](https://github.com/Gczmy/sched/releases/tag/v0.2.2) from

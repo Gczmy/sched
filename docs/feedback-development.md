@@ -222,8 +222,10 @@ schema；valid 不代表当前后台 daemon 被 Slurm 跟踪或具备硬隔离�
 锁存，原 CPU child 自然完成一次、后来 RUNNING 不恢复，只有显式私有重启后
 另一任务运行一次。没有结束真实租约、占真实 GPU、修改生产配置或重启生产 daemon。
 首次脚本误选 submit 自动启动后已退出的历史出生记录；修正为当前 owner 并清除
-私有 stop-when-idle 后最终通过，没有放宽运行代码。本提交完整 CI、真实租约结束、
-新版本发布与生产切换尚未取得；具体证据与来源摘要保存在仓库外。
+私有 stop-when-idle 后最终通过，没有放宽运行代码。固定来源
+`9b6f38edfcdcb63206ca4f95891e9451f00a656b` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37919596215) 14/14 成功。
+真实租约结束、新版本发布与生产切换尚未取得；具体证据与来源摘要保存在仓库外。
 本地 mock/私有只读与计算节点相关回归各运行 124 条、全部通过；最终 runtime 和
 专项脚本的逐文件 SHA256 核对一致。
 
@@ -531,6 +533,12 @@ schema 10→25 合成迁移/失败回滚检查，见 [真实 GPU 结果](recover
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
 | 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结/schema 23 显式接入/schema 24 MIG 区分与 schema 25 被动根健康候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+
+发布准备现已进入 0.5.0 候选元数据阶段，不覆盖官方 0.4.0。该新版本最终来源的
+完整 CI/原始包仍需单独核验，不能只沿用上述旧版本号来源的绿色矩阵。
+持久备份/恢复 CLI 需求见 [ND-05](next-development.md#nd-05升级恢复点的-cli-接口)；
+生产恢复点尚未验证，不能直接切换生产。硬隔离专项继续保留，但不作为阶段 2–11
+通用核心修复独立发布的前置条件，也不因此宣称其正向验收已完成。
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

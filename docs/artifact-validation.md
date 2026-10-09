@@ -2,7 +2,7 @@
 
 阶段 4 候选提供首次验证记录和只读查询；后续阶段 5 的独立写接口见
 [仅产物复验](artifact-revalidation.md)，这些查询本身仍不授予结算权。
-包版本仍为 0.4.0；必须查询实际部署的 `version --json` 中
+包版本为 0.5.0 候选；必须查询实际部署的 `version --json` 中
 `contracts.artifact_validations=sched-artifact-validations-v1` 与 schema 范围。
 推送、CI、计算节点验收、正式发布和生产切换分别记录，不能混用。
 

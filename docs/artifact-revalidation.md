@@ -2,7 +2,7 @@
 
 候选合同为 `sched-artifact-revalidations-v1`，引入时写 schema 13；当前候选写 25、
 完整只读范围 1–25，见 [reference](reference.md)，复验合同本身不变。
-包版本仍为 0.4.0，须协商实际部署的合同/schema；源码推送不是新发布或生产部署。
+包版本为 0.5.0 候选，须协商实际部署的合同/schema；源码推送不是新发布或生产部署。
 首次记录见 [artifact-validation](artifact-validation.md)，本接口不替代科学验收。
 
 ## 命令与回执

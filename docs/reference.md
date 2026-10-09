@@ -43,7 +43,7 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
 没有新增参数的旧 request 绑定保持原样。当前原根健康候选写 schema 25，完整只读范围为 1–25；
 已发布 0.4.0 写 schema 10；候选 writer 11–24 均不能回接 schema 25。原映射绑定表于 22 引入，
-23 记录设备必需标志，24 守卫新 v2 MIG 能力证据，25 守卫原根健康事件，均不回填旧事实。包版本尚未变更，能力须查询实际部署的合同与 schema。
+23 记录设备必需标志，24 守卫新 v2 MIG 能力证据，25 守卫原根健康事件，均不回填旧事实。当前包版本为 0.5.0 候选，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
