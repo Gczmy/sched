@@ -76,7 +76,7 @@ limit 默认 20、范围 1–100，精确 ID 与 cursor 互斥。单记录 256 K
 allocation 链的总查询预算 4 MiB；超限拒绝，实时 keyset 分页不是完整当前快照。
 查询只走私有 DB/WAL 快照，不采样硬件、迁移旧库或改变 revision；所有 runtime/
 admission/wait/physical 标志均 false。原记录过期仍可以查询，不解释为当前健康。
-完整 schema 1–21 返回 migration_required；当前完整只读范围 1–22。schema 21 及更旧
+完整 schema 1–21 返回 migration_required；当前完整只读范围 1–23。schema 21 及更旧
 writer 不可回接新库，回退只使用升级前验证恢复点，不能手改 state 或降低 schema。
 
 ## 验收与未完成项
@@ -90,6 +90,6 @@ writer 不可回接新库，回退只使用升级前验证恢复点，不能手�
 
 冻结绑定的[纯事务回归](../tests/test_device_inventory_state.py)检查原身份/策略/时效、
 不变历史、故障拒绝、分页/字节边界、旧库不迁移与 21→22 无回填；不是内核验收。
-尚未接通 scheduler 的实际安装/启动/恢复，未实现
-N/A 的可靠能力区分、MIG 精确权限或完成正向 BPF/真实 GPU 验收。原设备 intent/CAS、
-未知不重装、原 scope 删除后释放资源等守卫仍须由后续 controller 接入；未发布或部署。
+后续 schema 23 [显式设备 controller](device-controller.md) 已接通安装/原 handle 启动/
+恢复仅观察，writer 22 及更旧不得回接 23。仍未实现 N/A 的可靠能力区分、MIG 精确
+权限或完成正向 BPF/真实 GPU 验收；未发布或部署。

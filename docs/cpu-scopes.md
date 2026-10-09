@@ -68,7 +68,8 @@ observe 读取原 scope 的有效 CPU/NUMA、cgroup.events 的 populated（含�
 文件写权限的应用可能改配或移动进程；外部管理者和不合作的同 UID 改名仍可能在
 最终路径身份检查/rmdir 间竞争，不能将此模型宣称为对该攻击的原子隔离。scheduler
 接入串行化自己的 create/configure/remove；跨 UID 安全边界须由管理员/broker
-控制权限。cpuset 限制已加入该 scope 的 CPU，GPU 权限还需要单独设备 BPF，未实现。
+控制权限。cpuset 限制已加入该 scope 的 CPU，GPU 权限还需要单独设备 BPF；
+后续显式设备 controller 已有源码接入，但默认不启用且尚未完成正向验收。
 内核规则见 [cgroup-v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)。
 
 ## 持久记录层与释放守卫
@@ -119,7 +120,7 @@ linux_fd_owner 仍认证重连原 owner/child，不重新 start。配置匹配�
 完整事件链，列表提供有界实时分页，不探测内核或改变 revision。命名合同
 sched-cpu-scope-state-v1 与通用原语合同独立；所有 admission/wait/physical boundary
 标记为 false。完整 schema 1–18 查询明确 migration_required，不做初始化或回填；
-当前后续设备映射冻结绑定候选的完整只读范围为 1–22；旧 writer 不得回接更高写库，回退只用升级前验证
+当前后续显式设备接入候选的完整只读范围为 1–23；旧 writer 不得回接更高写库，回退只用升级前验证
 恢复点，不能手改 user_version。admission-explain 的 cgroup fit 明确 unknown，
 因为当前没有新鲜原委派观察供被动解释，不能把租约检查当作根目录可用性。
 
@@ -146,7 +147,9 @@ scope、FD 关闭和序列化边界；普通目录拒绝在 Linux 计算节点�
 实际验证三个 backend 的 join、mask 放宽受限、后代、并发/取消/原 wait/删除及停止后
 重启不重放。没有委派时该正向项明确跳过，不计为通过。
 
-尚未完成：授权正向 cpuset/原 owner 故障恢复验收、设备 BPF/GPU 权限隔离、原租约
+后续 schema 23 的[设备 controller](device-controller.md) 接入显式安装、原 handle 启动与
+恢复仅观察，默认 off 不安装；单独 CPU cgroup 不限制 GPU。
+尚未完成：授权正向 cpuset/原 owner 故障恢复验收、真实设备 BPF/GPU 权限验收、原租约
 真实终止矩阵、被动新鲜委派健康观察和授权生产 rollout。现有模型/拒绝测试及
 [CPU 亲和](cpu-isolation.md) 不能代替这些交付。
 
@@ -154,4 +157,5 @@ scope、FD 关闭和序列化边界；普通目录拒绝在 Linux 计算节点�
 安装/恢复核对，不自动接入本 controller；schema 20 的 scope 观察仍不证明设备隔离。
 后续 [schema 21 设备记录](device-scopes.md) 绑定原 allocation/inode/策略，已记录
 设备 intent 时现有 controller 拒绝 CPU-only 启动；原 CPU removed 与设备 released
-记录分开，未知不借 cold off/任务终态释放。仍没有实际 BPF 安装接入。
+记录分开，未知不借 cold off/任务终态释放。实际 opt-in 安装由上述 schema 23 接入，
+但没有特权正向 BPF/GPU 验收证据。

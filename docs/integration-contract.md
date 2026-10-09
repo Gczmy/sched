@@ -149,8 +149,8 @@ policy/program identity. Installation and launch intents are one-shot CAS;
 unknown results retain reservations, never authorize reinstall or CPU-only
 fallback. Original CPU removal and the referencing device release are distinct
 recorded facts, not a synthesized wait or proof of program garbage collection.
-The existing controller refuses device-bound CPU-only launches until the actual
-device-handle integration exists. Queries use private snapshots, never probe BPF
+The CPU-only controller refuses device-bound launches; the subsequent explicit
+device controller requires its original retained handle. Queries use private snapshots, never probe BPF
 or migrate complete schemas 1–20, and explicitly grant no kernel-health or
 execution authority. Default status/task/history, wait_reason and FD4 remain
 unchanged. Bounds and incomplete hardware acceptance are specified in
@@ -166,7 +166,7 @@ fresh non-simulated allocation UUID/index, excluding NVIDIA nodes for CPU-only.
 MIG enabled/unknown cannot grant a full-GPU rule. `runtime_probed` is true only
 for this opt-in query; admission/wait/physical-boundary authority remains false.
 It does not alter default status/task/history, schema 21 or passive device-scopes.
-No actual device installation exists yet; see
+Actual opt-in installation is described separately below; see
 [device inventory](device-inventory.md).
 
 The subsequent schema 22 candidate freezes complete inventory and its original
@@ -177,9 +177,28 @@ health assertion or launch permission. Complete schemas 1–21 report migration_
 and migration adds an empty retained table without rewriting older facts.
 The pure pre-effect revalidation requires the same fresh complete mapping and
 original claims; a new sample cannot refresh old topology or replace a GPU.
-Unknown/consumed effects cannot acquire new authority. Actual scheduler device
-handle/installation integration and privileged positive acceptance remain outstanding.
+Unknown/consumed effects cannot acquire new authority. Privileged positive acceptance
+remains outstanding; subsequent explicit handle integration is described below.
 Writer 21 and older cannot reopen schema 22; default JSON/FD4 shapes are unchanged.
+
+### Candidate explicit device controller
+
+`sched-device-cgroup-v1` adds cold `device_isolation.mode=nvidia` only with explicit
+CPU cgroup delegation; default off never installs. Fake topology is refused.
+Writer schema 23 freezes the optional original allocation.cpu_binding
+`device_isolation:"nvidia"` before any scope effect; migration does not backfill
+older records. Complete read support is 1–23, and writer 22 or older cannot reopen 23.
+It does not change default status/task/history, wait_reason or FD4 shapes.
+
+Original inventory/device intent precede the one-shot installation CAS; actual
+original attachment and durable installed binding precede launch constraints.
+CPU/device launch intents commit atomically after fresh original handle/map/lease
+checks. Restarts observe only original bindings, never reinstall or mint launch
+authority. Unknown retains reservations; original execution cleanup, empty original
+CPU inode removal and referencing device release remain distinct requirements.
+`device_cgroup_preflight` tests native/query prerequisites, never load/attach or GPU
+access. Privileged positive acceptance and rollout remain outstanding; see
+[device controller](device-controller.md).
 
 ### Candidate resource explanation
 

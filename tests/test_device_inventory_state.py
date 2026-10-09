@@ -336,8 +336,8 @@ class DeviceInventoryStateTests(affinity.CpuIsolationFixture):
         self.assertEqual("migration_required", json.loads(out)["reason"])
         state.init_db()
         with state.connect() as conn:
-            self.assertEqual(22, conn.execute("PRAGMA user_version").fetchone()[0])
-            self.assertTrue(state._schema_is_complete(conn, 22))
+            self.assertEqual(state.DB_SCHEMA_VERSION, conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertTrue(state._schema_is_complete(conn, state.DB_SCHEMA_VERSION))
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM device_inventory_bindings").fetchone()[0])
             self.assertEqual(before, {name: [tuple(r) for r in conn.execute("SELECT * FROM " + name)] for name in tables})
             self.assertEqual(intent.to_dict(), devices.load(conn, intent.scope.intent.scope_id)[0]["intent"])

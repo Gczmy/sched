@@ -253,6 +253,12 @@ def finish_removed(conn, allocation_id, job_id):
 
 def cpu_launch_guard(conn, allocation_id, job_id):
     entry = for_allocation(conn, allocation_id, job_id)
+    _, binding = cpu._allocation(conn, allocation_id, job_id)
+    if binding.get("device_isolation") == "nvidia":
+        if entry is None:
+            raise state.StateError("required original device policy missing; CPU-only launch refused")
+        from .device_inventory_state import load as frozen_inventory
+        frozen_inventory(conn, entry[0]["scope_id"])
     if entry is not None and entry[1][-1]["kind"] != "launch_intent":
         raise state.StateError("CPU launch cannot bypass original device launch intent")
 

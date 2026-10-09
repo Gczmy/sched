@@ -187,7 +187,9 @@ scheduler 实际安装、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改�
 后续[设备映射候选](device-inventory.md)核对 UUID/driver minor/节点，纯选择只放行
 原 allocation 的明确未分区整卡或 CPU-only 基线；显式 device-inventory 仅在计算节点
 只读探测，不读 DB。后续 schema 22 候选冻结原 allocation/CPU scope/device intent 的
-完整映射并提供纯新鲜重验。MIG/N/A 的可靠能力区分与实际安装/恢复仍待实现。
+完整映射并提供纯新鲜重验。后续 schema 23 [显式设备 controller](device-controller.md)
+接入安装、原 handle 启动与恢复仅观察；MIG/N/A 的可靠能力区分、授权正向
+CPU/BPF/真实 GPU/owner 故障矩阵、被动新鲜根健康及发布仍待完成。
 
 ### 已确认的设计方向
 

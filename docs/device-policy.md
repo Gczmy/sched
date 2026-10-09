@@ -1,7 +1,7 @@
 # 原 scope 设备策略原语（源码候选）
 
 这是独立 execution 接口 `sched-device-policy/v1`，不是 scheduler 配置、CLI 写入口
-或已交付 GPU 硬隔离。当前 daemon 不安装该策略；后续 schema 21
+或已交付 GPU 硬隔离。后续 schema 23 [显式 controller](device-controller.md) 可 opt-in 安装；默认 off 不安装。schema 21
 [设备记录与守卫](device-scopes.md) 不改变默认 status/task/history 查询。
 原 scope 与 CPU 清理合同见 [cpu-scopes](cpu-scopes.md)。
 
@@ -53,12 +53,12 @@ context 见 [Linux v6.8 UAPI](https://github.com/torvalds/linux/blob/v6.8/includ
 本接口不撤销已经打开/继承/传递的设备 FD，也不是对同 UID 可信 delegate 的恶意
 逃逸沙箱。实际设备访问受已有祖先限制；放行不保证 CUDA 成功。
 
-设备 intent/生命周期已有 [独立记录层候选](device-scopes.md)，但尚未接入实际安装；
+设备 intent/生命周期已有 [独立记录层候选](device-scopes.md)；显式安装/启动与恢复观察
+由 [设备 controller](device-controller.md) 接入，尚未取得真实正向验收。
 后续[设备映射候选](device-inventory.md)提供 control/UVM/整卡 UUID/driver minor 的显式
 只读核对与纯规则选择；后续 schema 22 候选冻结到原 allocation 并提供新鲜核对，
-但尚未接入实际安装；MIG 映射、
-必要 CPU 设备白名单、持久 owner 故障恢复接入和被动健康观察。因此不能声称现有
-cpu_isolation.mode=cgroup 限制 GPU，不能从 CUDA_VISIBLE_DEVICES 或 GPU claim 推断
+原映射接入显式 controller；仍需可靠 MIG 映射/能力区分、持久 owner 正向故障矩阵和
+被动健康观察。单独 cpu_isolation.mode=cgroup 不限制 GPU，不能从 CUDA_VISIBLE_DEVICES 或 GPU claim 推断
 设备隔离。正式 GPU 验收与生产切换需要另行授权。
 
 [回归](../tests/test_device_policy.py) 的解释器/故障模型验证有界策略、unsigned

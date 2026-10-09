@@ -243,6 +243,9 @@ schema 1–20 查询不迁移，schema 19 及更旧 writer 不可回接新库。
 
 ## 后续候选原设备映射绑定 schema 22
 
+当前后续显式设备接入写 schema 23，完整只读 1–23；以下为 22 引入原映射绑定的
+历史边界，23 的语义升级与回退约束见本文后续章节。
+
 原子新增空 device_inventory_bindings、唯一 allocation 和不可变/保留触发器，不回填
 原映射，不改变旧 instance/allocation/CPU/device intent/回执。冻结必须在安装意图前
 核对原完整 claims 与策略；新鲜重验不换卡、不刷新旧 topology、不授予启动权。
@@ -250,3 +253,18 @@ schema 1–20 查询不迁移，schema 19 及更旧 writer 不可回接新库。
 migration_required，当前完整只读范围为 1–22。schema 21 及更旧 writer 不可回接新库；
 回退只使用升级前验证恢复点。实际安装/恢复、授权正向设备与生产切换仍未完成。
 完整边界见 [设备映射与绑定](device-inventory.md)。
+
+## 后续候选显式设备接入 schema 23
+
+原表与历史内容不变；新增不可变 allocation.cpu_binding 的可选
+`device_isolation:"nvidia"` 语义，先提交必需设备隔离要求，再执行 CPU/设备效果。
+因此 writer 22 及更旧不能回接 23，不能把尚未创建设备记录的 allocation 当成 CPU-only。
+默认 off 的新旧 allocation 无该字段，不补绑历史设备；完整只读范围 1–23。
+
+安装意图在外部效果前提交，installed 原绑定在约束前提交；原 retained handle/
+attachment/完整映射/lease 新鲜检查后，CPU 与设备 launch_intent 同事务 CAS。
+重启仅观察原绑定，未知保留预留、不补装、不卸载、不重新 start；原 execution
+清理和空 CPU inode 实际删除后，设备 released 引用原 removed 才释放资源。
+配置与 native/query 检查不等于权限或实际设备访问验收。尚无授权特权正向 BPF/
+真实 GPU 故障矩阵、发布或生产切换；回退仍只用升级前验证恢复点。
+完整约束见 [设备 controller](device-controller.md)。

@@ -401,6 +401,29 @@ CPU inode/device intent/完整 mapping/time 必须一致；在 install_intent �
 本地与计算节点前后核对一致。不执行 BPF attach、不使用真实 GPU 计算，不更改生产
 安装/config/daemon 或 Slurm 父级；这是记录与拒绝/兼容证据，不是设备隔离部署。
 
+固定原映射绑定提交 `fc4f7d031c632f146d1159d2b873f4368d1aa572` 的
+[CI 37894327596](https://github.com/Gczmy/sched/actions/runs/37894327596)
+已完成 success，14/14 作业通过，含各 Python/native 矩阵与独立安装；未发布或部署。
+
+后续 schema 23 [显式设备 controller](device-controller.md) 接通冷配置
+device_isolation.mode=nvidia（必须 CPU cgroup，默认 off、fake 拒绝），先冻结原
+allocation 的必需设备标志，再提交原映射/安装意图并在 writer 外执行一次安装。
+原 installed binding 在约束前提交，原 handle/attachment/映射/lease 新鲜检查后，
+CPU 与设备 launch_intent 同事务 CAS。恢复只观察、不安装或 start；未知保留资源，
+原空 CPU inode 删除后由精确 removed 引用释放。没有回填旧事实，旧 writer 22
+不能回接 23；仍未取得真实正向 BPF/GPU 验收，未发布或部署。
+
+该候选在计算节点系统 Python 3.12.3 显式 native 构建后运行 1031 条完整回归：
+1026 通过、5 跳过，167.709 秒、退出码 0。3 条正向 scope 缺少明确委派仍跳过，
+另两条为 native 缺失与 Darwin 专项，不算实际隔离成功。新增 16 条 controller/
+配置/原 GPU minor/时效/语义降级模型回归通过；六组 CPU/CLI（含原 owner 实际崩溃
+重连）、CPU/设备普通目录与 fake 拒绝验收均通过。CPU/CLI 初次调用因没有设置
+PYTHONPATH 而中止，未算通过；只修正调用环境后同来源重跑通过。
+201 文件 runtime/native/fixture/构建脚本清单 SHA256 为
+`38ed19d993879b8dece4d8592c94ba49ac648043874e086f5313385ead385a5a`，
+本地与计算节点前后核对一致。不执行 BPF attach、真实 GPU 计算或 Slurm 父级准备，
+不修改生产安装/config/daemon；模型、默认 off 兼容与拒绝路径不是特权正向验收。
+
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |
 | 2 | 已提交修复验收 | 候选 CI/CPU/两主机验收通过 | 固定来源完整 CI/独立安装；计算节点隔离验收；原 RID 跨网关恢复不重复投递 |
@@ -416,7 +439,7 @@ CPU inode/device intent/完整 mapping/time 必须一致；在 install_intent �
 | 12 | 独立发布与生产切换 | 未执行 | 最终提交 CI/原始包/hash/迁移与回退；获授权的计算节点排空/安装/验收 |
 | ND-02 | 租约来源持久化/持续验证 | 候选 CI/计算节点 CPU 通过 | Slurm/cgroup 白名单来源；失效停新派发、不杀 running、不迁移；unknown 与退出追溯 |
 | ND-03 | CPU auto 容量 | 候选 CI/计算节点 CPU 通过 | Slurm/affinity 保守边界；0 兼容；固定超额提示/拒绝；持续租约验证 |
-| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语、schema 21 记录与 schema 22 原映射冻结候选；实际设备接入/正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
+| 硬隔离 | per-job affinity/cgroup | 亲和/CPU claim、schema 20 cgroup 派发/清理、设备原语/schema 21 记录/schema 22 原映射冻结与 schema 23 显式接入候选；正向验收未完成 | 明确启用和可用性；真实 CPU/设备边界；退出/取消/清理与恢复兼容 |
 
 阶段 3 的候选合同见 [reference](reference.md)；阶段 4–11 具体约束见 [ND-04](next-development.md)，ND-02/03 与硬隔离也在
 该文件记录。不能把本清单中的设计当作已可用 CLI/config。

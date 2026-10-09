@@ -263,10 +263,12 @@ def _validate(cfg: dict[str, Any], p: str) -> None:
     from .cluster_lease import policy as lease_policy
     from .cpu_capacity import policy as cpu_policy
     from .cpu_isolation import policy as cpu_isolation_policy
+    from .device_scope_controller import policy as device_isolation_policy
     try:
         lease_policy(cfg)
         cpu_policy(cfg)
         cpu_isolation_policy(cfg)
+        device_isolation_policy(cfg)
         storage_policy(cfg)
     except ValueError as error:
         raise ConfigError(f"{p}: {error}") from error

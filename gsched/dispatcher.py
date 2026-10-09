@@ -380,6 +380,7 @@ CONFIG_COLD_KEYS = (
     "native_exec_profiles", "execution_backends",
     "lease_validation",
     "cpu_isolation",
+    "device_isolation",
 )
 
 
@@ -4533,7 +4534,9 @@ class Dispatcher:
                                  ("host_mem_default_gib", 8)):
                 admission_cfg[key] = gpu_policy.get(key, default)
         from .cpu_isolation import policy as cpu_isolation_policy
-        if cpu_isolation_policy(gpu_policy) != cpu_isolation_policy(self.cfg):
+        from .device_scope_controller import policy as device_isolation_policy
+        if (cpu_isolation_policy(gpu_policy) != cpu_isolation_policy(self.cfg)
+                or device_isolation_policy(gpu_policy) != device_isolation_policy(self.cfg)):
             self.log_line("CPU isolation cold configuration changed/unreadable; new dispatch paused until explicit restart")
             return
         controller = getattr(self, "_cpu_scopes", None)

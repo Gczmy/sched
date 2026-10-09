@@ -67,6 +67,8 @@ def allocation_binding(conn, identifier, job_id):
                 raise ValueError("CPU scope authority/pool binding missing")
         except (KeyError, TypeError, ValueError) as error:
             raise state.StateError("CPU scope authority binding invalid") from error
+    if "device_isolation" in binding and (binding["mode"] != "cgroup" or binding["device_isolation"] != "nvidia"):
+        raise state.StateError("original device isolation requirement invalid")
     return value, binding
 
 

@@ -644,13 +644,20 @@ def check(fake: bool = False) -> list[dict[str, Any]]:
             add("CPU affinity", "kernel affinity and sealed bootstrap available; lease/claims still rechecked at launch",
                 check_id="cpu_affinity_primitives")
     if cpu_isolation_policy(cfg)["mode"] == "cgroup":
+        from .device_scope_controller import policy as device_policy
+        devices_requested = device_policy(cfg)["mode"] != "off"
         try:
             from .cpu_scope_controller import preflight_check
             preflight_check(cfg)
         except Exception as error:
             add("CPU cgroup delegation", str(error), "fail", check_id="cpu_cgroup_delegation")
+            if devices_requested:
+                add("Device cgroup prerequisites", str(error), "fail", check_id="device_cgroup_preflight")
         else:
             add("CPU cgroup delegation", "original hierarchy/private cpuset verified without creating a scope; launch rechecks required", check_id="cpu_cgroup_delegation")
+            if devices_requested:
+                add("Device cgroup prerequisites", "native/query prerequisites only; no BPF load/attach or GPU access tested",
+                    check_id="device_cgroup_preflight")
 
     # 用户身份 (H2)
     import getpass

@@ -3,7 +3,8 @@
 schema 21 新增空 `device_scopes` / `device_scope_events`、allocation 唯一索引与
 不可变／保留触发器；不回填旧设备事实，不修改 instance、原 CPU/执行/资源记录。
 通用原语见 [设备策略](device-policy.md)，CPU 生命周期见 [CPU scope](cpu-scopes.md)。
-此项尚未连接 scheduler 的设备安装：没有 GPU 设备配置或安装写 CLI，不执行 BPF。
+此 schema 21 记录层不安装设备；后续 schema 23 的显式冷配置接入见
+[设备 controller](device-controller.md)，没有安装写 CLI，真实正向验收尚未完成。
 
 ## 原绑定与提交边界
 
@@ -18,9 +19,9 @@ installed 只接受相同完整 DeviceIntent、实际 program ID/tag 绑定和�
 观察的 admission/wait 必须 false；该记录不验证内核，也不是被动查询的启动权。
 CPU launch_intent 要求设备 launch_intent 已在同一提交边界内写入。
 
-当前 CPU controller 没有设备 handle 接入，遇设备记录会拒绝 CPU-only 启动，即使记录
-已 installed 或 launch_intent；不会将数据库阶段当作真实策略已附加。后续实际安装
-需重构 prepare，在设备策略 binding 提交与原 attachment 新鲜核对后才授予启动 FD。
+显式设备 controller 只接受原 retained device handle，并在设备策略 binding 提交与原
+attachment 新鲜核对后才授予一次启动 FD；旧 CPU-only controller 遇设备记录仍拒绝。
+不会将数据库 installed 或 launch_intent 当作真实策略已附加。
 持久 owner 仍须原身份重连，不能因为 installed 记录而重新 start。
 
 安装效果已消耗但结果未知时只添加 unknown，不借查询发现的 program ID 补造 installed，
@@ -53,8 +54,8 @@ limit 默认 20、范围 1–100，使用实时 keyset，不是完整快照。�
 均 false；recorded_phase、程序绑定和 release_recorded_ready 均不是实时 kernel health。
 策略字节码解析核对两种有界端序并保留原摘要，不依赖查询主机 ABI；异端序不授予安装权。
 旧完整 schema 1–20 返回 migration_required，不猜设备绑定或升级；当前完整只读范围
-为 1–22（后续原映射绑定写 schema 22）。schema 20 及更旧 writer 不得回接 schema 21，
-schema 21 及更旧 writer 不得回接 schema 22；只能使用升级前验证恢复点回退，
+为 1–23（原映射绑定写 schema 22、显式接入写 23）。schema 20 及更旧 writer 不得回接 schema 21，
+schema 21 及更旧 writer 不得回接 schema 22，writer 22 及更旧不得回接 23；只能使用升级前验证恢复点回退，
 不能删表/事件、降低 user_version 或手改 state。包版本尚未更改、未发布或部署。
 
 ## 验收与剩余工作
@@ -65,7 +66,7 @@ schema 20 只读与无回填迁移、查询字节边界；均为 synthetic 证�
 
 后续[设备映射候选](device-inventory.md)提供 control/UVM/整卡原 UUID/minor/节点核对，
 不改变这里的被动查询或实际安装状态；后续 schema 22 候选冻结原 allocation/intent/
-inventory 并提供纯新鲜重验，仍未接通实际安装。尚未完成：scheduler 实际设备安装、
-MIG/能力区分、持久 owner
+inventory 并提供纯新鲜重验，schema 23 的显式安装/原 handle 启动与恢复仅观察见
+[设备 controller](device-controller.md)。尚未完成：MIG/能力区分、持久 owner
 设备故障矩阵、授权正向 CPU/BPF/真实 GPU 验收、被动新鲜根健康观察、原租约实际结束
 及授权发布／生产切换。此记录层不缩小或替代这些交付。

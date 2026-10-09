@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 
-from . import cluster_lease, cpu_scope_state as ledger, state
+from . import cluster_lease, cpu_scope_state as ledger, device_scope_controller as devices, state
 from .execution import CpuScopeBinding, CpuScopeIntent, DelegatedCpuScopes, ScopeUnavailable
 from .execution_policy import digest
 
@@ -119,10 +119,14 @@ class Controller:
         from .cpu_isolation import policy
         self.dispatcher = dispatcher
         self.policy = policy(dispatcher.cfg)
+        self.device_policy = devices.policy(dispatcher.cfg)
         if self.policy["mode"] != "cgroup":
             raise ValueError("CPU scope controller requires explicit cgroup mode")
+        if self.device_policy["mode"] != "off" and getattr(dispatcher, "fake", False):
+            raise ValueError("device isolation cannot run with fake GPU topology")
         self.manager = DelegatedCpuScopes(self.policy["delegated_root"])
         self.handles = {}
+        self.device_handles = {}
         self.job_handles = {}
         self.healthy = True
         self.sampled_at = None
@@ -144,6 +148,8 @@ class Controller:
             raise ValueError("original delegated CPU/NUMA parent capacity changed")
         if not set(current["affinity"]) & set(cpus):
             raise ValueError("delegated CPU parent has no CPU in original pool")
+        if self.device_policy["mode"] != "off":
+            devices.preflight(self.manager)
         self.authority, self.mems, self.cpus = authority, mems, cpus
         self.sampled_at = time.monotonic()
         return self.healthy
@@ -152,8 +158,11 @@ class Controller:
         return self.healthy and self.sampled_at is not None and 0 <= time.monotonic() - self.sampled_at <= 5
 
     def binding_fields(self):
-        return {"scope_parent": asdict(self.manager.parent), "scope_mems": list(self.mems),
-                "scope_authority": self.authority, "scope_pool": list(self.cpus)}
+        fields = {"scope_parent": asdict(self.manager.parent), "scope_mems": list(self.mems),
+                  "scope_authority": self.authority, "scope_pool": list(self.cpus)}
+        if self.device_policy["mode"] != "off":
+            fields["device_isolation"] = "nvidia"
+        return fields
 
     def reserve(self, conn, job):
         from .cpu_isolation import allocation_binding
@@ -167,6 +176,7 @@ class Controller:
         return intent
 
     def prepare(self, conn, job):
+        from .cpu_isolation import policy
         if conn.in_transaction:
             raise state.StateError("CPU scope create/configure must occur outside DB writer")
         row = conn.execute("SELECT scope_id FROM cpu_scopes WHERE allocation_id=? AND job_id=?", (job["allocation_id"], job["id"])).fetchone()
@@ -175,6 +185,13 @@ class Controller:
         value, events = ledger.load(conn, row[0])
         if events[-1]["kind"] != "reserved":
             raise state.StateError("CPU scope creation consumed; recovery cannot restart")
+        _, binding = ledger._allocation(conn, job["allocation_id"], job["id"], active=True)
+        from .device_scope_state import for_allocation
+        current = self.dispatcher._read_gpu_policy()
+        if (binding.get("device_isolation", "off") != self.device_policy["mode"]
+                or policy(current) != self.policy or devices.policy(current) != self.device_policy
+                or for_allocation(conn, job["allocation_id"], job["id"]) is not None):
+            raise state.StateError("original device requirement changed or preparation consumed")
         intent = CpuScopeIntent.from_dict(value["intent"])
         _advance(intent.scope_id, "create_intent")
         scope = None
@@ -184,7 +201,8 @@ class Controller:
             _advance(intent.scope_id, "configure_intent")
             observation = scope.configure()
             _advance(intent.scope_id, "configured", {"observation": observation})
-            constraints = scope.constraints()
+            constraints = (devices.prepare(self, conn, job, scope)
+                           if self.device_policy["mode"] != "off" else scope.constraints())
             self.handles[job["allocation_id"]] = scope
             self.job_handles[job["id"]] = job["allocation_id"]
             return constraints
@@ -202,9 +220,14 @@ class Controller:
         if conn.in_transaction:
             raise state.StateError("CPU scope launch probes must occur outside DB writer")
         from .device_scope_state import for_allocation
-        if for_allocation(conn, job["allocation_id"], job["id"]) is not None:
+        device_policy = getattr(self, "device_policy", {"mode": "off"})
+        if device_policy["mode"] == "off" and for_allocation(conn, job["allocation_id"], job["id"]) is not None:
             raise state.StateError("device scope requires original retained device handle; CPU-only launch refused")
-        if policy(self.dispatcher._read_gpu_policy()) != self.policy or not self.dispatcher._cluster_lease.update():
+        current = self.dispatcher._read_gpu_policy()
+        _, binding = ledger._allocation(conn, job["allocation_id"], job["id"], active=True)
+        if (policy(current) != self.policy or devices.policy(current) != device_policy
+                or binding.get("device_isolation", "off") != device_policy["mode"]
+                or not self.dispatcher._cluster_lease.update()):
             raise state.StateError("CPU scope cold policy or original lease changed")
         if not self.preflight():
             raise state.StateError("CPU scope health unresolved")
@@ -216,14 +239,20 @@ class Controller:
         _, events = ledger.load(conn, scope.binding.intent.scope_id)
         if events[-1]["kind"] != "configured":
             raise state.StateError("CPU scope launch intent consumed or cleanup requested")
-        return scope.binding.intent.scope_id, events[-1]["event_id"]
+        checked = scope.binding.intent.scope_id, events[-1]["event_id"]
+        if device_policy["mode"] != "off":
+            checked += devices.launch_check(self, conn, job, scope)
+        return checked
 
     @staticmethod
     def launch_intent(conn, checked):
+        if len(checked) == 4:
+            devices.launch_intent(conn, checked[0], checked[2], checked[3])
         return ledger.advance(conn, checked[0], checked[1], "launch_intent")
 
     def finish_launch(self, job_id):
         identifier = self.job_handles.pop(job_id, None)
+        self.device_handles.pop(identifier, None)
         scope = self.handles.pop(identifier, None)
         if scope is not None:
             scope.close()  # Never remove on close or transfer/reissue a capability.
@@ -232,6 +261,7 @@ class Controller:
         for scope in self.handles.values():
             scope.close()
         self.handles.clear()
+        self.device_handles.clear()
         self.job_handles.clear()
         self.manager.close()
 
@@ -248,6 +278,8 @@ def preflight_check(cfg):
         sample = cluster_lease.probe(job) if job else {"known": False}
         decision = cluster_lease.decide(origin, current, sample)
         authority_from_facts(with_manager.parent.path, origin, current, decision, _mounts())
+        if devices.policy(cfg)["mode"] != "off":
+            devices.preflight(with_manager)
     finally:
         with_manager.close()
 
@@ -300,6 +332,16 @@ def maintain(dispatcher):
             elif not observation["scope_configured"]:
                 healthy = False  # No resizing or killing a running application.
                 _unknown(identifier, "scope_configuration_drift")
+            elif not live:
+                try:
+                    with state.connect() as conn:
+                        devices.observe_restored(conn, scope, value["allocation_id"], value["job_id"])
+                except (OSError, ValueError, RuntimeError, state.StateError):
+                    try:
+                        devices.unknown(identifier, "original_device_observation_unknown")
+                    except Exception:
+                        pass
+                    raise
         except (OSError, ValueError, RuntimeError, state.StateError, ScopeUnavailable) as error:
             healthy = False
             dispatcher.log_line(f"CPU scope {identifier} retained; original identity/cleanup unavailable: {error}")

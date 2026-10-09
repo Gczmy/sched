@@ -54,7 +54,7 @@ class ScopeAuthorityTests(unittest.TestCase):
                 effects.mounts_from_text(text)
 
 
-class ScopeControllerTests(affinity.CpuIsolationFixture):
+class CpuScopeFixture(affinity.CpuIsolationFixture):
     def setUp(self):
         super().setUp()
         self.context["cgroups"] = [{"hierarchy": "0", "controllers": "", "path": "/example/controller"}]
@@ -163,6 +163,7 @@ class ScopeControllerTests(affinity.CpuIsolationFixture):
         with state.connect() as conn:
             return ledger.request_cleanup(conn, state.get_job(conn, job), cleanup_source="ordinary_group_gone")
 
+class ScopeControllerTests(CpuScopeFixture):
     def test_prepared_effects_follow_committed_intents_and_grant_only_once(self):
         job, identifier, intent, constraints = self.prepared()
         self.assertEqual((0,), constraints.cpu_affinity)

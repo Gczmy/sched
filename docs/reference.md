@@ -41,8 +41,9 @@ N 为 0..60 的有限秒数；只读查询原 RID，不重投，超时返回 `wa
 网关只投递文件；`delivered`/`persisted:false` 不表示已入库，daemon 在同一事务中保存批次与终态回执。
 结果不确定返回 75，不自动重投。不能与 `--dry-run` 或外层 `sched request` 嵌套。
 `sched request` 的 `--expect-instance`、`--expect-project` 在写事务内校验；项目预期只适用于 batch/task。
-没有新增参数的旧 request 绑定保持原样。当前设备映射冻结绑定候选写 schema 22，完整只读范围为 1–22；
-已发布 0.4.0 写 schema 10、失败隔离/首次验证/复验/精确批次依赖/任务 DAG/allocation/租约/CPU claim/scope 记录、cgroup 接入与设备记录候选写 11/12/13/14/15/16/17/18/19/20/21，都不能回接 schema 22。包版本尚未变更，能力须查询实际部署的合同与 schema。
+没有新增参数的旧 request 绑定保持原样。当前显式设备接入候选写 schema 23，完整只读范围为 1–23；
+已发布 0.4.0 写 schema 10；候选 writer 11–22 均不能回接 schema 23。原映射绑定表于 22 引入，
+23 为不可变 allocation 的设备必需标志添加语义守卫，不回填旧事实。包版本尚未变更，能力须查询实际部署的合同与 schema。
 
 `sched allocations <batch>:<task> [--version N] [--limit 20] [--cursor ID] --json`
 提供独立的 `sched-allocations-v1` 不可变分配摘要；`--allocation-id ID` 读取同任务/
@@ -208,7 +209,7 @@ CPU/GPU；原 CPU removed 引用和设备 released 记录均满足后才放行�
 `sched device-inventory --json` 是计算节点显式只读设备探测，不读 DB 或迁移；网关
 禁止执行，即使设置 foreign-write override。UUID/PCI/driver minor/节点核对成功才
 报告完整映射，runtime_probed=true 但 admission/wait/physical boundary=false。返回
-失败不等于空映射；MIG 未知不能用于整卡放行。未接实际安装，见[设备映射](device-inventory.md)。
+失败不等于空映射；MIG 未知不能用于整卡放行。显式冷配置接入见[设备 controller](device-controller.md)，不表示真实隔离验收已完成。
 
 `sched device-inventory-bindings [--scope-id ID] [--limit N] [--cursor ID] --json`
 协商独立 `sched-device-inventory-binding-v1`。schema 22 冻结原完整映射、allocation/
@@ -662,6 +663,10 @@ dispatcher；加 `--supervise` 可在满足所有权条件时自动重启，不�
 [CPU 亲和](cpu-isolation.md)。该模式不创建子 cgroup。候选显式 cgroup 模式仅在
 外部已授权委派内创建唯一子 cpuset，三种 backend 在 exec 前 join，原 inode/lease
 绑定、清理与未完成正向/设备验收见 [CPU scope](cpu-scopes.md)；不修改父 Slurm 资源。
+候选 `device_isolation.mode=nvidia` 必须同时显式启用 CPU cgroup，拒绝 fake；默认 off
+不安装。原设备 intent/完整映射/installed binding 先提交，exec 前核对原 retained handle、
+真实 attachment/映射/lease，再同事务提交设备与 CPU launch_intent。恢复只观察，未知
+不重装或 CPU 降级；schema 23/冷配置、preflight 和验收边界见 [设备 controller](device-controller.md)。
 候选 schema 17 保存白名单 Slurm/job/step、affinity/cgroup 启动来源与检查/退出事实；
 默认 auto 对有 Slurm 来源的 daemon 持续校验，未知默认暂停、已确认失效锁存停止新派发，
 不杀 running、不自动迁移新租约。通用 system cgroup 不能宣称 valid；旧 daemon 不补造来源，
