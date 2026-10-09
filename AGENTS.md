@@ -66,6 +66,7 @@
 | `docs/cpu-capacity.md` | 候选 CPU auto 保守容量、冻结运行预留与零值兼容；不等于 per-job 硬隔离 |
 | `docs/execution-constraints.md` | 候选公开 backend 启动约束；scope 接入与尚未完成的内核/设备验收 |
 | `docs/cpu-scopes.md` | 候选委派 cpuset、原 intent/inode/CAS、schema 20 显式派发/清理；不是完整硬隔离交付 |
+| `docs/device-policy.md` | 候选原 scope 设备 BPF 原语；尚未接入 scheduler 或完成特权正向/真实 GPU 验收 |
 | `docs/README.md` | 当前文档索引及历史记录的适用范围 |
 | `docs/repository-hygiene.md` | 公开仓库中的示例、运行记录与隐私信息边界 |
 | `../dsh-node-sched/docs/implementation-notes.md` | 配套插件的实现定案与历史原因 |

@@ -34,6 +34,7 @@
 | [cpu-capacity.md](cpu-capacity.md) | 候选显式 CPU auto、保守容量/冻结预留、零值兼容与 opt-in 只读查询 |
 | [cpu-isolation.md](cpu-isolation.md) | 候选 schema 18 显式 per-job 亲和、不可变 CPU claim、释放/重连与被动解释；不是 cgroup 硬隔离 |
 | [cpu-scopes.md](cpu-scopes.md) | 候选委派 cpuset 原语、持久 intent/inode/CAS 和 schema 20 显式派发/清理；正向内核/设备验收未完成 |
+| [device-policy.md](device-policy.md) | 候选原 scope 设备 BPF 原语；不接入 scheduler，不代表 GPU 内核隔离验收 |
 | [execution-constraints.md](execution-constraints.md) | 候选三种 backend 的启动前 CPU/cgroup FD 原语；scheduler 硬隔离整体尚未完成 |
 | [repository-hygiene.md](repository-hygiene.md) | 仓库中的隐私信息和运行记录边界 |
 

@@ -317,6 +317,20 @@ allocation/CPU claim/worker，无父级写入。兼容 CPU 亲和 CLI 六组在�
 之后仅补缺失 cgroup intent 的拒绝守卫并取得最终全量/拒绝路径证据。
 未使用真实 GPU、修改生产 daemon/config 或 Slurm 父级；尚未取得正向 cpuset/
 故障恢复/设备证据，未发布或部署。合同与授权正向脚本见 [CPU scope](cpu-scopes.md)。
+该源码固定提交 `a0b68742db13c9ccd9fd468422a737ecc6652de5` 的
+[完整 CI](https://github.com/Gczmy/sched/actions/runs/37885308857) 14 项均通过。
+
+后续独立 [设备策略原语](device-policy.md) 源码候选提供至多 256 条精确设备白名单、
+原 CPU inode/策略摘要/内核 program ID/tag 绑定；只安装一次、直接 MULTI 附加不替换、
+未知不重装/卸载/降级，恢复只观察原策略。普通 CPU 启动也不能绕过包装后的设备守卫。
+不新增 scheduler 配置/CLI/schema，不接入 NVIDIA 映射或持久设备生命周期；当前
+cgroup controller 仍不安装设备策略，不把该原语计作完整 GPU 硬隔离交付。
+指定计算租约内最终来源 native 编译通过；17 条新增回归含真实无特权 load 拒绝
+通过，未执行 attach。完整回归运行 953 条：948 通过、5 跳过，仍包括 3 条缺少
+委派的正向 scope 项。191 文件 runtime/fixture/构建脚本清单 SHA256 为
+`cb43a505263b3bea4c170b50e8659f22cff6d3b482635f2d7ce8ae57f9106ba8`，
+本地与计算节点核对一致。没有特权 BPF/真实设备访问证据；生产、Slurm 父级和
+真实 GPU 未改动，尚未发布或部署。
 
 | 阶段 | 工作 | 当前状态 | 必须取得的完成依据 |
 | --- | --- | --- | --- |

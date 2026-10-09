@@ -12,6 +12,6 @@ if enabled and sys.platform != "linux":
 setup(options={"build": {"build_base": "build/native" if enabled else "build/python"}},
       exclude_package_data={"gsched.execution": ["_fdexec*.so", "_fdexec*.pyd"]},
       ext_modules=[Extension(
-    "gsched.execution._fdexec", ["native/fdexec.c"],
+    "gsched.execution._fdexec", ["native/fdexec.c"], depends=["native/device_policy.h"],
     extra_compile_args=["-std=c11", "-Wall", "-Wextra", "-Werror"],
 )] if enabled else [])

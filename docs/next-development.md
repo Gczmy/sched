@@ -178,6 +178,10 @@ CPU claim 绑定的 intent、原 inode、配置/启动/清理的一次 CAS，未
 清理分开，新增 cleanup_ready，原 wait 跨 tick 保留，重启失去普通 wait 不补判成功；
 缺少明确测试委派时不宣称正向内核验收通过，仍不是完整 cgroup/设备交付。
 
+独立 [设备策略原语](device-policy.md) 源码候选新增有界精确白名单、原 CPU scope
+与程序摘要/ID/tag 绑定、一次安装和恢复只观察；无替换/卸载/失败降级。尚未接入
+scheduler 设备持久记录、NVIDIA 设备映射或正向 BPF/CUDA 验收，不改变当前 GPU 权限。
+
 ### 已确认的设计方向
 
 1. 显式增加 `cpus_total: "auto"` 与可选正整数 `cpus_auto_max`，保留

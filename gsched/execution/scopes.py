@@ -273,6 +273,7 @@ class CpuScope:
     def __init__(self, binding, parent_fd, scope_fd, phase):
         self.binding, self._parent, self._fd, self._phase = binding, parent_fd, scope_fd, phase
         self._procs = None
+        self._device_guard = None
 
     def _identity(self):
         if self._fd is None:
@@ -337,6 +338,8 @@ class CpuScope:
         if self._phase != "configured":
             raise RuntimeError("restored or consumed scope cannot grant another launch")
         self._phase = "launch_capability_issued"
+        if self._device_guard is not None:
+            self._device_guard()
         observation = self.observe()
         if not observation["scope_configured"] or observation["populated"] or observation["direct_process_count"]:
             _refuse("scope_changed_before_launch")

@@ -149,3 +149,6 @@ scope、FD 关闭和序列化边界；普通目录拒绝在 Linux 计算节点�
 尚未完成：授权正向 cpuset/原 owner 故障恢复验收、设备 BPF/GPU 权限隔离、原租约
 真实终止矩阵、被动新鲜委派健康观察和授权生产 rollout。现有模型/拒绝测试及
 [CPU 亲和](cpu-isolation.md) 不能代替这些交付。
+
+另有独立 [设备策略原语](device-policy.md) 源码候选，提供原 scope 的有界白名单
+安装/恢复核对，不自动接入本 controller；schema 20 的 scope 观察仍不证明设备隔离。

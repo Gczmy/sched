@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "device_policy.h"
 
 #define BINDING_LIMIT 128
 #define OWNED_LIMIT (BINDING_LIMIT + 6)
@@ -458,6 +459,11 @@ static PyObject *check_capabilities(PyObject *module, PyObject *unused) {
 }
 
 static PyMethodDef module_methods[] = {
+    {"device_program_load", device_program_load, METH_O, NULL},
+    {"device_program_info", device_program_info, METH_O, NULL},
+    {"device_program_fd", device_program_fd, METH_O, NULL},
+    {"device_program_query", device_program_query, METH_O, NULL},
+    {"device_program_attach", device_program_attach, METH_VARARGS, NULL},
     {"prepare", prepare, METH_VARARGS, NULL},
     {"check_capabilities", check_capabilities, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}
@@ -476,6 +482,9 @@ PyMODINIT_FUNC PyInit__fdexec(void) {
         Py_DECREF(result); return NULL;
     }
     if (PyModule_AddStringConstant(result, "constraints_interface_version", "sched-execution-constraints/v1") < 0) {
+        Py_DECREF(result); return NULL;
+    }
+    if (PyModule_AddStringConstant(result, "device_policy_interface_version", "sched-device-policy/v1") < 0) {
         Py_DECREF(result); return NULL;
     }
     return result;

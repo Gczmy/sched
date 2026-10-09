@@ -133,6 +133,10 @@ jobs:
         run: python -m pytest -q -rs tests
       - name: Real syscall denial capability checks
         run: python tests/run_capability_denial_accept.py
+      - name: Device policy models and unprivileged load denial (no attachment)
+        env:
+          SCHED_TEST_DEVICE_LOAD_DENIAL: "1"
+        run: python -m unittest tests.test_device_policy -v
       - name: Public execution CLI lifecycle
         run: python tests/run_execution_accept.py
       - name: CPU affinity claims and persistent-owner crash/reconnect
