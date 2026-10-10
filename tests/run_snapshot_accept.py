@@ -33,9 +33,10 @@ class SnapshotAcceptance(LeaseAcceptance):
         assert repaired["phase"] == "completed" and legacy.stat().st_mode & 0o777 == 0o700
         assert (legacy / "original.log").read_text() == "unknown wait is retained\n"
         print("PASS: independent CLI permission preview/CAS repair preserves pending version and original log", flush=True)
-        created = self.data("snapshot", "create", "--writers-quiesced", "--yes", "--json")
+        created = self.data("snapshot", "create", "--writers-quiesced", "--io-timeout-sec", "300", "--yes", "--json")
         identifier = created["snapshot_id"]
         assert created["maintenance_open"] and not created["daemon_started"]
+        assert created["io_timeout_sec"] == 300
         for command in (("daemon", "start", "--fake"), ("config", "reload"),
                         ("daemon", "foreground", "--fake", "--supervise")):
             self.cli(*command, expect=2)
@@ -48,6 +49,7 @@ class SnapshotAcceptance(LeaseAcceptance):
 
         verified = self.data("snapshot", "verify", identifier, "--json")
         assert verified["instance_id"] == instance and not verified["rollback_authorized"]
+        assert verified["io_timeout_sec"] == 300
         assert self.data("snapshot", "migrate", identifier, "--yes", "--json")["phase"] == "migrated"
         assert self.data("snapshot", "rollback", identifier, "--yes", "--json")["phase"] == "restored"
         assert self.data("snapshot", "rollback", identifier, "--yes", "--json")["phase"] == "restored"

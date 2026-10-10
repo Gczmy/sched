@@ -36,6 +36,12 @@ v0.5.0 提供 `snapshot create/verify/migrate/rollback/close/status`，命名合
 候选节点树范围为 20,000 项，关闭点清理为 30,000 项；原 0.6.0 安装仍受 10,000 项限制。
 完整保存原文件；其余字节、metadata 和数据库事实边界见[升级恢复点](upgrade-snapshot.md)。
 
+0.6.1 候选 `sched-upgrade-snapshot-io-budget/v1` 允许在 create 时显式设置
+`--io-timeout-sec N`（整数 1–900，默认 30 秒）。非默认预算随原 manifest/window 冻结，
+verify/migrate/rollback 沿用，不能为旧点调大。只影响各次节点树文件 I/O 复核；
+SQLite 备份、数据库事实和其他资源边界保持不变。create/verify/status 只在非默认时增加
+`io_timeout_sec`；调用端需为多次完整复核预留总时长。
+
 公开 JSON 保持 `schema_version:1`；命名合同见 [integration-contract.md](integration-contract.md)。
 `sched identity --json` 只读查询持久 `instance_id`、配置节点和查询主机。
 没有状态或未迁移旧 schema 时返回 `available:false` 和原因，查询不会初始化数据库。
