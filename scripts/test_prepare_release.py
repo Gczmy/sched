@@ -2,6 +2,7 @@
 import copy
 import io
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -65,17 +66,18 @@ class ReleasePreparationTests(unittest.TestCase):
             case.setUp()
             self.addCleanup(case.doCleanups)
             case.add_wheel(True)
-            if python == "3.14":
+            if python != "3.10":
+                abi = python.replace(".", "")
                 old = case.directory / "sched-0.2.1-cp310-cp310-linux_x86_64.whl"
-                new = case.directory / old.name.replace("310", "314")
+                new = case.directory / old.name.replace("310", abi)
                 with zipfile.ZipFile(old) as source, zipfile.ZipFile(new, "w") as output:
                     for name in source.namelist():
                         value = source.read(name)
                         if name.endswith("/WHEEL"):
-                            value = value.replace(b"310", b"314")
-                        output.writestr(name.replace("310", "314"), value)
+                            value = value.replace(b"310", abi.encode("ascii"))
+                        output.writestr(name.replace("310", abi), value)
                 old.unlink()
-                case.manifest["native_abi"] = "cpython-314-x86_64-linux-gnu"
+                case.manifest["native_abi"] = "cpython-" + abi + "-x86_64-linux-gnu"
                 case.manifest["independent_installations"][-1]["wheel"] = new.name
             case.manifest["python"] = python + ".0"
             case.manifest["libc"] = ["glibc", release.TARGETS[target]]
@@ -110,9 +112,9 @@ class ReleasePreparationTests(unittest.TestCase):
 
     def test_complete_bundle_preserves_zip_bytes_and_public_provenance(self):
         evidence, assets = self.prepare()
-        self.assertEqual(7, len(assets))
+        self.assertEqual(9, len(assets))
         self.assertEqual(self.commit, evidence["source_commit"])
-        self.assertEqual(4, len(evidence["artifacts"]))
+        self.assertEqual(6, len(evidence["artifacts"]))
         self.assertNotIn("not-for-public-evidence", json.dumps(evidence))
         for record in evidence["artifacts"]:
             self.assertEqual(self.data[record["github_artifact_id"]], assets[record["name"]])
@@ -144,6 +146,28 @@ class ReleasePreparationTests(unittest.TestCase):
             change(changed["jobs"])
             with self.assertRaises(ValueError):
                 release.validate_metadata(changed, self.repo, self.commit, self.run_id)
+
+    def test_python312_jobs_and_packets_are_required_on_both_libc_targets(self):
+        for target in release.TARGETS:
+            for kind in ("Native", "Candidate"):
+                changed = copy.deepcopy(self.meta)
+                name = f"{kind} Python 3.12 / {target}"
+                changed["jobs"] = [j for j in changed["jobs"] if j["name"] != name]
+                with self.assertRaisesRegex(ValueError, "CI matrix"):
+                    release.validate_metadata(changed, self.repo, self.commit, self.run_id)
+            changed = copy.deepcopy(self.meta)
+            name = f"sched-candidate-{self.commit}-python-3.12-{target}-attempt-1"
+            changed["artifacts"] = [a for a in changed["artifacts"] if a["name"] != name]
+            with self.assertRaisesRegex(ValueError, "candidate artifacts"):
+                release.validate_metadata(changed, self.repo, self.commit, self.run_id)
+
+    def test_ci_native_matrix_matches_release_admission(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+        for job in ("native", "candidate"):
+            section = workflow.split("\n  " + job + ":\n", 1)[1]
+            section = re.split(r"\n  [a-z_]+:\n", section, maxsplit=1)[0]
+            versions = re.search(r"python: \[([^\]]+)\]", section).group(1)
+            self.assertEqual(release.NATIVE_PYTHONS, tuple(json.loads("[" + versions + "]")))
 
     def test_artifact_expiry_duplicates_missing_and_cross_commit_are_rejected(self):
         for change in (lambda items: items.pop(), lambda items: items[0].update(expired=True),
@@ -216,9 +240,9 @@ class ReleasePreparationTests(unittest.TestCase):
             release.upload_draft(api, evidence, assets)
         result = release.upload_draft(api, evidence, assets)
         self.assertTrue(result["draft"])
-        self.assertEqual(7, len(api.releases[0]["assets"]))
+        self.assertEqual(9, len(api.releases[0]["assets"]))
         self.assertEqual(1, sum(method == "POST" and route == "/releases" for method, route in api.calls))
-        self.assertEqual(7, sum(method == "POST" and "/assets?" in route for method, route in api.calls))
+        self.assertEqual(9, sum(method == "POST" and "/assets?" in route for method, route in api.calls))
         self.assertFalse(any(method in ("PATCH", "DELETE") for method, route in api.calls))
 
     def test_published_and_conflicting_drafts_are_not_mutated(self):

@@ -10,7 +10,10 @@
 ## 在线准备
 
 先独立选定已审查的完整 main commit 和该提交完成的 main push CI run。
-整套 14 项矩阵必须成功，且四个候选 artifact 未过期。使用相同来源提交中的脚本：
+当前源码的整套 18 项矩阵必须成功，且六个候选 artifact 未过期。
+native 与候选矩阵为 CPython 3.10/3.12/3.14 × Ubuntu 22.04/24.04，
+原 0.6.1 及更早发布仍保留来源中的 14 项/四个 artifact，不能用新脚本重写旧资产。
+使用相同来源提交中的脚本：
 
 ```bash
 python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <successful-ci-run-id> \
@@ -26,7 +29,7 @@ python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <succ
 
 脚本核对 repository、当前 main、完整 commit、workflow、run/attempt、全部 job、
 artifact ID/name/digest 与其包内 CI/ABI/libc/安装证据；先校验原 ZIP 哈希，再按有界
-平面布局解包验证，不接受路径穿越或 symlink。输出四份原始 ZIP，以及
+平面布局解包验证，不接受路径穿越或 symlink。输出六份原始 ZIP，以及
 `release-evidence.json`、`RELEASE_NOTES.md`、`SHA256SUMS`。不重新打包 wheel 或修改 manifest。
 默认 wheel 可能逐字节不同，分别保留各自 manifest，不能跨包混用哈希。
 新增 target 时须同步 CI 和脚本的完整矩阵，不能仅凭版本标签扩大兼容范围。
@@ -58,3 +61,8 @@ workflow 不取消执行中的准备，以免自动中断写请求；常规 CI �
 不证明 GitHub 的当前状态，不能用于草稿上传。正式发布前保存全部已验收资产和
 CI 来源记录，并另核对最终 Release/tag；CI artifact 保留 30 天。
 安装和 schema 回退边界见 [execution-rollout.md](execution-rollout.md)。
+
+0.6.2 为构建矩阵扩展的候选版本，当前 writer/read schema 范围仍为 25 / 1–25。
+新增 CPython 3.12 的两套 libc 构建须通过实际 native 回归、独立安装和候选校验，
+不能以矩阵配置或另一 ABI 的通过结果宣布支持。正式发布、标签与目标升级另行记录；
+已发布 0.6.1 的七项原始资产保持不变。

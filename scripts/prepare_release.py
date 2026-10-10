@@ -18,8 +18,9 @@ import zipfile
 from verify_release_candidate import COMMIT, require, verify_candidate
 
 PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
+NATIVE_PYTHONS = ("3.10", "3.12", "3.14")
 TARGETS = {"ubuntu-22.04": "2.35", "ubuntu-24.04": "2.39"}
-PACKETS = tuple((python, target) for python in ("3.10", "3.14") for target in TARGETS)
+PACKETS = tuple((python, target) for python in NATIVE_PYTHONS for target in TARGETS)
 JOB_NAMES = {"Repository checks", *("Python " + p for p in PYTHONS),
              *(f"{kind} Python {p} / {t}" for kind in ("Native", "Candidate") for p, t in PACKETS)}
 MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
@@ -130,7 +131,7 @@ def validate_metadata(meta, repository, commit, run_id):
     expected = {f"sched-candidate-{commit}-python-{p}-{t}-attempt-{run['run_attempt']}" for p, t in PACKETS}
     artifacts = meta["artifacts"]
     require(len(artifacts) == len(PACKETS) and {a["name"] for a in artifacts} == expected
-            and len({a["id"] for a in artifacts}) == len(PACKETS), "four unique current-attempt candidate artifacts required")
+            and len({a["id"] for a in artifacts}) == len(PACKETS), "complete unique current-attempt candidate artifacts required")
     for artifact in artifacts:
         binding = artifact["workflow_run"]
         require(not artifact["expired"] and binding["id"] == run_id and binding["head_sha"] == commit

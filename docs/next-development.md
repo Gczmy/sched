@@ -12,6 +12,11 @@ execution 以 [execution-api.md](execution-api.md) 及其同仓验收为准。
 下文候选/未部署描述仅保留各阶段历史，不作为当前交付结论。
 缺少 cpuset/BPF 权限的环境暂停正向硬隔离专项；真实租约结束验收仍须独立安排。
 
+下一候选为 0.6.2：native 与发布候选矩阵补充 CPython 3.12 × glibc 2.35/2.39，
+完整 CI 从 14 项扩为 18 项，六份原始 ZIP 加三个说明/证据/校验和文件。
+配置矩阵不代表验收已通过或正式发布；最终来源与实际结果按[发布准备](release-preparation.md)核对。
+不改变 schema 25、运行时依赖、租约守护或未知执行禁止重放的合同。
+
 ## 历史版本 0.2.1
 
 [GitHub Release](https://github.com/Gczmy/sched/releases/tag/v0.2.1) 保存正式来源、
