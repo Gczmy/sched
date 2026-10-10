@@ -4,4 +4,4 @@
 零第三方依赖 (Python stdlib only), 拆分到独立仓库无痛 (零依赖纪律).
 """
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
