@@ -25,7 +25,7 @@ from .config import config_path
 FORMAT = "sched-upgrade-snapshot/v1"
 MAX_FILE_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_BYTES = 512 * 1024 * 1024
-MAX_FILES = 10000
+MAX_FILES = 20000
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 DATABASE_FILES = {"state.db", "state.db-wal", "state.db-shm"}
 
@@ -255,6 +255,8 @@ def _verified(identifier):
             or any(type(name) is not str for name in directories)
             or sorted(set(directories)) != directories):
         raise facts.SnapshotConflict("invalid snapshot directory inventory")
+    if len(files) + len(directories) > MAX_FILES:
+        raise facts.SnapshotConflict("snapshot combined inventory entry bound exceeded")
     for name in directories:
         if os.path.isabs(name) or os.path.normpath(name) != name or name == ".." or name.startswith("../"):
             raise facts.SnapshotConflict("invalid snapshot directory path")

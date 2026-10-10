@@ -16,6 +16,7 @@ from . import state
 CONTRACTS = {
     "upgrade_snapshot": "sched-upgrade-snapshot/v1",
     "upgrade_snapshot_management": "sched-upgrade-snapshot-management/v1",
+    "upgrade_snapshot_permissions": "sched-upgrade-snapshot-permissions/v1",
     "identity": "sched-identity-v1",
     "task": "sched-task-v1",
     "request_status": "sched-request-status-v1",
