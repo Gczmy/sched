@@ -28,15 +28,15 @@ v0.5.0 提供 `snapshot create/verify/migrate/rollback/close/status`，命名合
 须在计算节点，保留永久关闭/manifest/回退 journal，不触碰当前 DB 或恢复执行。
 旧关闭时间未知、活动窗口、绑定/镜像漂移均拒绝。该扩展未随原 v0.5.0 发布。
 
-0.6.1 候选协商 `sched-upgrade-snapshot-permissions/v1`：计算节点在 daemon 已排空、
+0.6.1 协商 `sched-upgrade-snapshot-permissions/v1`：计算节点在 daemon 已排空、
 旧 writer 停用、窗口关闭后，先 `snapshot permissions --dry-run --json`。
 执行使用 `--writers-quiesced --expect-plan <preview-plan_sha256> --yes --json`；
 原实例/数据库事实/配置/目录身份和权限全部重核，只收紧目录的 group/other 权限。
 中断保留已收紧目录与审计，须重新预览剩余项。没有自动迁移、清理日志、启动或任务重放。
-候选节点树范围为 20,000 项，关闭点清理为 30,000 项；原 0.6.0 安装仍受 10,000 项限制。
+节点树范围为 20,000 项，关闭点清理为 30,000 项；原 0.6.0 安装仍受 10,000 项限制。
 完整保存原文件；其余字节、metadata 和数据库事实边界见[升级恢复点](upgrade-snapshot.md)。
 
-0.6.1 候选 `sched-upgrade-snapshot-io-budget/v1` 允许在 create 时显式设置
+0.6.1 `sched-upgrade-snapshot-io-budget/v1` 允许在 create 时显式设置
 `--io-timeout-sec N`（整数 1–900，默认 30 秒）。非默认预算随原 manifest/window 冻结，
 verify/migrate/rollback 沿用，不能为旧点调大。只影响各次节点树文件 I/O 复核；
 SQLite 备份、数据库事实和其他资源边界保持不变。create/verify/status 只在非默认时增加

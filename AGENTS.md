@@ -52,7 +52,7 @@
 | `docs/release-preparation.md` | 固定来源的发布准备、原始产物校验、草稿续传与离线 evidence |
 | `docs/upgrade-snapshot.md` | 候选持久升级维护窗口、恢复点校验、未启动任务受控回退与故障续接 |
 | `docs/releases/0.4.0.md` | 已发布 0.4.0 的固定来源、集成合同、CI 与 schema 10 边界 |
-| `docs/releases/0.6.1.md` | 候选历史目录权限准备、原计划校验及较大实例的有界恢复点 |
+| `docs/releases/0.6.1.md` | 已发布 0.6.1 的固定来源/完整 CI/七项资产、原目录权限准备及冻结 I/O 预算 |
 | `docs/releases/0.5.0.md` | 已发布 0.5.0 的固定来源、schema 25、兼容模式与独立生产切换边界 |
 | `docs/releases/0.6.0.md` | 已发布 0.6.0 的固定来源、最终联合验收、完整 CI 与七项原始资产；生产切换独立安排 |
 | `docs/student-compatibility.md` | 无 cpuset/BPF 权限的显式启动祖先、120 声明预算、CPU affinity 联合验收与剩余交付 |

@@ -13,7 +13,7 @@ fields. Legacy task replies remain readable through their existing validation.
 Database schema 10 adds persistent identity and structured operation receipts.
 Read-only identity/receipt queries never initialize or migrate a database.
 The current source candidate writes schema 25 and reads complete schemas 1–25;
-the package version is a 0.6.1 candidate, distinct from published v0.6.0 (schema maximum
+the package version is published v0.6.1, distinct from published v0.6.0 (schema maximum
 25) and v0.4.0 (schema maximum 10). The phase-specific ranges below describe introduction boundaries, not the
 current reader maximum. Negotiate the installed CLI through `version --json`;
 `identity --json` binds an instance, not the set of supported capabilities.

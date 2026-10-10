@@ -12,8 +12,9 @@
 七项原始资产公开下载核对通过。保持 writer schema 25、完整只读 1–25；新增恢复点管理合同
 和兼容模式联合验收。生产切换仍另行安排。
 
-[0.6.1 候选](releases/0.6.1.md) 提供原历史目录权限准备与较大实例的有界恢复点。
-尚未发布或部署；不能当作现有 0.6.0 安装的能力。
+已发布 [v0.6.1](releases/0.6.1.md)，固定来源 `50e7d98`，main CI 14/14，七项原始资产
+公开下载核对通过。提供原目录权限准备、20,000 项恢复点及显式冻结的有界 I/O 预算。
+部署状态以目标 CLI 为准；原 0.6.0 安装不具备新增合同。
 
 | 文档 | 用途 |
 | --- | --- |
@@ -36,6 +37,7 @@
 | [0.4.0 Release 说明](releases/0.4.0.md) | 已发布集成合同、schema 10 与独立消费端兼容边界 |
 | [0.5.0 Release 说明](releases/0.5.0.md) | 固定来源、完整 CI、原始资产、租约/CPU 能力与 schema 25；生产切换另行安排 |
 | [0.6.0 Release 说明](releases/0.6.0.md) | 固定来源/完整 CI/七项公开资产、有界恢复点管理与最终兼容模式联合验收；生产切换另行安排 |
+| [0.6.1 Release 说明](releases/0.6.1.md) | 固定来源/完整 CI/七项公开资产、原目录权限准备、较大实例与冻结 I/O 预算 |
 | [student-compatibility.md](student-compatibility.md) | 无 cpuset/BPF 权限时的显式启动祖先、CPU affinity 合同与已通过的联合验收范围 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
