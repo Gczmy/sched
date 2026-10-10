@@ -38,6 +38,7 @@
 | [0.5.0 Release 说明](releases/0.5.0.md) | 固定来源、完整 CI、原始资产、租约/CPU 能力与 schema 25；生产切换另行安排 |
 | [0.6.0 Release 说明](releases/0.6.0.md) | 固定来源/完整 CI/七项公开资产、有界恢复点管理与最终兼容模式联合验收；生产切换另行安排 |
 | [0.6.1 Release 说明](releases/0.6.1.md) | 固定来源/完整 CI/七项公开资产、原目录权限准备、较大实例与冻结 I/O 预算 |
+| [0.6.2 候选说明](releases/0.6.2.md) | CPython 3.12 native/libc 矩阵、18 项 CI 与九项候选资产；正式发布另行记录 |
 | [student-compatibility.md](student-compatibility.md) | 无 cpuset/BPF 权限时的显式启动祖先、CPU affinity 合同与已通过的联合验收范围 |
 | [real-lease-end-acceptance.md](real-lease-end-acceptance.md) | 非生产真实租约结束、缺条件覆盖项与新租约中的显式恢复流程 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
