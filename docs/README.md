@@ -4,13 +4,13 @@
 节点、租约、会话、批次和部署目录保留在仓库外的私有运行记录中。
 
 已发布 [v0.5.0](releases/0.5.0.md)，固定来源 `7471c1c`，写库 schema 25，完整只读范围 1–25；
-生产切换和正向硬隔离验收仍未完成。各页的“引入 schema”
+目标安装和实时状态由私有交付记录与 CLI 确认，正向硬隔离验收仍未完成。各页的“引入 schema”
 表示功能加入时的边界，不是当前兼容上限。接收端以 `sched version --json`
 协商实际代码的 named contracts/schema；`sched identity --json` 只用于实例绑定。
 
 已发布 [v0.6.0](releases/0.6.0.md)，固定来源 `8f412cc`，完整 main CI 14/14，
 七项原始资产公开下载核对通过。保持 writer schema 25、完整只读 1–25；新增恢复点管理合同
-和兼容模式联合验收。生产切换仍另行安排。
+和兼容模式联合验收。发布记录不代替目标安装验收或实时健康查询。
 
 已发布 [v0.6.1](releases/0.6.1.md)，固定来源 `50e7d98`，main CI 14/14，七项原始资产
 公开下载核对通过。提供原目录权限准备、20,000 项恢复点及显式冻结的有界 I/O 预算。
@@ -39,6 +39,7 @@
 | [0.6.0 Release 说明](releases/0.6.0.md) | 固定来源/完整 CI/七项公开资产、有界恢复点管理与最终兼容模式联合验收；生产切换另行安排 |
 | [0.6.1 Release 说明](releases/0.6.1.md) | 固定来源/完整 CI/七项公开资产、原目录权限准备、较大实例与冻结 I/O 预算 |
 | [student-compatibility.md](student-compatibility.md) | 无 cpuset/BPF 权限时的显式启动祖先、CPU affinity 合同与已通过的联合验收范围 |
+| [real-lease-end-acceptance.md](real-lease-end-acceptance.md) | 非生产真实租约结束、缺条件覆盖项与新租约中的显式恢复流程 |
 | [0.3.1 Release 说明](releases/0.3.1.md) | SQLite 锁修复、版本查询与旧 schema 升级边界；发布事实以 Release/tag 为准 |
 | [native-integration.md](native-integration.md) | 旧实验接口的持久态保护与迁移限制 |
 | [native-deployment.md](native-deployment.md) | 已外移的旧实验部署绑定记录 |

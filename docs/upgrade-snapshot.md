@@ -6,7 +6,31 @@ CLI 写库仍为 schema 25；完整 schema 10–25 且已有原 instance 的库�
 低于 10、身份缺失、不完整或较新的库拒绝，不在创建/验证时自动迁移或补身份。
 
 该 CLI 已随 [v0.5.0](releases/0.5.0.md) 从 `7471c1c` 正式发布，最终完整 CI 14/14 成功。
-下文计算节点测试与早期来源 CI 为历史记录；生产恢复点仍未创建或验证。
+下文计算节点测试与早期来源 CI 为历史记录；[0.6.1](releases/0.6.1.md) 的
+目标安装/恢复点验收另留私有交付记录。当前窗口状态须查询 CLI，不能用旧描述推断。
+
+## 升级后的维护与保留
+
+已关闭窗口只能留作证据，不能再次 rollback；原 schema 10 镜像也不能授权
+schema 25 当前库回接旧 writer。下一次升级须停用所有 writer、无损排空，在同一
+原实例上重新 create/verify，再按新版本合同 migrate/close。新点不复活旧点。
+
+普通 daemon 恢复使用兼容当前 schema 的独立安装和用户指定的有效既有租约，
+先查询 daemon status、原租约与 CPU claim，再在实际计算节点 check/resume/start。
+已有 running 或未决启动时先按 execution/owner 合同保留和排空，不能凭 PID/日志
+补造 wait 或重启原 attempt。原租约失效不会自动换绑；旧点不能用作日常故障回滚。
+本合同没有实现任意灾难恢复，受管镜像不能按普通目录复制替换当前 state。
+
+健康复查同时检查 heartbeat、成功 tick、lease 和 CPU 观察的时效。跨节点的 stopped/
+stalled 显示须在目标计算节点复核，历史 valid 不授予当前派发权。check 的 GPU 探测
+失败时保留失败事实，不能因 CPU 记账为零跳过启动检查。出现 I/O 延迟时先保存 CLI
+时间戳与错误；大量诊断输出放在 state 外，暂存本地磁盘后再归档，不能放宽观察截止。
+
+恢复点默认保留 30 天及最近 2 个未清理关闭点。先分页 snapshot list，再对精确
+完整关闭点 prune --dry-run；保留期未满、属于 keep-last、未完成或损坏的点不清理。
+符合条件后才在计算节点沿用原 as-of/expect-plan/保留参数执行 --yes。
+没有明确清理对象时只记录预览；不降低保留参数使新点提前满足条件。
+永久 closed/必要审计保留，不能手工删除 state 或旧镜像。
 
 ## 操作顺序
 
@@ -89,7 +113,7 @@ rollback 在实际替换前保存原 DB/WAL/SHM 摘要和持久 intent，将回�
 restoring 时禁止 close。创建失败保持 creating 并冻结写入，可显式 close 放弃未完成点；
 不允许拿未完成点回退。后续源码提供下述恢复点管理扩展；不手工删除受管恢复记录。
 
-## 旧目录权限准备（0.6.1 候选）
+## 旧目录权限准备（0.6.1）
 
 合同 `sched-upgrade-snapshot-permissions/v1`。既有私有 state 根下的历史目录可能仍为
 0755；create 继续要求目录私有，不通过跳过这些目录创建不完整恢复点。
@@ -116,7 +140,7 @@ snapshot create/verify/migrate。已关闭点不因权限准备复活回退权�
 以下管理扩展已随 [v0.6.0](releases/0.6.0.md) 发布，不改变原升级窗口的回退权。
 
 命名合同 `sched-upgrade-snapshot-management/v1` 独立协商，不改变升级窗口 v1 的回退权限。
-此扩展尚未发布；已有 v0.5.0 安装不因文档更新取得新命令。
+已有 v0.5.0 安装不因文档更新取得新命令；使用前须核对实际 CLI 的合同。
 
 ```sh
 sched snapshot list --limit 20 --json
