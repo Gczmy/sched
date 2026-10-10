@@ -31,6 +31,9 @@ python scripts/prepare_release.py --commit <full-reviewed-commit> --run-id <succ
 artifact ID/name/digest 与其包内 CI/ABI/libc/安装证据；先校验原 ZIP 哈希，再按有界
 平面布局解包验证，不接受路径穿越或 symlink。输出六份原始 ZIP，以及
 `release-evidence.json`、`RELEASE_NOTES.md`、`SHA256SUMS`。不重新打包 wheel 或修改 manifest。
+所选来源须包含对应版本的 `docs/releases/<version>.md`，候选构建将它保存为原 ZIP 中的
+`RELEASE_NOTES.md`。六份原说明必须存在且一致；缺失时先补齐来源文档并重新生成 CI
+资产，不能手工补入已经验过摘要的 ZIP。
 默认 wheel 可能逐字节不同，分别保留各自 manifest，不能跨包混用哈希。
 新增 target 时须同步 CI 和脚本的完整矩阵，不能仅凭版本标签扩大兼容范围。
 

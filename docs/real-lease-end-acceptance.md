@@ -48,3 +48,27 @@ attempt 或执行计数。若控制器随后不可读，只能记录 unknown，�
 
 验收结果逐项记录：真实原租约终态、存活守护、新租约不自动接管、原 wait/未知保留、
 显式恢复及不重复执行。缺少执行条件的项报告未完成，不用已有夹具结果替代。
+
+## 2026-10-10 独立验收
+
+已安装 0.6.1 在两份明确授权、先后使用的短计算租约中完成 CPU/fake-GPU 验收。
+每份申请四个 CPU 和 512 MiB，不申请 GPU；原租约中的私有 daemon 只使用两个
+已有 CPU，新租约中的私有 daemon 使用四个。固定声明预算仍为 120，hard_isolation=false。
+会话、节点、租约、实例、任务 ID、路径和原始回执保存在私有证据中。
+
+原租约由真实 Slurm 时限自然结束，控制器先返回 COMPLETING/TimeLimit，随后 TIMEOUT。
+原 daemon 仍在运行，检查记录 invalid_latched=true、dispatch_allowed=false，原启动
+anchor 已不存在。正常 inbox 投递的单 CPU 探针入库后保持 pending；后来同节点出现
+新租约时，旧 daemon 的出生和当前 owner 绑定仍指向原租约，没有自动接管。
+
+在新租约中显式 drain 排空旧 daemon，check/resume/start 后，原待执行版本和探针
+各执行一次，基线仍只执行一次。三项任务各只有一个版本和一个不可变 allocation；
+基线绑定原租约，另两项绑定新租约，并分别记录 verified 的 local_supervisor_wait、
+returncode=0、binding_verified 和 group_clean。计数文件只用于执行次数，不能授予 wait 权限。
+原 lease origin 与已记录事件前缀保持不变，同一实例身份保留。
+
+收尾通过 CLI 无损停止私有 daemon，活动 CPU claim 为零；第二份短租约也自然到期。
+已有租约和生产配置未改动。私有分析脚本曾将公开 process_state 的 running 误写为 alive，
+导致覆盖项误报未完成；修正判定后沿用已保存的原始快照并通过只读 allocation 精确查询
+复核，没有重跑任务或申请第三份租约。原始结果与修正后的复核报告一并保留。
+该验收不包含真实 GPU 执行、cpuset/BPF 硬隔离或运行任务在真实到期时被清理的矩阵。
