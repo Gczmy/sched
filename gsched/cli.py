@@ -5297,7 +5297,7 @@ def cmd_snapshot(args) -> int:
                 print("未确认：snapshot 写操作需要 --yes", file=sys.stderr)
                 return 1
         if action == "create":
-            result = snapshot.create(writers_quiesced=args.writers_quiesced)
+            result = snapshot.create(writers_quiesced=args.writers_quiesced, io_timeout_sec=args.io_timeout_sec)
         elif action == "status":
             result = snapshot.status()
         elif action == "verify":
@@ -5609,6 +5609,7 @@ def _build_parser() -> argparse.ArgumentParser:
             parser.add_argument("--yes", action="store_true")
         if action == "create":
             parser.add_argument("--writers-quiesced", action="store_true", help="确认已停用不认识维护门禁的旧版写入端")
+            parser.add_argument("--io-timeout-sec", type=int, default=30, help="冻结每次文件清点/复制/复核的时间预算（默认 30，上限 900 秒）")
         if action == "permissions":
             parser.add_argument("--dry-run", action="store_true")
             parser.add_argument("--writers-quiesced", action="store_true")

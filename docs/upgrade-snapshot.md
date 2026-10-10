@@ -68,6 +68,15 @@ rollback 返回 restored 后窗口仍然开启，数据库为原 schema，配置
 单文件 128 MiB、节点文件总量 512 MiB、数据库事实 500,000 行/
 256 MiB；扫描/备份有界。超限不返回部分成功，也不能据此降低保护条件。
 
+0.6.1 候选提供 `sched-upgrade-snapshot-io-budget/v1`。网络文件系统上可显式使用
+`snapshot create --io-timeout-sec 300 --writers-quiesced --yes --json`；整数范围 1–900 秒，
+默认仍为 30 秒。此预算分别约束完整节点树清点/复制、镜像文件复核及原文件不变复核，
+不是整个 CLI 的总时长；SQLite 备份和数据库事实原时间限制保持不变。
+非默认值冻结在原 manifest 和维护窗口，并由原摘要绑定；verify、migrate、rollback
+沿用该值，没有后续调大参数。旧恢复点缺少此字段时仍使用 30 秒。显式预算在 create、
+verify、status JSON 中通过 `io_timeout_sec` 报告，默认输出结构保持不变。
+超时保留未完成点和 creating 门禁，不允许使用其回退；显式 close 后才能重新创建。
+
 daemon/前台 owner 或启动文件存在、running、GPU/CPU 活动分配、未决 execution/owner cleanup、
 CPU/device scope 未终结时拒绝创建。旧 native session 没有充分清理证明时也拒绝；不依据
 当前 PID 不存在、日志或产物猜测原执行已完成。历史 unknown 请求事实可保留，但旧写入端

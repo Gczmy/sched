@@ -27,7 +27,29 @@ MAX_FILE_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_FILES = 20000
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+DEFAULT_IO_TIMEOUT_SEC = 30
+MAX_IO_TIMEOUT_SEC = 900
 DATABASE_FILES = {"state.db", "state.db-wal", "state.db-shm"}
+
+
+def _io_timeout(value):
+    if type(value) is not int or not 1 <= value <= MAX_IO_TIMEOUT_SEC:
+        raise facts.SnapshotConflict("snapshot io timeout must be an integer from 1 to 900 seconds")
+    return value
+
+
+def _record_timeout(record):
+    return _io_timeout(record.get("io_timeout_sec", DEFAULT_IO_TIMEOUT_SEC))
+
+
+def _io_deadline(deadline):
+    if time.monotonic() > deadline:
+        raise facts.SnapshotConflict("snapshot inventory time bound exceeded")
+
+
+def _same_timeout(window, manifest):
+    if _record_timeout(window) != _record_timeout(manifest):
+        raise facts.SnapshotConflict("upgrade window io timeout binding mismatch")
 
 
 def _identifier(value):
@@ -121,11 +143,11 @@ def _binding():
             "uid": os.getuid(), "config_path": os.path.abspath(os.path.expanduser(config_path()))}
 
 
-def _inventory(*, destination=None):
+def _inventory(*, destination=None, io_timeout_sec=DEFAULT_IO_TIMEOUT_SEC):
     """Bounded entire node tree, excluding only SQLite's DB/WAL/SHM."""
     root = state.host_dir()
     found, budget, directories = {}, 0, {}
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + _io_timeout(io_timeout_sec)
     def walk_error(error):
         raise facts.SnapshotConflict("snapshot inventory is unreadable") from error
     for parent, names, files in os.walk(root, followlinks=False, onerror=walk_error):
@@ -137,8 +159,10 @@ def _inventory(*, destination=None):
         if destination is not None:
             state.ensure_private_directory(os.path.join(destination, relative))
         for name in names:
+            _io_deadline(deadline)
             _stat(os.path.join(parent, name), directory=True, private=True)
         for name in sorted(files):
+            _io_deadline(deadline)
             path = os.path.join(parent, name)
             relative_file = os.path.relpath(path, root)
             if relative_file in DATABASE_FILES:
@@ -152,10 +176,13 @@ def _inventory(*, destination=None):
                 target = os.path.join(destination, relative_file)
                 state.ensure_private_directory(os.path.dirname(target))
                 _write(target, data)
+            _io_deadline(deadline)
     for relative, identity in directories.items():
+        _io_deadline(deadline)
         now = _stat(os.path.join(root, relative), directory=True, private=True)
         if (now.st_dev, now.st_ino) != identity:
             raise facts.SnapshotConflict("snapshot directory was replaced")
+    _io_deadline(deadline)
     return {"files": found, "directories": sorted(directories)}
 
 
@@ -247,6 +274,7 @@ def _verified(identifier):
     manifest = _json(os.path.join(path, "manifest.json"))
     if manifest.get("format") != FORMAT or manifest.get("snapshot_id") != identifier:
         raise facts.SnapshotConflict("snapshot manifest identity mismatch")
+    deadline = time.monotonic() + _record_timeout(manifest)
     files = manifest.get("files")
     if type(files) is not dict or len(files) > MAX_FILES:
         raise facts.SnapshotConflict("invalid snapshot inventory")
@@ -258,6 +286,7 @@ def _verified(identifier):
     if len(files) + len(directories) > MAX_FILES:
         raise facts.SnapshotConflict("snapshot combined inventory entry bound exceeded")
     for name in directories:
+        _io_deadline(deadline)
         if os.path.isabs(name) or os.path.normpath(name) != name or name == ".." or name.startswith("../"):
             raise facts.SnapshotConflict("invalid snapshot directory path")
         parent = os.path.join(path, "files")
@@ -267,6 +296,7 @@ def _verified(identifier):
             _stat(parent, directory=True, private=True)
     total = 0
     for name, expected in files.items():
+        _io_deadline(deadline)
         if (type(name) is not str or name in DATABASE_FILES or os.path.isabs(name)
                 or os.path.normpath(name) != name or name == ".." or name.startswith("../")):
             raise facts.SnapshotConflict("invalid snapshot relative path")
@@ -278,6 +308,7 @@ def _verified(identifier):
         total += actual["bytes"]
         if actual != expected or total > MAX_TOTAL_BYTES:
             raise facts.SnapshotConflict("snapshot file digest mismatch or total byte bound exceeded")
+    _io_deadline(deadline)
     if _file_fact(os.path.join(path, "config.json"), private=True) != manifest.get("config"):
         raise facts.SnapshotConflict("snapshot config digest mismatch")
     image = os.path.join(path, "database.db")
@@ -297,10 +328,12 @@ def verify(identifier):
     return {"schema_version": 1, "contract": FORMAT, "snapshot_id": identifier,
             "verified": True, "instance_id": value["database_facts"]["instance_id"],
             "database_schema": value["database_facts"]["database_schema"],
-            "rollback_authorized": False, "daemon_started": False}
+            "rollback_authorized": False, "daemon_started": False,
+            **({"io_timeout_sec": value["io_timeout_sec"]} if "io_timeout_sec" in value else {})}
 
 
-def create(*, writers_quiesced=False):
+def create(*, writers_quiesced=False, io_timeout_sec=DEFAULT_IO_TIMEOUT_SEC):
+    io_timeout_sec = _io_timeout(io_timeout_sec)
     if not writers_quiesced:
         raise facts.SnapshotConflict("create requires --writers-quiesced: stop unaware old writer clients first")
     with maintenance.gate(exclusive=True):
@@ -313,6 +346,8 @@ def create(*, writers_quiesced=False):
             raise facts.SnapshotConflict("snapshot point identity already exists")
         state.ensure_private_directory(path)
         window = {"format": FORMAT, "snapshot_id": identifier, "binding": binding, "phase": "creating"}
+        if io_timeout_sec != DEFAULT_IO_TIMEOUT_SEC:
+            window["io_timeout_sec"] = io_timeout_sec
         _publish(maintenance.window_path(), window)
         # Failures deliberately retain the window and any partial private image.
         # close can abandon creating, but rollback cannot use partial evidence.
@@ -322,11 +357,13 @@ def create(*, writers_quiesced=False):
             _quiescent(conn)
         config = _read(binding["config_path"])
         _write(os.path.join(path, "config.json"), config)
-        inventory = _inventory(destination=os.path.join(path, "files"))
+        inventory = _inventory(destination=os.path.join(path, "files"), io_timeout_sec=io_timeout_sec)
         manifest = {"format": FORMAT, "snapshot_id": identifier, "binding": binding,
                     "created_at": state.now(), "database_facts": source,
                     "database": _file_fact(image, private=True), **inventory,
                     "config": {"bytes": len(config), "sha256": hashlib.sha256(config).hexdigest()}}
+        if io_timeout_sec != DEFAULT_IO_TIMEOUT_SEC:
+            manifest["io_timeout_sec"] = io_timeout_sec
         _publish(os.path.join(path, "manifest.json"), manifest)
         _, verified = _verified(identifier)
         _unchanged(verified)
@@ -355,12 +392,13 @@ def _unchanged(manifest):
     binding = _binding()
     if manifest.get("binding") != binding or _file_fact(binding["config_path"]) != manifest.get("config"):
         raise facts.SnapshotConflict("snapshot configuration or state directory binding changed")
-    if _inventory() != {"files": manifest.get("files"), "directories": manifest.get("directories")}:
+    if _inventory(io_timeout_sec=_record_timeout(manifest)) != {"files": manifest.get("files"), "directories": manifest.get("directories")}:
         raise facts.SnapshotConflict("post-snapshot non-database files changed; rollback refused")
 
 
 def _eligible(identifier, window):
     path, manifest = _verified(identifier)
+    _same_timeout(window, manifest)
     if window.get("manifest_sha256") != _file_fact(os.path.join(path, "manifest.json"), private=True)["sha256"]:
         raise facts.SnapshotConflict("upgrade window manifest binding mismatch")
     _unchanged(manifest)
@@ -413,7 +451,8 @@ def status():
         return {"schema_version": 1, "contract": FORMAT, "maintenance_open": False, "daemon_started": False}
     return {"schema_version": 1, "contract": FORMAT, "maintenance_open": True,
             "snapshot_id": window.get("snapshot_id"), "phase": window.get("phase"),
-            "rollback_authorized": False, "daemon_started": False}
+            "rollback_authorized": False, "daemon_started": False,
+            **({"io_timeout_sec": _record_timeout(window)} if "io_timeout_sec" in window else {})}
 
 
 def rollback(identifier):
@@ -422,6 +461,7 @@ def rollback(identifier):
         window = _window(identifier)
         if window.get("phase") == "restored":
             path, manifest = _verified(identifier)
+            _same_timeout(window, manifest)
             if window.get("manifest_sha256") != _file_fact(os.path.join(path, "manifest.json"), private=True)["sha256"]:
                 raise facts.SnapshotConflict("restored window manifest binding changed")
             _unchanged(manifest)
@@ -452,6 +492,7 @@ def rollback(identifier):
             _publish(maintenance.window_path(), window)
         # Interrupted renames resume against exact digests, never guessed state.
         _, manifest = _verified(identifier)
+        _same_timeout(window, manifest)
         if window.get("manifest_sha256") != _file_fact(os.path.join(path, "manifest.json"), private=True)["sha256"]:
             raise facts.SnapshotConflict("rollback resume manifest binding changed")
         _unchanged(manifest)

@@ -29,6 +29,71 @@ class SnapshotTests(TempStateCase):
     def create(self):
         return snapshot.create(writers_quiesced=True)["snapshot_id"]
 
+    def test_io_timeout_invalid_before_opening_window(self):
+        for value in (True, False, None, "300", 0, -1, 901, 1.5):
+            with self.subTest(value=value), self.assertRaises(snapshot_facts.SnapshotConflict):
+                snapshot.create(writers_quiesced=True, io_timeout_sec=value)
+            self.assertFalse(snapshot.status()["maintenance_open"])
+
+    def test_default_point_keeps_original_shape_and_timeout(self):
+        identifier = self.create()
+        manifest = snapshot._json(os.path.join(snapshot._point(identifier), "manifest.json"))
+        self.assertNotIn("io_timeout_sec", manifest)
+        self.assertNotIn("io_timeout_sec", snapshot.status())
+        self.assertNotIn("io_timeout_sec", snapshot.verify(identifier))
+        self.assertEqual(30, snapshot._record_timeout(manifest))
+        snapshot.close(identifier)
+
+    def test_slow_inventory_explicit_budget_survives_verify_migration_and_rollback(self):
+        downgrade_to_ten()
+        slow = os.path.join(state.host_dir(), "slow-original.log")
+        snapshot._write(slow, b"original evidence")
+        clock = [0]
+        original_read = snapshot._read
+        def delayed_read(path, **kwargs):
+            result = original_read(path, **kwargs)
+            if os.path.basename(path) == "slow-original.log":
+                clock[0] += 31
+            return result
+        with mock.patch.object(snapshot.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(snapshot, "_read", side_effect=delayed_read):
+            with self.assertRaisesRegex(snapshot_facts.SnapshotConflict, "time bound"):
+                self.create()
+            failed = snapshot.status()
+            self.assertEqual("creating", failed["phase"])
+            snapshot.close(failed["snapshot_id"])
+            code, out, err = self.capture(cli.main, ["snapshot", "create", "--writers-quiesced",
+                                          "--io-timeout-sec", "300", "--yes", "--json"])
+            self.assertEqual(0, code, (out, err))
+            created = json.loads(out)
+            self.assertEqual(300, created["io_timeout_sec"])
+            identifier = created["snapshot_id"]
+            self.assertEqual(300, snapshot.status()["io_timeout_sec"])
+            self.assertEqual(300, snapshot.verify(identifier)["io_timeout_sec"])
+            snapshot.migrate(identifier)
+            snapshot.rollback(identifier)
+            snapshot.rollback(identifier)
+            self.assertEqual(10, snapshot.verify(identifier)["database_schema"])
+            self.assertEqual(b"original evidence", original_read(slow))
+            snapshot.close(identifier)
+
+    def test_timeout_tamper_never_expands_original_rollback_authority(self):
+        identifier = snapshot.create(writers_quiesced=True, io_timeout_sec=300)["snapshot_id"]
+        window = snapshot._json(maintenance.window_path())
+        snapshot._publish(maintenance.window_path(), {**window, "io_timeout_sec": 900})
+        with self.assertRaisesRegex(snapshot_facts.SnapshotConflict, "timeout binding"):
+            snapshot.migrate(identifier)
+        snapshot._publish(maintenance.window_path(), window)
+        path = os.path.join(snapshot._point(identifier), "manifest.json")
+        manifest = snapshot._json(path)
+        snapshot._publish(path, {**manifest, "io_timeout_sec": 900})
+        with self.assertRaises(snapshot_facts.SnapshotConflict):
+            snapshot.rollback(identifier)
+        snapshot._publish(path, {**manifest, "io_timeout_sec": True})
+        with self.assertRaises(snapshot_facts.SnapshotConflict):
+            snapshot.verify(identifier)
+        snapshot.close(identifier)
+
     def test_schema10_migration_and_controlled_rollback_preserve_unknown_receipt(self):
         self.seed_batch(job_status="pending")
         with state.connect() as conn:

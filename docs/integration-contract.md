@@ -32,6 +32,13 @@ passive; mutation requires the original plan digest, quiesced unaware writers an
 explicit confirmation. It only removes group/other directory permissions and retains
 an intent/audit; it never grants database migration, execution, wait or rollback authority.
 
+The optional `sched-upgrade-snapshot-io-budget/v1` contract permits create-time
+`--io-timeout-sec` (integer 1–900, default 30) for each complete inventory/copy/file
+verification pass. A nondefault value is frozen in the original manifest/window;
+verify, migrate and rollback cannot widen it. Default and legacy point JSON retain
+their shape; opt-in create/verify/status reports `io_timeout_sec`. SQLite backup,
+database facts, entry and byte limits remain independent and unchanged.
+
 ## Identity and task ownership
 
 `identity --json` returns instance_id, configured node and query_host.
